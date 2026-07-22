@@ -418,6 +418,7 @@ class OpenAIServingCompletion(GenerateBaseServing):
                                     if request.return_token_ids
                                     else None
                                 ),
+                                artifact_sample_id=output.artifact_sample_id,
                             )
                         ],
                     )
@@ -593,6 +594,7 @@ class OpenAIServingCompletion(GenerateBaseServing):
                         as_list(output.token_ids) if request.return_token_ids else None
                     ),
                     routed_experts=routed_experts_b64,
+                    artifact_sample_id=output.artifact_sample_id,
                 )
                 choices.append(choice_data)
 

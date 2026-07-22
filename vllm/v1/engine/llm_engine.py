@@ -99,6 +99,7 @@ class LLMEngine:
             log_stats=self.log_stats,
             stream_interval=self.vllm_config.scheduler_config.stream_interval,
             tracing_enabled=tracing_endpoint is not None,
+            finalize_artifacts=self.vllm_config.model_config.enable_return_routed_experts,
         )
 
         # EngineCore (gets EngineCoreRequests and gives EngineCoreOutputs)
@@ -316,6 +317,7 @@ class LLMEngine:
         # 3) Abort any reqs that finished due to stop strings.
         with record_function_or_nullcontext("llm_engine step: abort_requests"):
             self.engine_core.abort_requests(processed_outputs.reqs_to_abort)
+            self.engine_core.finalize_requests(processed_outputs.reqs_to_finalize)
 
         # 4) Record stats
         with record_function_or_nullcontext("llm_engine step: record_stats"):

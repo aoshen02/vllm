@@ -13,12 +13,14 @@ from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.v1.core.sched.output import SchedulerOutput
 
 if TYPE_CHECKING:
+    from vllm.distributed.artifact_connector import ArtifactConnectorOutput
     from vllm.distributed.kv_events import KVConnectorKVEvents
     from vllm.distributed.kv_transfer.kv_connector.v1.base import (
         KVConnectorWorkerMetadata,
     )
     from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
 else:
+    ArtifactConnectorOutput = object
     KVConnectorStats = object
     KVConnectorWorkerMetadata = object
     KVConnectorKVEvents = object
@@ -195,6 +197,8 @@ class ModelRunnerOutput:
     kv_connector_output: KVConnectorOutput | None = None
 
     ec_connector_output: ECConnectorOutput | None = None
+
+    artifact_connector_output: ArtifactConnectorOutput | None = None
 
     # req_id -> num_nans_in_logits
     num_nans_in_logits: dict[str, int] | None = None

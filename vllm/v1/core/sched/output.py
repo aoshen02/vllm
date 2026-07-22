@@ -10,6 +10,7 @@ if TYPE_CHECKING:
     import numpy.typing as npt
     import torch
 
+    from vllm.distributed.artifact_connector import ArtifactConnectorMetadata
     from vllm.distributed.ec_transfer.ec_connector.base import ECConnectorMetadata
     from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
     from vllm.lora.request import LoRARequest
@@ -19,6 +20,7 @@ if TYPE_CHECKING:
     from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
     from vllm.v1.request import Request
 else:
+    ArtifactConnectorMetadata = object
     ECConnectorMetadata = object
     KVConnectorMetadata = object
     KVCacheBlockCopy = object
@@ -246,6 +248,14 @@ class SchedulerOutput:
 
     # EC Cache Connector metadata
     ec_connector_metadata: ECConnectorMetadata | None = None
+
+    # Terminal artifact work for the authoritative routed-experts worker.
+    artifact_connector_metadata: ArtifactConnectorMetadata | None = None
+
+    # Exact physical block snapshot for this model step. This stays on the
+    # scheduler side and prevents async schedules from replacing the mapping
+    # before their older output is processed.
+    artifact_block_ids: dict[str, list[int]] | None = None
 
     # Block IDs freshly allocated from the pool during this scheduling step.
     # The worker zeros the corresponding GPU memory before the blocks are used,

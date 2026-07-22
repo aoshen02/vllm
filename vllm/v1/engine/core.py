@@ -159,6 +159,8 @@ class EngineCore:
             block_size=scheduler_block_size,
             hash_block_size=hash_block_size,
         )
+        if vllm_config.model_config.enable_return_routed_experts:
+            self.model_executor.collective_rpc("validate_routed_experts_shm")
         self.use_spec_decode = vllm_config.speculative_config is not None
         self.check_for_draft_tokens = (
             self.use_spec_decode or vllm_config.model_config.is_diffusion
@@ -211,7 +213,11 @@ class EngineCore:
         self.is_pooling_model = vllm_config.model_config.runner_type == "pooling"
 
         self.request_block_hasher: Callable[[Request], list[BlockHash]] | None = None
-        if vllm_config.cache_config.enable_prefix_caching or kv_connector is not None:
+        if (
+            vllm_config.cache_config.enable_prefix_caching
+            or kv_connector is not None
+            or vllm_config.model_config.enable_return_routed_experts
+        ):
             caching_hash_fn = get_hash_fn_by_name(
                 vllm_config.cache_config.prefix_caching_hash_algo
             )
@@ -481,6 +487,10 @@ class EngineCore:
         # specific finish reason, TBD whether we propagate that
         # (i.e. client-aborted vs stop criteria met).
         self.scheduler.finish_requests(request_ids, RequestStatus.FINISHED_ABORTED)
+
+    def finalize_requests(self, requests: list[tuple[str, int, str]]) -> None:
+        """Finalize artifacts for requests stopped by the frontend."""
+        self.scheduler.finalize_requests(requests)
 
     @contextmanager
     def log_error_detail(self, scheduler_output: SchedulerOutput):
@@ -949,7 +959,27 @@ class EngineCore:
         args: tuple = (),
         kwargs: dict[str, Any] | None = None,
     ) -> list[_R]:
-        return self.model_executor.collective_rpc(method, timeout, args, kwargs)
+        method_name = method if isinstance(method, str) else None
+        starts_policy_update = method_name in (
+            "start_weight_update",
+            "start_draft_weight_update",
+            "reload_weights",
+        )
+        recovering_with_reload = (
+            method_name == "reload_weights"
+            and self.scheduler.artifact_policy_update_active
+        )
+        if starts_policy_update and not recovering_with_reload:
+            self.scheduler.begin_artifact_policy_update()
+        try:
+            result = self.model_executor.collective_rpc(method, timeout, args, kwargs)
+        except BaseException:
+            # A failed distributed update may already have changed a subset of
+            # workers. Keep admission fenced until a full reload succeeds.
+            raise
+        if method_name in ("finish_weight_update", "reload_weights"):
+            self.scheduler.advance_artifact_policy_epoch()
+        return result
 
     def preprocess_add_request(self, request: EngineCoreRequest) -> tuple[Request, int]:
         """Preprocess the request.
@@ -1478,6 +1508,13 @@ class EngineCoreProc(EngineCore):
         elif request_type == EngineCoreRequestType.ADD:
             req, request_wave = request
             if self._reject_add_in_shutdown(req):
+                return
+            if self.scheduler.artifact_policy_update_active:
+                logger.warning(
+                    "Rejecting request %s while a model-weight update is incomplete",
+                    req.request_id,
+                )
+                self._send_error_outputs_to_client([req.request_id], req.client_index)
                 return
             self.add_request(req, request_wave)
         elif request_type == EngineCoreRequestType.ABORT:

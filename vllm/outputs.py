@@ -43,6 +43,7 @@ class CompletionOutput:
     cumulative_logprob: float | None
     logprobs: SampleLogprobs | None
     routed_experts: np.ndarray | None = None  # [seq_len,layer_num,topk]
+    artifact: dict[str, Any] | None = None
     finish_reason: str | None = None
     stop_reason: int | str | None = None
     lora_request: LoRARequest | None = None
@@ -56,11 +57,22 @@ class CompletionOutput:
             f"text={self.text!r}, "
             f"token_ids={self.token_ids}, "
             f"routed_experts={self.routed_experts}, "
+            f"artifact={self.artifact}, "
             f"cumulative_logprob={self.cumulative_logprob}, "
             f"logprobs={self.logprobs}, "
             f"finish_reason={self.finish_reason}, "
             f"stop_reason={self.stop_reason})"
         )
+
+    @property
+    def artifact_sample_id(self) -> str | None:
+        """Return the external identity of the finalized artifact."""
+        if self.artifact is None:
+            return None
+        sample_id = self.artifact.get("artifact_sample_id")
+        if not isinstance(sample_id, str):
+            raise RuntimeError("artifact handle is missing artifact_sample_id")
+        return sample_id
 
 
 @dataclass
@@ -173,6 +185,8 @@ class RequestOutput:
                         )
                         completion.finish_reason = next_completion.finish_reason
                         completion.stop_reason = next_completion.stop_reason
+                        if next_completion.artifact is not None:
+                            completion.artifact = next_completion.artifact
                     else:
                         # Replace the output with the new one
                         self.outputs[i] = next_completion

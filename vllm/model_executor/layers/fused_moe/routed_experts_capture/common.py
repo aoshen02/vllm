@@ -4,7 +4,6 @@
 
 from typing import TYPE_CHECKING, Any
 
-from vllm.logger import init_logger
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheSpecKind,
@@ -13,8 +12,6 @@ from vllm.v1.kv_cache_interface import (
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
-
-logger = init_logger(__name__)
 
 _FULL_ATTENTION_KINDS = frozenset(
     {
@@ -29,8 +26,9 @@ def require_full_attn_group_id(kv_cache_config: KVCacheConfig) -> int:
     """Return the full-attention KV group used as the routing anchor.
 
     Raises:
-        ValueError: The model has no full-attention KV group (pure
-            sliding-window / Mamba models are unsupported).
+        ValueError: The model does not have exactly one full-attention KV
+            group. Pure sliding-window / Mamba models and multiple routing
+            anchors are unsupported.
     """
     full_attn_group_ids = [
         group_id
@@ -42,14 +40,13 @@ def require_full_attn_group_id(kv_cache_config: KVCacheConfig) -> int:
             "enable_return_routed_experts requires at least one full-attention "
             "KV cache group; pure sliding-window / Mamba models are unsupported."
         )
-    if len(full_attn_group_ids) > 1:
-        logger.warning_once(
-            "enable_return_routed_experts: %d full-attention KV cache groups "
-            "%s; anchoring routing on group %d only. Routing for tokens whose "
-            "KV lives in the other group(s) is not offloaded.",
-            len(full_attn_group_ids),
-            tuple(full_attn_group_ids),
-            full_attn_group_ids[0],
+    if len(full_attn_group_ids) != 1:
+        raise ValueError(
+            "enable_return_routed_experts requires exactly one "
+            "full-attention KV cache group; got full-attention groups "
+            f"{full_attn_group_ids}. Other hybrid KV cache groups are "
+            "supported, but routing cannot be anchored to multiple "
+            "full-attention groups."
         )
     return full_attn_group_ids[0]
 

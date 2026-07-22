@@ -31,6 +31,10 @@ import vllm.envs as envs
 from vllm.compilation.counter import compilation_counter
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
+from vllm.distributed.artifact_connector import (
+    ArtifactConnectorOutput,
+    ArtifactWorkerConnector,
+)
 from vllm.distributed.parallel_state import (
     get_dcp_group,
     get_pp_group,
@@ -54,7 +58,11 @@ from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
 from vllm.utils.torch_utils import PIN_MEMORY, STR_DTYPE_TO_TORCH_DTYPE
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
-from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
+from vllm.v1.outputs import (
+    EMPTY_MODEL_RUNNER_OUTPUT,
+    DraftTokenIds,
+    ModelRunnerOutput,
+)
 from vllm.v1.worker.cp_utils import check_attention_cp_compatibility
 from vllm.v1.worker.gpu import pcp_manager as pcp
 from vllm.v1.worker.gpu.async_utils import AsyncOutput, AsyncPoolingOutput
@@ -262,6 +270,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Expert parallelism load balancer.
         self.eplb = EPLBController(self.parallel_config, self.device)
         self.routed_experts_capture: RoutedExpertsCaptureState | None = None
+        self.artifact_connector: ArtifactWorkerConnector | None = None
+        self.artifact_connector_output: ArtifactConnectorOutput | None = None
 
     def update_max_model_len(self, max_model_len: int) -> None:
         self.max_model_len = max_model_len
@@ -270,12 +280,29 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     def init_routed_experts_capturer(self) -> None:
         if self.routed_experts_capture is not None:
             self.routed_experts_capture.close()
-        self.routed_experts_capture = RoutedExpertsCaptureState.create(
+        capture_state = RoutedExpertsCaptureState.create(
             model=self.model,
             vllm_config=self.vllm_config,
             kv_cache_config=self.kv_cache_config,
             max_num_batched_tokens=self.scheduler_config.max_num_batched_tokens,
         )
+        self.routed_experts_capture = capture_state
+        if capture_state.writer is not None:
+            self.artifact_connector = ArtifactWorkerConnector(
+                self.vllm_config, capture_state.writer
+            )
+
+    def _attach_artifact_connector_output(
+        self, output: ModelRunnerOutput
+    ) -> ModelRunnerOutput:
+        artifact_output = self.artifact_connector_output
+        self.artifact_connector_output = None
+        if artifact_output is None:
+            return output
+        if output is EMPTY_MODEL_RUNNER_OUTPUT:
+            output = ModelRunnerOutput(req_ids=[], req_id_to_index={})
+        output.artifact_connector_output = artifact_output
+        return output
 
     def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         tasks: list[SupportedTask] = []
@@ -1171,6 +1198,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         skip_attn_for_dummy_run: bool = False,
         is_profile: bool = False,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
+        self.artifact_connector_output = (
+            self.artifact_connector.finalize(
+                scheduler_output.artifact_connector_metadata
+            )
+            if self.artifact_connector is not None
+            else None
+        )
         routed_experts_capture = self.routed_experts_capture
         if routed_experts_capture is not None:
             routed_experts_capture.clear()
@@ -1185,7 +1219,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if scheduler_output.total_num_scheduled_tokens == 0:
                 # No need to run the model.
                 empty_output = self.kv_connector.no_forward(scheduler_output)
-                return empty_output
+                return self._attach_artifact_connector_output(empty_output)
 
         # Get batch descriptor and sync across DP ranks.
         num_reqs = len(scheduler_output.num_scheduled_tokens)
@@ -1221,7 +1255,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if batch_desc.num_tokens == 0:
             # All DP ranks have zero tokens to run.
             empty_output = self.kv_connector.no_forward(scheduler_output)
-            return empty_output
+            return self._attach_artifact_connector_output(empty_output)
 
         if not dummy_run:
             # Common case.
@@ -1453,7 +1487,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
             # Post-step KV connector related operations.
             kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
-            return ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
+            output = ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
+            return self._attach_artifact_connector_output(output)
 
         # Last rank: sample tokens
         hidden_states, input_batch = pcp.maybe_restore_pcp_for_sampling(
@@ -1491,6 +1526,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             req_id_to_index={req_id: i for i, req_id in enumerate(input_batch.req_ids)},
             sampled_token_ids=None,  # type: ignore
             prompt_logprobs_dict=prompt_logprobs_dict,  # type: ignore[arg-type]
+        )
+        model_runner_output = self._attach_artifact_connector_output(
+            model_runner_output
         )
         # Start async output copy here so that it can overlap with speculator proposal.
         async_output = AsyncOutput(
@@ -1585,7 +1623,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         if not self.is_last_pp_rank:
             self.postprocess_num_computed_tokens(input_batch)
-            return ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
+            output = ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
+            return self._attach_artifact_connector_output(output)
 
         assert self.pooling_runner is not None
         pooler_output, is_valid = self.pooling_runner.pool(
@@ -1597,6 +1636,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             req_ids=input_batch.req_ids,
             req_id_to_index={req_id: i for i, req_id in enumerate(input_batch.req_ids)},
             kv_connector_output=kv_connector_output,
+        )
+        model_runner_output = self._attach_artifact_connector_output(
+            model_runner_output
         )
         async_output = AsyncPoolingOutput(
             model_runner_output=model_runner_output,
@@ -1621,6 +1663,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         """Release GPU tensors (model weights, KV caches, workspace) so that
         memory is reclaimable when running in the same process."""
         torch.accelerator.synchronize()
+        if self.artifact_connector is not None:
+            self.artifact_connector.close()
+            self.artifact_connector = None
         if self.routed_experts_capture is not None:
             self.routed_experts_capture.close()
             self.routed_experts_capture = None

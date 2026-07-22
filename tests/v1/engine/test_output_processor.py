@@ -4,6 +4,7 @@
 import math
 import time
 
+import numpy as np
 import pytest
 
 from tests.v1.engine.utils import (
@@ -22,11 +23,16 @@ from vllm.tokenizers import TokenizerLike
 from vllm.v1.engine import (
     EngineCoreEvent,
     EngineCoreEventType,
+    EngineCoreOutput,
     EngineCoreOutputs,
     EngineCoreRequest,
     FinishReason,
 )
-from vllm.v1.engine.output_processor import OutputProcessor, RequestOutputCollector
+from vllm.v1.engine.output_processor import (
+    OutputProcessor,
+    RequestOutputCollector,
+    RequestState,
+)
 from vllm.v1.metrics.stats import IterationStats, SchedulerStats
 
 
@@ -895,6 +901,102 @@ def test_stop_string(
     )
 
     assert output_processor.get_num_unfinished_requests() == 0
+    assert not output_processor.has_unfinished_requests()
+
+
+def test_stop_string_waits_for_artifact_terminal_output():
+    class FakeDetokenizer:
+        def __init__(self):
+            self.output_token_ids = []
+
+        def update(self, token_ids, finished):
+            self.output_token_ids.extend(token_ids)
+            return "STOP" if token_ids and not finished else None
+
+        def num_output_tokens(self):
+            return len(self.output_token_ids)
+
+        def get_next_output_text(self, finished, delta):
+            return ""
+
+    class FakeLogprobsProcessor:
+        logprobs = None
+        prompt_logprobs = None
+        cumulative_logprob = None
+
+        def update_from_output(self, output):
+            return None
+
+        def pop_prompt_logprobs(self):
+            return None
+
+    output_processor = OutputProcessor(
+        None,
+        log_stats=False,
+        finalize_artifacts=True,
+    )
+    request_id = "request-int"
+    state = RequestState(
+        request_id=request_id,
+        external_req_id="request-ext",
+        parent_req=None,
+        request_index=0,
+        lora_request=None,
+        output_kind=RequestOutputKind.DELTA,
+        prompt="prompt",
+        prompt_token_ids=[1, 2, 3],
+        prompt_embeds=None,
+        logprobs_processor=FakeLogprobsProcessor(),
+        detokenizer=FakeDetokenizer(),
+        max_tokens_param=10,
+        arrival_time=0,
+        queue=None,
+        log_stats=False,
+        stream_interval=1,
+    )
+    output_processor.request_states[request_id] = state
+    output_processor.external_req_ids[state.external_req_id].append(request_id)
+
+    partial_routed_experts = np.full((2, 3, 2), 255, dtype=np.uint8)
+    processed = output_processor.process_outputs(
+        [
+            EngineCoreOutput(
+                request_id=request_id,
+                new_token_ids=[7, 8],
+                routed_experts=partial_routed_experts,
+            )
+        ]
+    )
+
+    assert not processed.reqs_to_abort
+    assert processed.reqs_to_finalize == [(request_id, 4, "STOP")]
+    assert all(not output.finished for output in processed.request_outputs)
+    assert request_id in output_processor.request_states
+
+    artifact = {"artifact_sample_id": "a" * 32}
+    full_routed_experts = np.arange(4 * 3 * 2, dtype=np.uint8).reshape(4, 3, 2)
+    processed = output_processor.process_outputs(
+        [
+            EngineCoreOutput(
+                request_id=request_id,
+                new_token_ids=[],
+                finish_reason=FinishReason.STOP,
+                stop_reason="STOP",
+                artifact=artifact,
+                routed_experts=full_routed_experts,
+            )
+        ]
+    )
+
+    assert not processed.reqs_to_abort
+    assert not processed.reqs_to_finalize
+    assert len(processed.request_outputs) == 1
+    final_output = processed.request_outputs[0]
+    assert final_output.finished
+    assert final_output.outputs[0].artifact == artifact
+    np.testing.assert_array_equal(
+        final_output.outputs[0].routed_experts, full_routed_experts
+    )
     assert not output_processor.has_unfinished_requests()
 
 

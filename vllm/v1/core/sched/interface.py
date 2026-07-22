@@ -35,6 +35,8 @@ class PauseState(enum.IntEnum):
 
 
 class SchedulerInterface(ABC):
+    artifact_policy_update_active: bool
+
     @abstractmethod
     def __init__(
         self,
@@ -165,6 +167,11 @@ class SchedulerInterface(ABC):
         raise NotImplementedError
 
     @abstractmethod
+    def finalize_requests(self, requests: list[tuple[str, int, str]]) -> None:
+        """Finalize requests stopped by frontend string matching."""
+        raise NotImplementedError
+
+    @abstractmethod
     def get_num_unfinished_requests(self) -> int:
         """Number of unfinished requests in the scheduler's internal queue."""
         raise NotImplementedError
@@ -218,6 +225,16 @@ class SchedulerInterface(ABC):
                 will only reset the KV prefix cache when there is no running request
                 taking KV cache.
         """
+        raise NotImplementedError
+
+    @abstractmethod
+    def begin_artifact_policy_update(self) -> None:
+        """Fence request admission before an artifact-producing weight update."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def advance_artifact_policy_epoch(self) -> None:
+        """Invalidate KV lookup and commit an artifact policy transition."""
         raise NotImplementedError
 
     @abstractmethod

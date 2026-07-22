@@ -34,6 +34,7 @@ from typing_extensions import TypeIs
 
 import vllm.envs as envs
 from vllm.config import (
+    ArtifactConfig,
     AttentionConfig,
     CacheConfig,
     CompilationConfig,
@@ -624,6 +625,7 @@ class EngineArgs:
     structured_outputs_config: StructuredOutputsConfig = get_field(
         VllmConfig, "structured_outputs_config"
     )
+    artifact_config: ArtifactConfig = get_field(VllmConfig, "artifact_config")
     reasoning_parser: str = StructuredOutputsConfig.reasoning_parser
     reasoning_parser_plugin: str | None = None
 
@@ -1569,6 +1571,7 @@ class EngineArgs:
         vllm_group.add_argument(
             "--structured-outputs-config", **vllm_kwargs["structured_outputs_config"]
         )
+        vllm_group.add_argument("--artifact-config", **vllm_kwargs["artifact_config"])
         vllm_group.add_argument("--profiler-config", **vllm_kwargs["profiler_config"])
         vllm_group.add_argument(
             "--optimization-level", **vllm_kwargs["optimization_level"]
@@ -2378,6 +2381,7 @@ class EngineArgs:
             load_config=load_config,
             offload_config=offload_config,
             attention_config=attention_config,
+            artifact_config=self.artifact_config,
             mamba_config=mamba_config,
             kernel_config=kernel_config,
             lora_config=lora_config,

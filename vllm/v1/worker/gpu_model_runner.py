@@ -37,6 +37,10 @@ from vllm.config import (
     update_config,
 )
 from vllm.config.cache import CacheConfig
+from vllm.distributed.artifact_connector import (
+    ArtifactConnectorOutput,
+    ArtifactWorkerConnector,
+)
 from vllm.distributed.ec_transfer import get_ec_transfer, has_ec_transfer
 from vllm.distributed.eplb.eplb_state import EplbState
 from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
@@ -489,6 +493,8 @@ class GPUModelRunner(
         self.is_multimodal_pruning_enabled = False
         self.requires_sequential_video_encoding = False
         self.routed_experts_capture: RoutedExpertsCaptureState | None = None
+        self.artifact_connector: ArtifactWorkerConnector | None = None
+        self.artifact_connector_output: ArtifactConnectorOutput | None = None
         self.max_model_len = model_config.max_model_len
 
         # Always set to false after the first forward pass
@@ -4111,6 +4117,14 @@ class GPUModelRunner(
                 "after execute_model() returns None."
             )
 
+        self.artifact_connector_output = (
+            self.artifact_connector.finalize(
+                scheduler_output.artifact_connector_metadata
+            )
+            if self.artifact_connector is not None
+            else None
+        )
+
         if self.routed_experts_capture is not None:
             self.routed_experts_capture.clear()
 
@@ -4167,8 +4181,16 @@ class GPUModelRunner(
                     self._dummy_run(1)
                 if not has_kv_transfer_group():
                     # Return empty ModelRunnerOutput if no work to do.
-                    return EMPTY_MODEL_RUNNER_OUTPUT
-                return self.kv_connector_no_forward(scheduler_output, self.vllm_config)
+                    output = copy(EMPTY_MODEL_RUNNER_OUTPUT)
+                else:
+                    output = self.kv_connector_no_forward(
+                        scheduler_output, self.vllm_config
+                    )
+                    if output is EMPTY_MODEL_RUNNER_OUTPUT:
+                        output = copy(output)
+                output.artifact_connector_output = self.artifact_connector_output
+                self.artifact_connector_output = None
+                return output
 
             if self.cache_config.kv_sharing_fast_prefill:
                 assert not self.num_prompt_logprobs, (
@@ -4497,7 +4519,12 @@ class GPUModelRunner(
                 self._pp_receive_prev_sampled_token_ids_to_input_batch()
             # In case of PP with kv transfer, we need to pass through the
             # kv_connector_output
-            return ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
+            output = ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
+            if output is EMPTY_MODEL_RUNNER_OUTPUT:
+                output = copy(output)
+            output.artifact_connector_output = self.artifact_connector_output
+            self.artifact_connector_output = None
+            return output
 
         # Unpack ephemeral state.
         (
@@ -4698,6 +4725,8 @@ class GPUModelRunner(
         # self.kv_connector_output may be modified during drafting
         kv_connector_output = self.kv_connector_output
         self.kv_connector_output = None
+        artifact_connector_output = self.artifact_connector_output
+        self.artifact_connector_output = None
 
         with record_function_or_nullcontext("gpu_model_runner: ModelRunnerOutput"):
             output = ModelRunnerOutput(
@@ -4710,6 +4739,7 @@ class GPUModelRunner(
                 ec_connector_output=ec_connector_output
                 if self.supports_mm_inputs
                 else None,
+                artifact_connector_output=artifact_connector_output,
                 num_nans_in_logits=num_nans_in_logits,
                 cudagraph_stats=cudagraph_stats,
             )
@@ -6466,6 +6496,10 @@ class GPUModelRunner(
         from vllm.model_executor.layers.rotary_embedding import _ROPE_DICT
         from vllm.v1.worker.workspace import reset_workspace_manager
 
+        if self.artifact_connector is not None:
+            self.artifact_connector.close()
+            self.artifact_connector = None
+
         # Calls torch.accelerator.synchronize()
         self._cleanup_profiling_kv_cache()
         if self.routed_experts_capture is not None:
@@ -7641,6 +7675,11 @@ class GPUModelRunner(
             (max_tokens,),
             dtype=torch.int64,
             device=self.device,
+        )
+
+        assert routed_experts_capture.writer is not None
+        self.artifact_connector = ArtifactWorkerConnector(
+            self.vllm_config, routed_experts_capture.writer
         )
 
     def may_add_encoder_only_layers_to_kv_cache_config(self) -> None:
