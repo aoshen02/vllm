@@ -12,6 +12,7 @@ from vllm.config import VllmConfig
 from vllm.distributed.artifact_connector import (
     ArtifactConnectorOutput,
     ArtifactSchedulerConnector,
+    PromptLogprobsArtifactRequest,
 )
 from vllm.distributed.ec_transfer.ec_connector.base import (
     ECConnectorBase,
@@ -1165,13 +1166,20 @@ class Scheduler(SchedulerInterface):
                     req,
                     req_to_new_blocks[req.request_id].get_block_ids(),
                     req._all_token_ids,
+                    prompt_logprobs_artifact=(
+                        self._make_prompt_logprobs_artifact_request(req)
+                    ),
                 )
                 for req in scheduled_new_reqs
             ]
         else:
             new_reqs_data = [
                 NewRequestData.from_request(
-                    req, req_to_new_blocks[req.request_id].get_block_ids()
+                    req,
+                    req_to_new_blocks[req.request_id].get_block_ids(),
+                    prompt_logprobs_artifact=(
+                        self._make_prompt_logprobs_artifact_request(req)
+                    ),
                 )
                 for req in scheduled_new_reqs
             ]
@@ -2328,6 +2336,15 @@ class Scheduler(SchedulerInterface):
                 # Streaming-input session finished.
                 self.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)
         else:
+            sampling_params = request.sampling_params
+            if (
+                self.use_v2_model_runner
+                and self.artifact_connector is not None
+                and sampling_params is not None
+                and sampling_params.prompt_logprobs is not None
+                and sampling_params._skip_reading_prefix_cache_was_default
+            ):
+                request.skip_reading_prefix_cache = False
             if request.resumable:
                 request.streaming_queue = deque()
             self._enqueue_waiting_request(request)
@@ -2336,6 +2353,30 @@ class Scheduler(SchedulerInterface):
                 self.connector.on_new_request(request)
             if self.log_stats:
                 request.record_event(EngineCoreEventType.QUEUED)
+
+    def _make_prompt_logprobs_artifact_request(
+        self, request: Request
+    ) -> "PromptLogprobsArtifactRequest | None":
+        sampling_params = request.sampling_params
+        if (
+            not self.use_v2_model_runner
+            or self.artifact_connector is None
+            or sampling_params is None
+            or sampling_params.prompt_logprobs is None
+        ):
+            return None
+        num_prompt_logprobs = sampling_params.prompt_logprobs
+        if num_prompt_logprobs == -1:
+            num_prompt_logprobs = self.vllm_config.model_config.get_vocab_size()
+        return self.artifact_connector.make_prompt_logprobs_request(
+            request_id=request.request_id,
+            block_hashes=[bytes(block_hash) for block_hash in request.block_hashes],
+            num_prompt_tokens=request.num_prompt_tokens,
+            num_prompt_logprobs=num_prompt_logprobs,
+            num_cached_tokens=request.num_computed_tokens,
+            hash_block_size=self.hash_block_size,
+            policy_epoch=self.artifact_policy_epoch,
+        )
 
     def finish_requests(
         self, request_ids: str | Iterable[str] | None, finished_status: RequestStatus

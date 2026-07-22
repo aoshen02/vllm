@@ -607,6 +607,17 @@ class LocalSharedMemoryArtifactStore(LocalSharedMemoryArtifactReader):
                 else:
                     self._retained_blocks[object_id] = count - 1
 
+    def retain_blocks(self, object_ids: list[str]) -> None:
+        """Keep existing immutable blocks alive while assembling a manifest."""
+        with self._lock:
+            for object_id in object_ids:
+                self._validate_id(object_id)
+                if not self._path("block", object_id).exists():
+                    raise FileNotFoundError(
+                        f"mandatory artifact block is missing: {object_id}"
+                    )
+                self._retained_blocks[object_id] += 1
+
     def _accept_existing(self, kind: str, object_id: str, incoming: np.ndarray) -> None:
         existing = self.read_array(kind, object_id)
         if existing.dtype != incoming.dtype or existing.shape != incoming.shape:

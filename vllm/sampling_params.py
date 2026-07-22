@@ -341,6 +341,8 @@ class SamplingParams(
     _bad_words_token_ids: list[list[int]] | None = None
 
     skip_reading_prefix_cache: bool | None = None
+    _skip_reading_prefix_cache_was_default: bool = False
+    """Whether prefix-cache behavior was selected automatically."""
     thinking_token_budget: int | None = None
     """Maximum number of tokens allowed for thinking operations."""
 
@@ -500,6 +502,7 @@ class SamplingParams(
         self._all_stop_token_ids.update(self.stop_token_ids)
 
         if self.skip_reading_prefix_cache is None:
+            self._skip_reading_prefix_cache_was_default = True
             # If prefix caching is enabled,
             # the output of prompt logprobs may less than n_prompt_tokens,
             # we need to skip reading cache at this request.

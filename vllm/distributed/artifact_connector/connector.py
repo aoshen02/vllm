@@ -14,6 +14,10 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
+from vllm.distributed.artifact_connector.prompt_logprobs import (
+    PromptLogprobsArrays,
+    PromptLogprobsArtifactManager,
+)
 from vllm.distributed.artifact_connector.protocol import (
     ArtifactCommitRequest,
     ArtifactCommitResult,
@@ -23,6 +27,7 @@ from vllm.distributed.artifact_connector.protocol import (
     ArtifactDiscardResult,
     ArtifactFinalizeRequest,
     ArtifactFinalizeResult,
+    PromptLogprobsArtifactRequest,
 )
 from vllm.distributed.artifact_connector.shm import (
     LocalSharedMemoryArtifactStore,
@@ -80,6 +85,28 @@ class ArtifactSchedulerConnector:
                 f"{state.token_start} != {token_start}"
             )
         return state
+
+    @staticmethod
+    def make_prompt_logprobs_request(
+        *,
+        request_id: str,
+        block_hashes: list[bytes],
+        num_prompt_tokens: int,
+        num_prompt_logprobs: int,
+        num_cached_tokens: int,
+        hash_block_size: int,
+        policy_epoch: int,
+    ) -> PromptLogprobsArtifactRequest:
+        """Describe the mandatory fixed-profile artifacts for one prompt."""
+        return PromptLogprobsArtifactRequest(
+            request_id=request_id,
+            block_hashes=list(block_hashes),
+            num_prompt_tokens=num_prompt_tokens,
+            num_prompt_logprobs=num_prompt_logprobs,
+            num_cached_tokens=num_cached_tokens,
+            hash_block_size=hash_block_size,
+            policy_epoch=policy_epoch,
+        )
 
     def request_progress(
         self,
@@ -299,10 +326,61 @@ class ArtifactWorkerConnector:
         ).hexdigest()
         self.policy_epoch = 0
         self._states: dict[str, _WorkerArtifactState] = {}
+        self.prompt_logprobs = PromptLogprobsArtifactManager(
+            self.store,
+            namespace=self.namespace,
+            logprobs_mode=model_config.logprobs_mode,
+        )
 
     def advance_policy_epoch(self) -> None:
         """Prevent block-key reuse after an in-place model weight update."""
         self.policy_epoch += 1
+
+    def restore_prompt_logprobs(
+        self, request: PromptLogprobsArtifactRequest
+    ) -> PromptLogprobsArrays | None:
+        self._validate_prompt_logprobs_epoch(request)
+        return self.prompt_logprobs.restore_cached_prefix(request)
+
+    def pending_prompt_logprobs_blocks(
+        self,
+        request: PromptLogprobsArtifactRequest,
+        completed_token_end: int,
+    ) -> list[int]:
+        self._validate_prompt_logprobs_epoch(request)
+        return self.prompt_logprobs.pending_block_indices(request, completed_token_end)
+
+    def store_prompt_logprobs_blocks(
+        self,
+        request: PromptLogprobsArtifactRequest,
+        arrays: PromptLogprobsArrays,
+        completed_token_end: int,
+        boundary_hidden: dict[int, np.ndarray],
+    ) -> None:
+        self._validate_prompt_logprobs_epoch(request)
+        self.prompt_logprobs.store_completed_blocks(
+            request, arrays, completed_token_end, boundary_hidden
+        )
+
+    def finalize_prompt_logprobs(
+        self,
+        request: PromptLogprobsArtifactRequest,
+        arrays: PromptLogprobsArrays,
+    ) -> PromptLogprobsArrays:
+        self._validate_prompt_logprobs_epoch(request)
+        return self.prompt_logprobs.finalize(request, arrays)
+
+    def discard_prompt_logprobs(self, request_id: str) -> None:
+        self.prompt_logprobs.discard(request_id)
+
+    def _validate_prompt_logprobs_epoch(
+        self, request: PromptLogprobsArtifactRequest
+    ) -> None:
+        if request.policy_epoch != self.policy_epoch:
+            raise RuntimeError(
+                "prompt-logprobs artifact policy epoch mismatch: "
+                f"scheduler={request.policy_epoch}, worker={self.policy_epoch}"
+            )
 
     @staticmethod
     def _object_id(prefix: bytes, *values: bytes) -> str:
@@ -703,6 +781,7 @@ class ArtifactWorkerConnector:
 
         discard_results: list[ArtifactDiscardResult] = []
         for discard_request in metadata.discards:
+            self.prompt_logprobs.discard(discard_request.request_id)
             discard_state = self._states.get(discard_request.request_id)
             if (
                 discard_state is not None

@@ -14,6 +14,7 @@ from vllm.distributed.artifact_connector.protocol import (
     ArtifactDiscardResult,
     ArtifactFinalizeRequest,
     ArtifactFinalizeResult,
+    PromptLogprobsArtifactRequest,
 )
 from vllm.distributed.artifact_connector.shm import (
     ArtifactCapacityError,
@@ -35,6 +36,7 @@ __all__ = [
     "ArtifactDiscardResult",
     "ArtifactFinalizeRequest",
     "ArtifactFinalizeResult",
+    "PromptLogprobsArtifactRequest",
     "ArtifactSchedulerConnector",
     "ArtifactStore",
     "ArtifactWorkerConnector",

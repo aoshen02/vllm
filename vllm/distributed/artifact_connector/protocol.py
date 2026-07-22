@@ -9,6 +9,19 @@ import numpy as np
 
 
 @dataclass(frozen=True)
+class PromptLogprobsArtifactRequest:
+    """Fixed-profile prompt-logprobs artifact metadata for one request."""
+
+    request_id: str
+    block_hashes: list[bytes]
+    num_prompt_tokens: int
+    num_prompt_logprobs: int
+    num_cached_tokens: int
+    hash_block_size: int
+    policy_epoch: int
+
+
+@dataclass(frozen=True)
 class ArtifactCommitRequest:
     """Newly completed full blocks that can be published before finalize."""
 

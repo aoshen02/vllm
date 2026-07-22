@@ -291,6 +291,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.artifact_connector = ArtifactWorkerConnector(
                 self.vllm_config, capture_state.writer
             )
+        if self.prompt_logprobs_worker is not None:
+            self.prompt_logprobs_worker.artifact_connector = self.artifact_connector
 
     def _attach_artifact_connector_output(
         self, output: ModelRunnerOutput
@@ -868,7 +870,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 )
                 assert self.prompt_logprobs_worker is not None
                 self.prompt_logprobs_worker.add_request(
-                    req_id, req_index, new_req_data.sampling_params
+                    req_id,
+                    req_index,
+                    new_req_data.sampling_params,
+                    new_req_data.prompt_logprobs_artifact,
                 )
 
         if scheduler_output.scheduled_new_reqs:

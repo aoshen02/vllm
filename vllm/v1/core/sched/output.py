@@ -10,7 +10,10 @@ if TYPE_CHECKING:
     import numpy.typing as npt
     import torch
 
-    from vllm.distributed.artifact_connector import ArtifactConnectorMetadata
+    from vllm.distributed.artifact_connector import (
+        ArtifactConnectorMetadata,
+        PromptLogprobsArtifactRequest,
+    )
     from vllm.distributed.ec_transfer.ec_connector.base import ECConnectorMetadata
     from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
     from vllm.lora.request import LoRARequest
@@ -21,6 +24,7 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 else:
     ArtifactConnectorMetadata = object
+    PromptLogprobsArtifactRequest = object
     ECConnectorMetadata = object
     KVConnectorMetadata = object
     KVCacheBlockCopy = object
@@ -41,6 +45,7 @@ class NewRequestData:
     block_ids: tuple[list[int], ...]
     num_computed_tokens: int
     lora_request: LoRARequest | None
+    prompt_logprobs_artifact: PromptLogprobsArtifactRequest | None = None
     prompt_embeds: "torch.Tensor | None" = None
     prompt_is_token_ids: list[bool] | None = None
 
@@ -53,6 +58,7 @@ class NewRequestData:
         request: Request,
         block_ids: tuple[list[int], ...],
         prefill_token_ids: list[int] | None = None,
+        prompt_logprobs_artifact: PromptLogprobsArtifactRequest | None = None,
     ) -> "NewRequestData":
         return cls(
             req_id=request.request_id,
@@ -63,6 +69,7 @@ class NewRequestData:
             block_ids=block_ids,
             num_computed_tokens=request.num_computed_tokens,
             lora_request=request.lora_request,
+            prompt_logprobs_artifact=prompt_logprobs_artifact,
             prompt_embeds=request.prompt_embeds,
             prompt_is_token_ids=request.prompt_is_token_ids,
             prefill_token_ids=prefill_token_ids,

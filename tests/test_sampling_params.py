@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from dataclasses import dataclass
 
+import msgspec
 import pytest
 
 from vllm import SamplingParams
@@ -48,3 +49,20 @@ def test_diffusion_accepts_top_k_top_p():
 def test_non_diffusion_models_unaffected():
     params = SamplingParams(temperature=0.7, top_k=10, seed=42)
     params.verify(MockModelConfig(), None, None, None)
+
+
+@pytest.mark.parametrize("explicit_skip", [None, True, False])
+def test_prefix_cache_default_survives_msgpack(explicit_skip: bool | None):
+    params = SamplingParams(
+        prompt_logprobs=1,
+        skip_reading_prefix_cache=explicit_skip,
+    )
+    decoded = msgspec.msgpack.decode(
+        msgspec.msgpack.encode(params),
+        type=SamplingParams,
+    )
+
+    assert decoded.skip_reading_prefix_cache is (
+        True if explicit_skip is None else explicit_skip
+    )
+    assert decoded._skip_reading_prefix_cache_was_default is (explicit_skip is None)
