@@ -13,6 +13,7 @@ from vllm.model_executor.layers.fused_moe.routed_experts_capture.async_output im
 )
 from vllm.model_executor.layers.fused_moe.routed_experts_capture.capturer import (
     RoutedExpertsCapturer,
+    bind_routed_experts_capturer,
 )
 from vllm.model_executor.layers.fused_moe.routed_experts_capture.common import (
     get_num_experts,
@@ -29,14 +30,19 @@ from vllm.model_executor.layers.fused_moe.routed_experts_capture.manager import 
 from vllm.model_executor.layers.fused_moe.routed_experts_capture.shared_region import (
     RoutedExpertsWorkerWriter,
 )
+from vllm.model_executor.layers.fused_moe.routed_experts_capture.state import (
+    RoutedExpertsCaptureState,
+)
 
 __all__ = [
     "FullAttnBlockMap",
+    "RoutedExpertsCaptureState",
     "RoutedExpertsCapturer",
     "RoutedExpertsManager",
     "RoutedExpertsTensors",
     "RoutedExpertsWorkerWriter",
     "RoutedExpertsWriteTask",
+    "bind_routed_experts_capturer",
     "compute_full_attn_block_map",
     "get_num_experts",
     "get_num_experts_per_token",

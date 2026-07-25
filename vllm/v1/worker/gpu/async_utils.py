@@ -5,6 +5,9 @@ import contextlib
 import numpy as np
 import torch
 
+from vllm.model_executor.layers.fused_moe.routed_experts_capture import (
+    RoutedExpertsWriteTask,
+)
 from vllm.v1.outputs import AsyncModelRunnerOutput, LogprobsTensors, ModelRunnerOutput
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 
@@ -17,6 +20,7 @@ class AsyncOutput(AsyncModelRunnerOutput):
         num_sampled_tokens: torch.Tensor,
         main_stream: torch.cuda.Stream,
         copy_stream: torch.cuda.Stream,
+        routed_experts_write_task: RoutedExpertsWriteTask | None = None,
     ):
         # NOTE(woosuk): We must retain references to the GPU tensors,
         # as the copy operations are performed on a different CUDA stream than
@@ -24,6 +28,7 @@ class AsyncOutput(AsyncModelRunnerOutput):
         self.model_runner_output = model_runner_output
         self.sampler_output = sampler_output
         self.num_sampled_tokens = num_sampled_tokens
+        self.routed_experts_write_task = routed_experts_write_task
         # Blocking (sleep) event to avoid busy-polling the CUDA driver lock.
         self.copy_event = torch.cuda.Event(blocking=True)
 
@@ -44,6 +49,8 @@ class AsyncOutput(AsyncModelRunnerOutput):
                 k: v.to_cpu_nonblocking() if v is not None else None
                 for k, v in self.model_runner_output.prompt_logprobs_dict.items()
             }
+            if self.routed_experts_write_task is not None:
+                self.routed_experts_write_task.start_copy()
             self.copy_event.record(copy_stream)
 
     def get_output(self) -> ModelRunnerOutput:
@@ -67,6 +74,9 @@ class AsyncOutput(AsyncModelRunnerOutput):
         if self.logprobs_tensors is not None:
             self.model_runner_output.logprobs = self.logprobs_tensors.tolists()
         self.model_runner_output.prompt_logprobs_dict = self.prompt_logprobs_dict
+        if self.routed_experts_write_task is not None:
+            self.routed_experts_write_task.finalize(self.model_runner_output)
+            self.routed_experts_write_task = None
         return self.model_runner_output
 
 
