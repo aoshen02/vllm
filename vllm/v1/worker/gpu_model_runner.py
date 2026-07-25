@@ -62,13 +62,8 @@ from vllm.model_executor.layers.attention import Attention, MLAAttention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.fused_moe.all2all_utils import get_ep_all2all_manager
 from vllm.model_executor.layers.fused_moe.routed_experts_capture import (
-    RoutedExpertsCapturer,
-    RoutedExpertsTensors,
-    RoutedExpertsWorkerWriter,
+    RoutedExpertsCaptureState,
     RoutedExpertsWriteTask,
-    get_routed_experts_output_rank,
-    get_routing_slot_shape_and_dtype,
-    require_full_attn_group_id,
 )
 from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
     initialize_mamba_ssu_backend,
@@ -494,10 +489,7 @@ class GPUModelRunner(
         # These will be overridden in load_model()
         self.is_multimodal_pruning_enabled = False
         self.requires_sequential_video_encoding = False
-        # Disabled during profiling and dummy runs.
-        self.routed_experts_initialized = False
-        # Only the scheduler-visible rank owns this writer.
-        self.routed_experts_writer: RoutedExpertsWorkerWriter | None = None
+        self.routed_experts_capture: RoutedExpertsCaptureState | None = None
         self.max_model_len = model_config.max_model_len
 
         # Always set to false after the first forward pass
@@ -2346,9 +2338,10 @@ class GPUModelRunner(
         block_table_gid_0 = _get_block_table(0)
         slot_mapping_gid_0 = slot_mappings[0]
 
-        if self.routed_experts_writer is not None:
+        routed_experts_capture = self.routed_experts_capture
+        if routed_experts_capture is not None and routed_experts_capture.can_write:
             # Snapshot the attention slot mapping before the next prepare pass.
-            full_attn_group_id = self.routed_experts_attn_group_id
+            full_attn_group_id = routed_experts_capture.full_attn_group_id
             attn_slot_mapping = slot_mappings[full_attn_group_id]
             self.routed_experts_slot_mapping_device[:num_tokens].copy_(
                 attn_slot_mapping[:num_tokens]
@@ -3759,8 +3752,9 @@ class GPUModelRunner(
         if not self.use_async_scheduling:
             # Queue routed-experts D2H before _to_list synchronizes the copy.
             # Only the output-rank writer consumes it, so other ranks skip it.
-            if self.routed_experts_writer is not None:
-                routing_buffer = self.routed_experts_capturer.get_device_buffer()
+            routed_experts_capture = self.routed_experts_capture
+            if routed_experts_capture is not None and routed_experts_capture.can_write:
+                routing_buffer = routed_experts_capture.get_device_buffer()
                 total_num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
                 self.routed_experts_cpu[:total_num_scheduled_tokens].copy_(
                     routing_buffer[:total_num_scheduled_tokens],
@@ -4172,8 +4166,8 @@ class GPUModelRunner(
                 "after execute_model() returns None."
             )
 
-        if self.routed_experts_initialized:
-            self.routed_experts_capturer.clear_buffer()
+        if self.routed_experts_capture is not None:
+            self.routed_experts_capture.clear()
 
         # If ngram_gpu is used, we need to copy the scheduler_output to avoid
         # the modification has influence on the scheduler_output in engine core process.
@@ -4777,7 +4771,8 @@ class GPUModelRunner(
             )
 
         if not self.use_async_scheduling:
-            if self.routed_experts_writer is not None:
+            routed_experts_capture = self.routed_experts_capture
+            if routed_experts_capture is not None and routed_experts_capture.can_write:
                 # _to_list has synchronized D2H; the store is CPU-only.
                 total_num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
                 routing_data = self.routed_experts_cpu[
@@ -4786,7 +4781,7 @@ class GPUModelRunner(
                 slot_mapping = self.routed_experts_slot_mapping_cpu[
                     :total_num_scheduled_tokens
                 ].numpy()
-                self.routed_experts_writer.store_batch(routing_data, slot_mapping)
+                routed_experts_capture.store_batch(routing_data, slot_mapping)
                 output.routed_experts_slots = slot_mapping
             return output
 
@@ -4796,18 +4791,12 @@ class GPUModelRunner(
             # Clone before the async copy stream; both sources are reused next
             # step. Only the output-rank writer consumes it.
             routed_experts_write_task = None
-            if self.routed_experts_writer is not None:
-                routing_buffer = self.routed_experts_capturer.get_device_buffer()
+            routed_experts_capture = self.routed_experts_capture
+            if routed_experts_capture is not None and routed_experts_capture.can_write:
                 total_num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
-                routed_experts_tensors = RoutedExpertsTensors(
-                    routing_data=routing_buffer[:total_num_scheduled_tokens].clone(),
-                    slot_mapping=self.routed_experts_slot_mapping_device[
-                        :total_num_scheduled_tokens
-                    ].clone(),
-                )
-                routed_experts_write_task = RoutedExpertsWriteTask(
-                    routed_experts_tensors=routed_experts_tensors,
-                    writer=self.routed_experts_writer,
+                routed_experts_write_task = routed_experts_capture.make_write_task(
+                    self.routed_experts_slot_mapping_device,
+                    total_num_scheduled_tokens,
                 )
 
             async_output = AsyncGPUModelRunnerOutput(
@@ -6540,6 +6529,9 @@ class GPUModelRunner(
 
         # Calls torch.accelerator.synchronize()
         self._cleanup_profiling_kv_cache()
+        if self.routed_experts_capture is not None:
+            self.routed_experts_capture.close()
+            self.routed_experts_capture = None
         if current_platform.is_rocm():
             # Drop captured graphs before distributed teardown. On ROCm, delayed
             # graph destruction can surface HSA faults in the next engine startup.
@@ -7670,24 +7662,24 @@ class GPUModelRunner(
             "Initializing routed experts capturer, enable_return_routed_experts: %s",
             self.model_config.enable_return_routed_experts,
         )
-        full_attn_group_id = require_full_attn_group_id(self.kv_cache_config)
-        self.routed_experts_capturer = RoutedExpertsCapturer(
-            max_num_batched_tokens=self.scheduler_config.max_num_batched_tokens,
+        if self.routed_experts_capture is not None:
+            self.routed_experts_capture.close()
+        routed_experts_capture = RoutedExpertsCaptureState.create(
+            model=self.model,
             vllm_config=self.vllm_config,
+            kv_cache_config=self.kv_cache_config,
+            max_num_batched_tokens=self.scheduler_config.max_num_batched_tokens,
         )
-        self.routed_experts_attn_group_id = full_attn_group_id
-        self._bind_routed_experts_capturer(self.routed_experts_capturer)
-        self.routed_experts_initialized = True
+        self.routed_experts_capture = routed_experts_capture
 
-        # Only the scheduler-visible rank stages routing for the shared slot
-        # buffer; other ranks only need the capturer (for the SP all_gather).
-        if self.parallel_config.rank != get_routed_experts_output_rank():
+        if not routed_experts_capture.can_write:
             return
 
         # Pinned memory keeps the routing D2H copy non-blocking.
+        device_buffer = routed_experts_capture.get_device_buffer()
         self.routed_experts_cpu = torch.empty(
-            self.routed_experts_capturer.device_buffer.shape,
-            dtype=self.routed_experts_capturer.device_buffer.dtype,
+            device_buffer.shape,
+            dtype=device_buffer.dtype,
             device="cpu",
             pin_memory=PIN_MEMORY,
         )
@@ -7704,50 +7696,6 @@ class GPUModelRunner(
             dtype=torch.int64,
             device=self.device,
         )
-
-        slot_shape, slot_dtype = get_routing_slot_shape_and_dtype(
-            self.vllm_config, self.kv_cache_config
-        )
-        self.routed_experts_writer = RoutedExpertsWorkerWriter(
-            instance_id=self.vllm_config.instance_id,
-            slot_shape=slot_shape,
-            dtype=slot_dtype,
-        )
-
-    def _bind_routed_experts_capturer(self, capturer: RoutedExpertsCapturer) -> None:
-        from vllm.model_executor.layers.fused_moe.layer import MoERunner
-        from vllm.model_executor.layers.fused_moe.modular_kernel import (
-            FusedMoEExpertsMonolithic,
-        )
-        from vllm.model_executor.layers.fused_moe.router.base_router import (
-            BaseRouter,
-        )
-
-        for module in self.model.modules():
-            if not isinstance(module, MoERunner):
-                continue
-            layer_id = module.layer_id
-
-            def _capture_fn(topk_ids, _layer_id=layer_id, _capturer=capturer):
-                _capturer.capture(_layer_id, topk_ids)
-
-            quant_method = module._quant_method
-            moe_kernel = getattr(quant_method, "moe_kernel", None)
-            impl = getattr(moe_kernel, "impl", None)
-            fused_experts = getattr(impl, "fused_experts", None)
-            if quant_method.is_monolithic:
-                if not (
-                    isinstance(fused_experts, FusedMoEExpertsMonolithic)
-                    and fused_experts.supports_routing_replay_capture()
-                ):
-                    raise ValueError(
-                        "--enable-return-routed-experts is not supported with "
-                        f"monolithic MoE kernel {type(fused_experts).__name__}; "
-                        "routed expert IDs would be silently all-zero."
-                    )
-                fused_experts.set_capture_fn(_capture_fn)
-            elif isinstance(module.router, BaseRouter):
-                module.router.set_capture_fn(_capture_fn)
 
     def may_add_encoder_only_layers_to_kv_cache_config(self) -> None:
         """

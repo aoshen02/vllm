@@ -932,7 +932,6 @@ class VllmConfig:
             self.model_config.enable_return_routed_experts
         ):
             return
-
         if self.parallel_config.pipeline_parallel_size > 1:
             raise ValueError(
                 "--enable-return-routed-experts is incompatible with "
@@ -946,7 +945,6 @@ class VllmConfig:
                 "--enable-return-routed-experts is incompatible with "
                 "context parallelism (DCP/PCP > 1)."
             )
-
         kv_transfer_config = self.kv_transfer_config
         if kv_transfer_config is None or not kv_transfer_config.is_kv_transfer_instance:
             return
@@ -2236,10 +2234,6 @@ class VllmConfig:
 
         if self.parallel_config.enable_elastic_ep:
             unsupported.append("elastic expert parallelism")
-
-        if model_config is not None and model_config.enable_return_routed_experts:
-            # Will be added by https://github.com/vllm-project/vllm/pull/38163
-            unsupported.append("routed experts capture")
 
         has_logitsproc_plugins = False
         if model_config is not None:

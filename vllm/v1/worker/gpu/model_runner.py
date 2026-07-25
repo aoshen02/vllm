@@ -39,6 +39,10 @@ from vllm.distributed.parallel_state import (
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.all2all_utils import get_ep_all2all_manager
+from vllm.model_executor.layers.fused_moe.routed_experts_capture import (
+    RoutedExpertsCaptureState,
+    RoutedExpertsWriteTask,
+)
 from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
     initialize_mamba_ssu_backend,
 )
@@ -278,10 +282,21 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # Expert parallelism load balancer.
         self.eplb = EPLBController(self.parallel_config, self.device)
+        self.routed_experts_capture: RoutedExpertsCaptureState | None = None
 
     def update_max_model_len(self, max_model_len: int) -> None:
         self.max_model_len = max_model_len
         self.req_states.max_model_len = max_model_len
+
+    def init_routed_experts_capturer(self) -> None:
+        if self.routed_experts_capture is not None:
+            self.routed_experts_capture.close()
+        self.routed_experts_capture = RoutedExpertsCaptureState.create(
+            model=self.model,
+            vllm_config=self.vllm_config,
+            kv_cache_config=self.kv_cache_config,
+            max_num_batched_tokens=self.scheduler_config.max_num_batched_tokens,
+        )
 
     def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         tasks: list[SupportedTask] = []
@@ -1207,6 +1222,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         skip_attn_for_dummy_run: bool = False,
         is_profile: bool = False,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
+        routed_experts_capture = self.routed_experts_capture
+        if routed_experts_capture is not None:
+            routed_experts_capture.clear()
         if not dummy_run:
             # Update the request states.
             self.update_pp_decode_requests()
@@ -1430,6 +1448,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             aux_hidden_states = None
             output_intermediate_tensors = model_output
 
+        routed_experts_write_task = None
+        if (
+            routed_experts_capture is not None
+            and not dummy_run
+            and slot_mappings is not None
+        ):
+            full_attn_group_id = routed_experts_capture.full_attn_group_id
+            routed_experts_write_task = routed_experts_capture.make_write_task(
+                slot_mappings[full_attn_group_id], num_toks
+            )
         finished_req_ids = scheduler_output.finished_req_ids
         self.execute_model_state = ExecuteModelState(
             input_batch=input_batch,
@@ -1438,6 +1466,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             hidden_states=hidden_states,
             aux_hidden_states=aux_hidden_states,
             finished_req_ids=finished_req_ids,
+            routed_experts_write_task=routed_experts_write_task,
         )
 
         if not self.is_last_pp_rank:
@@ -1460,6 +1489,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         hidden_states = self.execute_model_state.hidden_states
         aux_hidden_states = self.execute_model_state.aux_hidden_states
         finished_req_ids = self.execute_model_state.finished_req_ids
+        routed_experts_write_task = self.execute_model_state.routed_experts_write_task
         self.execute_model_state = None
 
         if not self.is_last_pp_rank:
@@ -1525,6 +1555,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             main_stream=self.main_stream,
             copy_stream=self.output_copy_stream,
             check_ep_fault=self.check_ep_fault,
+            routed_experts_write_task=routed_experts_write_task,
         )
 
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None
@@ -1648,6 +1679,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         """Release GPU tensors (model weights, KV caches, workspace) so that
         memory is reclaimable when running in the same process."""
         torch.accelerator.synchronize()
+        if self.routed_experts_capture is not None:
+            self.routed_experts_capture.close()
+            self.routed_experts_capture = None
         if hasattr(self, "kv_caches"):
             self.kv_caches.clear()
         if hasattr(self, "attn_groups"):
@@ -1705,6 +1739,7 @@ class ExecuteModelState(NamedTuple):
     hidden_states: torch.Tensor | None
     aux_hidden_states: list[torch.Tensor] | None
     finished_req_ids: set[str]
+    routed_experts_write_task: RoutedExpertsWriteTask | None
 
 
 def sort_batch_req_ids(

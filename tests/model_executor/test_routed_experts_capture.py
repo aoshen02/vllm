@@ -8,6 +8,8 @@ import numpy as np
 import pytest
 import torch
 
+from vllm.config import VllmConfig
+from vllm.config.compilation import CompilationMode
 from vllm.distributed.eplb.eplb_state import EplbLayerState
 from vllm.distributed.kv_transfer.kv_connector.v1.sidecar import (
     KVConnectorSidecarBlockMap,
@@ -17,9 +19,11 @@ from vllm.distributed.kv_transfer.kv_connector.v1.sidecar import (
 from vllm.model_executor.layers.fused_moe.config import RoutingMethodType
 from vllm.model_executor.layers.fused_moe.routed_experts_capture import (
     RoutedExpertsCapturer,
+    RoutedExpertsCaptureState,
     RoutedExpertsManager,
     RoutedExpertsTensors,
     RoutedExpertsWriteTask,
+    bind_routed_experts_capturer,
     require_full_attn_group_id,
 )
 from vllm.model_executor.layers.fused_moe.router.base_router import BaseRouter
@@ -224,12 +228,7 @@ def test_base_router_capture_with_eplb_enabled():
     assert torch.equal(topk_ids, torch.tensor([[11, 12], [13, 14]]))
 
 
-def test_gpu_model_runner_binds_router_capture(monkeypatch):
-    from vllm.v1.worker import gpu_model_runner
-
-    class _DummyRouter:
-        _routing_replay_out: torch.Tensor | None = None
-
+def test_bind_routed_experts_capturer(monkeypatch):
     class DummyFusedMoE:
         def __init__(self):
             self.layer_id = 7
@@ -246,17 +245,14 @@ def test_gpu_model_runner_binds_router_capture(monkeypatch):
 
     dummy_module = DummyFusedMoE()
 
-    # Patch the runtime import inside _bind_routed_experts_capturer.
     import vllm.model_executor.layers.fused_moe.layer as fused_moe_layer
 
     monkeypatch.setattr(fused_moe_layer, "MoERunner", DummyFusedMoE)
 
-    dummy_self = types.SimpleNamespace(
-        model=types.SimpleNamespace(modules=lambda: [dummy_module])
-    )
+    model = SimpleNamespace(modules=lambda: [dummy_module])
 
     capturer = DummyCapturer()
-    gpu_model_runner.GPUModelRunner._bind_routed_experts_capturer(dummy_self, capturer)
+    bind_routed_experts_capturer(model, capturer)
 
     assert dummy_module.router.capture_fn is not None
     dummy_module.router.capture_fn(torch.tensor([[5, 6]]))
@@ -267,46 +263,87 @@ def test_gpu_model_runner_binds_router_capture(monkeypatch):
     assert torch.equal(topk_ids, torch.tensor([[5, 6]]))
 
 
-def test_gpu_model_runner_binding_stage(monkeypatch):
-    from vllm.v1.worker import gpu_model_runner
-
-    class DummyFusedMoE:
-        def __init__(self):
-            self.layer_id = 11
-            self.router = _make_router()
-            self.routed_experts = _make_modular_routed_experts()
-            self._quant_method = self.routed_experts.quant_method
-
-    class DummyCapturer:
-        def __init__(self):
-            self.calls = []
-
-        def capture(self, layer_id, topk_ids):
-            self.calls.append((layer_id, topk_ids))
-
-    dummy_module = DummyFusedMoE()
-
-    import vllm.model_executor.layers.fused_moe.layer as fused_moe_layer
-
-    monkeypatch.setattr(fused_moe_layer, "MoERunner", DummyFusedMoE)
-
-    dummy_self = types.SimpleNamespace(
-        model=types.SimpleNamespace(modules=lambda: [dummy_module])
+def test_capture_state_write_task_owns_immutable_snapshot():
+    capturer = _capturer_with_buffer(max_tokens=4, num_layers=2)
+    capturer.device_buffer.copy_(torch.arange(16).reshape(4, 2, 2))
+    state = RoutedExpertsCaptureState(capturer, Mock(), full_attn_group_id=1)
+    slot_mappings = torch.tensor(
+        [[11, 12, 13, 14], [21, 22, 23, 24]], dtype=torch.int64
     )
 
-    assert dummy_module.router.capture_fn is None
+    write_task = state.make_write_task(slot_mappings[1], 3)
 
-    capturer = DummyCapturer()
-    gpu_model_runner.GPUModelRunner._bind_routed_experts_capturer(dummy_self, capturer)
+    assert write_task is not None
+    tensors = write_task.routed_experts_tensors
+    assert torch.equal(tensors.routing_data, capturer.device_buffer[:3])
+    assert torch.equal(tensors.slot_mapping, torch.tensor([21, 22, 23]))
+    capturer.clear_buffer()
+    slot_mappings.fill_(-1)
+    assert torch.equal(
+        tensors.routing_data,
+        torch.arange(12, dtype=torch.int32).reshape(3, 2, 2),
+    )
+    assert torch.equal(tensors.slot_mapping, torch.tensor([21, 22, 23]))
 
-    assert callable(dummy_module.router.capture_fn)
-    dummy_module.router.capture_fn(torch.tensor([[9, 10]]))
-    assert len(capturer.calls) == 1
+
+def test_capture_state_close_releases_resources():
+    capturer = Mock()
+    writer = Mock()
+    state = RoutedExpertsCaptureState(capturer, writer, full_attn_group_id=0)
+
+    state.close()
+
+    writer.close.assert_called_once_with()
+    assert state.capturer is None
+    assert state.writer is None
 
 
-def test_gpu_model_runner_does_not_bind_draft_router_capture(monkeypatch):
-    from vllm.v1.worker import gpu_model_runner as gmr
+@pytest.mark.parametrize(("rank", "creates_writer"), [(0, True), (1, False)])
+def test_capture_state_create_uses_explicit_dependencies(
+    monkeypatch, rank, creates_writer
+):
+    from vllm.model_executor.layers.fused_moe.routed_experts_capture import (
+        state as state_module,
+    )
 
+    model = Mock()
+    capturer = Mock()
+    writer = Mock()
+    writer_factory = Mock(return_value=writer)
+    bind = Mock()
+    monkeypatch.setattr(state_module, "require_full_attn_group_id", lambda _: 2)
+    monkeypatch.setattr(
+        state_module, "RoutedExpertsCapturer", Mock(return_value=capturer)
+    )
+    monkeypatch.setattr(state_module, "bind_routed_experts_capturer", bind)
+    monkeypatch.setattr(state_module, "get_routed_experts_output_rank", lambda: 0)
+    monkeypatch.setattr(
+        state_module,
+        "get_routing_slot_shape_and_dtype",
+        lambda *_: ((16, 4, 2), "uint8"),
+    )
+    monkeypatch.setattr(state_module, "RoutedExpertsWorkerWriter", writer_factory)
+    vllm_config = SimpleNamespace(
+        instance_id="instance",
+        parallel_config=SimpleNamespace(rank=rank, data_parallel_rank=3),
+    )
+    kv_cache_config = Mock()
+
+    state = RoutedExpertsCaptureState.create(
+        model=model,
+        vllm_config=vllm_config,
+        kv_cache_config=kv_cache_config,
+        max_num_batched_tokens=32,
+    )
+
+    assert state.capturer is capturer
+    assert state.full_attn_group_id == 2
+    assert state.can_write is creates_writer
+    bind.assert_called_once_with(model, capturer)
+    assert writer_factory.called is creates_writer
+
+
+def test_bind_routed_experts_capturer_only_visits_target_model(monkeypatch):
     class DummyFusedMoE:
         def __init__(self, layer_id):
             self.layer_id = layer_id
@@ -321,26 +358,15 @@ def test_gpu_model_runner_does_not_bind_draft_router_capture(monkeypatch):
 
     monkeypatch.setattr(fused_moe_layer, "MoERunner", DummyFusedMoE)
 
-    dummy_self = types.SimpleNamespace(
-        model=types.SimpleNamespace(modules=lambda: [target_module]),
-        compilation_config=types.SimpleNamespace(
-            static_forward_context={
-                "model.layers.7.mlp.experts": target_module,
-                "mtp.layers.0.mlp.experts": draft_module,
-            }
-        ),
-    )
-
-    capturer = types.SimpleNamespace(capture=lambda *_: None)
-    gmr.GPUModelRunner._bind_routed_experts_capturer(dummy_self, capturer)
+    model = SimpleNamespace(modules=lambda: [target_module])
+    capturer = SimpleNamespace(capture=lambda *_: None)
+    bind_routed_experts_capturer(model, capturer)
 
     assert target_module.router.capture_fn is not None
     assert draft_module.router.capture_fn is None
 
 
-def test_gpu_model_runner_rejects_monolithic_without_replay_support(monkeypatch):
-    from vllm.v1.worker import gpu_model_runner as gmr
-
+def test_bind_routed_experts_capturer_rejects_unsupported_monolithic(monkeypatch):
     class DummyFusedMoE:
         def __init__(self):
             self.layer_id = 3
@@ -373,12 +399,66 @@ def test_gpu_model_runner_rejects_monolithic_without_replay_support(monkeypatch)
 
     monkeypatch.setattr(fused_moe_layer, "MoERunner", DummyFusedMoE)
 
-    dummy_self = types.SimpleNamespace(
-        model=types.SimpleNamespace(modules=lambda: [dummy_module])
+    with pytest.raises(ValueError, match="monolithic MoE kernel"):
+        bind_routed_experts_capturer(
+            SimpleNamespace(modules=lambda: [dummy_module]), DummyCapturer()
+        )
+
+
+def test_v2_model_runner_accepts_routed_experts(monkeypatch):
+    monkeypatch.setattr("importlib.metadata.entry_points", lambda **_: ())
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            enable_return_routed_experts=True,
+            use_mla=False,
+            logits_processors=None,
+            enable_prompt_embeds=False,
+        ),
+        speculative_config=None,
+        parallel_config=SimpleNamespace(
+            prefill_context_parallel_size=1,
+            tensor_parallel_size=1,
+            distributed_executor_backend=None,
+            pipeline_parallel_size=1,
+            enable_dbo=False,
+            enable_elastic_ep=False,
+        ),
+        compilation_config=SimpleNamespace(
+            mode=CompilationMode.NONE,
+            pass_config=SimpleNamespace(enable_sp=False),
+        ),
+        cache_config=SimpleNamespace(kv_sharing_fast_prefill=False),
+        ec_transfer_config=None,
     )
 
-    with pytest.raises(ValueError, match="monolithic MoE kernel"):
-        gmr.GPUModelRunner._bind_routed_experts_capturer(dummy_self, DummyCapturer())
+    unsupported = VllmConfig._get_v2_model_runner_unsupported_features(config)
+
+    assert unsupported == []
+
+
+@pytest.mark.parametrize(
+    ("parallel_field", "error"),
+    [
+        ("pipeline_parallel_size", "pipeline parallelism"),
+        ("decode_context_parallel_size", "context parallelism"),
+        ("prefill_context_parallel_size", "context parallelism"),
+    ],
+)
+def test_routed_experts_reject_unsupported_parallelism(parallel_field, error):
+    parallel_config = SimpleNamespace(
+        pipeline_parallel_size=1,
+        decode_context_parallel_size=1,
+        prefill_context_parallel_size=1,
+    )
+    setattr(parallel_config, parallel_field, 2)
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(enable_return_routed_experts=True),
+        parallel_config=parallel_config,
+        kv_transfer_config=None,
+    )
+
+    with pytest.raises(ValueError, match=error):
+        VllmConfig._verify_return_routed_experts_compatibility(config)
 
 
 def test_routed_experts_capturer_single_dp_no_metadata():
