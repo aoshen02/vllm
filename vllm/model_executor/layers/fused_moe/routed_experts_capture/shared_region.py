@@ -113,6 +113,16 @@ class RoutedExpertsWorkerWriter:
         self._mmap_obj: mmap.mmap | None = None
         self._array: np.ndarray | None = None
 
+    @property
+    def dtype(self) -> np.dtype:
+        """Return the stable routed-experts payload dtype."""
+        return self._dtype
+
+    @property
+    def shape_per_token(self) -> tuple[int, ...]:
+        """Return the stable routed-experts payload shape for one token."""
+        return self._slot_shape[1:]
+
     def _ensure_mmap_attached(self) -> None:
         if self._array is not None:
             return
@@ -124,8 +134,11 @@ class RoutedExpertsWorkerWriter:
             except FileNotFoundError:
                 if time.monotonic() > deadline:
                     raise TimeoutError(
-                        f"Timed out waiting for shared routed-experts mmap "
-                        f"to appear at {self._path}"
+                        "Timed out waiting for shared routed-experts mmap "
+                        f"to appear at {self._path}. The routed-experts "
+                        "output worker (rank 0) and EngineCore must run on "
+                        "the same host and share the same /dev/shm IPC "
+                        "namespace."
                     ) from None
                 time.sleep(0.005)
         _wait_for_file_size(file_descriptor, self._nbytes, _WAIT_TIMEOUT_S)
@@ -145,6 +158,42 @@ class RoutedExpertsWorkerWriter:
         self._ensure_mmap_attached()
         assert self._array is not None, "shared routing mmap was not attached"
         self._array[slot_mapping] = routing_data
+
+    def read_token_range(
+        self,
+        block_ids: list[int],
+        *,
+        token_start: int,
+        token_end: int,
+        block_size: int,
+    ) -> np.ndarray:
+        """Copy a request token range out of the shared staging buffer."""
+        if token_start < 0 or token_end <= token_start:
+            raise ValueError(f"invalid token range: [{token_start}, {token_end})")
+        if block_size <= 0:
+            raise ValueError(f"block_size must be positive, got {block_size}")
+        block_ids_array = np.asarray(block_ids, dtype=np.int64)
+        token_positions = np.arange(token_start, token_end, dtype=np.int64)
+        logical_block_indices = token_positions // block_size
+        if len(block_ids_array) == 0 or int(logical_block_indices[-1]) >= len(
+            block_ids_array
+        ):
+            raise ValueError(
+                "routed-experts block table does not cover artifact range: "
+                f"num_blocks={len(block_ids_array)}, token_end={token_end}, "
+                f"block_size={block_size}"
+            )
+        slots = (
+            block_ids_array[logical_block_indices] * block_size
+            + token_positions % block_size
+        )
+        self._ensure_mmap_attached()
+        assert self._array is not None, "shared routing mmap was not attached"
+        return self._array[slots].copy()
+
+    def validate(self) -> None:
+        """Attach eagerly so an invalid SHM topology fails during startup."""
+        self._ensure_mmap_attached()
 
     def close(self) -> None:
         """Release the mapping. The manager owns the file."""

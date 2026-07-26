@@ -296,6 +296,7 @@ class ServingTokens(GenerateBaseServing):
                 finish_reason=output.finish_reason if output.finish_reason else "stop",
                 token_ids=as_list(output.token_ids),
                 routed_experts=routed_experts_b64,
+                artifact_sample_id=output.artifact_sample_id,
             )
 
             choices.append(choice_data)
@@ -422,6 +423,7 @@ class ServingTokens(GenerateBaseServing):
                                 finish_reason=finish_reason,
                                 token_ids=as_list(delta_token_ids),
                                 routed_experts=routed_experts_b64,
+                                artifact_sample_id=output.artifact_sample_id,
                             )
                         ],
                     )

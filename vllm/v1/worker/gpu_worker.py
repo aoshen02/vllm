@@ -443,6 +443,13 @@ class Worker(WorkerBase):
 
     def reload_weights(self, *args, **kwargs) -> None:
         self.model_runner.reload_weights(*args, **kwargs)
+        self._advance_artifact_policy_epoch()
+
+    def _advance_artifact_policy_epoch(self) -> None:
+        model_runner = getattr(self, "model_runner", None)
+        connector = getattr(model_runner, "artifact_connector", None)
+        if connector is not None:
+            connector.advance_policy_epoch()
 
     @torch.inference_mode()
     def determine_available_memory(self) -> int:
@@ -741,6 +748,13 @@ class Worker(WorkerBase):
             self.model_runner, "_init_kv_zero_meta"
         ):
             self.model_runner._init_kv_zero_meta()
+
+    def validate_routed_experts_shm(self) -> None:
+        """Validate that the authoritative worker sees EngineCore's mmap."""
+        capture_state = self.model_runner.routed_experts_capture
+        writer = capture_state.writer if capture_state is not None else None
+        if writer is not None:
+            writer.validate()
 
     @instrument(span_name="Warmup (GPU)")
     def compile_or_warm_up_model(self) -> CompilationTimes:
@@ -1375,6 +1389,7 @@ class Worker(WorkerBase):
         self.weight_transfer_engine.finish_weight_update()
         self.weight_transfer_engine.reset_weight_update_target()
         self._weight_update_active = False
+        self._advance_artifact_policy_epoch()
 
     def shutdown(self) -> None:
         gc.unfreeze()

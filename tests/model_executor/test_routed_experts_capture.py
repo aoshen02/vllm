@@ -14,6 +14,7 @@ from vllm.model_executor.layers.fused_moe.routed_experts_capture import (
     RoutedExpertsCapturer,
     RoutedExpertsCaptureState,
     RoutedExpertsTensors,
+    RoutedExpertsWorkerWriter,
     RoutedExpertsWriteTask,
     bind_routed_experts_capturer,
     require_full_attn_group_id,
@@ -23,6 +24,7 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
+    SlidingWindowSpec,
 )
 
 pytestmark = pytest.mark.cpu_test
@@ -32,7 +34,25 @@ _CAPTURER_MODULE = (
 )
 
 
-def test_multiple_full_attention_groups_use_hashable_warning_args():
+def test_worker_writer_rejects_unshared_engine_core_mmap(tmp_path, monkeypatch):
+    from vllm.model_executor.layers.fused_moe.routed_experts_capture import (
+        shared_region,
+    )
+
+    writer = RoutedExpertsWorkerWriter(
+        instance_id="missing",
+        dp_rank=0,
+        slot_shape=(1, 1, 1),
+        dtype="uint8",
+    )
+    writer._path = str(tmp_path / "missing.mmap")
+    monkeypatch.setattr(shared_region, "_WAIT_TIMEOUT_S", -1.0)
+
+    with pytest.raises(TimeoutError, match="rank 0.*same host"):
+        writer.validate()
+
+
+def test_multiple_full_attention_groups_are_rejected():
     kv_cache_spec = FullAttentionSpec(
         block_size=16,
         num_kv_heads=1,
@@ -45,6 +65,33 @@ def test_multiple_full_attention_groups_use_hashable_warning_args():
         kv_cache_groups=[
             KVCacheGroupSpec(["layer.0"], kv_cache_spec),
             KVCacheGroupSpec(["layer.1"], kv_cache_spec),
+        ],
+    )
+
+    with pytest.raises(ValueError, match="exactly one full-attention"):
+        require_full_attn_group_id(kv_cache_config)
+
+
+def test_hybrid_groups_with_one_full_attention_anchor_are_supported():
+    full_attention_spec = FullAttentionSpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.float32,
+    )
+    sliding_window_spec = SlidingWindowSpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.float32,
+        sliding_window=128,
+    )
+    kv_cache_config = KVCacheConfig(
+        num_blocks=1,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(["layer.0"], full_attention_spec),
+            KVCacheGroupSpec(["layer.1"], sliding_window_spec),
         ],
     )
 
@@ -362,12 +409,25 @@ def test_routed_experts_reject_unsupported_parallelism(parallel_field, error):
         pipeline_parallel_size=1,
         decode_context_parallel_size=1,
         prefill_context_parallel_size=1,
+        enable_dbo=False,
+        ubatch_size=1,
+        enable_elastic_ep=False,
     )
     setattr(parallel_config, parallel_field, 2)
     config = SimpleNamespace(
-        model_config=SimpleNamespace(enable_return_routed_experts=True),
+        model_config=SimpleNamespace(
+            enable_return_routed_experts=True,
+            is_moe=True,
+            runner_type="generate",
+            is_encoder_decoder=False,
+            is_multimodal_model=False,
+            is_diffusion=False,
+        ),
         parallel_config=parallel_config,
-        kv_transfer_config=None,
+        device_config=SimpleNamespace(device_type="cuda"),
+        cache_config=SimpleNamespace(kv_sharing_fast_prefill=False),
+        ec_transfer_config=None,
+        artifact_config=SimpleNamespace(shm_dir="/dev/shm"),
     )
 
     with pytest.raises(ValueError, match=error):
