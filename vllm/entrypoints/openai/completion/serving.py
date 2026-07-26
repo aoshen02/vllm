@@ -400,6 +400,14 @@ class OpenAIServingCompletion(GenerateBaseServing):
 
                     self._raise_if_error(finish_reason, request_id)
 
+                    routed_experts_b64 = None
+                    if output.routed_experts is not None:
+                        buf = io.BytesIO()
+                        np.save(buf, output.routed_experts)
+                        routed_experts_b64 = base64.b64encode(buf.getvalue()).decode(
+                            "ascii"
+                        )
+
                     chunk = CompletionStreamResponse(
                         id=request_id,
                         object="text_completion",
@@ -418,7 +426,7 @@ class OpenAIServingCompletion(GenerateBaseServing):
                                     if request.return_token_ids
                                     else None
                                 ),
-                                artifact_keys=output.artifact_keys,
+                                routed_experts=routed_experts_b64,
                             )
                         ],
                     )
@@ -594,7 +602,6 @@ class OpenAIServingCompletion(GenerateBaseServing):
                         as_list(output.token_ids) if request.return_token_ids else None
                     ),
                     routed_experts=routed_experts_b64,
-                    artifact_keys=output.artifact_keys,
                 )
                 choices.append(choice_data)
 

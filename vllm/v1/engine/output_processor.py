@@ -179,7 +179,6 @@ class RequestState:
 
         # Routed experts accumulation (prompt + sample chunks)
         self.routed_experts_chunks: list[np.ndarray] = []
-        self.artifact_keys: list[str] | None = None
         self.artifact_finalize_requested = False
 
         # Stream Interval
@@ -416,7 +415,6 @@ class RequestState:
             text=text,
             token_ids=token_ids,
             routed_experts=routed_experts,
-            artifact_keys=self.artifact_keys,
             logprobs=logprobs,
             cumulative_logprob=self.logprobs_processor.cumulative_logprob,
             finish_reason=str(finish_reason) if finished else None,
@@ -647,19 +645,9 @@ class OutputProcessor:
             kv_transfer_params = engine_core_output.kv_transfer_params
             ec_transfer_params = engine_core_output.ec_transfer_params
             if engine_core_output.routed_experts is not None:
-                if engine_core_output.finished:
-                    # The simple SHM backend returns the authoritative full
-                    # value with its terminal ACK. It replaces incremental
-                    # chunks, which can contain gaps after recomputation.
-                    req_state.routed_experts_chunks = [
-                        engine_core_output.routed_experts
-                    ]
-                else:
-                    req_state.routed_experts_chunks.append(
-                        engine_core_output.routed_experts
-                    )
-            if engine_core_output.artifact_keys is not None:
-                req_state.artifact_keys = engine_core_output.artifact_keys
+                req_state.routed_experts_chunks.append(
+                    engine_core_output.routed_experts
+                )
 
             if req_state.is_prefilling:
                 if engine_core_output.prefill_stats is not None:

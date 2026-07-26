@@ -8,17 +8,14 @@ import hashlib
 import json
 import uuid
 from collections import OrderedDict
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from vllm.distributed.artifact_connector.protocol import (
-    ArtifactBlockRef,
     ArtifactCommitRequest,
     ArtifactCommitResult,
     ArtifactConnectorMetadata,
     ArtifactConnectorOutput,
-    ArtifactDiscardRequest,
-    ArtifactDiscardResult,
     ArtifactFinalizeRequest,
     ArtifactFinalizeResult,
 )
@@ -45,9 +42,8 @@ logger = init_logger(__name__)
 @dataclass
 class _SchedulerArtifactState:
     request_attempt_id: str
-    token_start: int
     next_full_end: int
-    cached_blocks: list[ArtifactBlockRef] = field(default_factory=list)
+    started: bool = False
 
 
 class ArtifactSchedulerConnector:
@@ -61,9 +57,7 @@ class ArtifactSchedulerConnector:
             OrderedDict()
         )
         self._inflight_finalizes: dict[str, ArtifactFinalizeRequest] = {}
-        self._pending_discards: OrderedDict[str, ArtifactDiscardRequest] = OrderedDict()
-        self._inflight_discards: dict[str, ArtifactDiscardRequest] = {}
-        self._ready_blocks: dict[tuple[int, bytes], str] = {}
+        self._ready_blocks: dict[bytes, str] = {}
 
         config = vllm_config.artifact_config
         parallel_config = vllm_config.parallel_config
@@ -75,48 +69,31 @@ class ArtifactSchedulerConnector:
             ),
         )
 
-    def _state(
-        self, request_id: str, token_start: int, hash_block_size: int
-    ) -> _SchedulerArtifactState:
+    def _state(self, request_id: str) -> _SchedulerArtifactState:
         state = self._states.get(request_id)
         if state is None:
-            first_full_start = (
-                (token_start + hash_block_size - 1) // hash_block_size
-            ) * hash_block_size
             state = _SchedulerArtifactState(
                 request_attempt_id=uuid.uuid4().hex,
-                token_start=token_start,
-                next_full_end=first_full_start,
+                next_full_end=0,
             )
             self._states[request_id] = state
-        elif state.token_start != token_start:
-            raise RuntimeError(
-                f"artifact token start changed for request {request_id}: "
-                f"{state.token_start} != {token_start}"
-            )
         return state
 
     def max_ready_prefix_tokens(
         self,
         *,
         block_hashes: list[bytes],
-        token_start: int,
         max_tokens: int,
         hash_block_size: int,
-        policy_epoch: int,
     ) -> int:
         """Return the longest prefix jointly reusable by KV and R3."""
-        if token_start != 0:
-            raise ValueError(
-                "Artifact Connector currently requires routed_experts_prompt_start=0"
-            )
         if max_tokens <= 0:
             return max_tokens
         candidate_keys: list[str] = []
         for block_index in range(
             min(max_tokens, len(block_hashes) * hash_block_size) // hash_block_size
         ):
-            key = self._ready_blocks.get((policy_epoch, block_hashes[block_index]))
+            key = self._ready_blocks.get(block_hashes[block_index])
             if key is None:
                 break
             candidate_keys.append(key)
@@ -133,26 +110,18 @@ class ArtifactSchedulerConnector:
         *,
         request_id: str,
         block_hashes: list[bytes],
-        token_start: int,
         cached_token_end: int,
         hash_block_size: int,
-        policy_epoch: int,
     ) -> str:
-        state = self._state(request_id, token_start, hash_block_size)
-        if state.cached_blocks:
+        state = self._state(request_id)
+        if state.started:
             return state.request_attempt_id
+        state.started = True
         cached_full_end = cached_token_end // hash_block_size * hash_block_size
         if cached_full_end > 0:
-            state.cached_blocks = [
-                ArtifactBlockRef(
-                    block_index=block_index,
-                    block_hash=block_hashes[block_index],
-                )
-                for block_index in range(cached_full_end // hash_block_size)
-            ]
             keys = [
-                self._ready_blocks.get((policy_epoch, ref.block_hash))
-                for ref in state.cached_blocks
+                self._ready_blocks.get(block_hash)
+                for block_hash in block_hashes[: cached_full_end // hash_block_size]
             ]
             if any(key is None for key in keys) or not all(
                 self._reader.exists([key for key in keys if key is not None])
@@ -167,17 +136,11 @@ class ArtifactSchedulerConnector:
         request_id: str,
         block_ids: list[int],
         block_hashes: list[bytes],
-        token_start: int,
         accepted_token_end: int,
         physical_block_size: int,
         hash_block_size: int,
-        policy_epoch: int,
     ) -> str:
-        if token_start != 0:
-            raise ValueError(
-                "Artifact Connector currently requires routed_experts_prompt_start=0"
-            )
-        state = self._state(request_id, token_start, hash_block_size)
+        state = self._state(request_id)
         full_end = accepted_token_end // hash_block_size * hash_block_size
         if full_end <= state.next_full_end:
             return state.request_attempt_id
@@ -192,7 +155,6 @@ class ArtifactSchedulerConnector:
             block_end=full_end,
             physical_block_size=physical_block_size,
             hash_block_size=hash_block_size,
-            policy_epoch=policy_epoch,
         )
         state.next_full_end = full_end
         return state.request_attempt_id
@@ -203,71 +165,46 @@ class ArtifactSchedulerConnector:
         request_id: str,
         block_ids: list[int],
         block_hashes: list[bytes],
-        token_start: int,
         token_end: int,
         physical_block_size: int,
         hash_block_size: int,
-        policy_epoch: int,
     ) -> str:
-        if token_start != 0:
-            raise ValueError(
-                "Artifact Connector currently requires routed_experts_prompt_start=0"
-            )
         if (
             request_id in self._pending_finalizes
             or request_id in self._inflight_finalizes
         ):
             raise RuntimeError(f"artifact request is already pending: {request_id}")
-        state = self._state(request_id, token_start, hash_block_size)
+        state = self._state(request_id)
         self._pending_finalizes[request_id] = ArtifactFinalizeRequest(
             request_id=request_id,
             request_attempt_id=state.request_attempt_id,
             block_ids=list(block_ids),
             block_hashes=list(block_hashes),
-            token_start=token_start,
             token_end=token_end,
             physical_block_size=physical_block_size,
             hash_block_size=hash_block_size,
-            policy_epoch=policy_epoch,
-            cached_blocks=list(state.cached_blocks),
         )
         return state.request_attempt_id
 
-    def request_discarded(self, request_id: str) -> None:
-        state = self._states.get(request_id)
-        if state is None or request_id in self._pending_discards:
-            return
-        operation_id = uuid.uuid4().hex
-        self._pending_discards[request_id] = ArtifactDiscardRequest(
-            operation_id=operation_id,
-            request_id=request_id,
-            request_attempt_id=state.request_attempt_id,
-        )
+    def request_aborted(self, request_id: str) -> None:
+        self._states.pop(request_id, None)
 
     def build_connector_metadata(self) -> ArtifactConnectorMetadata | None:
-        if not (
-            self._pending_commits or self._pending_finalizes or self._pending_discards
-        ):
+        if not (self._pending_commits or self._pending_finalizes):
             return None
         commits = list(self._pending_commits.values())
-        requests = list(self._pending_finalizes.values())
-        discards = list(self._pending_discards.values())
+        finalizes = list(self._pending_finalizes.values())
         self._pending_commits.clear()
         self._pending_finalizes.clear()
-        self._pending_discards.clear()
         self._inflight_commits.update(
             (request.operation_id, request) for request in commits
         )
         self._inflight_finalizes.update(
-            (request.request_id, request) for request in requests
-        )
-        self._inflight_discards.update(
-            (request.operation_id, request) for request in discards
+            (request.request_id, request) for request in finalizes
         )
         return ArtifactConnectorMetadata(
-            requests=requests,
+            finalizes=finalizes,
             commits=commits,
-            discards=discards,
         )
 
     def acknowledge(
@@ -299,12 +236,7 @@ class ArtifactSchedulerConnector:
                         commit_request.block_start // commit_request.hash_block_size
                         + index
                     )
-                    self._ready_blocks[
-                        (
-                            commit_request.policy_epoch,
-                            commit_request.block_hashes[block_index],
-                        )
-                    ] = key
+                    self._ready_blocks[commit_request.block_hashes[block_index]] = key
         for finalize_result in output.results:
             finalize_request = self._inflight_finalizes.pop(
                 finalize_result.request_id, None
@@ -318,20 +250,6 @@ class ArtifactSchedulerConnector:
                     f"{finalize_result.request_id}"
                 )
             self._states.pop(finalize_result.request_id, None)
-        for discard_result in output.discard_results:
-            discard_request = self._inflight_discards.pop(
-                discard_result.operation_id, None
-            )
-            if discard_request is None or (
-                discard_request.request_id != discard_result.request_id
-                or discard_request.request_attempt_id
-                != discard_result.request_attempt_id
-            ):
-                raise RuntimeError(
-                    "worker acknowledged an unknown artifact discard: "
-                    f"{discard_result.operation_id}"
-                )
-            self._states.pop(discard_result.request_id, None)
         return output
 
     def has_unacked_commits(self, request_id: str) -> bool:
@@ -349,8 +267,6 @@ class ArtifactSchedulerConnector:
             or self._inflight_commits
             or self._pending_finalizes
             or self._inflight_finalizes
-            or self._pending_discards
-            or self._inflight_discards
         )
 
     def reset(self) -> None:
@@ -399,10 +315,7 @@ class ArtifactWorkerConnector:
             namespace=namespace,
         )
 
-    def advance_policy_epoch(self) -> None:
-        self.core.advance_policy_epoch()
-
-    def finalize(
+    def process(
         self, metadata: ArtifactConnectorMetadata | None
     ) -> ArtifactConnectorOutput | None:
         if metadata is None:
@@ -418,7 +331,6 @@ class ArtifactWorkerConnector:
                     commit_request.request_id,
                 )
                 message = f"{type(exc).__name__}: {exc}"
-                self.core.mark_error(commit_request.request_id, message)
                 commit_results.append(
                     ArtifactCommitResult(
                         operation_id=commit_request.operation_id,
@@ -439,33 +351,25 @@ class ArtifactWorkerConnector:
                         request_id=commit_request.request_id,
                         request_attempt_id=commit_request.request_attempt_id,
                         block_end=commit_request.block_end,
-                        block_keys=(
-                            [segment.key for segment in commit.segments]
-                            if commit_error is None
-                            else []
-                        ),
+                        block_keys=(commit.keys if commit_error is None else []),
                         error=commit_error,
                     )
                 )
 
         results: list[ArtifactFinalizeResult] = []
-        for finalize_request in metadata.requests:
+        for finalize_request in metadata.finalizes:
             try:
                 finalized = self.core.finalize(finalize_request)
                 result = ArtifactFinalizeResult(
                     request_id=finalize_request.request_id,
                     request_attempt_id=finalize_request.request_attempt_id,
-                    artifact_keys=(
-                        None if self.store.returns_inline_value else finalized.keys
-                    ),
-                    routed_experts=finalized.value,
+                    value=finalized.value,
                 )
             except Exception as exc:
                 logger.exception(
                     "Failed to finalize routed-experts artifact for request %s",
                     finalize_request.request_id,
                 )
-                self.core.discard(finalize_request.request_id)
                 result = ArtifactFinalizeResult(
                     request_id=finalize_request.request_id,
                     request_attempt_id=finalize_request.request_attempt_id,
@@ -473,20 +377,9 @@ class ArtifactWorkerConnector:
                 )
             results.append(result)
 
-        discard_results: list[ArtifactDiscardResult] = []
-        for discard_request in metadata.discards:
-            self.core.discard(discard_request.request_id)
-            discard_results.append(
-                ArtifactDiscardResult(
-                    operation_id=discard_request.operation_id,
-                    request_id=discard_request.request_id,
-                    request_attempt_id=discard_request.request_attempt_id,
-                )
-            )
         output = ArtifactConnectorOutput(
             results=results,
             commit_results=commit_results,
-            discard_results=discard_results,
         )
         return None if output.is_empty() else output
 

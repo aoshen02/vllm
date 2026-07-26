@@ -42,7 +42,6 @@ class LocalSharedMemoryArtifactReader:
     """Read self-describing artifact objects from a local SHM store."""
 
     backend_name = "shm"
-    returns_inline_value = True
 
     def __init__(self, root: str, store_id: str) -> None:
         if not _SAFE_STORE_ID.fullmatch(store_id):

@@ -960,26 +960,20 @@ class EngineCore:
         kwargs: dict[str, Any] | None = None,
     ) -> list[_R]:
         method_name = method if isinstance(method, str) else None
-        starts_policy_update = method_name in (
-            "start_weight_update",
-            "start_draft_weight_update",
-            "reload_weights",
-        )
-        recovering_with_reload = (
-            method_name == "reload_weights"
-            and self.scheduler.artifact_policy_update_active
-        )
-        if starts_policy_update and not recovering_with_reload:
-            self.scheduler.begin_artifact_policy_update()
-        try:
-            result = self.model_executor.collective_rpc(method, timeout, args, kwargs)
-        except BaseException:
-            # A failed distributed update may already have changed a subset of
-            # workers. Keep admission fenced until a full reload succeeds.
-            raise
-        if method_name in ("finish_weight_update", "reload_weights"):
-            self.scheduler.advance_artifact_policy_epoch()
-        return result
+        if (
+            self.vllm_config.model_config.enable_return_routed_experts
+            and method_name
+            in (
+                "start_weight_update",
+                "start_draft_weight_update",
+                "finish_weight_update",
+                "reload_weights",
+            )
+        ):
+            raise RuntimeError(
+                "Artifact Connector does not support in-place weight updates"
+            )
+        return self.model_executor.collective_rpc(method, timeout, args, kwargs)
 
     def preprocess_add_request(self, request: EngineCoreRequest) -> tuple[Request, int]:
         """Preprocess the request.
@@ -1508,13 +1502,6 @@ class EngineCoreProc(EngineCore):
         elif request_type == EngineCoreRequestType.ADD:
             req, request_wave = request
             if self._reject_add_in_shutdown(req):
-                return
-            if self.scheduler.artifact_policy_update_active:
-                logger.warning(
-                    "Rejecting request %s while a model-weight update is incomplete",
-                    req.request_id,
-                )
-                self._send_error_outputs_to_client([req.request_id], req.client_index)
                 return
             self.add_request(req, request_wave)
         elif request_type == EngineCoreRequestType.ABORT:

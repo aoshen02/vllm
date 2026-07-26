@@ -1199,7 +1199,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         is_profile: bool = False,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
         self.artifact_connector_output = (
-            self.artifact_connector.finalize(
+            self.artifact_connector.process(
                 scheduler_output.artifact_connector_metadata
             )
             if self.artifact_connector is not None

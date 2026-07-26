@@ -172,6 +172,11 @@ class Worker(WorkerBase):
             raise ValueError(f"Unknown profiler type: {self.profiler_config.profiler}")
 
         self.use_v2_model_runner = vllm_config.use_v2_model_runner
+        if (
+            vllm_config.model_config.enable_return_routed_experts
+            and not self.use_v2_model_runner
+        ):
+            raise ValueError("Artifact Connector requires Model Runner V2")
         # pending non-blocking PP send work from the previous iteration
         self._pp_send_work: list[Handle] = []
 
@@ -443,13 +448,6 @@ class Worker(WorkerBase):
 
     def reload_weights(self, *args, **kwargs) -> None:
         self.model_runner.reload_weights(*args, **kwargs)
-        self._advance_artifact_policy_epoch()
-
-    def _advance_artifact_policy_epoch(self) -> None:
-        model_runner = getattr(self, "model_runner", None)
-        connector = getattr(model_runner, "artifact_connector", None)
-        if connector is not None:
-            connector.advance_policy_epoch()
 
     @torch.inference_mode()
     def determine_available_memory(self) -> int:
@@ -1389,7 +1387,6 @@ class Worker(WorkerBase):
         self.weight_transfer_engine.finish_weight_update()
         self.weight_transfer_engine.reset_weight_update_target()
         self._weight_update_active = False
-        self._advance_artifact_policy_epoch()
 
     def shutdown(self) -> None:
         gc.unfreeze()

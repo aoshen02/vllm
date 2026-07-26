@@ -689,7 +689,6 @@ class OpenAIServingChat(GenerateBaseServing):
                             token_ids=(
                                 as_list(output.token_ids) if include_token_ids else None
                             ),
-                            artifact_keys=output.artifact_keys,
                         )
 
                     # if the model is finished generating
@@ -709,6 +708,13 @@ class OpenAIServingChat(GenerateBaseServing):
                             finish_reason_ = (
                                 output.finish_reason if output.finish_reason else "stop"
                             )
+                        routed_experts_b64 = None
+                        if output.routed_experts is not None:
+                            buf = io.BytesIO()
+                            np.save(buf, output.routed_experts)
+                            routed_experts_b64 = base64.b64encode(
+                                buf.getvalue()
+                            ).decode("ascii")
                         choice_data = ChatCompletionResponseStreamChoice(
                             index=i,
                             delta=delta_message,
@@ -718,7 +724,7 @@ class OpenAIServingChat(GenerateBaseServing):
                             token_ids=(
                                 as_list(output.token_ids) if include_token_ids else None
                             ),
-                            artifact_keys=output.artifact_keys,
+                            routed_experts=routed_experts_b64,
                         )
 
                         finish_reason_sent[i] = True
@@ -1006,7 +1012,6 @@ class OpenAIServingChat(GenerateBaseServing):
                     else None
                 ),
                 routed_experts=routed_experts_b64,
-                artifact_keys=output.artifact_keys,
             )
             choice_data = maybe_filter_parallel_tool_calls(choice_data, request)
 

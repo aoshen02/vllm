@@ -43,7 +43,6 @@ class ArtifactStore(Protocol):
 
     backend_name: str
     store_id: str
-    returns_inline_value: bool
 
     def put(self, objects: list[ArtifactObject]) -> list[ArtifactPutResult]: ...
 

@@ -6,13 +6,10 @@ from vllm.distributed.artifact_connector.connector import (
     ArtifactWorkerConnector,
 )
 from vllm.distributed.artifact_connector.protocol import (
-    ArtifactBlockRef,
     ArtifactCommitRequest,
     ArtifactCommitResult,
     ArtifactConnectorMetadata,
     ArtifactConnectorOutput,
-    ArtifactDiscardRequest,
-    ArtifactDiscardResult,
     ArtifactFinalizeRequest,
     ArtifactFinalizeResult,
 )
@@ -34,14 +31,11 @@ from vllm.distributed.artifact_connector.store import (
 
 __all__ = [
     "ArtifactCapacityError",
-    "ArtifactBlockRef",
     "ArtifactCommitRequest",
     "ArtifactCommitResult",
     "ArtifactConnectorMetadata",
     "ArtifactConnectorOutput",
     "ArtifactCorruptionError",
-    "ArtifactDiscardRequest",
-    "ArtifactDiscardResult",
     "ArtifactFinalizeRequest",
     "ArtifactFinalizeResult",
     "ArtifactObject",

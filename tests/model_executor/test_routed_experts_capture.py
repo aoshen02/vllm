@@ -102,19 +102,17 @@ def test_routed_experts_write_task_publishes_copied_tensors():
     routing_data = torch.tensor([[[1, 2]], [[3, 4]]], dtype=torch.int32)
     slot_mapping = torch.tensor([5, 9], dtype=torch.int64)
     writer = Mock()
-    output = SimpleNamespace(routed_experts_slots=None)
     write_task = RoutedExpertsWriteTask(
         routed_experts_tensors=RoutedExpertsTensors(routing_data, slot_mapping),
         writer=writer,
     )
 
     write_task.start_copy()
-    write_task.finalize(output)
+    write_task.finalize()
 
     stored_routing, stored_slots = writer.store_batch.call_args.args
     assert stored_routing.tolist() == routing_data.tolist()
     assert stored_slots.tolist() == slot_mapping.tolist()
-    assert output.routed_experts_slots.tolist() == slot_mapping.tolist()
 
 
 def _capturer_with_buffer(

@@ -62,3 +62,29 @@ async def test_routed_experts(server):
         assert topk == NUM_EXPERTS_PER_TOK
         assert (routed_experts >= 0).all()
         assert (routed_experts < NUM_LOCAL_EXPERTS).all()
+
+
+@pytest.mark.asyncio
+async def test_streaming_routed_experts(server):
+    """Test that the terminal streaming choice returns routed_experts."""
+    async with server.get_async_client() as client:
+        stream = await client.completions.create(
+            model=MODEL_NAME,
+            prompt="Hello, world",
+            max_tokens=4,
+            temperature=0,
+            stream=True,
+        )
+        choices = [
+            chunk.model_dump()["choices"][0] async for chunk in stream if chunk.choices
+        ]
+
+    assert all(choice["routed_experts"] is None for choice in choices[:-1])
+    assert choices[-1]["finish_reason"] is not None
+    routed_experts = np.load(
+        io.BytesIO(base64.b64decode(choices[-1]["routed_experts"]))
+    )
+    assert routed_experts.shape[1:] == (
+        NUM_HIDDEN_LAYERS,
+        NUM_EXPERTS_PER_TOK,
+    )

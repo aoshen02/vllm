@@ -32,7 +32,6 @@ from vllm.distributed.artifact_connector.request_core import (
     decode_artifact_array,
     encode_artifact_array,
 )
-from vllm.outputs import CompletionOutput
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.engine import EngineCoreOutput, FinishReason
 from vllm.v1.engine.core import EngineCore
@@ -105,22 +104,16 @@ def _request(
     request_attempt_id: str,
     block_ids: list[int],
     *,
-    token_start: int = 0,
     token_end: int = 10,
-    policy_epoch: int = 0,
-    cached_blocks=None,
 ) -> ArtifactFinalizeRequest:
     return ArtifactFinalizeRequest(
         request_id=request_id,
         request_attempt_id=request_attempt_id,
         block_ids=block_ids,
         block_hashes=[bytes([index]) * 32 for index in range(3)],
-        token_start=token_start,
         token_end=token_end,
         physical_block_size=4,
         hash_block_size=4,
-        policy_epoch=policy_epoch,
-        cached_blocks=[] if cached_blocks is None else cached_blocks,
     )
 
 
@@ -138,7 +131,6 @@ def _commit_request(request: ArtifactFinalizeRequest) -> ArtifactCommitRequest |
         block_end=block_end,
         physical_block_size=request.physical_block_size,
         hash_block_size=request.hash_block_size,
-        policy_epoch=request.policy_epoch,
     )
 
 
@@ -194,7 +186,7 @@ def test_object_envelope_rejects_corruption():
         decode_artifact_array(corrupted, expected_key="key")
 
 
-def test_core_returns_ordered_keys_and_inline_value(tmp_path):
+def test_core_returns_ordered_keys_and_shm_value(tmp_path):
     connector, logical, block_ids = _make_worker_connector(tmp_path)
     request = _request("request-a", "a" * 32, block_ids)
 
@@ -240,27 +232,13 @@ def test_key_count_is_ceiling_of_executed_tokens(tmp_path, token_end):
     connector.close()
 
 
-def test_nonzero_prompt_start_is_rejected(tmp_path):
-    connector, _, block_ids = _make_worker_connector(tmp_path)
-    request = _request(
-        "request-a",
-        "a" * 32,
-        block_ids,
-        token_start=1,
-    )
-
-    with pytest.raises(ValueError, match="routed_experts_prompt_start=0"):
-        connector.core.finalize(request)
-    connector.close()
-
-
 def test_worker_batches_commits_and_reports_keys_per_request(tmp_path):
     connector, _, block_ids = _make_worker_connector(tmp_path)
     first = _request("request-a", "a" * 32, block_ids, token_end=4)
     second = _request("request-b", "b" * 32, block_ids, token_end=8)
     commits = [_commit_request(first), _commit_request(second)]
 
-    output = connector.finalize(
+    output = connector.process(
         ArtifactConnectorMetadata(
             commits=[commit for commit in commits if commit is not None]
         )
@@ -276,16 +254,11 @@ def test_cached_blocks_are_reused_without_put(tmp_path):
     connector, logical, block_ids = _make_worker_connector(tmp_path)
     first = _request("request-a", "a" * 32, block_ids, token_end=8)
     first_finalized = _prepare_and_finalize(connector, first)
-    block_refs = [
-        SimpleNamespace(block_index=0, block_hash=first.block_hashes[0]),
-        SimpleNamespace(block_index=1, block_hash=first.block_hashes[1]),
-    ]
     second = _request(
         "request-b",
         "b" * 32,
         block_ids,
         token_end=10,
-        cached_blocks=block_refs,
     )
     connector.store.put = Mock(wraps=connector.store.put)
 
@@ -305,32 +278,10 @@ def test_missing_cached_block_fails_closed(tmp_path):
         "a" * 32,
         block_ids,
         token_end=4,
-        cached_blocks=[
-            SimpleNamespace(block_index=0, block_hash=b"a" * 32),
-        ],
     )
 
-    with pytest.raises(RuntimeError, match="not ready"):
+    with pytest.raises(RuntimeError, match="missing a reusable full block"):
         connector.core.finalize(request)
-    connector.close()
-
-
-def test_policy_epoch_fences_keys(tmp_path):
-    connector, _, block_ids = _make_worker_connector(tmp_path)
-    first = _request("request-a", "a" * 32, block_ids, token_end=4)
-    first_finalized = _prepare_and_finalize(connector, first)
-    connector.core.advance_policy_epoch()
-    second = _request(
-        "request-b",
-        "b" * 32,
-        block_ids,
-        token_end=4,
-        policy_epoch=1,
-    )
-
-    second_finalized = _prepare_and_finalize(connector, second)
-
-    assert first_finalized.keys != second_finalized.keys
     connector.close()
 
 
@@ -435,11 +386,9 @@ def test_scheduler_connector_checks_shm_existence(tmp_path):
         request_id="request-a",
         block_ids=[1],
         block_hashes=[b"a" * 32],
-        token_start=0,
         accepted_token_end=4,
         physical_block_size=4,
         hash_block_size=4,
-        policy_epoch=0,
     )
     metadata = connector.build_connector_metadata()
     assert metadata is not None
@@ -462,10 +411,8 @@ def test_scheduler_connector_checks_shm_existence(tmp_path):
     assert (
         connector.max_ready_prefix_tokens(
             block_hashes=[b"a" * 32],
-            token_start=0,
             max_tokens=4,
             hash_block_size=4,
-            policy_epoch=0,
         )
         == 4
     )
@@ -473,10 +420,8 @@ def test_scheduler_connector_checks_shm_existence(tmp_path):
     assert (
         connector.max_ready_prefix_tokens(
             block_hashes=[b"a" * 32],
-            token_start=0,
             max_tokens=4,
             hash_block_size=4,
-            policy_epoch=0,
         )
         == 0
     )
@@ -488,7 +433,6 @@ def test_scheduler_finalizes_only_the_accepted_range():
     scheduler = object.__new__(Scheduler)
     scheduler.artifact_connector = Mock()
     scheduler.artifact_connector.has_unacked_commits.return_value = False
-    scheduler.artifact_policy_epoch = 0
     scheduler._routed_experts_block_ids = {"request-a": [3, 5, 7]}
     scheduler.routed_experts_manager = SimpleNamespace(block_size=4)
     scheduler.hash_block_size = 4
@@ -511,11 +455,9 @@ def test_scheduler_finalizes_only_the_accepted_range():
         request_id="request-a",
         block_ids=[3, 5, 7],
         block_hashes=[b"a" * 32, b"b" * 32, b"c" * 32],
-        token_start=0,
         token_end=9,
         physical_block_size=4,
         hash_block_size=4,
-        policy_epoch=0,
     )
 
 
@@ -558,24 +500,17 @@ def test_async_preemption_retains_slots_until_output_is_consumed():
     assert freed_blocks == [retained_block]
 
 
-def test_failed_weight_update_stays_fenced_and_reload_recovers():
+def test_weight_update_is_rejected_while_artifacts_are_enabled():
     engine_core = object.__new__(EngineCore)
     engine_core.model_executor = Mock()
-    engine_core.model_executor.collective_rpc.side_effect = RuntimeError("failed")
-    engine_core.scheduler = Mock()
-    engine_core.scheduler.artifact_policy_update_active = False
+    engine_core.vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(enable_return_routed_experts=True)
+    )
 
-    with pytest.raises(RuntimeError, match="failed"):
+    with pytest.raises(RuntimeError, match="does not support in-place weight updates"):
         engine_core.collective_rpc("start_weight_update")
 
-    engine_core.scheduler.begin_artifact_policy_update.assert_called_once_with()
-    engine_core.scheduler.advance_artifact_policy_epoch.assert_not_called()
-
-    engine_core.model_executor.collective_rpc.side_effect = None
-    engine_core.model_executor.collective_rpc.return_value = [None]
-    engine_core.scheduler.artifact_policy_update_active = True
-    engine_core.collective_rpc("reload_weights")
-    engine_core.scheduler.advance_artifact_policy_epoch.assert_called_once_with()
+    engine_core.model_executor.collective_rpc.assert_not_called()
 
 
 def test_scheduler_releases_inline_terminal_output_after_ack(tmp_path):
@@ -587,11 +522,9 @@ def test_scheduler_releases_inline_terminal_output_after_ack(tmp_path):
         request_id="request-a",
         block_ids=[1, 2],
         block_hashes=[b"a" * 32, b"b" * 32],
-        token_start=0,
         token_end=6,
         physical_block_size=4,
         hash_block_size=4,
-        policy_epoch=0,
     )
     scheduler.artifact_connector.build_connector_metadata()
     request = SimpleNamespace(request_id="request-a", client_index=3)
@@ -600,7 +533,8 @@ def test_scheduler_releases_inline_terminal_output_after_ack(tmp_path):
         new_token_ids=[7],
         finish_reason=FinishReason.STOP,
     )
-    scheduler._pending_artifact_outputs = {"request-a": (request, terminal_output)}
+    scheduler.requests = {"request-a": request}
+    scheduler._pending_artifact_outputs = {"request-a": terminal_output}
     scheduler.finished_req_ids_dict = defaultdict(set)
     scheduler._free_blocks = Mock()
     outputs: dict[int, list[EngineCoreOutput]] = defaultdict(list)
@@ -612,7 +546,7 @@ def test_scheduler_releases_inline_terminal_output_after_ack(tmp_path):
                 ArtifactFinalizeResult(
                     request_id="request-a",
                     request_attempt_id=attempt_id,
-                    routed_experts=routed_experts,
+                    value=routed_experts,
                 )
             ]
         ),
@@ -620,64 +554,5 @@ def test_scheduler_releases_inline_terminal_output_after_ack(tmp_path):
     )
 
     assert terminal_output.routed_experts is routed_experts
-    assert terminal_output.artifact_keys is None
     scheduler._free_blocks.assert_called_once_with(request)
     scheduler.artifact_connector.close()
-
-
-def test_scheduler_releases_external_keys_after_ack(tmp_path):
-    scheduler = object.__new__(Scheduler)
-    scheduler.artifact_connector = ArtifactSchedulerConnector(
-        _make_vllm_config(tmp_path)
-    )
-    attempt_id = scheduler.artifact_connector.request_finished(
-        request_id="request-a",
-        block_ids=[1],
-        block_hashes=[b"a" * 32],
-        token_start=0,
-        token_end=2,
-        physical_block_size=4,
-        hash_block_size=4,
-        policy_epoch=0,
-    )
-    scheduler.artifact_connector.build_connector_metadata()
-    request = SimpleNamespace(request_id="request-a", client_index=0)
-    terminal_output = EngineCoreOutput(
-        request_id="request-a",
-        new_token_ids=[7],
-        finish_reason=FinishReason.STOP,
-    )
-    scheduler._pending_artifact_outputs = {"request-a": (request, terminal_output)}
-    scheduler.finished_req_ids_dict = defaultdict(set)
-    scheduler._free_blocks = Mock()
-    outputs: dict[int, list[EngineCoreOutput]] = defaultdict(list)
-
-    scheduler._release_artifact_outputs(
-        ArtifactConnectorOutput(
-            [
-                ArtifactFinalizeResult(
-                    request_id="request-a",
-                    request_attempt_id=attempt_id,
-                    artifact_keys=["key"],
-                )
-            ]
-        ),
-        outputs,
-    )
-
-    assert terminal_output.routed_experts is None
-    assert terminal_output.artifact_keys == ["key"]
-    scheduler.artifact_connector.close()
-
-
-def test_public_output_exposes_ordered_artifact_keys():
-    output = CompletionOutput(
-        index=0,
-        text="",
-        token_ids=[],
-        cumulative_logprob=None,
-        logprobs=None,
-        artifact_keys=["key-0", "key-1"],
-    )
-
-    assert output.artifact_keys == ["key-0", "key-1"]

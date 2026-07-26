@@ -957,13 +957,11 @@ def test_stop_string_waits_for_artifact_terminal_output():
     output_processor.request_states[request_id] = state
     output_processor.external_req_ids[state.external_req_id].append(request_id)
 
-    partial_routed_experts = np.full((2, 3, 2), 255, dtype=np.uint8)
     processed = output_processor.process_outputs(
         [
             EngineCoreOutput(
                 request_id=request_id,
                 new_token_ids=[7, 8],
-                routed_experts=partial_routed_experts,
             )
         ]
     )
@@ -991,7 +989,6 @@ def test_stop_string_waits_for_artifact_terminal_output():
     assert len(processed.request_outputs) == 1
     final_output = processed.request_outputs[0]
     assert final_output.finished
-    assert final_output.outputs[0].artifact_keys is None
     np.testing.assert_array_equal(
         final_output.outputs[0].routed_experts, full_routed_experts
     )

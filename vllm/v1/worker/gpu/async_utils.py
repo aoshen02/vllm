@@ -75,7 +75,7 @@ class AsyncOutput(AsyncModelRunnerOutput):
             self.model_runner_output.logprobs = self.logprobs_tensors.tolists()
         self.model_runner_output.prompt_logprobs_dict = self.prompt_logprobs_dict
         if self.routed_experts_write_task is not None:
-            self.routed_experts_write_task.finalize(self.model_runner_output)
+            self.routed_experts_write_task.finalize()
             self.routed_experts_write_task = None
         return self.model_runner_output
 

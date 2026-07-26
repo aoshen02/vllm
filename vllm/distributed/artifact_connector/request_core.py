@@ -8,14 +8,13 @@ import hashlib
 import json
 import math
 import struct
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
 from vllm.distributed.artifact_connector.fields import ROUTED_EXPERTS, ArtifactField
 from vllm.distributed.artifact_connector.protocol import (
-    ArtifactBlockRef,
     ArtifactCommitRequest,
     ArtifactFinalizeRequest,
 )
@@ -212,36 +211,20 @@ def materialize_routed_experts(
 
 
 @dataclass(frozen=True)
-class _Segment:
-    key: str
-    source_token_start: int
-    valid_len: int
-
-
-@dataclass
-class _RequestState:
-    request_attempt_id: str
-    field_profile_id: str
-    next_full_start: int | None = None
-    segments: dict[int, _Segment] = field(default_factory=dict)
-    error: str | None = None
-
-
-@dataclass(frozen=True)
 class PreparedCommit:
     request: ArtifactCommitRequest
     objects: list[ArtifactObject]
-    segments: list[_Segment]
+    keys: list[str]
 
 
 @dataclass(frozen=True)
 class FinalizedArtifact:
     keys: list[str]
-    value: np.ndarray | None
+    value: np.ndarray
 
 
 class ArtifactRequestCore:
-    """Own the single request state machine shared by all stores."""
+    """Encode immutable R3 objects and materialize terminal artifacts."""
 
     def __init__(
         self,
@@ -253,14 +236,9 @@ class ArtifactRequestCore:
         self.store = store
         self.writer = writer
         self.namespace = namespace
-        self.policy_epoch = 0
         self.field_spec = ROUTED_EXPERTS
-        self._states: dict[str, _RequestState] = {}
 
-    def advance_policy_epoch(self) -> None:
-        self.policy_epoch += 1
-
-    def _profile_id(self, hash_block_size: int, policy_epoch: int) -> str:
+    def _profile_id(self, hash_block_size: int) -> str:
         profile = {
             "schema_version": _SCHEMA_VERSION,
             "field": self.field_spec.name,
@@ -270,7 +248,6 @@ class ArtifactRequestCore:
             "reuse_policy": self.field_spec.reuse_policy,
             "logical_coordinate": self.field_spec.logical_coordinate,
             "hash_block_size": hash_block_size,
-            "policy_epoch": policy_epoch,
         }
         return hashlib.sha256(_canonical_json(profile)).hexdigest()
 
@@ -279,9 +256,8 @@ class ArtifactRequestCore:
         *,
         block_hash: bytes,
         hash_block_size: int,
-        policy_epoch: int,
     ) -> str:
-        profile_id = self._profile_id(hash_block_size, policy_epoch)
+        profile_id = self._profile_id(hash_block_size)
         digest = _digest(
             b"vllm.artifact.field-block.v3",
             self.namespace.encode(),
@@ -296,58 +272,25 @@ class ArtifactRequestCore:
     def _tail_key(
         self,
         *,
-        state: _RequestState,
+        field_profile_id: str,
         request_id: str,
+        request_attempt_id: str,
         source_start: int,
         source_end: int,
-        policy_epoch: int,
     ) -> str:
         digest = _digest(
             b"vllm.artifact.field-tail.v3",
             self.namespace.encode(),
             self.field_spec.name.encode(),
-            state.field_profile_id.encode(),
+            field_profile_id.encode(),
             request_id.encode(),
-            state.request_attempt_id.encode(),
+            request_attempt_id.encode(),
             source_start.to_bytes(8, "big"),
             source_end.to_bytes(8, "big"),
-            policy_epoch.to_bytes(8, "big"),
         )
         return (
             f"vllm-artifact/{self.store.store_id}/{self.field_spec.name}/tail/{digest}"
         )
-
-    def _state(
-        self,
-        request_id: str,
-        request_attempt_id: str,
-        *,
-        hash_block_size: int,
-        policy_epoch: int,
-    ) -> _RequestState:
-        if policy_epoch != self.policy_epoch:
-            raise RuntimeError(
-                "artifact policy epoch mismatch: "
-                f"scheduler={policy_epoch}, worker={self.policy_epoch}"
-            )
-        profile_id = self._profile_id(hash_block_size, policy_epoch)
-        state = self._states.get(request_id)
-        if state is None:
-            state = _RequestState(
-                request_attempt_id=request_attempt_id,
-                field_profile_id=profile_id,
-            )
-            self._states[request_id] = state
-        elif state.request_attempt_id != request_attempt_id:
-            raise RuntimeError(
-                f"artifact attempt changed for request {request_id}: "
-                f"{state.request_attempt_id} != {request_attempt_id}"
-            )
-        elif state.field_profile_id != profile_id:
-            raise RuntimeError(
-                f"artifact field profile changed for request {request_id}"
-            )
-        return state
 
     def prepare_commit(self, request: ArtifactCommitRequest) -> PreparedCommit:
         if (
@@ -360,21 +303,7 @@ class ArtifactRequestCore:
                 "invalid artifact full-block range: "
                 f"[{request.block_start}, {request.block_end})"
             )
-        state = self._state(
-            request.request_id,
-            request.request_attempt_id,
-            hash_block_size=request.hash_block_size,
-            policy_epoch=request.policy_epoch,
-        )
-        if state.error is not None:
-            raise RuntimeError(state.error)
-        if state.next_full_start is None:
-            state.next_full_start = request.block_start
-        if request.block_start != state.next_full_start:
-            raise RuntimeError(
-                "non-contiguous artifact block commit: "
-                f"expected={state.next_full_start}, got={request.block_start}"
-            )
+        field_profile_id = self._profile_id(request.hash_block_size)
         array = self.writer.read_token_range(
             request.block_ids,
             token_start=request.block_start,
@@ -388,7 +317,7 @@ class ArtifactRequestCore:
             raise RuntimeError("routed-experts capture profile changed")
 
         objects: list[ArtifactObject] = []
-        segments: list[_Segment] = []
+        keys: list[str] = []
         for source_start in range(
             request.block_start, request.block_end, request.hash_block_size
         ):
@@ -403,7 +332,6 @@ class ArtifactRequestCore:
             key = self.block_key(
                 block_hash=block_hash,
                 hash_block_size=request.hash_block_size,
-                policy_epoch=request.policy_epoch,
             )
             local_start = source_start - request.block_start
             block_array = array[local_start : local_start + request.hash_block_size]
@@ -414,7 +342,7 @@ class ArtifactRequestCore:
                         key=key,
                         kind="block",
                         field_spec=self.field_spec,
-                        field_profile_id=state.field_profile_id,
+                        field_profile_id=field_profile_id,
                         array=block_array,
                         source_token_start=source_start,
                         valid_len=request.hash_block_size,
@@ -422,15 +350,8 @@ class ArtifactRequestCore:
                     ),
                 )
             )
-            segments.append(
-                _Segment(
-                    key=key,
-                    source_token_start=source_start,
-                    valid_len=request.hash_block_size,
-                )
-            )
-        state.next_full_start = request.block_end
-        return PreparedCommit(request=request, objects=objects, segments=segments)
+            keys.append(key)
+        return PreparedCommit(request=request, objects=objects, keys=keys)
 
     def publish_commits(self, commits: list[PreparedCommit]) -> dict[str, str | None]:
         objects = [obj for commit in commits for obj in commit.objects]
@@ -447,58 +368,16 @@ class ArtifactRequestCore:
                 None,
             )
             errors[commit.request.operation_id] = error
-            state = self._states[commit.request.request_id]
-            if error is None:
-                state.segments.update(
-                    (segment.source_token_start, segment) for segment in commit.segments
-                )
-            else:
-                state.error = error
         return errors
-
-    def mark_error(self, request_id: str, message: str) -> None:
-        state = self._states.get(request_id)
-        if state is not None:
-            state.error = message
-
-    def _bind_cached_blocks(
-        self,
-        state: _RequestState,
-        cached_blocks: list[ArtifactBlockRef],
-        hash_block_size: int,
-        policy_epoch: int,
-    ) -> None:
-        new_segments: list[_Segment] = []
-        for cached in cached_blocks:
-            source_start = cached.block_index * hash_block_size
-            if source_start in state.segments:
-                continue
-            new_segments.append(
-                _Segment(
-                    key=self.block_key(
-                        block_hash=cached.block_hash,
-                        hash_block_size=hash_block_size,
-                        policy_epoch=policy_epoch,
-                    ),
-                    source_token_start=source_start,
-                    valid_len=hash_block_size,
-                )
-            )
-        ready = self.store.exists([segment.key for segment in new_segments])
-        if len(ready) != len(new_segments) or not all(ready):
-            raise RuntimeError("scheduler admitted an artifact block that is not ready")
-        state.segments.update(
-            (segment.source_token_start, segment) for segment in new_segments
-        )
 
     def _put_tail(
         self,
         request: ArtifactFinalizeRequest,
-        state: _RequestState,
         *,
+        field_profile_id: str,
         source_start: int,
         source_end: int,
-    ) -> _Segment:
+    ) -> str:
         array = self.writer.read_token_range(
             request.block_ids,
             token_start=source_start,
@@ -506,11 +385,11 @@ class ArtifactRequestCore:
             block_size=request.physical_block_size,
         )
         key = self._tail_key(
-            state=state,
+            field_profile_id=field_profile_id,
             request_id=request.request_id,
+            request_attempt_id=request.request_attempt_id,
             source_start=source_start,
             source_end=source_end,
-            policy_epoch=request.policy_epoch,
         )
         result = self.store.put(
             [
@@ -520,7 +399,7 @@ class ArtifactRequestCore:
                         key=key,
                         kind="tail",
                         field_spec=self.field_spec,
-                        field_profile_id=state.field_profile_id,
+                        field_profile_id=field_profile_id,
                         array=array,
                         source_token_start=source_start,
                         valid_len=source_end - source_start,
@@ -531,57 +410,50 @@ class ArtifactRequestCore:
         if len(result) != 1 or result[0].error is not None:
             message = result[0].error if result else "missing put result"
             raise RuntimeError(f"failed to publish artifact tail: {message}")
-        return _Segment(
-            key=key,
-            source_token_start=source_start,
-            valid_len=source_end - source_start,
-        )
+        return key
 
     def finalize(self, request: ArtifactFinalizeRequest) -> FinalizedArtifact:
-        if request.token_start != 0:
-            raise ValueError(
-                "Artifact Connector currently requires routed_experts_prompt_start=0"
-            )
         if request.token_end <= 0:
             raise ValueError(f"invalid artifact token range: [0, {request.token_end})")
-        state = self._state(
-            request.request_id,
-            request.request_attempt_id,
-            hash_block_size=request.hash_block_size,
-            policy_epoch=request.policy_epoch,
-        )
-        if state.error is not None:
-            raise RuntimeError(state.error)
-        self._bind_cached_blocks(
-            state,
-            request.cached_blocks,
-            request.hash_block_size,
-            request.policy_epoch,
-        )
-
+        field_profile_id = self._profile_id(request.hash_block_size)
         full_end = (
             request.token_end // request.hash_block_size * request.hash_block_size
         )
-        segments: list[_Segment] = []
-        for source_start in range(0, full_end, request.hash_block_size):
-            segment = state.segments.get(source_start)
-            if segment is None:
-                raise RuntimeError(
-                    "terminal artifact is missing a reusable full block: "
-                    f"request={request.request_id}, block_start={source_start}"
-                )
-            segments.append(segment)
+        full_block_count = full_end // request.hash_block_size
+        if len(request.block_hashes) < full_block_count:
+            raise RuntimeError(
+                "terminal artifact is missing KV-compatible block hashes: "
+                f"request={request.request_id}, expected={full_block_count}, "
+                f"actual={len(request.block_hashes)}"
+            )
+        keys = [
+            self.block_key(
+                block_hash=request.block_hashes[block_index],
+                hash_block_size=request.hash_block_size,
+            )
+            for block_index in range(full_block_count)
+        ]
+        ready = self.store.exists(keys)
+        if len(ready) != len(keys) or not all(ready):
+            missing_block = next(
+                (index for index, exists in enumerate(ready) if not exists),
+                len(ready),
+            )
+            raise RuntimeError(
+                "terminal artifact is missing a reusable full block: "
+                f"request={request.request_id}, "
+                f"block_start={missing_block * request.hash_block_size}"
+            )
         if full_end < request.token_end:
-            segments.append(
+            keys.append(
                 self._put_tail(
                     request,
-                    state,
+                    field_profile_id=field_profile_id,
                     source_start=full_end,
                     source_end=request.token_end,
                 )
             )
 
-        keys = [segment.key for segment in segments]
         expected_key_count = (
             request.token_end + request.hash_block_size - 1
         ) // request.hash_block_size
@@ -589,21 +461,12 @@ class ArtifactRequestCore:
             raise RuntimeError(
                 "artifact key count does not match the terminal token range"
             )
-        value = (
-            materialize_routed_experts(
-                self.store,
-                keys,
-                expected_profile_id=state.field_profile_id,
-            )
-            if self.store.returns_inline_value
-            else None
+        value = materialize_routed_experts(
+            self.store,
+            keys,
+            expected_profile_id=field_profile_id,
         )
-        self.discard(request.request_id)
         return FinalizedArtifact(keys=keys, value=value)
 
-    def discard(self, request_id: str) -> None:
-        self._states.pop(request_id, None)
-
     def close(self) -> None:
-        self._states.clear()
         self.store.close()

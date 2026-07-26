@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, NamedTuple
+from typing import NamedTuple
 
 import numpy as np
 import torch
@@ -13,9 +13,6 @@ import torch
 from vllm.model_executor.layers.fused_moe.routed_experts_capture.shared_region import (
     RoutedExpertsWorkerWriter,
 )
-
-if TYPE_CHECKING:
-    from vllm.v1.outputs import ModelRunnerOutput
 
 
 class RoutedExpertsTensors(NamedTuple):
@@ -68,8 +65,8 @@ class RoutedExpertsWriteTask:
             self.routed_experts_tensors.to_cpu_nonblocking()
         )
 
-    def finalize(self, output: ModelRunnerOutput) -> None:
-        """Publish the copied routing data and update the model output."""
+    def finalize(self) -> None:
+        """Publish the copied routing data."""
         assert self._routed_experts_tensors_cpu is not None, (
             "routed-experts CPU tensors are unavailable; call start_copy first"
         )
@@ -78,4 +75,3 @@ class RoutedExpertsWriteTask:
             routed_experts.routing_data,
             routed_experts.slot_mapping,
         )
-        output.routed_experts_slots = routed_experts.slot_mapping
