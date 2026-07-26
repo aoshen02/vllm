@@ -14,6 +14,11 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 
 from vllm.distributed.artifact_connector.buffer import RoutedExpertsArtifactBuffer
+from vllm.distributed.artifact_connector.mooncake import (
+    MooncakeArtifactPublisher,
+    MooncakeArtifactReader,
+    MooncakeArtifactStore,
+)
 from vllm.distributed.artifact_connector.protocol import (
     ArtifactCommitRequest,
     ArtifactCommitResult,
@@ -23,20 +28,40 @@ from vllm.distributed.artifact_connector.protocol import (
     ArtifactFinalizeResult,
 )
 from vllm.distributed.artifact_connector.request_core import (
+    ArtifactKeySpace,
     ArtifactRequestCore,
     PreparedCommit,
+    max_artifact_object_bytes,
 )
 from vllm.distributed.artifact_connector.shm import (
     LocalSharedMemoryArtifactReader,
     LocalSharedMemoryArtifactStore,
     make_shm_store_id,
 )
+from vllm.distributed.artifact_connector.store import ArtifactStore
 from vllm.logger import init_logger
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
 logger = init_logger(__name__)
+
+
+def _artifact_namespace(vllm_config: VllmConfig) -> str:
+    model_config = vllm_config.model_config
+    namespace_input = {
+        "model": model_config.model,
+        "revision": model_config.revision,
+        "tokenizer_revision": model_config.tokenizer_revision,
+    }
+    return hashlib.sha256(
+        json.dumps(
+            namespace_input,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode()
+    ).hexdigest()
 
 
 @dataclass
@@ -49,7 +74,13 @@ class _SchedulerArtifactState:
 class ArtifactSchedulerConnector:
     """Turn accepted-token progress into worker block commits."""
 
-    def __init__(self, vllm_config: VllmConfig) -> None:
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        *,
+        dtype: np.dtype[Any],
+        shape_per_token: tuple[int, ...],
+    ) -> None:
         self._states: dict[str, _SchedulerArtifactState] = {}
         self._pending_commits: OrderedDict[str, ArtifactCommitRequest] = OrderedDict()
         self._inflight_commits: dict[str, ArtifactCommitRequest] = {}
@@ -57,17 +88,35 @@ class ArtifactSchedulerConnector:
             OrderedDict()
         )
         self._inflight_finalizes: dict[str, ArtifactFinalizeRequest] = {}
-        self._ready_blocks: dict[bytes, str] = {}
 
         config = vllm_config.artifact_config
         parallel_config = vllm_config.parallel_config
-        self._reader = LocalSharedMemoryArtifactReader(
-            config.shm_dir,
-            make_shm_store_id(
+        if config.backend == "shm":
+            store_id = make_shm_store_id(
                 vllm_config.instance_id,
                 parallel_config.data_parallel_rank,
-            ),
+            )
+            self._reader: LocalSharedMemoryArtifactReader | MooncakeArtifactReader = (
+                LocalSharedMemoryArtifactReader(
+                    config.shm_dir,
+                    store_id,
+                )
+            )
+        else:
+            store_id = config.mooncake_store_id
+            self._reader = MooncakeArtifactReader(store_id)
+        self._key_space = ArtifactKeySpace(
+            store_id,
+            _artifact_namespace(vllm_config),
+            dtype,
+            shape_per_token,
         )
+
+    def _block_keys(self, block_hashes: list[bytes], hash_block_size: int) -> list[str]:
+        return [
+            self._key_space.block_key(block_hash, hash_block_size)
+            for block_hash in block_hashes
+        ]
 
     def _state(self, request_id: str) -> _SchedulerArtifactState:
         state = self._states.get(request_id)
@@ -89,14 +138,12 @@ class ArtifactSchedulerConnector:
         """Return the longest prefix jointly reusable by KV and R3."""
         if max_tokens <= 0:
             return max_tokens
-        candidate_keys: list[str] = []
-        for block_index in range(
+        num_candidates = (
             min(max_tokens, len(block_hashes) * hash_block_size) // hash_block_size
-        ):
-            key = self._ready_blocks.get(block_hashes[block_index])
-            if key is None:
-                break
-            candidate_keys.append(key)
+        )
+        candidate_keys = self._block_keys(
+            block_hashes[:num_candidates], hash_block_size
+        )
         ready = self._reader.exists(candidate_keys)
         ready_blocks = 0
         for exists in ready:
@@ -119,13 +166,11 @@ class ArtifactSchedulerConnector:
         state.started = True
         cached_full_end = cached_token_end // hash_block_size * hash_block_size
         if cached_full_end > 0:
-            keys = [
-                self._ready_blocks.get(block_hash)
-                for block_hash in block_hashes[: cached_full_end // hash_block_size]
-            ]
-            if any(key is None for key in keys) or not all(
-                self._reader.exists([key for key in keys if key is not None])
-            ):
+            keys = self._block_keys(
+                block_hashes[: cached_full_end // hash_block_size],
+                hash_block_size,
+            )
+            if not all(self._reader.exists(keys)):
                 raise RuntimeError("scheduler admitted an R3 block that is not ready")
             state.next_full_end = cached_full_end
         return state.request_attempt_id
@@ -220,15 +265,11 @@ class ArtifactSchedulerConnector:
             expected_blocks = (
                 commit_request.block_end - commit_request.block_start
             ) // commit_request.hash_block_size
-            if commit_result.error is None:
-                if len(commit_result.block_keys) != expected_blocks:
-                    raise RuntimeError("worker returned the wrong artifact key count")
-                for index, key in enumerate(commit_result.block_keys):
-                    block_index = (
-                        commit_request.block_start // commit_request.hash_block_size
-                        + index
-                    )
-                    self._ready_blocks[commit_request.block_hashes[block_index]] = key
+            if (
+                commit_result.error is None
+                and len(commit_result.block_keys) != expected_blocks
+            ):
+                raise RuntimeError("worker returned the wrong artifact key count")
         for finalize_result in output.results:
             finalize_request = self._inflight_finalizes.pop(
                 finalize_result.request_id, None
@@ -255,7 +296,6 @@ class ArtifactSchedulerConnector:
     def reset(self) -> None:
         if self.has_pending_work() or self._states:
             raise RuntimeError("cannot reset Artifact Connector with active requests")
-        self._ready_blocks.clear()
 
     def close(self) -> None:
         self._reader.close()
@@ -273,27 +313,28 @@ class ArtifactWorkerConnector:
     ) -> None:
         config = vllm_config.artifact_config
         parallel_config = vllm_config.parallel_config
-        self.store = LocalSharedMemoryArtifactStore(
-            config.shm_dir,
-            vllm_config.instance_id,
-            parallel_config.data_parallel_rank,
-            max_bytes=config.max_shm_bytes,
-            ttl_seconds=config.shm_ttl_seconds,
-        )
-        model_config = vllm_config.model_config
-        namespace_input = {
-            "model": model_config.model,
-            "revision": model_config.revision,
-            "tokenizer_revision": model_config.tokenizer_revision,
-        }
-        namespace = hashlib.sha256(
-            json.dumps(
-                namespace_input,
-                sort_keys=True,
-                separators=(",", ":"),
-                default=str,
-            ).encode()
-        ).hexdigest()
+        self.store: ArtifactStore
+        if config.backend == "shm":
+            self.store = LocalSharedMemoryArtifactStore(
+                config.shm_dir,
+                vllm_config.instance_id,
+                parallel_config.data_parallel_rank,
+                max_bytes=config.max_shm_bytes,
+                ttl_seconds=config.shm_ttl_seconds,
+            )
+        else:
+            max_object_bytes = max_artifact_object_bytes(
+                dtype,
+                shape_per_token,
+                vllm_config.cache_config.prefix_match_unit
+                or vllm_config.cache_config.block_size,
+            )
+            mooncake_store = MooncakeArtifactStore(
+                config.mooncake_store_id,
+                staging_buffer_bytes=config.mooncake_staging_buffer_bytes,
+                max_object_bytes=max_object_bytes,
+            )
+            self.store = MooncakeArtifactPublisher(mooncake_store)
         self.buffer = RoutedExpertsArtifactBuffer(
             dtype,
             shape_per_token,
@@ -301,7 +342,8 @@ class ArtifactWorkerConnector:
         self.core = ArtifactRequestCore(
             self.store,
             self.buffer,
-            namespace=namespace,
+            namespace=_artifact_namespace(vllm_config),
+            materialize=config.backend == "shm",
         )
 
     def capture_step(
@@ -365,6 +407,7 @@ class ArtifactWorkerConnector:
                 result = ArtifactFinalizeResult(
                     request_id=finalize_request.request_id,
                     request_attempt_id=finalize_request.request_attempt_id,
+                    artifact_keys=(finalized.keys if finalized.value is None else None),
                     value=finalized.value,
                 )
             except Exception as exc:

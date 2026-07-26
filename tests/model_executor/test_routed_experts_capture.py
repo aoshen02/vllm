@@ -510,7 +510,7 @@ def test_routed_experts_reject_unsupported_parallelism(parallel_field, error):
         device_config=SimpleNamespace(device_type="cuda"),
         cache_config=SimpleNamespace(kv_sharing_fast_prefill=False),
         ec_transfer_config=None,
-        artifact_config=SimpleNamespace(shm_dir="/dev/shm"),
+        artifact_config=SimpleNamespace(backend="shm", shm_dir="/dev/shm"),
     )
 
     with pytest.raises(ValueError, match=error):

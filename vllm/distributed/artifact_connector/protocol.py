@@ -57,6 +57,7 @@ class ArtifactFinalizeResult:
 
     request_id: str
     request_attempt_id: str
+    artifact_keys: list[str] | None = None
     value: np.ndarray | None = None
     error: str | None = None
 

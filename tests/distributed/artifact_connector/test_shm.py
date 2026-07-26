@@ -43,9 +43,14 @@ pytestmark = pytest.mark.cpu_test
 
 def _make_vllm_config(tmp_path):
     return SimpleNamespace(
-        artifact_config=SimpleNamespace(shm_dir=str(tmp_path)),
+        artifact_config=SimpleNamespace(backend="shm", shm_dir=str(tmp_path)),
         parallel_config=SimpleNamespace(data_parallel_rank=0),
         instance_id="instance",
+        model_config=SimpleNamespace(
+            model="model",
+            revision=None,
+            tokenizer_revision=None,
+        ),
     )
 
 
@@ -363,7 +368,11 @@ def test_scheduler_connector_checks_shm_existence(tmp_path):
         max_bytes=100,
         ttl_seconds=60,
     )
-    connector = ArtifactSchedulerConnector(_make_vllm_config(tmp_path))
+    connector = ArtifactSchedulerConnector(
+        _make_vllm_config(tmp_path),
+        dtype=np.dtype(np.uint8),
+        shape_per_token=(3, 2),
+    )
     attempt_id = connector.request_progress(
         request_id="request-a",
         block_hashes=[b"a" * 32],
@@ -372,7 +381,7 @@ def test_scheduler_connector_checks_shm_existence(tmp_path):
     )
     metadata = connector.build_connector_metadata()
     assert metadata is not None
-    key = "vllm-artifact/test/routed_experts/block/key"
+    key = connector._block_keys([b"a" * 32], 4)[0]
     assert store.put([ArtifactObject(key, b"payload")])[0].error is None
     connector.acknowledge(
         ArtifactConnectorOutput(
@@ -474,7 +483,9 @@ def test_weight_update_is_rejected_while_artifacts_are_enabled():
 def test_scheduler_releases_inline_terminal_output_after_ack(tmp_path):
     scheduler = object.__new__(Scheduler)
     scheduler.artifact_connector = ArtifactSchedulerConnector(
-        _make_vllm_config(tmp_path)
+        _make_vllm_config(tmp_path),
+        dtype=np.dtype(np.uint8),
+        shape_per_token=(3, 2),
     )
     attempt_id = scheduler.artifact_connector.request_finished(
         request_id="request-a",
