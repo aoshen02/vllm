@@ -55,8 +55,8 @@ def _verify_routed_experts_config(**overrides):
 def test_artifact_config_has_only_a_real_shm_backend():
     config = ArtifactConfig()
 
+    assert config.backend == "shm"
     assert config.shm_dir == "/dev/shm/vllm-artifacts"
-    assert not hasattr(config, "backend")
 
 
 @pytest.mark.parametrize(

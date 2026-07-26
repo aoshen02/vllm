@@ -991,7 +991,7 @@ def test_stop_string_waits_for_artifact_terminal_output():
     assert len(processed.request_outputs) == 1
     final_output = processed.request_outputs[0]
     assert final_output.finished
-    assert final_output.outputs[0].artifact_sample_id is None
+    assert final_output.outputs[0].artifact_keys is None
     np.testing.assert_array_equal(
         final_output.outputs[0].routed_experts, full_routed_experts
     )

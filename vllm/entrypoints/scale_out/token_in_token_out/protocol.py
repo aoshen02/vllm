@@ -195,8 +195,8 @@ class GenerateResponseChoice(BaseModel):
     # ``None`` if (a) the request was aborted before any forward pass,
     # or (b) ``enable_return_routed_experts`` is off server-side.
     routed_experts: str | None = None
-    # Engine-generated identity of the finalized execution artifact.
-    artifact_sample_id: str | None = None
+    # Ordered production-backend keys; absent for inline SHM delivery.
+    artifact_keys: list[str] | None = None
 
     @field_validator("token_ids")
     @classmethod
@@ -213,7 +213,7 @@ class GenerateResponseStreamChoice(BaseModel):
     token_ids: list[int] | None = None
     routed_experts: str | None = None
     # Present only on the terminal stream choice after artifact finalization.
-    artifact_sample_id: str | None = None
+    artifact_keys: list[str] | None = None
 
 
 class GenerateStreamResponse(BaseModel):

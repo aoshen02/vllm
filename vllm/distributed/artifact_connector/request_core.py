@@ -1,25 +1,27 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Backend-independent request lifecycle for execution artifacts."""
+"""Backend-independent request lifecycle and object format."""
 
 from __future__ import annotations
 
 import hashlib
 import json
-import time
+import math
+import struct
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
+from vllm.distributed.artifact_connector.fields import ROUTED_EXPERTS, ArtifactField
 from vllm.distributed.artifact_connector.protocol import (
     ArtifactBlockRef,
     ArtifactCommitRequest,
     ArtifactFinalizeRequest,
 )
 from vllm.distributed.artifact_connector.store import (
-    ArtifactArray,
     ArtifactCorruptionError,
+    ArtifactObject,
     ArtifactStore,
 )
 
@@ -28,97 +30,214 @@ if TYPE_CHECKING:
         RoutedExpertsWorkerWriter,
     )
 
-_FIELD_NAME = "routed_experts"
-_REUSE_POLICY = "prefix_block"
-_LOGICAL_COORDINATE = "executed_token"
+_SCHEMA_VERSION = 3
+_HEADER_LENGTH = struct.Struct("<I")
+_MAX_HEADER_BYTES = 4096
 
 
-def _digest(prefix: bytes, *values: bytes) -> str:
-    digest = hashlib.sha256(prefix)
-    for value in values:
-        digest.update(b"\0")
-        digest.update(value)
+def _canonical_json(value: dict[str, Any]) -> bytes:
+    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+
+
+def _digest(*parts: bytes) -> str:
+    digest = hashlib.sha256()
+    for part in parts:
+        digest.update(len(part).to_bytes(8, "big"))
+        digest.update(part)
     return digest.hexdigest()
+
+
+def encode_artifact_array(
+    *,
+    key: str,
+    kind: str,
+    field_spec: ArtifactField,
+    field_profile_id: str,
+    array: np.ndarray,
+    source_token_start: int,
+    valid_len: int,
+    kv_block_hash: bytes | None = None,
+) -> bytes:
+    """Encode one self-describing immutable array object."""
+    contiguous = np.ascontiguousarray(array)
+    raw = contiguous.tobytes(order="C")
+    header = {
+        "schema_version": _SCHEMA_VERSION,
+        "key": key,
+        "kind": kind,
+        "field": field_spec.name,
+        "reuse_policy": field_spec.reuse_policy,
+        "logical_coordinate": field_spec.logical_coordinate,
+        "field_profile_id": field_profile_id,
+        "dtype": contiguous.dtype.str,
+        "shape": list(contiguous.shape),
+        "source_token_start": source_token_start,
+        "valid_len": valid_len,
+        "kv_block_hash": kv_block_hash.hex() if kv_block_hash is not None else None,
+        "payload_nbytes": len(raw),
+        "payload_sha256": hashlib.sha256(raw).hexdigest(),
+    }
+    header["header_sha256"] = hashlib.sha256(_canonical_json(header)).hexdigest()
+    encoded_header = _canonical_json(header)
+    if len(encoded_header) > _MAX_HEADER_BYTES:
+        raise ValueError("artifact object header is too large")
+    return _HEADER_LENGTH.pack(len(encoded_header)) + encoded_header + raw
+
+
+def decode_artifact_array(
+    payload: bytes,
+    *,
+    expected_key: str,
+    expected_field: ArtifactField = ROUTED_EXPERTS,
+    expected_profile_id: str | None = None,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Decode and validate one self-describing immutable array object."""
+    if len(payload) < _HEADER_LENGTH.size:
+        raise ArtifactCorruptionError("artifact object is truncated")
+    (header_length,) = _HEADER_LENGTH.unpack(payload[: _HEADER_LENGTH.size])
+    if header_length <= 0 or header_length > _MAX_HEADER_BYTES:
+        raise ArtifactCorruptionError("invalid artifact header length")
+    header_end = _HEADER_LENGTH.size + header_length
+    if header_end > len(payload):
+        raise ArtifactCorruptionError("artifact header is truncated")
+    try:
+        header = json.loads(payload[_HEADER_LENGTH.size : header_end])
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ArtifactCorruptionError("invalid artifact object header") from error
+    if not isinstance(header, dict):
+        raise ArtifactCorruptionError("artifact object header must be an object")
+    header_sha256 = header.get("header_sha256")
+    unsigned = dict(header)
+    unsigned.pop("header_sha256", None)
+    if header_sha256 != hashlib.sha256(_canonical_json(unsigned)).hexdigest():
+        raise ArtifactCorruptionError("artifact header checksum mismatch")
+    if (
+        header.get("schema_version") != _SCHEMA_VERSION
+        or header.get("key") != expected_key
+        or header.get("kind") not in ("block", "tail")
+        or header.get("field") != expected_field.name
+        or header.get("reuse_policy") != expected_field.reuse_policy
+        or header.get("logical_coordinate") != expected_field.logical_coordinate
+    ):
+        raise ArtifactCorruptionError("artifact object identity mismatch")
+    if (
+        expected_profile_id is not None
+        and header.get("field_profile_id") != expected_profile_id
+    ):
+        raise ArtifactCorruptionError("artifact field profile mismatch")
+
+    raw = payload[header_end:]
+    if header.get("payload_nbytes") != len(raw):
+        raise ArtifactCorruptionError("artifact payload size mismatch")
+    if header.get("payload_sha256") != hashlib.sha256(raw).hexdigest():
+        raise ArtifactCorruptionError("artifact payload checksum mismatch")
+    try:
+        dtype = np.dtype(header["dtype"])
+        shape = tuple(int(value) for value in header["shape"])
+        valid_len = int(header["valid_len"])
+        source_token_start = int(header["source_token_start"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise ArtifactCorruptionError("invalid artifact array metadata") from error
+    if (
+        not shape
+        or any(dimension < 0 for dimension in shape)
+        or dtype.kind not in "biuf"
+        or valid_len <= 0
+        or valid_len != shape[0]
+        or source_token_start < 0
+        or math.prod(shape) * dtype.itemsize != len(raw)
+    ):
+        raise ArtifactCorruptionError("invalid artifact array shape")
+    try:
+        array = np.frombuffer(raw, dtype=dtype).reshape(shape).copy()
+    except (TypeError, ValueError) as error:
+        raise ArtifactCorruptionError("invalid artifact array payload") from error
+    array.setflags(write=False)
+    return array, header
+
+
+def max_artifact_object_bytes(
+    dtype: np.dtype[Any],
+    shape_per_token: tuple[int, ...],
+    block_size: int,
+) -> int:
+    """Return a safe registered-buffer capacity for one block object."""
+    payload_bytes = block_size * math.prod(shape_per_token) * dtype.itemsize
+    return _HEADER_LENGTH.size + _MAX_HEADER_BYTES + payload_bytes
+
+
+def materialize_routed_experts(
+    store: ArtifactStore,
+    artifact_keys: list[str],
+    *,
+    expected_profile_id: str | None = None,
+) -> np.ndarray:
+    """Read ordered keys and materialize complete routed-experts rows."""
+    if not artifact_keys:
+        raise ValueError("routed-experts artifact key list must not be empty")
+    payloads = store.get(artifact_keys)
+    if len(payloads) != len(artifact_keys):
+        raise ArtifactCorruptionError(
+            "artifact backend returned the wrong object count"
+        )
+    arrays: list[np.ndarray] = []
+    next_start = 0
+    shape_per_token: tuple[int, ...] | None = None
+    dtype: np.dtype[Any] | None = None
+    profile_id: str | None = expected_profile_id
+    for key, payload in zip(artifact_keys, payloads, strict=True):
+        array, header = decode_artifact_array(
+            payload,
+            expected_key=key,
+            expected_profile_id=profile_id,
+        )
+        current_profile = str(header["field_profile_id"])
+        if profile_id is None:
+            profile_id = current_profile
+        elif current_profile != profile_id:
+            raise ArtifactCorruptionError("artifact key list mixes field profiles")
+        source_start = int(header["source_token_start"])
+        if source_start != next_start:
+            raise ArtifactCorruptionError(
+                "artifact keys do not cover one contiguous logical range"
+            )
+        if shape_per_token is None:
+            shape_per_token = array.shape[1:]
+            dtype = array.dtype
+        elif array.shape[1:] != shape_per_token or array.dtype != dtype:
+            raise ArtifactCorruptionError("artifact key list mixes array schemas")
+        next_start += array.shape[0]
+        arrays.append(array)
+    return np.concatenate(arrays, axis=0)
+
+
+@dataclass(frozen=True)
+class _Segment:
+    key: str
+    source_token_start: int
+    valid_len: int
 
 
 @dataclass
 class _RequestState:
-    sample_id: str
-    profile_id: str
+    request_attempt_id: str
+    field_profile_id: str
     next_full_start: int | None = None
-    segments: dict[int, dict[str, Any]] = field(default_factory=dict)
+    segments: dict[int, _Segment] = field(default_factory=dict)
     error: str | None = None
 
 
 @dataclass(frozen=True)
 class PreparedCommit:
-    """One validated commit whose payload has not been published yet."""
-
     request: ArtifactCommitRequest
-    blocks: list[ArtifactArray]
-    segments: list[dict[str, Any]]
+    objects: list[ArtifactObject]
+    segments: list[_Segment]
 
 
 @dataclass(frozen=True)
 class FinalizedArtifact:
-    """Terminal publication result returned to the worker connector."""
-
-    sample_id: str
-    manifest_sha256: str
+    keys: list[str]
     value: np.ndarray | None
-
-
-def materialize_routed_experts(store: ArtifactStore, sample_id: str) -> np.ndarray:
-    """Materialize the routed-experts field using the common manifest."""
-    manifest = store.read_manifest(sample_id)
-    if (
-        manifest.get("schema_version") != 2
-        or manifest.get("store_id") != store.store_id
-        or manifest.get("artifact_sample_id") != sample_id
-    ):
-        raise ArtifactCorruptionError("invalid artifact manifest identity")
-    fields = manifest.get("fields")
-    field_manifest = fields.get(_FIELD_NAME) if isinstance(fields, dict) else None
-    if not isinstance(field_manifest, dict):
-        raise ArtifactCorruptionError("routed-experts field is missing")
-    try:
-        dtype = np.dtype(field_manifest["dtype"])
-        shape = tuple(int(value) for value in field_manifest["shape"])
-        segments = field_manifest["segments"]
-    except (KeyError, TypeError, ValueError) as error:
-        raise ArtifactCorruptionError(
-            "invalid routed-experts field manifest"
-        ) from error
-    if not isinstance(segments, list):
-        raise ArtifactCorruptionError("artifact segments must be a list")
-    output = np.empty(shape, dtype=dtype)
-    covered = 0
-    for segment in segments:
-        if not isinstance(segment, dict):
-            raise ArtifactCorruptionError("invalid artifact segment")
-        kind = segment.get("kind")
-        object_id = segment.get("object_id")
-        output_start = segment.get("output_start")
-        valid_len = segment.get("valid_len")
-        if (
-            kind not in ("block", "tail")
-            or not isinstance(object_id, str)
-            or not isinstance(output_start, int)
-            or not isinstance(valid_len, int)
-            or output_start != covered
-            or valid_len <= 0
-        ):
-            raise ArtifactCorruptionError("invalid artifact segment layout")
-        array = store.read_array(kind, object_id)
-        if array.dtype != dtype or array.shape[0] != valid_len:
-            raise ArtifactCorruptionError("artifact segment shape mismatch")
-        output[output_start : output_start + valid_len] = array
-        covered += valid_len
-    if covered != shape[0]:
-        raise ArtifactCorruptionError(
-            "artifact segments do not cover the terminal output"
-        )
-    return output
 
 
 class ArtifactRequestCore:
@@ -130,39 +249,78 @@ class ArtifactRequestCore:
         writer: RoutedExpertsWorkerWriter,
         *,
         namespace: str,
-        inline_value: bool,
     ) -> None:
         self.store = store
         self.writer = writer
         self.namespace = namespace
-        self.inline_value = inline_value
         self.policy_epoch = 0
+        self.field_spec = ROUTED_EXPERTS
         self._states: dict[str, _RequestState] = {}
 
     def advance_policy_epoch(self) -> None:
-        """Prevent block reuse after an in-place model weight update."""
         self.policy_epoch += 1
 
     def _profile_id(self, hash_block_size: int, policy_epoch: int) -> str:
         profile = {
-            "schema_version": 2,
-            "field": _FIELD_NAME,
+            "schema_version": _SCHEMA_VERSION,
+            "field": self.field_spec.name,
             "namespace": self.namespace,
             "dtype": self.writer.dtype.str,
             "shape_per_token": list(self.writer.shape_per_token),
-            "reuse_policy": _REUSE_POLICY,
-            "logical_coordinate": _LOGICAL_COORDINATE,
+            "reuse_policy": self.field_spec.reuse_policy,
+            "logical_coordinate": self.field_spec.logical_coordinate,
             "hash_block_size": hash_block_size,
             "policy_epoch": policy_epoch,
         }
-        return hashlib.sha256(
-            json.dumps(profile, sort_keys=True, separators=(",", ":")).encode()
-        ).hexdigest()
+        return hashlib.sha256(_canonical_json(profile)).hexdigest()
+
+    def block_key(
+        self,
+        *,
+        block_hash: bytes,
+        hash_block_size: int,
+        policy_epoch: int,
+    ) -> str:
+        profile_id = self._profile_id(hash_block_size, policy_epoch)
+        digest = _digest(
+            b"vllm.artifact.field-block.v3",
+            self.namespace.encode(),
+            self.field_spec.name.encode(),
+            profile_id.encode(),
+            block_hash,
+        )
+        return (
+            f"vllm-artifact/{self.store.store_id}/{self.field_spec.name}/block/{digest}"
+        )
+
+    def _tail_key(
+        self,
+        *,
+        state: _RequestState,
+        request_id: str,
+        source_start: int,
+        source_end: int,
+        policy_epoch: int,
+    ) -> str:
+        digest = _digest(
+            b"vllm.artifact.field-tail.v3",
+            self.namespace.encode(),
+            self.field_spec.name.encode(),
+            state.field_profile_id.encode(),
+            request_id.encode(),
+            state.request_attempt_id.encode(),
+            source_start.to_bytes(8, "big"),
+            source_end.to_bytes(8, "big"),
+            policy_epoch.to_bytes(8, "big"),
+        )
+        return (
+            f"vllm-artifact/{self.store.store_id}/{self.field_spec.name}/tail/{digest}"
+        )
 
     def _state(
         self,
         request_id: str,
-        sample_id: str,
+        request_attempt_id: str,
         *,
         hash_block_size: int,
         policy_epoch: int,
@@ -175,40 +333,23 @@ class ArtifactRequestCore:
         profile_id = self._profile_id(hash_block_size, policy_epoch)
         state = self._states.get(request_id)
         if state is None:
-            state = _RequestState(sample_id=sample_id, profile_id=profile_id)
-            self._states[request_id] = state
-        elif state.sample_id != sample_id:
-            raise RuntimeError(
-                f"artifact sample changed for request {request_id}: "
-                f"{state.sample_id} != {sample_id}"
+            state = _RequestState(
+                request_attempt_id=request_attempt_id,
+                field_profile_id=profile_id,
             )
-        elif state.profile_id != profile_id:
+            self._states[request_id] = state
+        elif state.request_attempt_id != request_attempt_id:
+            raise RuntimeError(
+                f"artifact attempt changed for request {request_id}: "
+                f"{state.request_attempt_id} != {request_attempt_id}"
+            )
+        elif state.field_profile_id != profile_id:
             raise RuntimeError(
                 f"artifact field profile changed for request {request_id}"
             )
         return state
 
-    def _block_object_id(self, profile_id: str, block_hash: bytes) -> str:
-        return _digest(
-            b"vllm.artifact.field-block.v2",
-            _FIELD_NAME.encode(),
-            profile_id.encode(),
-            block_hash,
-        )
-
-    def _tail_object_id(
-        self, sample_id: str, source_start: int, source_end: int
-    ) -> str:
-        return _digest(
-            b"vllm.artifact.field-tail.v2",
-            _FIELD_NAME.encode(),
-            sample_id.encode(),
-            source_start.to_bytes(8, "big"),
-            source_end.to_bytes(8, "big"),
-        )
-
     def prepare_commit(self, request: ArtifactCommitRequest) -> PreparedCommit:
-        """Validate and assemble newly completed full blocks."""
         if (
             request.block_start < 0
             or request.block_end <= request.block_start
@@ -221,7 +362,7 @@ class ArtifactRequestCore:
             )
         state = self._state(
             request.request_id,
-            request.artifact_sample_id,
+            request.request_attempt_id,
             hash_block_size=request.hash_block_size,
             policy_epoch=request.policy_epoch,
         )
@@ -246,8 +387,8 @@ class ArtifactRequestCore:
         ):
             raise RuntimeError("routed-experts capture profile changed")
 
-        blocks: list[ArtifactArray] = []
-        segments: list[dict[str, Any]] = []
+        objects: list[ArtifactObject] = []
+        segments: list[_Segment] = []
         for source_start in range(
             request.block_start, request.block_end, request.hash_block_size
         ):
@@ -259,43 +400,61 @@ class ArtifactRequestCore:
                     f"num_hashes={len(request.block_hashes)}"
                 )
             block_hash = request.block_hashes[block_index]
-            object_id = self._block_object_id(state.profile_id, block_hash)
+            key = self.block_key(
+                block_hash=block_hash,
+                hash_block_size=request.hash_block_size,
+                policy_epoch=request.policy_epoch,
+            )
             local_start = source_start - request.block_start
             block_array = array[local_start : local_start + request.hash_block_size]
-            blocks.append(
-                ArtifactArray(
-                    object_id=object_id,
-                    array=block_array,
-                    metadata={
-                        "namespace": self.namespace,
-                        "field": _FIELD_NAME,
-                        "field_profile_id": state.profile_id,
-                        "kv_block_hash": block_hash.hex(),
-                        "source_token_start": source_start,
-                        "valid_len": request.hash_block_size,
-                    },
+            objects.append(
+                ArtifactObject(
+                    key=key,
+                    payload=encode_artifact_array(
+                        key=key,
+                        kind="block",
+                        field_spec=self.field_spec,
+                        field_profile_id=state.field_profile_id,
+                        array=block_array,
+                        source_token_start=source_start,
+                        valid_len=request.hash_block_size,
+                        kv_block_hash=block_hash,
+                    ),
                 )
             )
             segments.append(
-                {
-                    "kind": "block",
-                    "object_id": object_id,
-                    "kv_block_hash": block_hash.hex(),
-                    "source_token_start": source_start,
-                    "valid_len": request.hash_block_size,
-                }
+                _Segment(
+                    key=key,
+                    source_token_start=source_start,
+                    valid_len=request.hash_block_size,
+                )
             )
         state.next_full_start = request.block_end
-        return PreparedCommit(request=request, blocks=blocks, segments=segments)
+        return PreparedCommit(request=request, objects=objects, segments=segments)
 
-    def publish_commits(self, commits: list[PreparedCommit]) -> None:
-        """Publish a worker-step batch and attach its segments to requests."""
-        self.store.put_blocks([block for commit in commits for block in commit.blocks])
+    def publish_commits(self, commits: list[PreparedCommit]) -> dict[str, str | None]:
+        objects = [obj for commit in commits for obj in commit.objects]
+        results = self.store.put(objects)
+        if len(results) != len(objects):
+            raise RuntimeError("artifact store returned the wrong put result count")
+        errors: dict[str, str | None] = {}
+        offset = 0
         for commit in commits:
-            state = self._states[commit.request.request_id]
-            state.segments.update(
-                (segment["source_token_start"], segment) for segment in commit.segments
+            commit_results = results[offset : offset + len(commit.objects)]
+            offset += len(commit.objects)
+            error = next(
+                (result.error for result in commit_results if result.error),
+                None,
             )
+            errors[commit.request.operation_id] = error
+            state = self._states[commit.request.request_id]
+            if error is None:
+                state.segments.update(
+                    (segment.source_token_start, segment) for segment in commit.segments
+                )
+            else:
+                state.error = error
+        return errors
 
     def mark_error(self, request_id: str, message: str) -> None:
         state = self._states.get(request_id)
@@ -307,29 +466,30 @@ class ArtifactRequestCore:
         state: _RequestState,
         cached_blocks: list[ArtifactBlockRef],
         hash_block_size: int,
+        policy_epoch: int,
     ) -> None:
-        object_ids: list[str] = []
-        new_segments: list[tuple[int, dict[str, Any]]] = []
+        new_segments: list[_Segment] = []
         for cached in cached_blocks:
             source_start = cached.block_index * hash_block_size
             if source_start in state.segments:
                 continue
-            object_id = self._block_object_id(state.profile_id, cached.block_hash)
-            object_ids.append(object_id)
             new_segments.append(
-                (
-                    source_start,
-                    {
-                        "kind": "block",
-                        "object_id": object_id,
-                        "kv_block_hash": cached.block_hash.hex(),
-                        "source_token_start": source_start,
-                        "valid_len": hash_block_size,
-                    },
+                _Segment(
+                    key=self.block_key(
+                        block_hash=cached.block_hash,
+                        hash_block_size=hash_block_size,
+                        policy_epoch=policy_epoch,
+                    ),
+                    source_token_start=source_start,
+                    valid_len=hash_block_size,
                 )
             )
-        self.store.retain_blocks(object_ids)
-        state.segments.update(new_segments)
+        ready = self.store.exists([segment.key for segment in new_segments])
+        if len(ready) != len(new_segments) or not all(ready):
+            raise RuntimeError("scheduler admitted an artifact block that is not ready")
+        state.segments.update(
+            (segment.source_token_start, segment) for segment in new_segments
+        )
 
     def _put_tail(
         self,
@@ -338,151 +498,112 @@ class ArtifactRequestCore:
         *,
         source_start: int,
         source_end: int,
-        output_start: int,
-    ) -> dict[str, Any]:
+    ) -> _Segment:
         array = self.writer.read_token_range(
             request.block_ids,
             token_start=source_start,
             token_end=source_end,
             block_size=request.physical_block_size,
         )
-        object_id = self._tail_object_id(
-            request.artifact_sample_id, source_start, source_end
+        key = self._tail_key(
+            state=state,
+            request_id=request.request_id,
+            source_start=source_start,
+            source_end=source_end,
+            policy_epoch=request.policy_epoch,
         )
-        self.store.put_array(
-            "tail",
-            object_id,
-            array,
-            {
-                "namespace": self.namespace,
-                "field": _FIELD_NAME,
-                "field_profile_id": state.profile_id,
-                "artifact_sample_id": request.artifact_sample_id,
-                "source_token_start": source_start,
-                "valid_len": source_end - source_start,
-            },
+        result = self.store.put(
+            [
+                ArtifactObject(
+                    key=key,
+                    payload=encode_artifact_array(
+                        key=key,
+                        kind="tail",
+                        field_spec=self.field_spec,
+                        field_profile_id=state.field_profile_id,
+                        array=array,
+                        source_token_start=source_start,
+                        valid_len=source_end - source_start,
+                    ),
+                )
+            ]
         )
-        return {
-            "kind": "tail",
-            "object_id": object_id,
-            "output_start": output_start,
-            "source_token_start": source_start,
-            "valid_len": source_end - source_start,
-        }
+        if len(result) != 1 or result[0].error is not None:
+            message = result[0].error if result else "missing put result"
+            raise RuntimeError(f"failed to publish artifact tail: {message}")
+        return _Segment(
+            key=key,
+            source_token_start=source_start,
+            valid_len=source_end - source_start,
+        )
 
     def finalize(self, request: ArtifactFinalizeRequest) -> FinalizedArtifact:
-        """Seal one manifest and optionally materialize its inline value."""
-        if request.token_start < 0 or request.token_end <= request.token_start:
+        if request.token_start != 0:
             raise ValueError(
-                "invalid artifact token range: "
-                f"[{request.token_start}, {request.token_end})"
+                "Artifact Connector currently requires routed_experts_prompt_start=0"
             )
+        if request.token_end <= 0:
+            raise ValueError(f"invalid artifact token range: [0, {request.token_end})")
         state = self._state(
             request.request_id,
-            request.artifact_sample_id,
+            request.request_attempt_id,
             hash_block_size=request.hash_block_size,
             policy_epoch=request.policy_epoch,
         )
         if state.error is not None:
             raise RuntimeError(state.error)
-        self._bind_cached_blocks(state, request.cached_blocks, request.hash_block_size)
+        self._bind_cached_blocks(
+            state,
+            request.cached_blocks,
+            request.hash_block_size,
+            request.policy_epoch,
+        )
 
-        block_size = request.hash_block_size
-        first_full_start = (
-            (request.token_start + block_size - 1) // block_size
-        ) * block_size
-        full_end = request.token_end // block_size * block_size
-        segments: list[dict[str, Any]] = []
-        output_start = 0
-
-        if request.token_start < min(first_full_start, request.token_end):
-            head_end = min(first_full_start, request.token_end)
-            segments.append(
-                self._put_tail(
-                    request,
-                    state,
-                    source_start=request.token_start,
-                    source_end=head_end,
-                    output_start=output_start,
-                )
-            )
-            output_start += head_end - request.token_start
-
-        for source_start in range(first_full_start, full_end, block_size):
+        full_end = (
+            request.token_end // request.hash_block_size * request.hash_block_size
+        )
+        segments: list[_Segment] = []
+        for source_start in range(0, full_end, request.hash_block_size):
             segment = state.segments.get(source_start)
             if segment is None:
                 raise RuntimeError(
                     "terminal artifact is missing a reusable full block: "
                     f"request={request.request_id}, block_start={source_start}"
                 )
-            segments.append({**segment, "output_start": output_start})
-            output_start += block_size
-
-        tail_start = max(full_end, request.token_start)
-        if tail_start < request.token_end:
+            segments.append(segment)
+        if full_end < request.token_end:
             segments.append(
                 self._put_tail(
                     request,
                     state,
-                    source_start=tail_start,
+                    source_start=full_end,
                     source_end=request.token_end,
-                    output_start=output_start,
                 )
             )
-            output_start += request.token_end - tail_start
 
-        expected_len = request.token_end - request.token_start
-        if output_start != expected_len:
-            raise RuntimeError("artifact segments do not cover the terminal range")
-        field_manifest = {
-            "reuse_policy": _REUSE_POLICY,
-            "logical_coordinate": _LOGICAL_COORDINATE,
-            "field_profile_id": state.profile_id,
-            "dtype": self.writer.dtype.str,
-            "shape": [expected_len, *self.writer.shape_per_token],
-            "source_token_start": request.token_start,
-            "source_token_end": request.token_end,
-            "segments": segments,
-        }
-        manifest = {
-            "schema_version": 2,
-            "store_id": self.store.store_id,
-            "artifact_sample_id": request.artifact_sample_id,
-            "namespace": self.namespace,
-            "policy_epoch": request.policy_epoch,
-            "request_id": request.request_id,
-            "terminal_boundary": {
-                "coordinate": _LOGICAL_COORDINATE,
-                "start": request.token_start,
-                "end": request.token_end,
-            },
-            "fields": {_FIELD_NAME: field_manifest},
-            "created_at_unix_ns": time.time_ns(),
-        }
-        manifest_sha256 = self.store.put_manifest(request.artifact_sample_id, manifest)
+        keys = [segment.key for segment in segments]
+        expected_key_count = (
+            request.token_end + request.hash_block_size - 1
+        ) // request.hash_block_size
+        if len(keys) != expected_key_count:
+            raise RuntimeError(
+                "artifact key count does not match the terminal token range"
+            )
         value = (
-            self.materialize(request.artifact_sample_id) if self.inline_value else None
+            materialize_routed_experts(
+                self.store,
+                keys,
+                expected_profile_id=state.field_profile_id,
+            )
+            if self.store.returns_inline_value
+            else None
         )
         self.discard(request.request_id)
-        return FinalizedArtifact(
-            sample_id=request.artifact_sample_id,
-            manifest_sha256=manifest_sha256,
-            value=value,
-        )
-
-    def materialize(self, sample_id: str) -> np.ndarray:
-        """Materialize the routed-experts field using the common manifest."""
-        return materialize_routed_experts(self.store, sample_id)
+        return FinalizedArtifact(keys=keys, value=value)
 
     def discard(self, request_id: str) -> None:
-        """Drop one request state while keeping immutable published blocks."""
-        state = self._states.pop(request_id, None)
-        if state is not None:
-            self.store.release_blocks(
-                [segment["object_id"] for segment in state.segments.values()]
-            )
+        self._states.pop(request_id, None)
 
     def close(self) -> None:
-        for request_id in list(self._states):
-            self.discard(request_id)
+        self._states.clear()
         self.store.close()

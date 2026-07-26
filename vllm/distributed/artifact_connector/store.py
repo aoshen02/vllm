@@ -3,52 +3,52 @@
 """Backend boundary for immutable execution-artifact objects."""
 
 from dataclasses import dataclass
-from typing import Any, Protocol
-
-import numpy as np
+from typing import Protocol
 
 
 @dataclass(frozen=True)
-class ArtifactArray:
-    """One immutable array object prepared by the common assembly path."""
+class ArtifactObject:
+    """One immutable, self-describing object."""
 
-    object_id: str
-    array: np.ndarray
-    metadata: dict[str, Any]
+    key: str
+    payload: bytes
 
 
-class ArtifactCorruptionError(RuntimeError):
+@dataclass(frozen=True)
+class ArtifactPutResult:
+    """Per-object result from a batch publication."""
+
+    key: str
+    error: str | None = None
+
+
+class ArtifactStoreError(RuntimeError):
+    """Base class for artifact-store failures."""
+
+
+class ArtifactCapacityError(ArtifactStoreError):
+    """The artifact store cannot retain another object."""
+
+
+class ArtifactCorruptionError(ArtifactStoreError):
     """An artifact object failed structural or checksum validation."""
 
 
-class ArtifactNotReadyError(RuntimeError):
-    """An artifact object exists but is not ready for consumption."""
+class ArtifactNotFoundError(ArtifactStoreError):
+    """A requested artifact object is not present."""
 
 
 class ArtifactStore(Protocol):
-    """Opaque payload operations required by the request core."""
+    """Opaque byte-object operations required by the request core."""
 
     backend_name: str
     store_id: str
+    returns_inline_value: bool
 
-    def put_blocks(self, blocks: list[ArtifactArray]) -> None: ...
+    def put(self, objects: list[ArtifactObject]) -> list[ArtifactPutResult]: ...
 
-    def retain_blocks(self, object_ids: list[str]) -> None: ...
+    def exists(self, keys: list[str]) -> list[bool]: ...
 
-    def release_blocks(self, object_ids: list[str]) -> None: ...
-
-    def put_array(
-        self,
-        kind: str,
-        object_id: str,
-        array: np.ndarray,
-        metadata: dict[str, Any],
-    ) -> None: ...
-
-    def put_manifest(self, sample_id: str, manifest: dict[str, Any]) -> str: ...
-
-    def read_array(self, kind: str, object_id: str) -> np.ndarray: ...
-
-    def read_manifest(self, sample_id: str) -> dict[str, Any]: ...
+    def get(self, keys: list[str]) -> list[bytes]: ...
 
     def close(self) -> None: ...

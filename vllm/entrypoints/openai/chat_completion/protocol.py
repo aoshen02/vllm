@@ -110,8 +110,8 @@ class ChatCompletionResponseChoice(OpenAIBaseModel):
     # ``None`` if (a) the request was aborted before any forward pass,
     # or (b) ``enable_return_routed_experts`` is off server-side.
     routed_experts: str | None = None
-    # Engine-generated identity of the finalized execution artifact.
-    artifact_sample_id: str | None = None
+    # Ordered production-backend keys; absent for inline SHM delivery.
+    artifact_keys: list[str] | None = None
 
 
 class ChatCompletionResponse(OpenAIBaseModel):
@@ -146,7 +146,7 @@ class ChatCompletionResponseStreamChoice(OpenAIBaseModel):
     finish_reason: str | None = None
     stop_reason: int | str | None = None
     # Present only on the terminal stream choice after artifact finalization.
-    artifact_sample_id: str | None = None
+    artifact_keys: list[str] | None = None
     # not part of the OpenAI spec but for tracing the tokens
     token_ids: list[int] | None = None
 

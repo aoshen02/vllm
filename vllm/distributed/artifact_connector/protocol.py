@@ -1,16 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Scheduler/worker protocol for execution artifact finalization."""
+"""Scheduler/worker protocol for execution-artifact publication."""
 
 from dataclasses import dataclass, field
-from typing import Literal
 
 import numpy as np
 
 
 @dataclass(frozen=True)
 class ArtifactBlockRef:
-    """One reusable field block already committed by an earlier request."""
+    """One reusable block already admitted as jointly ready."""
 
     block_index: int
     block_hash: bytes
@@ -22,7 +21,7 @@ class ArtifactCommitRequest:
 
     operation_id: str
     request_id: str
-    artifact_sample_id: str
+    request_attempt_id: str
     block_ids: list[int]
     block_hashes: list[bytes]
     block_start: int
@@ -37,7 +36,7 @@ class ArtifactFinalizeRequest:
     """One terminal request whose staged routing must be made immutable."""
 
     request_id: str
-    artifact_sample_id: str
+    request_attempt_id: str
     block_ids: list[int]
     block_hashes: list[bytes]
     token_start: int
@@ -54,7 +53,7 @@ class ArtifactDiscardRequest:
 
     operation_id: str
     request_id: str
-    artifact_sample_id: str
+    request_attempt_id: str
 
 
 @dataclass
@@ -72,19 +71,19 @@ class ArtifactCommitResult:
 
     operation_id: str
     request_id: str
-    artifact_sample_id: str
+    request_attempt_id: str
     block_end: int
+    block_keys: list[str] = field(default_factory=list)
     error: str | None = None
 
 
 @dataclass(frozen=True)
 class ArtifactFinalizeResult:
-    """Worker acknowledgement for one artifact finalization request."""
+    """Worker acknowledgement for one terminal artifact."""
 
     request_id: str
-    artifact_sample_id: str
-    delivery: Literal["inline", "sample_id"] | None = None
-    manifest_sha256: str | None = None
+    request_attempt_id: str
+    artifact_keys: list[str] | None = None
     routed_experts: np.ndarray | None = None
     error: str | None = None
 
@@ -95,7 +94,7 @@ class ArtifactDiscardResult:
 
     operation_id: str
     request_id: str
-    artifact_sample_id: str
+    request_attempt_id: str
 
 
 @dataclass

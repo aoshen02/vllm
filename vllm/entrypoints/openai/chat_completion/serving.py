@@ -689,7 +689,7 @@ class OpenAIServingChat(GenerateBaseServing):
                             token_ids=(
                                 as_list(output.token_ids) if include_token_ids else None
                             ),
-                            artifact_sample_id=output.artifact_sample_id,
+                            artifact_keys=output.artifact_keys,
                         )
 
                     # if the model is finished generating
@@ -718,7 +718,7 @@ class OpenAIServingChat(GenerateBaseServing):
                             token_ids=(
                                 as_list(output.token_ids) if include_token_ids else None
                             ),
-                            artifact_sample_id=output.artifact_sample_id,
+                            artifact_keys=output.artifact_keys,
                         )
 
                         finish_reason_sent[i] = True
@@ -1006,7 +1006,7 @@ class OpenAIServingChat(GenerateBaseServing):
                     else None
                 ),
                 routed_experts=routed_experts_b64,
-                artifact_sample_id=output.artifact_sample_id,
+                artifact_keys=output.artifact_keys,
             )
             choice_data = maybe_filter_parallel_tool_calls(choice_data, request)
 

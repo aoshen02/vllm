@@ -179,7 +179,7 @@ class RequestState:
 
         # Routed experts accumulation (prompt + sample chunks)
         self.routed_experts_chunks: list[np.ndarray] = []
-        self.artifact_sample_id: str | None = None
+        self.artifact_keys: list[str] | None = None
         self.artifact_finalize_requested = False
 
         # Stream Interval
@@ -416,7 +416,7 @@ class RequestState:
             text=text,
             token_ids=token_ids,
             routed_experts=routed_experts,
-            artifact_sample_id=self.artifact_sample_id,
+            artifact_keys=self.artifact_keys,
             logprobs=logprobs,
             cumulative_logprob=self.logprobs_processor.cumulative_logprob,
             finish_reason=str(finish_reason) if finished else None,
@@ -658,8 +658,8 @@ class OutputProcessor:
                     req_state.routed_experts_chunks.append(
                         engine_core_output.routed_experts
                     )
-            if engine_core_output.artifact_sample_id is not None:
-                req_state.artifact_sample_id = engine_core_output.artifact_sample_id
+            if engine_core_output.artifact_keys is not None:
+                req_state.artifact_keys = engine_core_output.artifact_keys
 
             if req_state.is_prefilling:
                 if engine_core_output.prefill_stats is not None:

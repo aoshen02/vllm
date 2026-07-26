@@ -370,7 +370,7 @@ class Scheduler(SchedulerInterface):
             # Snapshot block IDs before forward because async scheduling may
             # release or reassign them before model output is processed.
             self._routed_experts_block_ids: dict[str, list[int]] = {}
-            self.artifact_connector = ArtifactSchedulerConnector()
+            self.artifact_connector = ArtifactSchedulerConnector(vllm_config)
 
         self._pause_state: PauseState = PauseState.UNPAUSED
 
@@ -2358,6 +2358,14 @@ class Scheduler(SchedulerInterface):
             raise RuntimeError(
                 "cannot admit requests while an artifact policy update is active"
             )
+        if (
+            self.artifact_connector is not None
+            and request.sampling_params is not None
+            and request.sampling_params.routed_experts_prompt_start not in (None, 0)
+        ):
+            raise ValueError(
+                "Artifact Connector currently requires routed_experts_prompt_start=0"
+            )
         existing = self.requests.get(request.request_id)
         if existing is not None:
             update = StreamingUpdate.from_request(request)
@@ -2643,26 +2651,24 @@ class Scheduler(SchedulerInterface):
                 )
                 engine_core_output.finish_reason = FinishReason.ERROR
                 engine_core_output.stop_reason = finalize_result.error
-            elif finalize_result.delivery == "inline":
-                if finalize_result.routed_experts is None:
+            elif finalize_result.routed_experts is not None:
+                if finalize_result.artifact_keys is not None:
                     raise RuntimeError(
-                        "successful artifact acknowledgement is missing its "
-                        f"inline value: {finalize_result.request_id}"
+                        "artifact acknowledgement contains both inline value "
+                        f"and external keys: {finalize_result.request_id}"
                     )
                 engine_core_output.routed_experts = finalize_result.routed_experts
-            elif finalize_result.delivery == "sample_id":
-                if finalize_result.routed_experts is not None:
+            elif finalize_result.artifact_keys is not None:
+                if not finalize_result.artifact_keys:
                     raise RuntimeError(
-                        "external artifact acknowledgement unexpectedly contains "
-                        f"an inline value: {finalize_result.request_id}"
+                        "successful artifact acknowledgement contains no keys: "
+                        f"{finalize_result.request_id}"
                     )
-                engine_core_output.artifact_sample_id = (
-                    finalize_result.artifact_sample_id
-                )
+                engine_core_output.artifact_keys = finalize_result.artifact_keys
             else:
                 raise RuntimeError(
-                    "successful artifact acknowledgement is missing its "
-                    f"delivery mode: {finalize_result.request_id}"
+                    "successful artifact acknowledgement is missing its result: "
+                    f"{finalize_result.request_id}"
                 )
 
             outputs[request.client_index].append(engine_core_output)
@@ -2858,6 +2864,7 @@ class Scheduler(SchedulerInterface):
                 "failed to invalidate KV caches for artifact policy update"
             )
         self.artifact_policy_epoch += 1
+        self.artifact_connector.reset()
         self.artifact_policy_update_active = False
 
     def reset_connector_cache(self) -> bool:

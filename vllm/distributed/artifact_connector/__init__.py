@@ -21,16 +21,19 @@ from vllm.distributed.artifact_connector.request_core import (
     materialize_routed_experts,
 )
 from vllm.distributed.artifact_connector.shm import (
-    ArtifactCapacityError,
-    ArtifactCorruptionError,
     LocalSharedMemoryArtifactReader,
     LocalSharedMemoryArtifactStore,
 )
-from vllm.distributed.artifact_connector.store import ArtifactArray, ArtifactStore
+from vllm.distributed.artifact_connector.store import (
+    ArtifactCapacityError,
+    ArtifactCorruptionError,
+    ArtifactObject,
+    ArtifactPutResult,
+    ArtifactStore,
+)
 
 __all__ = [
     "ArtifactCapacityError",
-    "ArtifactArray",
     "ArtifactBlockRef",
     "ArtifactCommitRequest",
     "ArtifactCommitResult",
@@ -41,6 +44,8 @@ __all__ = [
     "ArtifactDiscardResult",
     "ArtifactFinalizeRequest",
     "ArtifactFinalizeResult",
+    "ArtifactObject",
+    "ArtifactPutResult",
     "ArtifactRequestCore",
     "ArtifactSchedulerConnector",
     "ArtifactStore",
