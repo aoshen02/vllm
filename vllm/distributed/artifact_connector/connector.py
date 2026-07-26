@@ -9,7 +9,7 @@ import json
 import uuid
 from collections import OrderedDict
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from vllm.distributed.artifact_connector.protocol import (
     ArtifactBlockRef,
@@ -28,6 +28,10 @@ from vllm.distributed.artifact_connector.request_core import (
 )
 from vllm.distributed.artifact_connector.shm import (
     LocalSharedMemoryArtifactStore,
+)
+from vllm.distributed.artifact_connector.store import ArtifactStore
+from vllm.distributed.artifact_connector.transfer_queue import (
+    TransferQueueArtifactStore,
 )
 from vllm.logger import init_logger
 
@@ -51,7 +55,11 @@ class _SchedulerArtifactState:
 class ArtifactSchedulerConnector:
     """Turn accepted-token progress into worker block commits."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        backend: Literal["shm", "transfer_queue"] = "shm",
+    ) -> None:
+        self.returns_inline_value = backend == "shm"
         self._states: dict[str, _SchedulerArtifactState] = {}
         self._pending_commits: OrderedDict[str, ArtifactCommitRequest] = OrderedDict()
         self._inflight_commits: dict[str, ArtifactCommitRequest] = {}
@@ -346,13 +354,25 @@ class ArtifactWorkerConnector:
     ) -> None:
         config = vllm_config.artifact_config
         parallel_config = vllm_config.parallel_config
-        self.store = LocalSharedMemoryArtifactStore(
-            config.shm_dir,
-            vllm_config.instance_id,
-            parallel_config.data_parallel_rank,
-            max_bytes=config.max_shm_bytes,
-            ttl_seconds=config.shm_ttl_seconds,
-        )
+        self.delivery: Literal["inline", "sample_id"]
+        if config.backend == "shm":
+            self.store: ArtifactStore = LocalSharedMemoryArtifactStore(
+                config.shm_dir,
+                vllm_config.instance_id,
+                parallel_config.data_parallel_rank,
+                max_bytes=config.max_shm_bytes,
+                ttl_seconds=config.shm_ttl_seconds,
+            )
+            self.delivery = "inline"
+        else:
+            self.store = TransferQueueArtifactStore(
+                ray_address=config.tq_ray_address,
+                store_id=config.tq_store_id,
+                data_partition=config.tq_data_partition,
+                request_partition=config.tq_request_partition,
+                connect_timeout_seconds=config.tq_connect_timeout_seconds,
+            )
+            self.delivery = "sample_id"
         model_config = vllm_config.model_config
         namespace_input = {
             "model": model_config.model,
@@ -371,7 +391,7 @@ class ArtifactWorkerConnector:
             self.store,
             writer,
             namespace=namespace,
-            inline_value=True,
+            inline_value=self.delivery == "inline",
         )
 
     def advance_policy_epoch(self) -> None:
@@ -440,7 +460,7 @@ class ArtifactWorkerConnector:
                 result = ArtifactFinalizeResult(
                     request_id=finalize_request.request_id,
                     artifact_sample_id=finalize_request.artifact_sample_id,
-                    delivery="inline",
+                    delivery=self.delivery,
                     manifest_sha256=finalized.manifest_sha256,
                     routed_experts=finalized.value,
                 )

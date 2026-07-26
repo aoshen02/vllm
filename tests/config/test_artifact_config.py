@@ -52,11 +52,24 @@ def _verify_routed_experts_config(**overrides):
     config._verify_return_routed_experts_compatibility()
 
 
-def test_artifact_config_has_only_a_real_shm_backend():
+def test_artifact_config_defaults_to_shm():
     config = ArtifactConfig()
 
+    assert config.backend == "shm"
     assert config.shm_dir == "/dev/shm/vllm-artifacts"
-    assert not hasattr(config, "backend")
+
+
+def test_transfer_queue_config_rejects_empty_identifiers():
+    with pytest.raises(ValueError, match="tq_store_id"):
+        ArtifactConfig(backend="transfer_queue", tq_store_id="")
+
+
+def test_transfer_queue_config_rejects_negative_connect_timeout():
+    with pytest.raises(ValueError, match="tq_connect_timeout_seconds"):
+        ArtifactConfig(
+            backend="transfer_queue",
+            tq_connect_timeout_seconds=-1,
+        )
 
 
 @pytest.mark.parametrize(
@@ -85,6 +98,13 @@ def test_artifact_connector_rejects_unsupported_modes(overrides, error):
 
 def test_artifact_connector_accepts_tp_execution():
     _verify_routed_experts_config()
+
+
+def test_transfer_queue_backend_does_not_require_dev_shm():
+    _verify_routed_experts_config(
+        artifact__backend="transfer_queue",
+        artifact__shm_dir="/tmp/not-used",
+    )
 
 
 def test_artifact_connector_accepts_speculative_decoding():

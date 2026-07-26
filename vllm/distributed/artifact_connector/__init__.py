@@ -27,6 +27,9 @@ from vllm.distributed.artifact_connector.shm import (
     LocalSharedMemoryArtifactStore,
 )
 from vllm.distributed.artifact_connector.store import ArtifactArray, ArtifactStore
+from vllm.distributed.artifact_connector.transfer_queue import (
+    TransferQueueArtifactStore,
+)
 
 __all__ = [
     "ArtifactCapacityError",
@@ -47,5 +50,6 @@ __all__ = [
     "ArtifactWorkerConnector",
     "LocalSharedMemoryArtifactReader",
     "LocalSharedMemoryArtifactStore",
+    "TransferQueueArtifactStore",
     "materialize_routed_experts",
 ]

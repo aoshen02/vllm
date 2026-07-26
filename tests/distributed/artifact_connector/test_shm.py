@@ -77,6 +77,7 @@ def _make_worker_connector(tmp_path, *, max_bytes: int = 1 << 20):
         ]
 
     connector = ArtifactWorkerConnector.__new__(ArtifactWorkerConnector)
+    connector.delivery = "inline"
     writer = FakeRoutingWriter(slots)
     connector.store = LocalSharedMemoryArtifactStore(
         str(tmp_path),

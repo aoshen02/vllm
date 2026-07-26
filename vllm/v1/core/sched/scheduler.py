@@ -370,7 +370,9 @@ class Scheduler(SchedulerInterface):
             # Snapshot block IDs before forward because async scheduling may
             # release or reassign them before model output is processed.
             self._routed_experts_block_ids: dict[str, list[int]] = {}
-            self.artifact_connector = ArtifactSchedulerConnector()
+            self.artifact_connector = ArtifactSchedulerConnector(
+                vllm_config.artifact_config.backend
+            )
 
         self._pause_state: PauseState = PauseState.UNPAUSED
 
@@ -1957,6 +1959,10 @@ class Scheduler(SchedulerInterface):
             routed_experts = None
             if (
                 self.enable_return_routed_experts
+                and (
+                    self.artifact_connector is None
+                    or self.artifact_connector.returns_inline_value
+                )
                 and routing_slots is not None
                 and new_token_ids
             ):
