@@ -91,13 +91,22 @@ def get_routing_slot_shape_and_dtype(
     block_size = kv_cache_config.kv_cache_groups[
         full_attn_group_id
     ].kv_cache_spec.block_size
-    hf_config = vllm_config.model_config.hf_text_config
-    num_layers = hf_config.num_hidden_layers
-    moe_top_k = get_num_experts_per_token(hf_config)
-    num_experts = get_num_experts(hf_config)
+    shape_per_token, dtype = get_routing_shape_and_dtype(vllm_config)
     max_num_slots = kv_cache_config.num_blocks * block_size
-    dtype = "uint8" if num_experts <= 256 else "uint16"
-    return (max_num_slots, num_layers, moe_top_k), dtype
+    return (max_num_slots, *shape_per_token), dtype
+
+
+def get_routing_shape_and_dtype(
+    vllm_config: "VllmConfig",
+) -> tuple[tuple[int, int], str]:
+    """Return the routed-experts shape per token and storage dtype."""
+    hf_config = vllm_config.model_config.hf_text_config
+    shape_per_token = (
+        hf_config.num_hidden_layers,
+        get_num_experts_per_token(hf_config),
+    )
+    dtype = "uint8" if get_num_experts(hf_config) <= 256 else "uint16"
+    return shape_per_token, dtype
 
 
 def get_routed_experts_output_rank() -> int:

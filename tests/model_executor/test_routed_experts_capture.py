@@ -122,7 +122,7 @@ def test_write_task_splits_requests_and_drops_rejected_rows():
     sink = Mock()
     write_task = RoutedExpertsWriteTask(
         routed_experts_tensors=RoutedExpertsTensors(routing_data, slot_mapping),
-        writer=Mock(),
+        writer=None,
         request_ids=("a", "b"),
         query_start_locs=np.array([0, 2, 6]),
         token_starts=np.array([4, 8]),
@@ -135,6 +135,25 @@ def test_write_task_splits_requests_and_drops_rejected_rows():
     assert [call.args[:2] for call in sink.call_args_list] == [("a", 4), ("b", 8)]
     np.testing.assert_array_equal(sink.call_args_list[0].args[2], routing_data[:2])
     np.testing.assert_array_equal(sink.call_args_list[1].args[2], routing_data[2:4])
+
+
+@pytest.mark.parametrize(
+    ("writer", "sink"),
+    [
+        (None, None),
+        (Mock(), Mock()),
+    ],
+)
+def test_write_task_requires_exactly_one_destination(writer, sink):
+    with pytest.raises(ValueError, match="exactly one destination"):
+        RoutedExpertsWriteTask(
+            routed_experts_tensors=RoutedExpertsTensors(
+                torch.zeros((1, 1, 1)),
+                torch.zeros(1, dtype=torch.int64),
+            ),
+            writer=writer,
+            artifact_sink=sink,
+        )
 
 
 def _capturer_with_buffer(
@@ -287,6 +306,37 @@ def test_capture_state_write_task_owns_immutable_snapshot():
     assert torch.equal(tensors.slot_mapping, torch.tensor([21, 22, 23]))
 
 
+def test_capture_state_artifact_task_skips_shared_slot_writer():
+    capturer = _capturer_with_buffer(max_tokens=4, num_layers=2)
+    capturer.device_buffer.copy_(torch.arange(16).reshape(4, 2, 2))
+    state = RoutedExpertsCaptureState(
+        capturer,
+        None,
+        full_attn_group_id=0,
+        is_output_rank=True,
+    )
+    sink = Mock()
+
+    write_task = state.make_write_task(
+        None,
+        3,
+        request_ids=("request",),
+        query_start_locs=np.array([0, 3]),
+        token_starts=np.array([7]),
+        artifact_sink=sink,
+    )
+
+    assert write_task is not None
+    assert write_task.writer is None
+    assert write_task.routed_experts_tensors.slot_mapping is None
+    write_task.start_copy()
+    write_task.finalize()
+    np.testing.assert_array_equal(
+        sink.call_args.args[2],
+        np.arange(12, dtype=np.int32).reshape(3, 2, 2),
+    )
+
+
 def test_capture_state_close_releases_resources():
     capturer = Mock()
     writer = Mock()
@@ -299,9 +349,21 @@ def test_capture_state_close_releases_resources():
     assert state.writer is None
 
 
-@pytest.mark.parametrize(("rank", "creates_writer"), [(0, True), (1, False)])
+@pytest.mark.parametrize(
+    ("rank", "create_shared_writer", "can_write", "creates_writer"),
+    [
+        (0, True, True, True),
+        (0, False, True, False),
+        (1, True, False, False),
+        (1, False, False, False),
+    ],
+)
 def test_capture_state_create_uses_explicit_dependencies(
-    monkeypatch, rank, creates_writer
+    monkeypatch,
+    rank,
+    create_shared_writer,
+    can_write,
+    creates_writer,
 ):
     from vllm.model_executor.layers.fused_moe.routed_experts_capture import (
         state as state_module,
@@ -335,11 +397,12 @@ def test_capture_state_create_uses_explicit_dependencies(
         vllm_config=vllm_config,
         kv_cache_config=kv_cache_config,
         max_num_batched_tokens=32,
+        create_shared_writer=create_shared_writer,
     )
 
     assert state.capturer is capturer
     assert state.full_attn_group_id == 2
-    assert state.can_write is creates_writer
+    assert state.can_write is can_write
     bind.assert_called_once_with(model, capturer)
     assert writer_factory.called is creates_writer
 

@@ -747,13 +747,6 @@ class Worker(WorkerBase):
         ):
             self.model_runner._init_kv_zero_meta()
 
-    def validate_routed_experts_shm(self) -> None:
-        """Validate that the authoritative worker sees EngineCore's mmap."""
-        capture_state = self.model_runner.routed_experts_capture
-        writer = capture_state.writer if capture_state is not None else None
-        if writer is not None:
-            writer.validate()
-
     @instrument(span_name="Warmup (GPU)")
     def compile_or_warm_up_model(self) -> CompilationTimes:
         warmup_sizes: list[int] = []

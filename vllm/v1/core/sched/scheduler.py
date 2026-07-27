@@ -29,10 +29,6 @@ from vllm.distributed.kv_transfer.kv_connector.v1 import (
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
 from vllm.logger import init_logger
-from vllm.model_executor.layers.fused_moe.routed_experts_capture import (
-    RoutedExpertsManager,
-    require_full_attn_group_id,
-)
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.multimodal.encoder_budget import MultiModalBudget
 from vllm.multimodal.utils import get_mm_features_in_window
@@ -340,26 +336,12 @@ class Scheduler(SchedulerInterface):
         self._pending_artifact_outputs: dict[str, EngineCoreOutput] = {}
 
         if self.enable_return_routed_experts:
-            # Under DCP/PCP, physical slots are interleaved across ranks. A
-            # rank-local buffer therefore needs global token addressing.
+            # Cross-rank logical-token assembly is not implemented yet.
             assert self.dcp_world_size == 1 and self.pcp_world_size == 1, (
                 "enable_return_routed_experts does not support context "
                 "parallelism (dcp_world_size > 1 or pcp_world_size > 1)"
             )
 
-            num_offload_blocks = None
-            block_size_factor = 1
-            if self.connector is not None:
-                num_offload_blocks, block_size_factor = (
-                    self._validate_routed_experts_offload(kv_cache_config)
-                )
-
-            self.routed_experts_manager = RoutedExpertsManager(
-                vllm_config=vllm_config,
-                kv_cache_config=kv_cache_config,
-                num_offload_blocks=num_offload_blocks,
-                block_size_factor=block_size_factor,
-            )
             self.artifact_connector = ArtifactSchedulerConnector(vllm_config)
 
         self._pause_state: PauseState = PauseState.UNPAUSED
@@ -367,52 +349,6 @@ class Scheduler(SchedulerInterface):
         # In-flight requests still prefilling (prefill chunks + in-progress
         # async KV loads). Their remaining-block reservation gates async loads.
         self._inflight_prefills: set[Request] = set()
-
-    def _validate_routed_experts_offload(
-        self, kv_cache_config: KVCacheConfig
-    ) -> tuple[int, int]:
-        """Validate the KV connector for offloaded routed experts.
-
-        The CPU OffloadingConnector stores/loads routing rows on the
-        scheduler side, following the KV blocks' offload transfer jobs.
-
-        Returns:
-            The number of offload blocks and the block-size factor.
-
-        Raises:
-            ValueError: On any unsupported connector / spec combination.
-        """
-        from vllm.distributed.kv_transfer.kv_connector.v1.offloading_connector import (  # noqa: E501
-            OffloadingConnector,
-        )
-        from vllm.v1.kv_offload.cpu.spec import CPUOffloadingSpec
-
-        if not isinstance(self.connector, OffloadingConnector):
-            raise ValueError(
-                "--enable-return-routed-experts only supports the CPU "
-                f"OffloadingConnector; got {type(self.connector).__name__}"
-            )
-        connector_scheduler = self.connector.connector_scheduler
-        assert connector_scheduler is not None, (
-            "OffloadingConnector must provide a connector scheduler"
-        )
-        if not isinstance(connector_scheduler.spec, CPUOffloadingSpec):
-            raise ValueError(
-                "--enable-return-routed-experts only supports "
-                "CPUOffloadingSpec; "
-                f"got {type(connector_scheduler.spec).__name__}"
-            )
-        require_full_attn_group_id(kv_cache_config)
-        if connector_scheduler.spec.num_blocks <= 0:
-            raise ValueError(
-                "--enable-return-routed-experts with KV offload requires "
-                "a non-empty CPU offload block pool; increase "
-                "kv_offloading_size / cpu_bytes_to_use."
-            )
-        return (
-            connector_scheduler.spec.num_blocks,
-            connector_scheduler.spec.blocks_per_chunk,
-        )
 
     def _mamba_block_aligned_split(
         self,
@@ -1711,23 +1647,6 @@ class Scheduler(SchedulerInterface):
                 num_scheduled_tokens,
             )
 
-        if self.enable_return_routed_experts and self.connector is not None:
-            from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (  # noqa: E501
-                OffloadingConnectorMetadata,
-            )
-
-            offload_metadata = scheduler_output.kv_connector_metadata
-            if offload_metadata is not None:
-                if not isinstance(offload_metadata, OffloadingConnectorMetadata):
-                    raise RuntimeError(
-                        "routed-experts offload requires "
-                        "OffloadingConnectorMetadata, got "
-                        f"{type(offload_metadata).__name__}"
-                    )
-                self.routed_experts_manager.apply_offload_transfers(offload_metadata)
-
-        # Artifact finalization holds terminal KV blocks. Release them only
-        # after this step's routing offload transfers have been applied.
         self._release_artifact_outputs(artifact_connector_output, outputs)
 
         # NOTE(woosuk): As len(num_scheduled_tokens) can be up to 1K or more,
@@ -2664,9 +2583,6 @@ class Scheduler(SchedulerInterface):
 
         if self.ec_connector is not None:
             self.ec_connector.shutdown()
-
-        if getattr(self, "routed_experts_manager", None) is not None:
-            self.routed_experts_manager.shutdown()
 
         logger.debug_once("[shutdown] Scheduler: complete")
 

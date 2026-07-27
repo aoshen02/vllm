@@ -40,10 +40,15 @@ class RoutedExpertsCaptureState:
         capturer: RoutedExpertsCapturer,
         writer: RoutedExpertsWorkerWriter | None,
         full_attn_group_id: int,
+        *,
+        is_output_rank: bool | None = None,
     ) -> None:
         self.capturer: RoutedExpertsCapturer | None = capturer
         self.writer = writer
         self.full_attn_group_id = full_attn_group_id
+        self.is_output_rank = (
+            writer is not None if is_output_rank is None else is_output_rank
+        )
 
     @classmethod
     def create(
@@ -52,6 +57,8 @@ class RoutedExpertsCaptureState:
         vllm_config: VllmConfig,
         kv_cache_config: KVCacheConfig,
         max_num_batched_tokens: int,
+        *,
+        create_shared_writer: bool = True,
     ) -> RoutedExpertsCaptureState:
         full_attn_group_id = require_full_attn_group_id(kv_cache_config)
         capturer = RoutedExpertsCapturer(
@@ -60,9 +67,10 @@ class RoutedExpertsCaptureState:
         )
         bind_routed_experts_capturer(model, capturer)
 
-        writer = None
         parallel_config = vllm_config.parallel_config
-        if parallel_config.rank == get_routed_experts_output_rank():
+        is_output_rank = parallel_config.rank == get_routed_experts_output_rank()
+        writer = None
+        if is_output_rank and create_shared_writer:
             slot_shape, slot_dtype = get_routing_slot_shape_and_dtype(
                 vllm_config, kv_cache_config
             )
@@ -72,11 +80,16 @@ class RoutedExpertsCaptureState:
                 slot_shape=slot_shape,
                 dtype=slot_dtype,
             )
-        return cls(capturer, writer, full_attn_group_id)
+        return cls(
+            capturer,
+            writer,
+            full_attn_group_id,
+            is_output_rank=is_output_rank,
+        )
 
     @property
     def can_write(self) -> bool:
-        return self.writer is not None
+        return self.is_output_rank
 
     def clear(self) -> None:
         if self.capturer is not None:
@@ -88,7 +101,7 @@ class RoutedExpertsCaptureState:
 
     def make_write_task(
         self,
-        slot_mapping: torch.Tensor,
+        slot_mapping: torch.Tensor | None,
         num_tokens: int,
         *,
         request_ids: tuple[str, ...] = (),
@@ -96,12 +109,18 @@ class RoutedExpertsCaptureState:
         token_starts: np.ndarray | None = None,
         artifact_sink: Callable[[str, int, np.ndarray], None] | None = None,
     ) -> RoutedExpertsWriteTask | None:
-        writer = self.writer
-        if writer is None:
+        if not self.is_output_rank:
             return None
+        writer = self.writer
+        if writer is None and artifact_sink is None:
+            return None
+        if writer is not None:
+            assert slot_mapping is not None
         tensors = RoutedExpertsTensors(
             routing_data=self.get_device_buffer()[:num_tokens].clone(),
-            slot_mapping=slot_mapping[:num_tokens].clone(),
+            slot_mapping=(
+                slot_mapping[:num_tokens].clone() if slot_mapping is not None else None
+            ),
         )
         return RoutedExpertsWriteTask(
             routed_experts_tensors=tensors,

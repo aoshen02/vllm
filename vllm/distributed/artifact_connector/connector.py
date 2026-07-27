@@ -9,7 +9,7 @@ import json
 import uuid
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
@@ -35,9 +35,6 @@ from vllm.logger import init_logger
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
-    from vllm.model_executor.layers.fused_moe.routed_experts_capture import (
-        RoutedExpertsWorkerWriter,
-    )
 
 logger = init_logger(__name__)
 
@@ -270,7 +267,9 @@ class ArtifactWorkerConnector:
     def __init__(
         self,
         vllm_config: VllmConfig,
-        writer: RoutedExpertsWorkerWriter,
+        *,
+        dtype: np.dtype[Any],
+        shape_per_token: tuple[int, ...],
     ) -> None:
         config = vllm_config.artifact_config
         parallel_config = vllm_config.parallel_config
@@ -296,8 +295,8 @@ class ArtifactWorkerConnector:
             ).encode()
         ).hexdigest()
         self.buffer = RoutedExpertsArtifactBuffer(
-            writer.dtype,
-            writer.shape_per_token,
+            dtype,
+            shape_per_token,
         )
         self.core = ArtifactRequestCore(
             self.store,

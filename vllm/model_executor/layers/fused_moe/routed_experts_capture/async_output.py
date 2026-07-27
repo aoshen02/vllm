@@ -22,7 +22,7 @@ class RoutedExpertsTensors(NamedTuple):
     # (num_scheduled_tokens, num_layers, moe_top_k)
     routing_data: torch.Tensor
     # (num_scheduled_tokens,)
-    slot_mapping: torch.Tensor
+    slot_mapping: torch.Tensor | None
 
     def to_cpu_nonblocking(self) -> RoutedExpertsTensors:
         """Copy the tensors to CPU without blocking the current stream."""
@@ -30,14 +30,22 @@ class RoutedExpertsTensors(NamedTuple):
             return self
         return RoutedExpertsTensors(
             self.routing_data.to("cpu", non_blocking=True),
-            self.slot_mapping.to("cpu", non_blocking=True),
+            (
+                self.slot_mapping.to("cpu", non_blocking=True)
+                if self.slot_mapping is not None
+                else None
+            ),
         )
 
     def tolists(self) -> RoutedExpertsLists:
         """Convert the tensors to the numpy-backed worker representation."""
         return RoutedExpertsLists(
             self.routing_data.cpu().numpy(),
-            self.slot_mapping.cpu().numpy(),
+            (
+                self.slot_mapping.cpu().numpy()
+                if self.slot_mapping is not None
+                else None
+            ),
         )
 
 
@@ -47,7 +55,7 @@ class RoutedExpertsLists(NamedTuple):
     # (num_scheduled_tokens, num_layers, moe_top_k)
     routing_data: np.ndarray
     # (num_scheduled_tokens,)
-    slot_mapping: np.ndarray
+    slot_mapping: np.ndarray | None
 
 
 @dataclass
@@ -55,7 +63,7 @@ class RoutedExpertsWriteTask:
     """Copy and publish one step of routed-experts output."""
 
     routed_experts_tensors: RoutedExpertsTensors
-    writer: RoutedExpertsWorkerWriter
+    writer: RoutedExpertsWorkerWriter | None
     request_ids: tuple[str, ...] = ()
     query_start_locs: np.ndarray | None = None
     token_starts: np.ndarray | None = None
@@ -63,6 +71,14 @@ class RoutedExpertsWriteTask:
     _routed_experts_tensors_cpu: RoutedExpertsTensors | None = field(
         init=False, default=None
     )
+
+    def __post_init__(self) -> None:
+        if (self.writer is None) == (self.artifact_sink is None):
+            raise ValueError(
+                "routed-experts write task requires exactly one destination"
+            )
+        if self.writer is not None and self.routed_experts_tensors.slot_mapping is None:
+            raise ValueError("shared-slot writer requires a slot mapping")
 
     def start_copy(self) -> None:
         """Start copying the routed-experts tensors on the current stream."""
@@ -76,10 +92,12 @@ class RoutedExpertsWriteTask:
             "routed-experts CPU tensors are unavailable; call start_copy first"
         )
         routed_experts = self._routed_experts_tensors_cpu.tolists()
-        self.writer.store_batch(
-            routed_experts.routing_data,
-            routed_experts.slot_mapping,
-        )
+        if self.writer is not None:
+            assert routed_experts.slot_mapping is not None
+            self.writer.store_batch(
+                routed_experts.routing_data,
+                routed_experts.slot_mapping,
+            )
         if self.artifact_sink is None:
             return
         assert self.query_start_locs is not None

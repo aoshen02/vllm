@@ -46,6 +46,9 @@ from vllm.model_executor.layers.fused_moe.routed_experts_capture import (
     RoutedExpertsCaptureState,
     RoutedExpertsWriteTask,
 )
+from vllm.model_executor.layers.fused_moe.routed_experts_capture.common import (
+    get_routing_shape_and_dtype,
+)
 from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
     initialize_mamba_ssu_backend,
 )
@@ -285,11 +288,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             vllm_config=self.vllm_config,
             kv_cache_config=self.kv_cache_config,
             max_num_batched_tokens=self.scheduler_config.max_num_batched_tokens,
+            create_shared_writer=False,
         )
         self.routed_experts_capture = capture_state
-        if capture_state.writer is not None:
+        if capture_state.can_write:
+            shape_per_token, dtype = get_routing_shape_and_dtype(self.vllm_config)
             self.artifact_connector = ArtifactWorkerConnector(
-                self.vllm_config, capture_state.writer
+                self.vllm_config,
+                dtype=np.dtype(dtype),
+                shape_per_token=shape_per_token,
             )
 
     def _attach_artifact_connector_output(
@@ -1429,14 +1436,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             output_intermediate_tensors = model_output
 
         routed_experts_write_task = None
-        if (
-            routed_experts_capture is not None
-            and not dummy_run
-            and slot_mappings is not None
-        ):
-            full_attn_group_id = routed_experts_capture.full_attn_group_id
+        if routed_experts_capture is not None and not dummy_run:
             routed_experts_write_task = routed_experts_capture.make_write_task(
-                slot_mappings[full_attn_group_id],
+                None,
                 num_toks,
                 request_ids=tuple(input_batch.req_ids),
                 query_start_locs=input_batch.query_start_loc_np.copy(),

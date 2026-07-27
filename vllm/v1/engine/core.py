@@ -159,8 +159,6 @@ class EngineCore:
             block_size=scheduler_block_size,
             hash_block_size=hash_block_size,
         )
-        if vllm_config.model_config.enable_return_routed_experts:
-            self.model_executor.collective_rpc("validate_routed_experts_shm")
         self.use_spec_decode = vllm_config.speculative_config is not None
         self.check_for_draft_tokens = (
             self.use_spec_decode or vllm_config.model_config.is_diffusion
