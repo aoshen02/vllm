@@ -165,6 +165,69 @@ def max_artifact_object_bytes(
     return _HEADER_LENGTH.size + _MAX_HEADER_BYTES + payload_bytes
 
 
+class ArtifactKeySpace:
+    """Derive backend-independent immutable keys for one artifact field."""
+
+    def __init__(
+        self,
+        store_id: str,
+        namespace: str,
+        dtype: np.dtype[Any],
+        shape_per_token: tuple[int, ...],
+        field_spec: ArtifactField = ROUTED_EXPERTS,
+    ) -> None:
+        self.store_id = store_id
+        self.namespace = namespace
+        self.dtype = np.dtype(dtype)
+        self.shape_per_token = shape_per_token
+        self.field_spec = field_spec
+
+    def profile_id(self, hash_block_size: int) -> str:
+        profile = {
+            "schema_version": _SCHEMA_VERSION,
+            "field": self.field_spec.name,
+            "namespace": self.namespace,
+            "dtype": self.dtype.str,
+            "shape_per_token": list(self.shape_per_token),
+            "reuse_policy": self.field_spec.reuse_policy,
+            "logical_coordinate": self.field_spec.logical_coordinate,
+            "hash_block_size": hash_block_size,
+        }
+        return hashlib.sha256(_canonical_json(profile)).hexdigest()
+
+    def block_key(self, block_hash: bytes, hash_block_size: int) -> str:
+        profile_id = self.profile_id(hash_block_size)
+        digest = _digest(
+            b"vllm.artifact.field-block.v3",
+            self.namespace.encode(),
+            self.field_spec.name.encode(),
+            profile_id.encode(),
+            block_hash,
+        )
+        return f"vllm-artifact/{self.store_id}/{self.field_spec.name}/block/{digest}"
+
+    def tail_key(
+        self,
+        *,
+        request_id: str,
+        request_attempt_id: str,
+        source_start: int,
+        source_end: int,
+        hash_block_size: int,
+    ) -> str:
+        digest = _digest(
+            b"vllm.artifact.field-tail.v3",
+            self.namespace.encode(),
+            self.field_spec.name.encode(),
+            self.profile_id(hash_block_size).encode(),
+            request_id.encode(),
+            request_attempt_id.encode(),
+            source_start.to_bytes(8, "big"),
+            source_end.to_bytes(8, "big"),
+        )
+        return f"vllm-artifact/{self.store_id}/{self.field_spec.name}/tail/{digest}"
+
+
 def materialize_routed_experts(
     store: ArtifactStore,
     artifact_keys: list[str],
@@ -220,7 +283,7 @@ class PreparedCommit:
 @dataclass(frozen=True)
 class FinalizedArtifact:
     keys: list[str]
-    value: np.ndarray
+    value: np.ndarray | None
 
 
 class ArtifactRequestCore:
@@ -232,24 +295,23 @@ class ArtifactRequestCore:
         source: RoutedExpertsArtifactBuffer,
         *,
         namespace: str,
+        materialize: bool = True,
     ) -> None:
         self.store = store
         self.source = source
         self.namespace = namespace
+        self.materialize = materialize
         self.field_spec = ROUTED_EXPERTS
+        self.key_space = ArtifactKeySpace(
+            store.store_id,
+            namespace,
+            source.dtype,
+            source.shape_per_token,
+            self.field_spec,
+        )
 
     def _profile_id(self, hash_block_size: int) -> str:
-        profile = {
-            "schema_version": _SCHEMA_VERSION,
-            "field": self.field_spec.name,
-            "namespace": self.namespace,
-            "dtype": self.source.dtype.str,
-            "shape_per_token": list(self.source.shape_per_token),
-            "reuse_policy": self.field_spec.reuse_policy,
-            "logical_coordinate": self.field_spec.logical_coordinate,
-            "hash_block_size": hash_block_size,
-        }
-        return hashlib.sha256(_canonical_json(profile)).hexdigest()
+        return self.key_space.profile_id(hash_block_size)
 
     def block_key(
         self,
@@ -257,39 +319,23 @@ class ArtifactRequestCore:
         block_hash: bytes,
         hash_block_size: int,
     ) -> str:
-        profile_id = self._profile_id(hash_block_size)
-        digest = _digest(
-            b"vllm.artifact.field-block.v3",
-            self.namespace.encode(),
-            self.field_spec.name.encode(),
-            profile_id.encode(),
-            block_hash,
-        )
-        return (
-            f"vllm-artifact/{self.store.store_id}/{self.field_spec.name}/block/{digest}"
-        )
+        return self.key_space.block_key(block_hash, hash_block_size)
 
     def _tail_key(
         self,
         *,
-        field_profile_id: str,
         request_id: str,
         request_attempt_id: str,
         source_start: int,
         source_end: int,
+        hash_block_size: int,
     ) -> str:
-        digest = _digest(
-            b"vllm.artifact.field-tail.v3",
-            self.namespace.encode(),
-            self.field_spec.name.encode(),
-            field_profile_id.encode(),
-            request_id.encode(),
-            request_attempt_id.encode(),
-            source_start.to_bytes(8, "big"),
-            source_end.to_bytes(8, "big"),
-        )
-        return (
-            f"vllm-artifact/{self.store.store_id}/{self.field_spec.name}/tail/{digest}"
+        return self.key_space.tail_key(
+            request_id=request_id,
+            request_attempt_id=request_attempt_id,
+            source_start=source_start,
+            source_end=source_end,
+            hash_block_size=hash_block_size,
         )
 
     def prepare_commit(self, request: ArtifactCommitRequest) -> PreparedCommit:
@@ -387,11 +433,11 @@ class ArtifactRequestCore:
             source_end,
         )
         key = self._tail_key(
-            field_profile_id=field_profile_id,
             request_id=request.request_id,
             request_attempt_id=request.request_attempt_id,
             source_start=source_start,
             source_end=source_end,
+            hash_block_size=request.hash_block_size,
         )
         result = self.store.put(
             [
@@ -435,17 +481,18 @@ class ArtifactRequestCore:
             )
             for block_index in range(full_block_count)
         ]
-        ready = self.store.exists(keys)
-        if len(ready) != len(keys) or not all(ready):
-            missing_block = next(
-                (index for index, exists in enumerate(ready) if not exists),
-                len(ready),
-            )
-            raise RuntimeError(
-                "terminal artifact is missing a reusable full block: "
-                f"request={request.request_id}, "
-                f"block_start={missing_block * request.hash_block_size}"
-            )
+        if self.materialize:
+            ready = self.store.exists(keys)
+            if len(ready) != len(keys) or not all(ready):
+                missing_block = next(
+                    (index for index, exists in enumerate(ready) if not exists),
+                    len(ready),
+                )
+                raise RuntimeError(
+                    "terminal artifact is missing a reusable full block: "
+                    f"request={request.request_id}, "
+                    f"block_start={missing_block * request.hash_block_size}"
+                )
         if full_end < request.token_end:
             keys.append(
                 self._put_tail(
@@ -463,10 +510,14 @@ class ArtifactRequestCore:
             raise RuntimeError(
                 "artifact key count does not match the terminal token range"
             )
-        value = materialize_routed_experts(
-            self.store,
-            keys,
-            expected_profile_id=field_profile_id,
+        value = (
+            materialize_routed_experts(
+                self.store,
+                keys,
+                expected_profile_id=field_profile_id,
+            )
+            if self.materialize
+            else None
         )
         self.source.discard(request.request_id)
         return FinalizedArtifact(keys=keys, value=value)

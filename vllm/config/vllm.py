@@ -965,11 +965,13 @@ class VllmConfig:
         if self.ec_transfer_config is not None:
             unsupported.append("EC transfer")
 
-        shm_root = os.path.realpath(self.artifact_config.shm_dir)
-        if os.path.commonpath((shm_root, "/dev/shm")) != "/dev/shm":
-            unsupported.append(
-                f"artifact shm_dir outside /dev/shm ({self.artifact_config.shm_dir!r})"
-            )
+        if self.artifact_config.backend == "shm":
+            shm_root = os.path.realpath(self.artifact_config.shm_dir)
+            if os.path.commonpath((shm_root, "/dev/shm")) != "/dev/shm":
+                unsupported.append(
+                    "artifact shm_dir outside /dev/shm "
+                    f"({self.artifact_config.shm_dir!r})"
+                )
 
         if unsupported:
             raise ValueError(

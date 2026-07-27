@@ -7,6 +7,8 @@ from collections.abc import Iterable
 from dataclasses import replace
 from typing import Any
 
+import numpy as np
+
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import VllmConfig
 from vllm.distributed.artifact_connector import (
@@ -29,6 +31,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1 import (
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
 from vllm.logger import init_logger
+from vllm.model_executor.layers.fused_moe.routed_experts_capture.common import (
+    get_routing_shape_and_dtype,
+)
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.multimodal.encoder_budget import MultiModalBudget
 from vllm.multimodal.utils import get_mm_features_in_window
@@ -342,7 +347,12 @@ class Scheduler(SchedulerInterface):
                 "parallelism (dcp_world_size > 1 or pcp_world_size > 1)"
             )
 
-            self.artifact_connector = ArtifactSchedulerConnector(vllm_config)
+            shape_per_token, dtype = get_routing_shape_and_dtype(vllm_config)
+            self.artifact_connector = ArtifactSchedulerConnector(
+                vllm_config,
+                dtype=np.dtype(dtype),
+                shape_per_token=shape_per_token,
+            )
 
         self._pause_state: PauseState = PauseState.UNPAUSED
 
@@ -2330,6 +2340,13 @@ class Scheduler(SchedulerInterface):
                 )
                 engine_core_output.finish_reason = FinishReason.ERROR
                 engine_core_output.stop_reason = finalize_result.error
+            elif finalize_result.artifact_keys is not None:
+                if not finalize_result.artifact_keys:
+                    raise RuntimeError(
+                        "artifact acknowledgement returned an empty key list: "
+                        f"{finalize_result.request_id}"
+                    )
+                engine_core_output.artifact_keys = finalize_result.artifact_keys
             elif finalize_result.value is not None:
                 engine_core_output.routed_experts = finalize_result.value
             else:

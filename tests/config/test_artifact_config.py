@@ -52,11 +52,12 @@ def _verify_routed_experts_config(**overrides):
     config._verify_return_routed_experts_compatibility()
 
 
-def test_artifact_config_has_only_a_real_shm_backend():
+def test_artifact_config_defaults_to_shm_and_bounds_mooncake_memory():
     config = ArtifactConfig()
 
     assert config.backend == "shm"
     assert config.shm_dir == "/dev/shm/vllm-artifacts"
+    assert config.mooncake_staging_buffer_bytes == 64 << 20
 
 
 @pytest.mark.parametrize(
@@ -85,6 +86,13 @@ def test_artifact_connector_rejects_unsupported_modes(overrides, error):
 
 def test_artifact_connector_accepts_tp_execution():
     _verify_routed_experts_config()
+
+
+def test_mooncake_backend_does_not_require_a_shm_object_directory():
+    _verify_routed_experts_config(
+        artifact__backend="mooncake",
+        artifact__shm_dir="/tmp/not-used",
+    )
 
 
 def test_artifact_connector_accepts_speculative_decoding():

@@ -5,6 +5,11 @@ from vllm.distributed.artifact_connector.connector import (
     ArtifactSchedulerConnector,
     ArtifactWorkerConnector,
 )
+from vllm.distributed.artifact_connector.mooncake import (
+    MooncakeArtifactPublisher,
+    MooncakeArtifactReader,
+    MooncakeArtifactStore,
+)
 from vllm.distributed.artifact_connector.protocol import (
     ArtifactCommitRequest,
     ArtifactCommitResult,
@@ -14,6 +19,7 @@ from vllm.distributed.artifact_connector.protocol import (
     ArtifactFinalizeResult,
 )
 from vllm.distributed.artifact_connector.request_core import (
+    ArtifactKeySpace,
     ArtifactRequestCore,
     materialize_routed_experts,
 )
@@ -38,6 +44,7 @@ __all__ = [
     "ArtifactCorruptionError",
     "ArtifactFinalizeRequest",
     "ArtifactFinalizeResult",
+    "ArtifactKeySpace",
     "ArtifactObject",
     "ArtifactPutResult",
     "ArtifactRequestCore",
@@ -46,5 +53,8 @@ __all__ = [
     "ArtifactWorkerConnector",
     "LocalSharedMemoryArtifactReader",
     "LocalSharedMemoryArtifactStore",
+    "MooncakeArtifactReader",
+    "MooncakeArtifactPublisher",
+    "MooncakeArtifactStore",
     "materialize_routed_experts",
 ]
