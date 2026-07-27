@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -89,6 +90,11 @@ class RoutedExpertsCaptureState:
         self,
         slot_mapping: torch.Tensor,
         num_tokens: int,
+        *,
+        request_ids: tuple[str, ...] = (),
+        query_start_locs: np.ndarray | None = None,
+        token_starts: np.ndarray | None = None,
+        artifact_sink: Callable[[str, int, np.ndarray], None] | None = None,
     ) -> RoutedExpertsWriteTask | None:
         writer = self.writer
         if writer is None:
@@ -100,6 +106,10 @@ class RoutedExpertsCaptureState:
         return RoutedExpertsWriteTask(
             routed_experts_tensors=tensors,
             writer=writer,
+            request_ids=request_ids,
+            query_start_locs=query_start_locs,
+            token_starts=token_starts,
+            artifact_sink=artifact_sink,
         )
 
     def store_batch(

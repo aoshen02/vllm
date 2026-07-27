@@ -25,8 +25,8 @@ from vllm.distributed.artifact_connector.store import (
 )
 
 if TYPE_CHECKING:
-    from vllm.model_executor.layers.fused_moe.routed_experts_capture import (
-        RoutedExpertsWorkerWriter,
+    from vllm.distributed.artifact_connector.buffer import (
+        RoutedExpertsArtifactBuffer,
     )
 
 _SCHEMA_VERSION = 3
@@ -229,12 +229,12 @@ class ArtifactRequestCore:
     def __init__(
         self,
         store: ArtifactStore,
-        writer: RoutedExpertsWorkerWriter,
+        source: RoutedExpertsArtifactBuffer,
         *,
         namespace: str,
     ) -> None:
         self.store = store
-        self.writer = writer
+        self.source = source
         self.namespace = namespace
         self.field_spec = ROUTED_EXPERTS
 
@@ -243,8 +243,8 @@ class ArtifactRequestCore:
             "schema_version": _SCHEMA_VERSION,
             "field": self.field_spec.name,
             "namespace": self.namespace,
-            "dtype": self.writer.dtype.str,
-            "shape_per_token": list(self.writer.shape_per_token),
+            "dtype": self.source.dtype.str,
+            "shape_per_token": list(self.source.shape_per_token),
             "reuse_policy": self.field_spec.reuse_policy,
             "logical_coordinate": self.field_spec.logical_coordinate,
             "hash_block_size": hash_block_size,
@@ -304,15 +304,14 @@ class ArtifactRequestCore:
                 f"[{request.block_start}, {request.block_end})"
             )
         field_profile_id = self._profile_id(request.hash_block_size)
-        array = self.writer.read_token_range(
-            request.block_ids,
-            token_start=request.block_start,
-            token_end=request.block_end,
-            block_size=request.physical_block_size,
+        array = self.source.read(
+            request.request_id,
+            request.block_start,
+            request.block_end,
         )
         if (
-            array.dtype != self.writer.dtype
-            or array.shape[1:] != self.writer.shape_per_token
+            array.dtype != self.source.dtype
+            or array.shape[1:] != self.source.shape_per_token
         ):
             raise RuntimeError("routed-experts capture profile changed")
 
@@ -368,6 +367,10 @@ class ArtifactRequestCore:
                 None,
             )
             errors[commit.request.operation_id] = error
+            if error is None:
+                self.source.release_through(
+                    commit.request.request_id, commit.request.block_end
+                )
         return errors
 
     def _put_tail(
@@ -378,11 +381,10 @@ class ArtifactRequestCore:
         source_start: int,
         source_end: int,
     ) -> str:
-        array = self.writer.read_token_range(
-            request.block_ids,
-            token_start=source_start,
-            token_end=source_end,
-            block_size=request.physical_block_size,
+        array = self.source.read(
+            request.request_id,
+            source_start,
+            source_end,
         )
         key = self._tail_key(
             field_profile_id=field_profile_id,
@@ -466,6 +468,7 @@ class ArtifactRequestCore:
             keys,
             expected_profile_id=field_profile_id,
         )
+        self.source.discard(request.request_id)
         return FinalizedArtifact(keys=keys, value=value)
 
     def close(self) -> None:

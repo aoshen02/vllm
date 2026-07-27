@@ -338,11 +338,6 @@ class Scheduler(SchedulerInterface):
         )
         self.artifact_connector: ArtifactSchedulerConnector | None = None
         self._pending_artifact_outputs: dict[str, EngineCoreOutput] = {}
-        # Blocks popped by async preemption must remain owned until the
-        # corresponding model output has either been consumed or finalized.
-        self._artifact_preempted_blocks: dict[
-            str, list[tuple[int, list[KVCacheBlock]]]
-        ] = {}
 
         if self.enable_return_routed_experts:
             # Under DCP/PCP, physical slots are interleaved across ranks. A
@@ -365,9 +360,6 @@ class Scheduler(SchedulerInterface):
                 num_offload_blocks=num_offload_blocks,
                 block_size_factor=block_size_factor,
             )
-            # Snapshot block IDs before forward because async scheduling may
-            # release or reassign them before model output is processed.
-            self._routed_experts_block_ids: dict[str, list[int]] = {}
             self.artifact_connector = ArtifactSchedulerConnector(vllm_config)
 
         self._pause_state: PauseState = PauseState.UNPAUSED
@@ -1248,18 +1240,6 @@ class Scheduler(SchedulerInterface):
                 scheduled_encoder_inputs
             )
 
-        artifact_block_ids = None
-        if self.artifact_connector is not None:
-            full_attn_group_id = self.routed_experts_manager.full_attn_group_id
-            artifact_block_ids = {
-                request_id: list(
-                    self.kv_cache_manager.get_blocks(request_id).get_block_ids()[
-                        full_attn_group_id
-                    ]
-                )
-                for request_id in num_scheduled_tokens
-            }
-
         scheduler_output = SchedulerOutput(
             scheduled_new_reqs=new_reqs_data,
             scheduled_cached_reqs=cached_reqs_data,
@@ -1279,7 +1259,6 @@ class Scheduler(SchedulerInterface):
             new_block_ids_to_zero=self._get_new_block_ids_to_zero(),
             kv_cache_block_copies=pending_kv_cache_block_copies,
             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
-            artifact_block_ids=artifact_block_ids,
         )
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
@@ -1339,18 +1318,7 @@ class Scheduler(SchedulerInterface):
         assert request.status == RequestStatus.RUNNING, (
             "Only running requests can be preempted"
         )
-        retain_for_artifact = self.artifact_connector is not None and (
-            request.num_in_flight_tokens > 0
-            or self.artifact_connector.has_unacked_commits(request.request_id)
-        )
-        if retain_for_artifact:
-            blocks = self.kv_cache_manager.pop_blocks_for_free(request)
-            if blocks:
-                self._artifact_preempted_blocks.setdefault(
-                    request.request_id, []
-                ).append((request.last_sched_seq, blocks))
-        else:
-            self._free_request_blocks(request)
+        self._free_request_blocks(request)
         self.encoder_cache_manager.free(request)
         self._inflight_prefills.discard(request)
         request.status = RequestStatus.PREEMPTED
@@ -1395,8 +1363,6 @@ class Scheduler(SchedulerInterface):
 
         # Keep the latest per-step snapshot for terminal finalization. update()
         # preserves older async steps until their outputs are consumed.
-        if scheduler_output.artifact_block_ids is not None:
-            self._routed_experts_block_ids.update(scheduler_output.artifact_block_ids)
 
         # Clear the finished and preempted request IDs.
         # NOTE: We shouldn't just clear() here because it will also affect
@@ -1762,9 +1728,7 @@ class Scheduler(SchedulerInterface):
 
         # Artifact finalization holds terminal KV blocks. Release them only
         # after this step's routing offload transfers have been applied.
-        artifact_release_candidates = self._release_artifact_outputs(
-            artifact_connector_output, outputs
-        )
+        self._release_artifact_outputs(artifact_connector_output, outputs)
 
         # NOTE(woosuk): As len(num_scheduled_tokens) can be up to 1K or more,
         # the below loop can be a performance bottleneck. We should do our best
@@ -1878,12 +1842,6 @@ class Scheduler(SchedulerInterface):
                     stopped = True
 
             if self.artifact_connector is not None:
-                block_ids = (scheduler_output.artifact_block_ids or {}).get(req_id)
-                if block_ids is None:
-                    raise RuntimeError(
-                        "missing per-step routed-experts block snapshot for "
-                        f"artifact request: {req_id}"
-                    )
                 # num_computed_tokens includes scheduled future async work;
                 # subtracting in-flight tokens yields exactly the prefix whose
                 # model output has now been accepted. The final sampled token
@@ -1895,12 +1853,10 @@ class Scheduler(SchedulerInterface):
                 if accepted_token_end > 0:
                     self.artifact_connector.request_progress(
                         request_id=req_id,
-                        block_ids=block_ids,
                         block_hashes=[
                             bytes(block_hash) for block_hash in request.block_hashes
                         ],
                         accepted_token_end=accepted_token_end,
-                        physical_block_size=self.routed_experts_manager.block_size,
                         hash_block_size=self.hash_block_size,
                     )
 
@@ -1976,15 +1932,6 @@ class Scheduler(SchedulerInterface):
             else:
                 # Invariant: EngineCore returns no partial prefill outputs.
                 assert not prompt_logprobs_tensors
-
-            if not stopped and status_before_stop == RequestStatus.PREEMPTED:
-                self._release_artifact_preempted_blocks(req_id)
-
-        # A commit ACK can arrive with a newer model output for the same
-        # preempted request. Release only after processing that output, so any
-        # newly completed blocks have first queued their own commit.
-        for req_id in artifact_release_candidates:
-            self._release_artifact_preempted_blocks(req_id)
 
         # Remove the stopped requests from the running and waiting queues.
         if stopped_running_reqs:
@@ -2373,8 +2320,6 @@ class Scheduler(SchedulerInterface):
         self._inflight_prefills.discard(request)
         if self.artifact_connector is not None:
             self.artifact_connector.request_aborted(request.request_id)
-        if self.enable_return_routed_experts:
-            self._routed_experts_block_ids.pop(request.request_id, None)
         connector_delay_free_blocks, kv_xfer_params, ec_xfer_params = (
             self._finish_connectors(request)
         )
@@ -2409,12 +2354,6 @@ class Scheduler(SchedulerInterface):
         assert request.is_finished()
         assert self.artifact_connector is not None
 
-        block_ids = self._routed_experts_block_ids.get(request.request_id)
-        if block_ids is None:
-            raise RuntimeError(
-                "missing routed-experts block snapshot for terminal artifact: "
-                f"{request.request_id}"
-            )
         if token_end is None:
             token_end = request.num_tokens - 1
 
@@ -2426,14 +2365,11 @@ class Scheduler(SchedulerInterface):
 
         self.artifact_connector.request_finished(
             request_id=request.request_id,
-            block_ids=block_ids,
             block_hashes=[bytes(block_hash) for block_hash in request.block_hashes],
             token_end=token_end,
-            physical_block_size=self.routed_experts_manager.block_size,
             hash_block_size=self.hash_block_size,
         )
         self._inflight_prefills.discard(request)
-        self._routed_experts_block_ids.pop(request.request_id, None)
         self.encoder_cache_manager.free(request)
         self.finished_req_ids.add(request.request_id)
         return kv_xfer_params, ec_xfer_params
@@ -2442,17 +2378,14 @@ class Scheduler(SchedulerInterface):
         self,
         artifact_output: ArtifactConnectorOutput | None,
         outputs: dict[int, list[EngineCoreOutput]],
-    ) -> set[str]:
+    ) -> None:
         if self.artifact_connector is None:
             if artifact_output is not None and not artifact_output.is_empty():
                 raise RuntimeError(
                     "received artifact output while connector is disabled"
                 )
-            return set()
+            return
         acknowledged = self.artifact_connector.acknowledge(artifact_output)
-        release_candidates = {
-            result.request_id for result in acknowledged.commit_results
-        }
 
         for finalize_result in acknowledged.results:
             pending = self._pending_artifact_outputs.pop(
@@ -2490,28 +2423,11 @@ class Scheduler(SchedulerInterface):
             if self.finished_req_ids_dict is not None:
                 self.finished_req_ids_dict[request.client_index].add(request.request_id)
             self._free_blocks(request)
-        return release_candidates
 
     def _free_blocks(self, request: Request):
         assert request.is_finished()
-        self._release_artifact_preempted_blocks(request.request_id)
         self._free_request_blocks(request)
         del self.requests[request.request_id]
-
-    def _release_artifact_preempted_blocks(self, request_id: str) -> None:
-        if (
-            self.artifact_connector is not None
-            and self.artifact_connector.has_unacked_commits(request_id)
-        ):
-            return
-        retained = self._artifact_preempted_blocks.pop(request_id, None)
-        if retained is None:
-            return
-        for fence_seq, blocks in retained:
-            if self.defer_block_free and fence_seq > self.processed_step_seq:
-                self.deferred_frees.append((fence_seq, blocks))
-            else:
-                self.kv_cache_manager.block_pool.free_blocks(reversed(blocks))
 
     @property
     def pause_state(self) -> PauseState:

@@ -1200,7 +1200,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     ) -> ModelRunnerOutput | IntermediateTensors | None:
         self.artifact_connector_output = (
             self.artifact_connector.process(
-                scheduler_output.artifact_connector_metadata
+                scheduler_output.artifact_connector_metadata,
+                scheduler_output.finished_req_ids,
             )
             if self.artifact_connector is not None
             else None
@@ -1435,7 +1436,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         ):
             full_attn_group_id = routed_experts_capture.full_attn_group_id
             routed_experts_write_task = routed_experts_capture.make_write_task(
-                slot_mappings[full_attn_group_id], num_toks
+                slot_mappings[full_attn_group_id],
+                num_toks,
+                request_ids=tuple(input_batch.req_ids),
+                query_start_locs=input_batch.query_start_loc_np.copy(),
+                token_starts=input_batch.num_computed_tokens_np.copy(),
+                artifact_sink=(
+                    self.artifact_connector.capture_step
+                    if self.artifact_connector is not None
+                    else None
+                ),
             )
         finished_req_ids = scheduler_output.finished_req_ids
         self.execute_model_state = ExecuteModelState(
@@ -1535,6 +1545,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             model_runner_output=model_runner_output,
             sampler_output=sampler_output,
             num_sampled_tokens=num_sampled,
+            num_rejected_tokens=num_rejected,
             main_stream=self.main_stream,
             copy_stream=self.output_copy_stream,
             routed_experts_write_task=routed_experts_write_task,

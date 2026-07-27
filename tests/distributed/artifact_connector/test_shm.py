@@ -4,7 +4,7 @@
 import multiprocessing
 import os
 import time
-from collections import defaultdict, deque
+from collections import defaultdict
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -27,6 +27,7 @@ from vllm.distributed.artifact_connector import (
     LocalSharedMemoryArtifactStore,
     materialize_routed_experts,
 )
+from vllm.distributed.artifact_connector.buffer import RoutedExpertsArtifactBuffer
 from vllm.distributed.artifact_connector.fields import ROUTED_EXPERTS
 from vllm.distributed.artifact_connector.request_core import (
     decode_artifact_array,
@@ -40,29 +41,6 @@ from vllm.v1.request import RequestStatus
 pytestmark = pytest.mark.cpu_test
 
 
-class FakeRoutingWriter:
-    def __init__(self, slots: np.ndarray) -> None:
-        self.slots = slots
-        self.dtype = slots.dtype
-        self.shape_per_token = slots.shape[1:]
-
-    def read_token_range(
-        self,
-        block_ids: list[int],
-        *,
-        token_start: int,
-        token_end: int,
-        block_size: int,
-    ) -> np.ndarray:
-        positions = np.arange(token_start, token_end)
-        block_ids_array = np.asarray(block_ids)
-        slot_ids = (
-            block_ids_array[positions // block_size] * block_size
-            + positions % block_size
-        )
-        return self.slots[slot_ids].copy()
-
-
 def _make_vllm_config(tmp_path):
     return SimpleNamespace(
         artifact_config=SimpleNamespace(shm_dir=str(tmp_path)),
@@ -73,17 +51,8 @@ def _make_vllm_config(tmp_path):
 
 def _make_worker_connector(tmp_path, *, max_bytes: int = 1 << 20):
     logical = np.arange(12 * 3 * 2, dtype=np.uint8).reshape(12, 3, 2)
-    block_ids = [2, 0, 3]
-    slots = np.zeros((16, 3, 2), dtype=np.uint8)
-    for logical_block, physical_block in enumerate(block_ids):
-        logical_start = logical_block * 4
-        physical_start = physical_block * 4
-        slots[physical_start : physical_start + 4] = logical[
-            logical_start : logical_start + 4
-        ]
 
     connector = ArtifactWorkerConnector.__new__(ArtifactWorkerConnector)
-    writer = FakeRoutingWriter(slots)
     connector.store = LocalSharedMemoryArtifactStore(
         str(tmp_path),
         "instance",
@@ -91,28 +60,26 @@ def _make_worker_connector(tmp_path, *, max_bytes: int = 1 << 20):
         max_bytes=max_bytes,
         ttl_seconds=60,
     )
+    connector.buffer = RoutedExpertsArtifactBuffer(logical.dtype, logical.shape[1:])
     connector.core = ArtifactRequestCore(
         connector.store,
-        writer,
+        connector.buffer,
         namespace="test-namespace",
     )
-    return connector, logical, block_ids
+    return connector, logical
 
 
 def _request(
     request_id: str,
     request_attempt_id: str,
-    block_ids: list[int],
     *,
     token_end: int = 10,
 ) -> ArtifactFinalizeRequest:
     return ArtifactFinalizeRequest(
         request_id=request_id,
         request_attempt_id=request_attempt_id,
-        block_ids=block_ids,
         block_hashes=[bytes([index]) * 32 for index in range(3)],
         token_end=token_end,
-        physical_block_size=4,
         hash_block_size=4,
     )
 
@@ -125,11 +92,9 @@ def _commit_request(request: ArtifactFinalizeRequest) -> ArtifactCommitRequest |
         operation_id=f"commit-{request.request_id}",
         request_id=request.request_id,
         request_attempt_id=request.request_attempt_id,
-        block_ids=request.block_ids,
         block_hashes=request.block_hashes,
         block_start=0,
         block_end=block_end,
-        physical_block_size=request.physical_block_size,
         hash_block_size=request.hash_block_size,
     )
 
@@ -137,7 +102,9 @@ def _commit_request(request: ArtifactFinalizeRequest) -> ArtifactCommitRequest |
 def _prepare_and_finalize(
     connector: ArtifactWorkerConnector,
     request: ArtifactFinalizeRequest,
+    logical: np.ndarray,
 ):
+    connector.buffer.capture(request.request_id, 0, logical[: request.token_end])
     commit = _commit_request(request)
     if commit is not None:
         prepared = connector.core.prepare_commit(commit)
@@ -186,11 +153,26 @@ def test_object_envelope_rejects_corruption():
         decode_artifact_array(corrupted, expected_key="key")
 
 
-def test_core_returns_ordered_keys_and_shm_value(tmp_path):
-    connector, logical, block_ids = _make_worker_connector(tmp_path)
-    request = _request("request-a", "a" * 32, block_ids)
+def test_logical_buffer_survives_recompute_and_release():
+    buffer = RoutedExpertsArtifactBuffer(np.dtype("uint8"), (1,))
+    buffer.capture("request", 4, np.arange(4, 8, dtype=np.uint8).reshape(-1, 1))
+    buffer.capture("request", 6, np.array([[60], [70], [80]], dtype=np.uint8))
 
-    finalized = _prepare_and_finalize(connector, request)
+    np.testing.assert_array_equal(
+        buffer.read("request", 4, 9).ravel(),
+        [4, 5, 60, 70, 80],
+    )
+    buffer.release_through("request", 8)
+    np.testing.assert_array_equal(buffer.read("request", 8, 9).ravel(), [80])
+    buffer.capture("request", 0, np.arange(9, dtype=np.uint8).reshape(-1, 1))
+    np.testing.assert_array_equal(buffer.read("request", 8, 9).ravel(), [8])
+
+
+def test_core_returns_ordered_keys_and_shm_value(tmp_path):
+    connector, logical = _make_worker_connector(tmp_path)
+    request = _request("request-a", "a" * 32)
+
+    finalized = _prepare_and_finalize(connector, request, logical)
 
     assert len(finalized.keys) == 3
     assert "/block/" in finalized.keys[0]
@@ -205,10 +187,10 @@ def test_core_returns_ordered_keys_and_shm_value(tmp_path):
 
 
 def test_exact_block_request_has_no_tail(tmp_path):
-    connector, logical, block_ids = _make_worker_connector(tmp_path)
-    request = _request("request-a", "a" * 32, block_ids, token_end=8)
+    connector, logical = _make_worker_connector(tmp_path)
+    request = _request("request-a", "a" * 32, token_end=8)
 
-    finalized = _prepare_and_finalize(connector, request)
+    finalized = _prepare_and_finalize(connector, request, logical)
 
     assert len(finalized.keys) == 2
     assert all("/block/" in key for key in finalized.keys)
@@ -218,24 +200,25 @@ def test_exact_block_request_has_no_tail(tmp_path):
 
 @pytest.mark.parametrize("token_end", [1, 4, 5, 8, 9, 12])
 def test_key_count_is_ceiling_of_executed_tokens(tmp_path, token_end):
-    connector, _, block_ids = _make_worker_connector(tmp_path)
+    connector, logical = _make_worker_connector(tmp_path)
     request = _request(
         f"request-{token_end}",
         f"{token_end:032x}",
-        block_ids,
         token_end=token_end,
     )
 
-    finalized = _prepare_and_finalize(connector, request)
+    finalized = _prepare_and_finalize(connector, request, logical)
 
     assert len(finalized.keys) == (token_end + 3) // 4
     connector.close()
 
 
 def test_worker_batches_commits_and_reports_keys_per_request(tmp_path):
-    connector, _, block_ids = _make_worker_connector(tmp_path)
-    first = _request("request-a", "a" * 32, block_ids, token_end=4)
-    second = _request("request-b", "b" * 32, block_ids, token_end=8)
+    connector, logical = _make_worker_connector(tmp_path)
+    first = _request("request-a", "a" * 32, token_end=4)
+    second = _request("request-b", "b" * 32, token_end=8)
+    connector.buffer.capture(first.request_id, 0, logical[:4])
+    connector.buffer.capture(second.request_id, 0, logical[:8])
     commits = [_commit_request(first), _commit_request(second)]
 
     output = connector.process(
@@ -251,15 +234,15 @@ def test_worker_batches_commits_and_reports_keys_per_request(tmp_path):
 
 
 def test_cached_blocks_are_reused_without_put(tmp_path):
-    connector, logical, block_ids = _make_worker_connector(tmp_path)
-    first = _request("request-a", "a" * 32, block_ids, token_end=8)
-    first_finalized = _prepare_and_finalize(connector, first)
+    connector, logical = _make_worker_connector(tmp_path)
+    first = _request("request-a", "a" * 32, token_end=8)
+    first_finalized = _prepare_and_finalize(connector, first, logical)
     second = _request(
         "request-b",
         "b" * 32,
-        block_ids,
         token_end=10,
     )
+    connector.buffer.capture(second.request_id, 8, logical[8:10])
     connector.store.put = Mock(wraps=connector.store.put)
 
     finalized = connector.core.finalize(second)
@@ -272,11 +255,10 @@ def test_cached_blocks_are_reused_without_put(tmp_path):
 
 
 def test_missing_cached_block_fails_closed(tmp_path):
-    connector, _, block_ids = _make_worker_connector(tmp_path)
+    connector, _ = _make_worker_connector(tmp_path)
     request = _request(
         "request-a",
         "a" * 32,
-        block_ids,
         token_end=4,
     )
 
@@ -286,9 +268,9 @@ def test_missing_cached_block_fails_closed(tmp_path):
 
 
 def test_reader_materializes_from_another_process(tmp_path):
-    connector, logical, block_ids = _make_worker_connector(tmp_path)
-    request = _request("request-a", "a" * 32, block_ids)
-    finalized = _prepare_and_finalize(connector, request)
+    connector, logical = _make_worker_connector(tmp_path)
+    request = _request("request-a", "a" * 32)
+    finalized = _prepare_and_finalize(connector, request, logical)
     context = multiprocessing.get_context("spawn")
     result_queue = context.Queue()
     process = context.Process(
@@ -384,10 +366,8 @@ def test_scheduler_connector_checks_shm_existence(tmp_path):
     connector = ArtifactSchedulerConnector(_make_vllm_config(tmp_path))
     attempt_id = connector.request_progress(
         request_id="request-a",
-        block_ids=[1],
         block_hashes=[b"a" * 32],
         accepted_token_end=4,
-        physical_block_size=4,
         hash_block_size=4,
     )
     metadata = connector.build_connector_metadata()
@@ -432,9 +412,6 @@ def test_scheduler_connector_checks_shm_existence(tmp_path):
 def test_scheduler_finalizes_only_the_accepted_range():
     scheduler = object.__new__(Scheduler)
     scheduler.artifact_connector = Mock()
-    scheduler.artifact_connector.has_unacked_commits.return_value = False
-    scheduler._routed_experts_block_ids = {"request-a": [3, 5, 7]}
-    scheduler.routed_experts_manager = SimpleNamespace(block_size=4)
     scheduler.hash_block_size = 4
     scheduler._connector_finished = Mock(return_value=(False, None))
     scheduler.ec_connector = None
@@ -453,34 +430,21 @@ def test_scheduler_finalizes_only_the_accepted_range():
 
     scheduler.artifact_connector.request_finished.assert_called_once_with(
         request_id="request-a",
-        block_ids=[3, 5, 7],
         block_hashes=[b"a" * 32, b"b" * 32, b"c" * 32],
         token_end=9,
-        physical_block_size=4,
         hash_block_size=4,
     )
 
 
-def test_async_preemption_retains_slots_until_output_is_consumed():
+def test_async_preemption_uses_standard_kv_lifecycle():
     scheduler = object.__new__(Scheduler)
     scheduler.artifact_connector = Mock()
-    scheduler.artifact_connector.has_unacked_commits.return_value = False
-    scheduler.kv_cache_manager = Mock()
+    scheduler._free_request_blocks = Mock()
     scheduler.encoder_cache_manager = Mock()
     scheduler._inflight_prefills = set()
     scheduler.waiting = Mock()
     scheduler.reset_preempted_req_ids = set()
     scheduler.log_stats = False
-    scheduler.defer_block_free = True
-    scheduler.processed_step_seq = 2
-    scheduler.deferred_frees = deque()
-    scheduler._artifact_preempted_blocks = {}
-    retained_block = Mock()
-    scheduler.kv_cache_manager.pop_blocks_for_free.return_value = [retained_block]
-    freed_blocks = []
-    scheduler.kv_cache_manager.block_pool.free_blocks.side_effect = lambda blocks: (
-        freed_blocks.extend(blocks)
-    )
     request = Mock()
     request.request_id = "request-a"
     request.status = RequestStatus.RUNNING
@@ -491,13 +455,7 @@ def test_async_preemption_retains_slots_until_output_is_consumed():
 
     scheduler._preempt_request(request, 0.0)
 
-    assert scheduler._artifact_preempted_blocks[request.request_id] == [
-        (3, [retained_block])
-    ]
-    assert not freed_blocks
-    scheduler.processed_step_seq = 3
-    scheduler._release_artifact_preempted_blocks(request.request_id)
-    assert freed_blocks == [retained_block]
+    scheduler._free_request_blocks.assert_called_once_with(request)
 
 
 def test_weight_update_is_rejected_while_artifacts_are_enabled():
@@ -520,10 +478,8 @@ def test_scheduler_releases_inline_terminal_output_after_ack(tmp_path):
     )
     attempt_id = scheduler.artifact_connector.request_finished(
         request_id="request-a",
-        block_ids=[1, 2],
         block_hashes=[b"a" * 32, b"b" * 32],
         token_end=6,
-        physical_block_size=4,
         hash_block_size=4,
     )
     scheduler.artifact_connector.build_connector_metadata()

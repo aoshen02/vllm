@@ -11,6 +11,9 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+import numpy as np
+
+from vllm.distributed.artifact_connector.buffer import RoutedExpertsArtifactBuffer
 from vllm.distributed.artifact_connector.protocol import (
     ArtifactCommitRequest,
     ArtifactCommitResult,
@@ -134,10 +137,8 @@ class ArtifactSchedulerConnector:
         self,
         *,
         request_id: str,
-        block_ids: list[int],
         block_hashes: list[bytes],
         accepted_token_end: int,
-        physical_block_size: int,
         hash_block_size: int,
     ) -> str:
         state = self._state(request_id)
@@ -149,11 +150,9 @@ class ArtifactSchedulerConnector:
             operation_id=operation_id,
             request_id=request_id,
             request_attempt_id=state.request_attempt_id,
-            block_ids=list(block_ids),
             block_hashes=list(block_hashes),
             block_start=state.next_full_end,
             block_end=full_end,
-            physical_block_size=physical_block_size,
             hash_block_size=hash_block_size,
         )
         state.next_full_end = full_end
@@ -163,10 +162,8 @@ class ArtifactSchedulerConnector:
         self,
         *,
         request_id: str,
-        block_ids: list[int],
         block_hashes: list[bytes],
         token_end: int,
-        physical_block_size: int,
         hash_block_size: int,
     ) -> str:
         if (
@@ -178,10 +175,8 @@ class ArtifactSchedulerConnector:
         self._pending_finalizes[request_id] = ArtifactFinalizeRequest(
             request_id=request_id,
             request_attempt_id=state.request_attempt_id,
-            block_ids=list(block_ids),
             block_hashes=list(block_hashes),
             token_end=token_end,
-            physical_block_size=physical_block_size,
             hash_block_size=hash_block_size,
         )
         return state.request_attempt_id
@@ -252,15 +247,6 @@ class ArtifactSchedulerConnector:
             self._states.pop(finalize_result.request_id, None)
         return output
 
-    def has_unacked_commits(self, request_id: str) -> bool:
-        return any(
-            request.request_id == request_id
-            for request in (
-                *self._pending_commits.values(),
-                *self._inflight_commits.values(),
-            )
-        )
-
     def has_pending_work(self) -> bool:
         return bool(
             self._pending_commits
@@ -309,16 +295,33 @@ class ArtifactWorkerConnector:
                 default=str,
             ).encode()
         ).hexdigest()
+        self.buffer = RoutedExpertsArtifactBuffer(
+            writer.dtype,
+            writer.shape_per_token,
+        )
         self.core = ArtifactRequestCore(
             self.store,
-            writer,
+            self.buffer,
             namespace=namespace,
         )
 
+    def capture_step(
+        self,
+        request_id: str,
+        token_start: int,
+        rows: np.ndarray,
+    ) -> None:
+        self.buffer.capture(request_id, token_start, rows)
+
     def process(
-        self, metadata: ArtifactConnectorMetadata | None
+        self,
+        metadata: ArtifactConnectorMetadata | None,
+        finished_req_ids: set[str] | None = None,
     ) -> ArtifactConnectorOutput | None:
         if metadata is None:
+            if finished_req_ids:
+                for request_id in finished_req_ids:
+                    self.buffer.discard(request_id)
             return None
         commit_results: list[ArtifactCommitResult] = []
         prepared: list[PreparedCommit] = []
@@ -375,12 +378,16 @@ class ArtifactWorkerConnector:
                     request_attempt_id=finalize_request.request_attempt_id,
                     error=f"{type(exc).__name__}: {exc}",
                 )
+                self.buffer.discard(finalize_request.request_id)
             results.append(result)
 
         output = ArtifactConnectorOutput(
             results=results,
             commit_results=commit_results,
         )
+        if finished_req_ids:
+            for request_id in finished_req_ids:
+                self.buffer.discard(request_id)
         return None if output.is_empty() else output
 
     def close(self) -> None:

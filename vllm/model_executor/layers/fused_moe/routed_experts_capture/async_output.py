@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import NamedTuple
 
@@ -55,6 +56,10 @@ class RoutedExpertsWriteTask:
 
     routed_experts_tensors: RoutedExpertsTensors
     writer: RoutedExpertsWorkerWriter
+    request_ids: tuple[str, ...] = ()
+    query_start_locs: np.ndarray | None = None
+    token_starts: np.ndarray | None = None
+    artifact_sink: Callable[[str, int, np.ndarray], None] | None = None
     _routed_experts_tensors_cpu: RoutedExpertsTensors | None = field(
         init=False, default=None
     )
@@ -65,7 +70,7 @@ class RoutedExpertsWriteTask:
             self.routed_experts_tensors.to_cpu_nonblocking()
         )
 
-    def finalize(self) -> None:
+    def finalize(self, num_rejected_tokens: np.ndarray | None = None) -> None:
         """Publish the copied routing data."""
         assert self._routed_experts_tensors_cpu is not None, (
             "routed-experts CPU tensors are unavailable; call start_copy first"
@@ -75,3 +80,18 @@ class RoutedExpertsWriteTask:
             routed_experts.routing_data,
             routed_experts.slot_mapping,
         )
+        if self.artifact_sink is None:
+            return
+        assert self.query_start_locs is not None
+        assert self.token_starts is not None
+        if num_rejected_tokens is None:
+            num_rejected_tokens = np.zeros(len(self.request_ids), dtype=np.int32)
+        for index, request_id in enumerate(self.request_ids):
+            row_start = int(self.query_start_locs[index])
+            row_end = int(self.query_start_locs[index + 1])
+            accepted_end = row_end - int(num_rejected_tokens[index])
+            self.artifact_sink(
+                request_id,
+                int(self.token_starts[index]),
+                routed_experts.routing_data[row_start:accepted_end],
+            )

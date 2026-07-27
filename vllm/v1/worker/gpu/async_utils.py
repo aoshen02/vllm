@@ -18,6 +18,7 @@ class AsyncOutput(AsyncModelRunnerOutput):
         model_runner_output: ModelRunnerOutput,
         sampler_output: SamplerOutput,
         num_sampled_tokens: torch.Tensor,
+        num_rejected_tokens: torch.Tensor,
         main_stream: torch.cuda.Stream,
         copy_stream: torch.cuda.Stream,
         routed_experts_write_task: RoutedExpertsWriteTask | None = None,
@@ -28,6 +29,7 @@ class AsyncOutput(AsyncModelRunnerOutput):
         self.model_runner_output = model_runner_output
         self.sampler_output = sampler_output
         self.num_sampled_tokens = num_sampled_tokens
+        self.num_rejected_tokens = num_rejected_tokens
         self.routed_experts_write_task = routed_experts_write_task
         # Blocking (sleep) event to avoid busy-polling the CUDA driver lock.
         self.copy_event = torch.cuda.Event(blocking=True)
@@ -45,6 +47,7 @@ class AsyncOutput(AsyncModelRunnerOutput):
             if sampler_output.num_nans is not None:
                 self.num_nans = async_copy_to_np(sampler_output.num_nans)
             self.num_sampled_tokens_np = async_copy_to_np(num_sampled_tokens)
+            self.num_rejected_tokens_np = async_copy_to_np(num_rejected_tokens)
             self.prompt_logprobs_dict = {
                 k: v.to_cpu_nonblocking() if v is not None else None
                 for k, v in self.model_runner_output.prompt_logprobs_dict.items()
@@ -75,7 +78,7 @@ class AsyncOutput(AsyncModelRunnerOutput):
             self.model_runner_output.logprobs = self.logprobs_tensors.tolists()
         self.model_runner_output.prompt_logprobs_dict = self.prompt_logprobs_dict
         if self.routed_experts_write_task is not None:
-            self.routed_experts_write_task.finalize()
+            self.routed_experts_write_task.finalize(self.num_rejected_tokens_np)
             self.routed_experts_write_task = None
         return self.model_runner_output
 

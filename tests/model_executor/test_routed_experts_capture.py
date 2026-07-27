@@ -3,6 +3,7 @@
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import numpy as np
 import pytest
 import torch
 
@@ -113,6 +114,27 @@ def test_routed_experts_write_task_publishes_copied_tensors():
     stored_routing, stored_slots = writer.store_batch.call_args.args
     assert stored_routing.tolist() == routing_data.tolist()
     assert stored_slots.tolist() == slot_mapping.tolist()
+
+
+def test_write_task_splits_requests_and_drops_rejected_rows():
+    routing_data = torch.arange(12, dtype=torch.int32).reshape(6, 1, 2)
+    slot_mapping = torch.arange(6)
+    sink = Mock()
+    write_task = RoutedExpertsWriteTask(
+        routed_experts_tensors=RoutedExpertsTensors(routing_data, slot_mapping),
+        writer=Mock(),
+        request_ids=("a", "b"),
+        query_start_locs=np.array([0, 2, 6]),
+        token_starts=np.array([4, 8]),
+        artifact_sink=sink,
+    )
+
+    write_task.start_copy()
+    write_task.finalize(np.array([0, 2]))
+
+    assert [call.args[:2] for call in sink.call_args_list] == [("a", 4), ("b", 8)]
+    np.testing.assert_array_equal(sink.call_args_list[0].args[2], routing_data[:2])
+    np.testing.assert_array_equal(sink.call_args_list[1].args[2], routing_data[2:4])
 
 
 def _capturer_with_buffer(

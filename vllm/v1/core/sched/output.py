@@ -252,11 +252,6 @@ class SchedulerOutput:
     # Terminal artifact work for the authoritative routed-experts worker.
     artifact_connector_metadata: ArtifactConnectorMetadata | None = None
 
-    # Exact physical block snapshot for this model step. This stays on the
-    # scheduler side and prevents async schedules from replacing the mapping
-    # before their older output is processed.
-    artifact_block_ids: dict[str, list[int]] | None = None
-
     # Block IDs freshly allocated from the pool during this scheduling step.
     # The worker zeros the corresponding GPU memory before the blocks are used,
     # preventing stale NaN/data from corrupting attention or SSM computation.

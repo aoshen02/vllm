@@ -14,11 +14,9 @@ class ArtifactCommitRequest:
     operation_id: str
     request_id: str
     request_attempt_id: str
-    block_ids: list[int]
     block_hashes: list[bytes]
     block_start: int
     block_end: int
-    physical_block_size: int
     hash_block_size: int
 
 
@@ -28,10 +26,8 @@ class ArtifactFinalizeRequest:
 
     request_id: str
     request_attempt_id: str
-    block_ids: list[int]
     block_hashes: list[bytes]
     token_end: int
-    physical_block_size: int
     hash_block_size: int
 
 
@@ -45,7 +41,7 @@ class ArtifactConnectorMetadata:
 
 @dataclass(frozen=True)
 class ArtifactCommitResult:
-    """Worker acknowledgement for one incremental full-block commit."""
+    """Worker acknowledgement that one full-block publication was started."""
 
     operation_id: str
     request_id: str
