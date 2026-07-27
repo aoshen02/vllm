@@ -9,6 +9,10 @@ from typing import Any
 
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import VllmConfig
+from vllm.distributed.artifact_connector import (
+    ArtifactConnectorOutput,
+    ArtifactSchedulerConnector,
+)
 from vllm.distributed.ec_transfer.ec_connector.base import (
     ECConnectorBase,
     ECConnectorMetadata,
@@ -25,10 +29,6 @@ from vllm.distributed.kv_transfer.kv_connector.v1 import (
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
 from vllm.logger import init_logger
-from vllm.model_executor.layers.fused_moe.routed_experts_capture import (
-    RoutedExpertsManager,
-    require_full_attn_group_id,
-)
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.multimodal.encoder_budget import MultiModalBudget
 from vllm.multimodal.utils import get_mm_features_in_window
@@ -54,7 +54,12 @@ from vllm.v1.core.sched.request_queue import (
     create_request_queue,
 )
 from vllm.v1.core.sched.utils import check_stop, remove_all
-from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
+from vllm.v1.engine import (
+    EngineCoreEventType,
+    EngineCoreOutput,
+    EngineCoreOutputs,
+    FinishReason,
+)
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
 from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
@@ -327,83 +332,23 @@ class Scheduler(SchedulerInterface):
         self.enable_return_routed_experts = (
             vllm_config.model_config.enable_return_routed_experts
         )
+        self.artifact_connector: ArtifactSchedulerConnector | None = None
+        self._pending_artifact_outputs: dict[str, EngineCoreOutput] = {}
 
         if self.enable_return_routed_experts:
-            # Under DCP/PCP, physical slots are interleaved across ranks. A
-            # rank-local buffer therefore needs global token addressing.
+            # Cross-rank logical-token assembly is not implemented yet.
             assert self.dcp_world_size == 1 and self.pcp_world_size == 1, (
                 "enable_return_routed_experts does not support context "
                 "parallelism (dcp_world_size > 1 or pcp_world_size > 1)"
             )
 
-            num_offload_blocks = None
-            block_size_factor = 1
-            if self.connector is not None:
-                num_offload_blocks, block_size_factor = (
-                    self._validate_routed_experts_offload(kv_cache_config)
-                )
-
-            self.routed_experts_manager = RoutedExpertsManager(
-                vllm_config=vllm_config,
-                kv_cache_config=kv_cache_config,
-                num_offload_blocks=num_offload_blocks,
-                block_size_factor=block_size_factor,
-            )
-            # Snapshot block IDs before forward because async scheduling may
-            # release or reassign them before model output is processed.
-            self._routed_experts_block_ids: dict[str, list[int]] = {}
+            self.artifact_connector = ArtifactSchedulerConnector(vllm_config)
 
         self._pause_state: PauseState = PauseState.UNPAUSED
 
         # In-flight requests still prefilling (prefill chunks + in-progress
         # async KV loads). Their remaining-block reservation gates async loads.
         self._inflight_prefills: set[Request] = set()
-
-    def _validate_routed_experts_offload(
-        self, kv_cache_config: KVCacheConfig
-    ) -> tuple[int, int]:
-        """Validate the KV connector for offloaded routed experts.
-
-        The CPU OffloadingConnector stores/loads routing rows on the
-        scheduler side, following the KV blocks' offload transfer jobs.
-
-        Returns:
-            The number of offload blocks and the block-size factor.
-
-        Raises:
-            ValueError: On any unsupported connector / spec combination.
-        """
-        from vllm.distributed.kv_transfer.kv_connector.v1.offloading_connector import (  # noqa: E501
-            OffloadingConnector,
-        )
-        from vllm.v1.kv_offload.cpu.spec import CPUOffloadingSpec
-
-        if not isinstance(self.connector, OffloadingConnector):
-            raise ValueError(
-                "--enable-return-routed-experts only supports the CPU "
-                f"OffloadingConnector; got {type(self.connector).__name__}"
-            )
-        connector_scheduler = self.connector.connector_scheduler
-        assert connector_scheduler is not None, (
-            "OffloadingConnector must provide a connector scheduler"
-        )
-        if not isinstance(connector_scheduler.spec, CPUOffloadingSpec):
-            raise ValueError(
-                "--enable-return-routed-experts only supports "
-                "CPUOffloadingSpec; "
-                f"got {type(connector_scheduler.spec).__name__}"
-            )
-        require_full_attn_group_id(kv_cache_config)
-        if connector_scheduler.spec.num_blocks <= 0:
-            raise ValueError(
-                "--enable-return-routed-experts with KV offload requires "
-                "a non-empty CPU offload block pool; increase "
-                "kv_offloading_size / cpu_bytes_to_use."
-            )
-        return (
-            connector_scheduler.spec.num_blocks,
-            connector_scheduler.spec.blocks_per_chunk,
-        )
 
     def _mamba_block_aligned_split(
         self,
@@ -763,6 +708,17 @@ class Scheduler(SchedulerInterface):
                 num_external_computed_tokens = 0
                 load_kv_async = False
                 connector_prefix_cache_queries, connector_prefix_cache_hits = 0, 0
+                artifact_max_cache_hit = request.num_tokens - 1
+                if self.artifact_connector is not None:
+                    artifact_max_cache_hit = (
+                        self.artifact_connector.max_ready_prefix_tokens(
+                            block_hashes=[
+                                bytes(block_hash) for block_hash in request.block_hashes
+                            ],
+                            max_tokens=request.num_tokens - 1,
+                            hash_block_size=self.hash_block_size,
+                        )
+                    )
 
                 # Get already-cached tokens.
                 if request.num_computed_tokens == 0:
@@ -777,7 +733,7 @@ class Scheduler(SchedulerInterface):
                     ):
                         computed, per_group_hits = (
                             self.kv_cache_manager.coordinator.find_longest_cache_hit_per_group(
-                                request.block_hashes, request.num_tokens - 1
+                                request.block_hashes, artifact_max_cache_hit
                             )
                         )
                         new_computed_blocks = (
@@ -812,7 +768,10 @@ class Scheduler(SchedulerInterface):
                             # tail) survives retention and serves a later hit; 0
                             # if no uncached shared prefix was detected.
                             request.shared_prefix_boundary,
-                        ) = self.kv_cache_manager.get_computed_blocks(request)
+                        ) = self.kv_cache_manager.get_computed_blocks(
+                            request,
+                            max_cache_hit_length=artifact_max_cache_hit,
+                        )
 
                     # Get externally-cached tokens if using a KVConnector.
                     if self.connector is not None:
@@ -830,7 +789,16 @@ class Scheduler(SchedulerInterface):
                             step_skipped_waiting.prepend_request(request)
                             continue
 
-                        num_external_computed_tokens = ext_tokens
+                        num_external_computed_tokens = min(
+                            ext_tokens,
+                            max(
+                                0,
+                                artifact_max_cache_hit - num_new_local_computed_tokens,
+                            ),
+                        )
+                        load_kv_async = (
+                            load_kv_async and num_external_computed_tokens > 0
+                        )
 
                         connector_prefix_cache_queries = (
                             request.num_tokens - num_new_local_computed_tokens
@@ -1061,6 +1029,16 @@ class Scheduler(SchedulerInterface):
                         )
                     continue
 
+                if self.artifact_connector is not None:
+                    self.artifact_connector.request_started(
+                        request_id=request_id,
+                        block_hashes=[
+                            bytes(block_hash) for block_hash in request.block_hashes
+                        ],
+                        cached_token_end=num_computed_tokens,
+                        hash_block_size=self.hash_block_size,
+                    )
+
                 self.running.append(request)
                 if self.log_stats:
                     request.record_event(
@@ -1234,6 +1212,11 @@ class Scheduler(SchedulerInterface):
             )
             scheduler_output.ec_connector_metadata = ec_meta
 
+        if self.artifact_connector is not None:
+            scheduler_output.artifact_connector_metadata = (
+                self.artifact_connector.build_connector_metadata()
+            )
+
         # Advance the fence only for non-empty steps (those that actually
         # write KV and have their output processed later in update_from_output).
         if self.defer_block_free and total_num_scheduled_tokens > 0:
@@ -1314,23 +1297,8 @@ class Scheduler(SchedulerInterface):
             if not request.is_prefill_chunk:
                 self._inflight_prefills.discard(request)
 
-        # Snapshot block IDs for routed experts before forward starts.
-        # A concurrent schedule() may preempt requests and free blocks
-        # before update_from_output runs; the snapshot survives that.
-        # Use update() to preserve entries from the previous step that
-        # have not yet been consumed by update_from_output (async
-        # scheduling may call _update_after_schedule again before the
-        # prior update_from_output runs).
-        if self.enable_return_routed_experts:
-            full_attn_group_id = self.routed_experts_manager.full_attn_group_id
-            self._routed_experts_block_ids.update(
-                {
-                    request_id: self.kv_cache_manager.get_blocks(
-                        request_id
-                    ).get_block_ids()[full_attn_group_id]
-                    for request_id in num_scheduled_tokens
-                }
-            )
+        # Keep the latest per-step snapshot for terminal finalization. update()
+        # preserves older async steps until their outputs are consumed.
 
         # Clear the finished and preempted request IDs.
         # NOTE: We shouldn't just clear() here because it will also affect
@@ -1653,6 +1621,7 @@ class Scheduler(SchedulerInterface):
         pooler_outputs = model_runner_output.pooler_output
         num_nans_in_logits = model_runner_output.num_nans_in_logits
         kv_connector_output = model_runner_output.kv_connector_output
+        artifact_connector_output = model_runner_output.artifact_connector_output
         cudagraph_stats = model_runner_output.cudagraph_stats
 
         # Every GPU write enqueued by this and earlier steps has completed, so it is
@@ -1678,34 +1647,7 @@ class Scheduler(SchedulerInterface):
                 num_scheduled_tokens,
             )
 
-        # The worker stores routing in shared memory and returns per-step slot
-        # indices. Keeping slots in ModelRunnerOutput prevents a later async
-        # schedule from overwriting request-keyed metadata. Slots follow
-        # model_runner_output.req_ids order, and lock-free access relies on
-        # EngineCore processing step outputs in FIFO order.
-        routing_slots = None
-        routing_offsets: dict[str, int] = {}
-        if model_runner_output.routed_experts_slots is not None:
-            routing_slots = model_runner_output.routed_experts_slots
-            offset = 0
-            for request_id in model_runner_output.req_ids:
-                routing_offsets[request_id] = offset
-                offset += num_scheduled_tokens[request_id]
-
-        if self.enable_return_routed_experts and self.connector is not None:
-            from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (  # noqa: E501
-                OffloadingConnectorMetadata,
-            )
-
-            offload_metadata = scheduler_output.kv_connector_metadata
-            if offload_metadata is not None:
-                if not isinstance(offload_metadata, OffloadingConnectorMetadata):
-                    raise RuntimeError(
-                        "routed-experts offload requires "
-                        "OffloadingConnectorMetadata, got "
-                        f"{type(offload_metadata).__name__}"
-                    )
-                self.routed_experts_manager.apply_offload_transfers(offload_metadata)
+        self._release_artifact_outputs(artifact_connector_output, outputs)
 
         # NOTE(woosuk): As len(num_scheduled_tokens) can be up to 1K or more,
         # the below loop can be a performance bottleneck. We should do our best
@@ -1778,9 +1720,9 @@ class Scheduler(SchedulerInterface):
             pooler_output = pooler_outputs[req_index] if pooler_outputs else None
             kv_transfer_params = None
             ec_transfer_params = None
+            defer_artifact_output = False
             prefill_stats = None
             status_before_stop = request.status
-            num_output_tokens_before = len(request._output_token_ids)
 
             # Check for stop and update request status.
             if new_token_ids:
@@ -1818,61 +1760,23 @@ class Scheduler(SchedulerInterface):
                     request.resumable = False
                     stopped = True
 
-            routed_experts = None
-            if (
-                self.enable_return_routed_experts
-                and routing_slots is not None
-                and new_token_ids
-            ):
-                request_offset = routing_offsets[req_id]
-                request_end = request_offset + num_tokens_scheduled
-                if num_output_tokens_before == 0:
-                    # Prefill done: read full prompt routing via the block-ID
-                    # snapshot from schedule time (a sequence-prefix, so it
-                    # survives async preemption / later schedules).
-                    block_ids = self._routed_experts_block_ids.get(req_id, [])
-                    if (
-                        request.sampling_params is not None
-                        and request.sampling_params.routed_experts_prompt_start
-                        is not None
-                    ):
-                        prompt_start = (
-                            request.sampling_params.routed_experts_prompt_start
-                        )
-                        if (
-                            prompt_start < 0
-                            or prompt_start >= request.num_prompt_tokens
-                        ):
-                            raise ValueError(
-                                "routed_experts_prompt_start "
-                                f"({prompt_start}) must be >= 0 and "
-                                "< num_prompt_tokens "
-                                f"({request.num_prompt_tokens})"
-                            )
-                    else:
-                        prompt_start = 0
-                    routed_experts = self.routed_experts_manager.get(
-                        block_ids,
-                        token_end=request.num_prompt_tokens,
-                        token_start=prompt_start,
-                    )
-                else:
-                    num_new_tokens = len(new_token_ids)
-                    if scheduled_spec_token_ids:
-                        # Spec decode accepts a prefix of the scheduled token
-                        # sequence, so its routing slots start at the request
-                        # offset.
-                        selected_slots = routing_slots[
-                            request_offset : request_offset + num_new_tokens
-                        ]
-                    else:
-                        # Normal decode samples from the final scheduled token
-                        # positions, so its routing slots end at request_end.
-                        selected_slots = routing_slots[
-                            request_end - num_new_tokens : request_end
-                        ]
-                    routed_experts = self.routed_experts_manager.get_by_slots(
-                        selected_slots
+            if self.artifact_connector is not None:
+                # num_computed_tokens includes scheduled future async work;
+                # subtracting in-flight tokens yields exactly the prefix whose
+                # model output has now been accepted. The final sampled token
+                # has no routed-experts row yet and is excluded by num_tokens-1.
+                accepted_token_end = min(
+                    request.num_tokens - 1,
+                    request.num_computed_tokens - request.num_in_flight_tokens,
+                )
+                if accepted_token_end > 0:
+                    self.artifact_connector.request_progress(
+                        request_id=req_id,
+                        block_hashes=[
+                            bytes(block_hash) for block_hash in request.block_hashes
+                        ],
+                        accepted_token_end=accepted_token_end,
+                        hash_block_size=self.hash_block_size,
                     )
 
             should_emit_output = bool(
@@ -1892,7 +1796,18 @@ class Scheduler(SchedulerInterface):
                 finish_reason = request.get_finished_reason()
                 finished = self._handle_stopped_request(request)
                 if finished:
-                    kv_transfer_params, ec_transfer_params = self._free_request(request)
+                    if self.artifact_connector is not None and finish_reason not in (
+                        FinishReason.ABORT,
+                        FinishReason.ERROR,
+                    ):
+                        kv_transfer_params, ec_transfer_params = (
+                            self._start_artifact_finalize(request)
+                        )
+                        defer_artifact_output = True
+                    else:
+                        kv_transfer_params, ec_transfer_params = self._free_request(
+                            request
+                        )
 
                 if status_before_stop == RequestStatus.RUNNING:
                     stopped_running_reqs.add(request)
@@ -1914,24 +1829,25 @@ class Scheduler(SchedulerInterface):
             prompt_logprobs_tensors = prompt_logprobs_dict.get(req_id)
             if should_emit_output:
                 # Add EngineCoreOutput for this Request.
-                outputs[request.client_index].append(
-                    EngineCoreOutput(
-                        request_id=req_id,
-                        new_token_ids=new_token_ids,
-                        finish_reason=finish_reason,
-                        new_logprobs=new_logprobs,
-                        new_prompt_logprobs_tensors=prompt_logprobs_tensors,
-                        pooling_output=pooler_output,
-                        stop_reason=request.stop_reason,
-                        events=request.take_events(),
-                        prefill_stats=prefill_stats,
-                        kv_transfer_params=kv_transfer_params,
-                        ec_transfer_params=ec_transfer_params,
-                        trace_headers=request.trace_headers,
-                        routed_experts=routed_experts,
-                        num_nans_in_logits=request.num_nans_in_logits,
-                    )
+                engine_core_output = EngineCoreOutput(
+                    request_id=req_id,
+                    new_token_ids=new_token_ids,
+                    finish_reason=finish_reason,
+                    new_logprobs=new_logprobs,
+                    new_prompt_logprobs_tensors=prompt_logprobs_tensors,
+                    pooling_output=pooler_output,
+                    stop_reason=request.stop_reason,
+                    events=request.take_events(),
+                    prefill_stats=prefill_stats,
+                    kv_transfer_params=kv_transfer_params,
+                    ec_transfer_params=ec_transfer_params,
+                    trace_headers=request.trace_headers,
+                    num_nans_in_logits=request.num_nans_in_logits,
                 )
+                if defer_artifact_output:
+                    self._pending_artifact_outputs[req_id] = engine_core_output
+                else:
+                    outputs[request.client_index].append(engine_core_output)
             else:
                 # Invariant: EngineCore returns no partial prefill outputs.
                 assert not prompt_logprobs_tensors
@@ -2193,6 +2109,14 @@ class Scheduler(SchedulerInterface):
         return len(self.running), len(self.waiting) + len(self.skipped_waiting)
 
     def add_request(self, request: Request) -> None:
+        if (
+            self.artifact_connector is not None
+            and request.sampling_params is not None
+            and request.sampling_params.routed_experts_prompt_start not in (None, 0)
+        ):
+            raise ValueError(
+                "Artifact Connector currently requires routed_experts_prompt_start=0"
+            )
         existing = self.requests.get(request.request_id)
         if existing is not None:
             update = StreamingUpdate.from_request(request)
@@ -2231,38 +2155,11 @@ class Scheduler(SchedulerInterface):
             include any that were already finished.
         """
         assert RequestStatus.is_finished(finished_status)
-        if isinstance(request_ids, str):
+        if request_ids is None:
+            request_ids = list(self.requests)
+        elif isinstance(request_ids, str):
             request_ids = (request_ids,)
-        elif request_ids is not None:
-            request_ids = set(request_ids)
-        else:
-            request_ids = self.requests.keys()
-
-        running_requests_to_remove = set()
-        waiting_requests_to_remove = []
-        valid_requests = []
-
-        # First pass: collect requests to remove from queues
-        for req_id in request_ids:
-            request = self.requests.get(req_id)
-            if request is None or request.is_finished():
-                # Invalid request ID.
-                continue
-
-            valid_requests.append(request)
-            if request.status == RequestStatus.RUNNING:
-                running_requests_to_remove.add(request)
-            else:
-                if request.status == RequestStatus.WAITING_FOR_STREAMING_REQ:
-                    self.num_waiting_for_streaming_input -= 1
-                waiting_requests_to_remove.append(request)
-
-        # Remove all requests from queues at once for better efficiency
-        if running_requests_to_remove:
-            self.running = remove_all(self.running, running_requests_to_remove)
-        if waiting_requests_to_remove:
-            self.waiting.remove_requests(waiting_requests_to_remove)
-            self.skipped_waiting.remove_requests(waiting_requests_to_remove)
+        valid_requests = self._take_requests(request_ids)
 
         # Second pass: set status and free requests
         for request in valid_requests:
@@ -2279,24 +2176,72 @@ class Scheduler(SchedulerInterface):
 
         return [(r.request_id, r.client_index) for r in valid_requests]
 
+    def _take_requests(self, request_ids: Iterable[str]) -> list[Request]:
+        """Remove active requests from scheduling queues without freeing them."""
+        requests = [
+            request
+            for request_id in request_ids
+            if (request := self.requests.get(request_id)) is not None
+            and not request.is_finished()
+        ]
+        running = {
+            request for request in requests if request.status == RequestStatus.RUNNING
+        }
+        waiting = [request for request in requests if request not in running]
+        self.num_waiting_for_streaming_input -= sum(
+            request.status == RequestStatus.WAITING_FOR_STREAMING_REQ
+            for request in waiting
+        )
+        if running:
+            self.running = remove_all(self.running, running)
+        if waiting:
+            self.waiting.remove_requests(waiting)
+            self.skipped_waiting.remove_requests(waiting)
+        return requests
+
+    def finalize_requests(self, requests: list[tuple[str, int, str]]) -> None:
+        """Finalize requests stopped by frontend string matching."""
+        if self.artifact_connector is None:
+            raise RuntimeError("artifact finalization requested while disabled")
+        finalize_args = {
+            request_id: (token_end, stop_reason)
+            for request_id, token_end, stop_reason in requests
+        }
+        for request in self._take_requests(finalize_args):
+            token_end, stop_reason = finalize_args[request.request_id]
+            if token_end <= 0 or token_end > request.num_tokens - 1:
+                raise RuntimeError(
+                    "invalid frontend artifact token boundary: "
+                    f"request={request.request_id}, token_end={token_end}, "
+                    f"available={request.num_tokens - 1}"
+                )
+            request.status = RequestStatus.FINISHED_STOPPED
+            request.stop_reason = stop_reason
+            kv_transfer_params, ec_transfer_params = self._start_artifact_finalize(
+                request, token_end=token_end
+            )
+            self._pending_artifact_outputs[request.request_id] = EngineCoreOutput(
+                request_id=request.request_id,
+                new_token_ids=[],
+                finish_reason=FinishReason.STOP,
+                stop_reason=stop_reason,
+                events=request.take_events(),
+                kv_transfer_params=kv_transfer_params,
+                ec_transfer_params=ec_transfer_params,
+                trace_headers=request.trace_headers,
+            )
+
     def _free_request(
         self, request: Request, delay_free_blocks: bool = False
     ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
         assert request.is_finished()
 
         self._inflight_prefills.discard(request)
-        if self.enable_return_routed_experts:
-            self._routed_experts_block_ids.pop(request.request_id, None)
-        connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
-
-        # EC Connector: mirror the KV hook. The contract requires firing
-        # before the encoder cache is freed so the connector can inspect
-        # per-request state (e.g. which mm_hashes it recorded during
-        # save_caches()) and emit ec_transfer_params for the response body.
-        ec_xfer_params: dict[str, Any] | None = None
-        if self.ec_connector is not None:
-            ec_delay_free, ec_xfer_params = self.ec_connector.request_finished(request)
-            connector_delay_free_blocks |= ec_delay_free
+        if self.artifact_connector is not None:
+            self.artifact_connector.request_aborted(request.request_id)
+        connector_delay_free_blocks, kv_xfer_params, ec_xfer_params = (
+            self._finish_connectors(request)
+        )
 
         self.encoder_cache_manager.free(request)
         request_id = request.request_id
@@ -2309,6 +2254,94 @@ class Scheduler(SchedulerInterface):
             self._free_blocks(request)
 
         return kv_xfer_params, ec_xfer_params
+
+    def _finish_connectors(
+        self, request: Request
+    ) -> tuple[bool, dict[str, Any] | None, dict[str, Any] | None]:
+        """Notify KV and encoder-cache connectors before request state is freed."""
+        delay_free, kv_xfer_params = self._connector_finished(request)
+        ec_xfer_params: dict[str, Any] | None = None
+        if self.ec_connector is not None:
+            ec_delay_free, ec_xfer_params = self.ec_connector.request_finished(request)
+            delay_free |= ec_delay_free
+        return delay_free, kv_xfer_params, ec_xfer_params
+
+    def _start_artifact_finalize(
+        self, request: Request, *, token_end: int | None = None
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        """Hold a terminal request until its worker-owned artifact is ready."""
+        assert request.is_finished()
+        assert self.artifact_connector is not None
+
+        if token_end is None:
+            token_end = request.num_tokens - 1
+
+        delay_free, kv_xfer_params, ec_xfer_params = self._finish_connectors(request)
+        if delay_free:
+            raise RuntimeError(
+                "Artifact Connector does not support delayed connector cleanup"
+            )
+
+        self.artifact_connector.request_finished(
+            request_id=request.request_id,
+            block_hashes=[bytes(block_hash) for block_hash in request.block_hashes],
+            token_end=token_end,
+            hash_block_size=self.hash_block_size,
+        )
+        self._inflight_prefills.discard(request)
+        self.encoder_cache_manager.free(request)
+        self.finished_req_ids.add(request.request_id)
+        return kv_xfer_params, ec_xfer_params
+
+    def _release_artifact_outputs(
+        self,
+        artifact_output: ArtifactConnectorOutput | None,
+        outputs: dict[int, list[EngineCoreOutput]],
+    ) -> None:
+        if self.artifact_connector is None:
+            if artifact_output is not None and not artifact_output.is_empty():
+                raise RuntimeError(
+                    "received artifact output while connector is disabled"
+                )
+            return
+        acknowledged = self.artifact_connector.acknowledge(artifact_output)
+
+        for finalize_result in acknowledged.results:
+            pending = self._pending_artifact_outputs.pop(
+                finalize_result.request_id, None
+            )
+            if pending is None:
+                raise RuntimeError(
+                    "missing pending terminal output for artifact request: "
+                    f"{finalize_result.request_id}"
+                )
+            request = self.requests.get(finalize_result.request_id)
+            if request is None:
+                raise RuntimeError(
+                    "artifact request disappeared before finalization: "
+                    f"{finalize_result.request_id}"
+                )
+            engine_core_output = pending
+            if finalize_result.error is not None:
+                logger.error(
+                    "Artifact finalization failed for request %s: %s",
+                    finalize_result.request_id,
+                    finalize_result.error,
+                )
+                engine_core_output.finish_reason = FinishReason.ERROR
+                engine_core_output.stop_reason = finalize_result.error
+            elif finalize_result.value is not None:
+                engine_core_output.routed_experts = finalize_result.value
+            else:
+                raise RuntimeError(
+                    "successful artifact acknowledgement is missing its result: "
+                    f"{finalize_result.request_id}"
+                )
+
+            outputs[request.client_index].append(engine_core_output)
+            if self.finished_req_ids_dict is not None:
+                self.finished_req_ids_dict[request.client_index].add(request.request_id)
+            self._free_blocks(request)
 
     def _free_blocks(self, request: Request):
         assert request.is_finished()
@@ -2377,6 +2410,10 @@ class Scheduler(SchedulerInterface):
 
     def has_finished_requests(self) -> bool:
         if self.finished_req_ids:
+            return True
+        if self.artifact_connector is not None and (
+            self.artifact_connector.has_pending_work()
+        ):
             return True
         if self.connector is None:
             return False
@@ -2546,9 +2583,6 @@ class Scheduler(SchedulerInterface):
 
         if self.ec_connector is not None:
             self.ec_connector.shutdown()
-
-        if getattr(self, "routed_experts_manager", None) is not None:
-            self.routed_experts_manager.shutdown()
 
         logger.debug_once("[shutdown] Scheduler: complete")
 

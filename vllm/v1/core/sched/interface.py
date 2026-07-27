@@ -165,6 +165,11 @@ class SchedulerInterface(ABC):
         raise NotImplementedError
 
     @abstractmethod
+    def finalize_requests(self, requests: list[tuple[str, int, str]]) -> None:
+        """Finalize requests stopped by frontend string matching."""
+        raise NotImplementedError
+
+    @abstractmethod
     def get_num_unfinished_requests(self) -> int:
         """Number of unfinished requests in the scheduler's internal queue."""
         raise NotImplementedError

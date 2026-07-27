@@ -3,6 +3,7 @@
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import numpy as np
 import pytest
 import torch
 
@@ -14,6 +15,7 @@ from vllm.model_executor.layers.fused_moe.routed_experts_capture import (
     RoutedExpertsCapturer,
     RoutedExpertsCaptureState,
     RoutedExpertsTensors,
+    RoutedExpertsWorkerWriter,
     RoutedExpertsWriteTask,
     bind_routed_experts_capturer,
     require_full_attn_group_id,
@@ -23,6 +25,7 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
+    SlidingWindowSpec,
 )
 
 pytestmark = pytest.mark.cpu_test
@@ -32,7 +35,25 @@ _CAPTURER_MODULE = (
 )
 
 
-def test_multiple_full_attention_groups_use_hashable_warning_args():
+def test_worker_writer_rejects_unshared_engine_core_mmap(tmp_path, monkeypatch):
+    from vllm.model_executor.layers.fused_moe.routed_experts_capture import (
+        shared_region,
+    )
+
+    writer = RoutedExpertsWorkerWriter(
+        instance_id="missing",
+        dp_rank=0,
+        slot_shape=(1, 1, 1),
+        dtype="uint8",
+    )
+    writer._path = str(tmp_path / "missing.mmap")
+    monkeypatch.setattr(shared_region, "_WAIT_TIMEOUT_S", -1.0)
+
+    with pytest.raises(TimeoutError, match="rank 0.*same host"):
+        writer.validate()
+
+
+def test_multiple_full_attention_groups_are_rejected():
     kv_cache_spec = FullAttentionSpec(
         block_size=16,
         num_kv_heads=1,
@@ -48,6 +69,33 @@ def test_multiple_full_attention_groups_use_hashable_warning_args():
         ],
     )
 
+    with pytest.raises(ValueError, match="exactly one full-attention"):
+        require_full_attn_group_id(kv_cache_config)
+
+
+def test_hybrid_groups_with_one_full_attention_anchor_are_supported():
+    full_attention_spec = FullAttentionSpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.float32,
+    )
+    sliding_window_spec = SlidingWindowSpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.float32,
+        sliding_window=128,
+    )
+    kv_cache_config = KVCacheConfig(
+        num_blocks=1,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(["layer.0"], full_attention_spec),
+            KVCacheGroupSpec(["layer.1"], sliding_window_spec),
+        ],
+    )
+
     assert require_full_attn_group_id(kv_cache_config) == 0
 
 
@@ -55,19 +103,57 @@ def test_routed_experts_write_task_publishes_copied_tensors():
     routing_data = torch.tensor([[[1, 2]], [[3, 4]]], dtype=torch.int32)
     slot_mapping = torch.tensor([5, 9], dtype=torch.int64)
     writer = Mock()
-    output = SimpleNamespace(routed_experts_slots=None)
     write_task = RoutedExpertsWriteTask(
         routed_experts_tensors=RoutedExpertsTensors(routing_data, slot_mapping),
         writer=writer,
     )
 
     write_task.start_copy()
-    write_task.finalize(output)
+    write_task.finalize()
 
     stored_routing, stored_slots = writer.store_batch.call_args.args
     assert stored_routing.tolist() == routing_data.tolist()
     assert stored_slots.tolist() == slot_mapping.tolist()
-    assert output.routed_experts_slots.tolist() == slot_mapping.tolist()
+
+
+def test_write_task_splits_requests_and_drops_rejected_rows():
+    routing_data = torch.arange(12, dtype=torch.int32).reshape(6, 1, 2)
+    slot_mapping = torch.arange(6)
+    sink = Mock()
+    write_task = RoutedExpertsWriteTask(
+        routed_experts_tensors=RoutedExpertsTensors(routing_data, slot_mapping),
+        writer=None,
+        request_ids=("a", "b"),
+        query_start_locs=np.array([0, 2, 6]),
+        token_starts=np.array([4, 8]),
+        artifact_sink=sink,
+    )
+
+    write_task.start_copy()
+    write_task.finalize(np.array([0, 2]))
+
+    assert [call.args[:2] for call in sink.call_args_list] == [("a", 4), ("b", 8)]
+    np.testing.assert_array_equal(sink.call_args_list[0].args[2], routing_data[:2])
+    np.testing.assert_array_equal(sink.call_args_list[1].args[2], routing_data[2:4])
+
+
+@pytest.mark.parametrize(
+    ("writer", "sink"),
+    [
+        (None, None),
+        (Mock(), Mock()),
+    ],
+)
+def test_write_task_requires_exactly_one_destination(writer, sink):
+    with pytest.raises(ValueError, match="exactly one destination"):
+        RoutedExpertsWriteTask(
+            routed_experts_tensors=RoutedExpertsTensors(
+                torch.zeros((1, 1, 1)),
+                torch.zeros(1, dtype=torch.int64),
+            ),
+            writer=writer,
+            artifact_sink=sink,
+        )
 
 
 def _capturer_with_buffer(
@@ -220,6 +306,37 @@ def test_capture_state_write_task_owns_immutable_snapshot():
     assert torch.equal(tensors.slot_mapping, torch.tensor([21, 22, 23]))
 
 
+def test_capture_state_artifact_task_skips_shared_slot_writer():
+    capturer = _capturer_with_buffer(max_tokens=4, num_layers=2)
+    capturer.device_buffer.copy_(torch.arange(16).reshape(4, 2, 2))
+    state = RoutedExpertsCaptureState(
+        capturer,
+        None,
+        full_attn_group_id=0,
+        is_output_rank=True,
+    )
+    sink = Mock()
+
+    write_task = state.make_write_task(
+        None,
+        3,
+        request_ids=("request",),
+        query_start_locs=np.array([0, 3]),
+        token_starts=np.array([7]),
+        artifact_sink=sink,
+    )
+
+    assert write_task is not None
+    assert write_task.writer is None
+    assert write_task.routed_experts_tensors.slot_mapping is None
+    write_task.start_copy()
+    write_task.finalize()
+    np.testing.assert_array_equal(
+        sink.call_args.args[2],
+        np.arange(12, dtype=np.int32).reshape(3, 2, 2),
+    )
+
+
 def test_capture_state_close_releases_resources():
     capturer = Mock()
     writer = Mock()
@@ -232,9 +349,21 @@ def test_capture_state_close_releases_resources():
     assert state.writer is None
 
 
-@pytest.mark.parametrize(("rank", "creates_writer"), [(0, True), (1, False)])
+@pytest.mark.parametrize(
+    ("rank", "create_shared_writer", "can_write", "creates_writer"),
+    [
+        (0, True, True, True),
+        (0, False, True, False),
+        (1, True, False, False),
+        (1, False, False, False),
+    ],
+)
 def test_capture_state_create_uses_explicit_dependencies(
-    monkeypatch, rank, creates_writer
+    monkeypatch,
+    rank,
+    create_shared_writer,
+    can_write,
+    creates_writer,
 ):
     from vllm.model_executor.layers.fused_moe.routed_experts_capture import (
         state as state_module,
@@ -268,11 +397,12 @@ def test_capture_state_create_uses_explicit_dependencies(
         vllm_config=vllm_config,
         kv_cache_config=kv_cache_config,
         max_num_batched_tokens=32,
+        create_shared_writer=create_shared_writer,
     )
 
     assert state.capturer is capturer
     assert state.full_attn_group_id == 2
-    assert state.can_write is creates_writer
+    assert state.can_write is can_write
     bind.assert_called_once_with(model, capturer)
     assert writer_factory.called is creates_writer
 
@@ -362,12 +492,25 @@ def test_routed_experts_reject_unsupported_parallelism(parallel_field, error):
         pipeline_parallel_size=1,
         decode_context_parallel_size=1,
         prefill_context_parallel_size=1,
+        enable_dbo=False,
+        ubatch_size=1,
+        enable_elastic_ep=False,
     )
     setattr(parallel_config, parallel_field, 2)
     config = SimpleNamespace(
-        model_config=SimpleNamespace(enable_return_routed_experts=True),
+        model_config=SimpleNamespace(
+            enable_return_routed_experts=True,
+            is_moe=True,
+            runner_type="generate",
+            is_encoder_decoder=False,
+            is_multimodal_model=False,
+            is_diffusion=False,
+        ),
         parallel_config=parallel_config,
-        kv_transfer_config=None,
+        device_config=SimpleNamespace(device_type="cuda"),
+        cache_config=SimpleNamespace(kv_sharing_fast_prefill=False),
+        ec_transfer_config=None,
+        artifact_config=SimpleNamespace(shm_dir="/dev/shm"),
     )
 
     with pytest.raises(ValueError, match=error):

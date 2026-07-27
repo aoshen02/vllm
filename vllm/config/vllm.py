@@ -27,6 +27,7 @@ from vllm.triton_utils import HAS_TRITON
 from vllm.utils import random_uuid
 from vllm.utils.hashing import safe_hash
 
+from .artifact import ArtifactConfig
 from .attention import AttentionConfig
 from .cache import CacheConfig
 from .compilation import CompilationConfig, CompilationMode, CUDAGraphMode
@@ -329,6 +330,8 @@ class VllmConfig:
     """Model weight offloading configuration."""
     attention_config: AttentionConfig = Field(default_factory=AttentionConfig)
     """Attention configuration."""
+    artifact_config: ArtifactConfig = Field(default_factory=ArtifactConfig)
+    """Execution artifact configuration."""
     mamba_config: MambaConfig = Field(default_factory=MambaConfig)
     """Mamba configuration."""
     kernel_config: KernelConfig = Field(default_factory=KernelConfig)
@@ -890,25 +893,12 @@ class VllmConfig:
         # This is the same for all backends
         self.kv_transfer_config.kv_role = "kv_both"
 
-    def _verify_return_routed_experts_compatibility(self) -> None:
-        """Reject unsupported routed-experts configurations."""
+    def _verify_return_routed_experts_kv_compatibility(self) -> None:
+        """Reject unsupported KV transfer connectors for routed-experts returns."""
         if self.model_config is None or not (
             self.model_config.enable_return_routed_experts
         ):
             return
-        if self.parallel_config.pipeline_parallel_size > 1:
-            raise ValueError(
-                "--enable-return-routed-experts is incompatible with "
-                "pipeline parallelism (PP > 1)."
-            )
-        if (
-            self.parallel_config.decode_context_parallel_size > 1
-            or self.parallel_config.prefill_context_parallel_size > 1
-        ):
-            raise ValueError(
-                "--enable-return-routed-experts is incompatible with "
-                "context parallelism (DCP/PCP > 1)."
-            )
         kv_transfer_config = self.kv_transfer_config
         if kv_transfer_config is None or not kv_transfer_config.is_kv_transfer_instance:
             return
@@ -926,6 +916,66 @@ class VllmConfig:
                 "offload connector (OffloadingConnector + CPUOffloadingSpec) "
                 "with kv_role=kv_both; PD disaggregation and other KV "
                 "connectors are not supported."
+            )
+
+    def _verify_return_routed_experts_compatibility(self) -> None:
+        """Reject execution modes not handled by routed-experts artifacts."""
+        model_config = self.model_config
+        if model_config is None or not model_config.enable_return_routed_experts:
+            return
+
+        parallel_config = self.parallel_config
+        unsupported: list[str] = []
+        if self.device_config.device_type != "cuda":
+            unsupported.append(f"device_type={self.device_config.device_type!r}")
+        if not model_config.is_moe:
+            unsupported.append("non-MoE models")
+        if model_config.runner_type != "generate":
+            unsupported.append(f"runner_type={model_config.runner_type!r}")
+        if model_config.is_encoder_decoder:
+            unsupported.append("encoder-decoder models")
+        if model_config.is_multimodal_model:
+            unsupported.append("multimodal models")
+        if model_config.is_diffusion:
+            unsupported.append("discrete diffusion models")
+        if parallel_config.pipeline_parallel_size > 1:
+            unsupported.append(
+                f"pipeline parallelism (PP={parallel_config.pipeline_parallel_size})"
+            )
+        if parallel_config.decode_context_parallel_size > 1:
+            unsupported.append(
+                "decode context parallelism "
+                f"(DCP={parallel_config.decode_context_parallel_size})"
+            )
+        if parallel_config.prefill_context_parallel_size > 1:
+            unsupported.append(
+                "prefill context parallelism "
+                f"(PCP={parallel_config.prefill_context_parallel_size})"
+            )
+        if parallel_config.enable_dbo:
+            unsupported.append("dual batch overlap")
+        elif parallel_config.ubatch_size > 1:
+            unsupported.append(
+                f"executor microbatching (ubatch_size={parallel_config.ubatch_size})"
+            )
+        if parallel_config.enable_elastic_ep:
+            unsupported.append("elastic expert parallelism")
+        if self.cache_config.kv_sharing_fast_prefill:
+            unsupported.append("KV sharing fast prefill")
+        if self.ec_transfer_config is not None:
+            unsupported.append("EC transfer")
+
+        shm_root = os.path.realpath(self.artifact_config.shm_dir)
+        if os.path.commonpath((shm_root, "/dev/shm")) != "/dev/shm":
+            unsupported.append(
+                f"artifact shm_dir outside /dev/shm ({self.artifact_config.shm_dir!r})"
+            )
+
+        if unsupported:
+            raise ValueError(
+                "--enable-return-routed-experts does not support "
+                + ", ".join(unsupported)
+                + "."
             )
 
     def _verify_kv_transfer_compat(self) -> None:
@@ -987,6 +1037,8 @@ class VllmConfig:
             self.model_config.verify_dual_chunk_attention_config(self.load_config)
 
             self.parallel_config.is_moe_model = self.model_config.is_moe
+
+        self._verify_return_routed_experts_compatibility()
 
         if self.lora_config is not None:
             self.lora_config.verify_with_model_config(self.model_config)
@@ -1577,7 +1629,7 @@ class VllmConfig:
         # before the HMA check below, which inspects the connector class.
         self._post_init_kv_transfer_config()
 
-        self._verify_return_routed_experts_compatibility()
+        self._verify_return_routed_experts_kv_compatibility()
 
         # Hybrid KV cache manager (HMA) runtime rules:
         # - Explicit enable (--no-disable-kv-cache-manager): error if runtime
@@ -2127,6 +2179,7 @@ class VllmConfig:
             f"quantization_config={self.model_config.quantization_config}, "  # noqa
             f"enforce_eager={self.model_config.enforce_eager}, "
             f"enable_return_routed_experts={self.model_config.enable_return_routed_experts}, "  # noqa
+            f"artifact_config={self.artifact_config!r}, "
             f"kv_cache_dtype={self.cache_config.cache_dtype}, "
             f"device_config={self.device_config.device}, "
             f"structured_outputs_config={self.structured_outputs_config!r}, "

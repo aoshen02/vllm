@@ -336,7 +336,3 @@ class RoutedExpertsManager:
             + token_positions % block_size
         )
         return self.routed_experts_by_slot[slot_mapping]
-
-    def get_by_slots(self, slots: np.ndarray) -> np.ndarray:
-        """Read routing for explicit slot indices (decode path)."""
-        return self.routed_experts_by_slot[slots]

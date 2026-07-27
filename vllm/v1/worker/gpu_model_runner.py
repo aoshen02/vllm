@@ -331,7 +331,7 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
         output.logprobs = logprobs_lists
 
         if self._routed_experts_write_task is not None:
-            self._routed_experts_write_task.finalize(output)
+            self._routed_experts_write_task.finalize()
         del self._routed_experts_write_task
 
         if self._has_fault is not None and self._has_fault.item():
@@ -4726,7 +4726,6 @@ class GPUModelRunner(
                     :total_num_scheduled_tokens
                 ].numpy()
                 routed_experts_capture.store_batch(routing_data, slot_mapping)
-                output.routed_experts_slots = slot_mapping
             return output
 
         with record_function_or_nullcontext(

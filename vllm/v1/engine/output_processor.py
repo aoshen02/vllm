@@ -110,6 +110,7 @@ class RequestOutputCollector:
 class OutputProcessorOutput:
     request_outputs: list[RequestOutput | PoolingRequestOutput]
     reqs_to_abort: list[str]
+    reqs_to_finalize: list[tuple[str, int, str]]
 
 
 @dataclass
@@ -178,6 +179,7 @@ class RequestState:
 
         # Routed experts accumulation (prompt + sample chunks)
         self.routed_experts_chunks: list[np.ndarray] = []
+        self.artifact_finalize_requested = False
 
         # Stream Interval
         self.stream_interval = stream_interval
@@ -433,6 +435,7 @@ class OutputProcessor:
         log_stats: bool,
         stream_interval: int = 1,
         tracing_enabled: bool = False,
+        finalize_artifacts: bool = False,
     ):
         self.log_stats = log_stats
         self.tokenizer = tokenizer
@@ -442,6 +445,7 @@ class OutputProcessor:
         self.external_req_ids: defaultdict[str, list[str]] = defaultdict(list)
         self.lora_states = LoRARequestStates(log_stats)
         self.tracing_enabled = tracing_enabled
+        self.finalize_artifacts = finalize_artifacts
 
     def get_num_unfinished_requests(self):
         return len(self.request_states)
@@ -613,11 +617,20 @@ class OutputProcessor:
 
         request_outputs: list[RequestOutput | PoolingRequestOutput] = []
         reqs_to_abort: list[str] = []
+        reqs_to_finalize: list[tuple[str, int, str]] = []
         for engine_core_output in engine_core_outputs:
             req_id = engine_core_output.request_id
             req_state = self.request_states.get(req_id)
             if req_state is None:
                 # Ignore output for already-aborted request.
+                continue
+            if (
+                req_state.artifact_finalize_requested
+                and engine_core_output.finish_reason is None
+            ):
+                # A later async frame may already have been executing when the
+                # frontend found the stop string. Its rows are outside the
+                # committed artifact boundary sent below.
                 continue
 
             # 1) Compute stats for this iteration.
@@ -656,6 +669,21 @@ class OutputProcessor:
                 if stop_string:
                     finish_reason = FinishReason.STOP
                     stop_reason = stop_string
+                    if self.finalize_artifacts and not engine_core_output.finished:
+                        req_state.artifact_finalize_requested = True
+                        reqs_to_finalize.append(
+                            (
+                                req_id,
+                                req_state.prompt_len
+                                + req_state.detokenizer.num_output_tokens()
+                                - 1,
+                                stop_string,
+                            )
+                        )
+                        # Emit this chunk as non-terminal. The artifact ACK
+                        # supplies the terminal output and artifact identity.
+                        finish_reason = None
+                        stop_reason = None
 
                 # 3) Compute sample and prompt logprobs for request,
                 # if required.
@@ -705,6 +733,7 @@ class OutputProcessor:
         return OutputProcessorOutput(
             request_outputs=request_outputs,
             reqs_to_abort=reqs_to_abort,
+            reqs_to_finalize=reqs_to_finalize,
         )
 
     def _finish_request(self, req_state: RequestState) -> None:

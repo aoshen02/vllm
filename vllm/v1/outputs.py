@@ -13,12 +13,14 @@ from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.v1.core.sched.output import SchedulerOutput
 
 if TYPE_CHECKING:
+    from vllm.distributed.artifact_connector import ArtifactConnectorOutput
     from vllm.distributed.kv_events import KVConnectorKVEvents
     from vllm.distributed.kv_transfer.kv_connector.v1.base import (
         KVConnectorWorkerMetadata,
     )
     from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
 else:
+    ArtifactConnectorOutput = object
     KVConnectorStats = object
     KVConnectorWorkerMetadata = object
     KVConnectorKVEvents = object
@@ -196,20 +198,13 @@ class ModelRunnerOutput:
 
     ec_connector_output: ECConnectorOutput | None = None
 
+    artifact_connector_output: ArtifactConnectorOutput | None = None
+
     # req_id -> num_nans_in_logits
     num_nans_in_logits: dict[str, int] | None = None
 
     # information related to cudagraph execution
     cudagraph_stats: CUDAGraphStat | None = None
-
-    # Per-step routing slot indices captured by the worker (output_rank).
-    # ``(num_scheduled_tokens,)`` int: the physical KV-cache slot each scheduled
-    # token's routing was scattered into the scheduler-shared slot buffer. The
-    # scheduler reads the routing back from that buffer by these slots for
-    # decode tokens. Only the slots are returned (not the routing payload),
-    # and they ride this step's output so they stay paired with the step under
-    # async scheduling. ``None`` when ``enable_return_routed_experts`` is off.
-    routed_experts_slots: np.ndarray | None = None
 
     @staticmethod
     def with_kv_conn_output_only(

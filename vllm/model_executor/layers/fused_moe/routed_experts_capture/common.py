@@ -4,7 +4,6 @@
 
 from typing import TYPE_CHECKING, Any
 
-from vllm.logger import init_logger
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheSpecKind,
@@ -13,8 +12,6 @@ from vllm.v1.kv_cache_interface import (
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
-
-logger = init_logger(__name__)
 
 _FULL_ATTENTION_KINDS = frozenset(
     {
@@ -29,8 +26,9 @@ def require_full_attn_group_id(kv_cache_config: KVCacheConfig) -> int:
     """Return the full-attention KV group used as the routing anchor.
 
     Raises:
-        ValueError: The model has no full-attention KV group (pure
-            sliding-window / Mamba models are unsupported).
+        ValueError: The model does not have exactly one full-attention KV
+            group. Pure sliding-window / Mamba models and multiple routing
+            anchors are unsupported.
     """
     full_attn_group_ids = [
         group_id
@@ -42,14 +40,13 @@ def require_full_attn_group_id(kv_cache_config: KVCacheConfig) -> int:
             "enable_return_routed_experts requires at least one full-attention "
             "KV cache group; pure sliding-window / Mamba models are unsupported."
         )
-    if len(full_attn_group_ids) > 1:
-        logger.warning_once(
-            "enable_return_routed_experts: %d full-attention KV cache groups "
-            "%s; anchoring routing on group %d only. Routing for tokens whose "
-            "KV lives in the other group(s) is not offloaded.",
-            len(full_attn_group_ids),
-            tuple(full_attn_group_ids),
-            full_attn_group_ids[0],
+    if len(full_attn_group_ids) != 1:
+        raise ValueError(
+            "enable_return_routed_experts requires exactly one "
+            "full-attention KV cache group; got full-attention groups "
+            f"{full_attn_group_ids}. Other hybrid KV cache groups are "
+            "supported, but routing cannot be anchored to multiple "
+            "full-attention groups."
         )
     return full_attn_group_ids[0]
 
@@ -94,13 +91,22 @@ def get_routing_slot_shape_and_dtype(
     block_size = kv_cache_config.kv_cache_groups[
         full_attn_group_id
     ].kv_cache_spec.block_size
-    hf_config = vllm_config.model_config.hf_text_config
-    num_layers = hf_config.num_hidden_layers
-    moe_top_k = get_num_experts_per_token(hf_config)
-    num_experts = get_num_experts(hf_config)
+    shape_per_token, dtype = get_routing_shape_and_dtype(vllm_config)
     max_num_slots = kv_cache_config.num_blocks * block_size
-    dtype = "uint8" if num_experts <= 256 else "uint16"
-    return (max_num_slots, num_layers, moe_top_k), dtype
+    return (max_num_slots, *shape_per_token), dtype
+
+
+def get_routing_shape_and_dtype(
+    vllm_config: "VllmConfig",
+) -> tuple[tuple[int, int], str]:
+    """Return the routed-experts shape per token and storage dtype."""
+    hf_config = vllm_config.model_config.hf_text_config
+    shape_per_token = (
+        hf_config.num_hidden_layers,
+        get_num_experts_per_token(hf_config),
+    )
+    dtype = "uint8" if get_num_experts(hf_config) <= 256 else "uint16"
+    return shape_per_token, dtype
 
 
 def get_routed_experts_output_rank() -> int:

@@ -211,7 +211,11 @@ class EngineCore:
         self.is_pooling_model = vllm_config.model_config.runner_type == "pooling"
 
         self.request_block_hasher: Callable[[Request], list[BlockHash]] | None = None
-        if vllm_config.cache_config.enable_prefix_caching or kv_connector is not None:
+        if (
+            vllm_config.cache_config.enable_prefix_caching
+            or kv_connector is not None
+            or vllm_config.model_config.enable_return_routed_experts
+        ):
             caching_hash_fn = get_hash_fn_by_name(
                 vllm_config.cache_config.prefix_caching_hash_algo
             )
@@ -481,6 +485,10 @@ class EngineCore:
         # specific finish reason, TBD whether we propagate that
         # (i.e. client-aborted vs stop criteria met).
         self.scheduler.finish_requests(request_ids, RequestStatus.FINISHED_ABORTED)
+
+    def finalize_requests(self, requests: list[tuple[str, int, str]]) -> None:
+        """Finalize artifacts for requests stopped by the frontend."""
+        self.scheduler.finalize_requests(requests)
 
     @contextmanager
     def log_error_detail(self, scheduler_output: SchedulerOutput):
@@ -949,6 +957,20 @@ class EngineCore:
         args: tuple = (),
         kwargs: dict[str, Any] | None = None,
     ) -> list[_R]:
+        method_name = method if isinstance(method, str) else None
+        if (
+            self.vllm_config.model_config.enable_return_routed_experts
+            and method_name
+            in (
+                "start_weight_update",
+                "start_draft_weight_update",
+                "finish_weight_update",
+                "reload_weights",
+            )
+        ):
+            raise RuntimeError(
+                "Artifact Connector does not support in-place weight updates"
+            )
         return self.model_executor.collective_rpc(method, timeout, args, kwargs)
 
     def preprocess_add_request(self, request: EngineCoreRequest) -> tuple[Request, int]:
