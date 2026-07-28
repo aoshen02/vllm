@@ -128,9 +128,12 @@ def _make_recorder(
 
         bound_args = signature.bind(*args, **kwargs)
         bound_args.apply_defaults()
+        result = inner(*args, **kwargs)
+        if result is False:
+            return result
         if (key := make_load_key(tensor_name, bound_args)) is not None:
             _RECORDING.setdefault(layer, Counter())[key] += 1
-        return inner(*args, **kwargs)
+        return result
 
     load_recorder._is_load_recorder = True  # type: ignore[attr-defined]
     # `None` where the tensor had no loader, so unwrapping restores the absence

@@ -835,7 +835,8 @@ def test_non_local_expert_applications_are_absorbed():
     model = torch.nn.Sequential(layer)
 
     record_metadata_for_reloading(model)
-    _load_experts(layer, [0, 1], 1.0)  # rank-filtered, as from disk
+    # A broadcast startup loader sees every expert, but only local ones accept.
+    _load_experts(layer, [0, 1, 2, 3], 1.0, return_success=True)
     freeze_load_plan(model)
 
     initialize_layerwise_reload(model)
