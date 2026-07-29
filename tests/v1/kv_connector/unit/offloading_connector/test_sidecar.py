@@ -54,7 +54,16 @@ def test_normalize_sidecar_transfers_preserves_direction():
                 req_id="load",
                 src_spec=load_connector_spec,
                 dst_spec=load_gpu_spec,
-            )
+            ),
+            3: TransferJob(
+                req_id="load-2",
+                src_spec=CPULoadStoreSpec([102, 201]),
+                dst_spec=GPULoadStoreSpec(
+                    block_ids=[13, 21],
+                    group_sizes=[1, 1],
+                    block_indices=[4, 2],
+                ),
+            ),
         },
         store_jobs={
             2: TransferJob(
@@ -72,31 +81,31 @@ def test_normalize_sidecar_transfers_preserves_direction():
         expected_num_groups=2,
     )
 
-    assert len(transfers.loads) == 1
+    assert transfers.load is not None
     np.testing.assert_array_equal(
-        transfers.loads[0].gpu_block_ids,
-        [10, 11, 12],
+        transfers.load.gpu_block_ids,
+        [10, 11, 12, 13],
     )
     np.testing.assert_array_equal(
-        transfers.loads[0].connector_block_ids,
-        [100, 101, 101],
+        transfers.load.connector_block_ids,
+        [100, 101, 101, 102],
     )
     np.testing.assert_array_equal(
-        transfers.loads[0].connector_block_offsets,
-        [1, 0, 1],
+        transfers.load.connector_block_offsets,
+        [1, 0, 1, 0],
     )
 
-    assert len(transfers.stores) == 1
+    assert transfers.store is not None
     np.testing.assert_array_equal(
-        transfers.stores[0].gpu_block_ids,
+        transfers.store.gpu_block_ids,
         [30, 31, 32],
     )
     np.testing.assert_array_equal(
-        transfers.stores[0].connector_block_ids,
+        transfers.store.connector_block_ids,
         [300, 300, 301],
     )
     np.testing.assert_array_equal(
-        transfers.stores[0].connector_block_offsets,
+        transfers.store.connector_block_offsets,
         [0, 1, 0],
     )
 
