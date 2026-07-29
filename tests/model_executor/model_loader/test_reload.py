@@ -851,6 +851,31 @@ def test_non_local_expert_applications_are_absorbed():
     assert torch.equal(layer.w, torch.full((2, 2), 5.0))
 
 
+def test_load_plan_excludes_rejected_startup_experts():
+    """The startup contract contains only the experts this EP rank accepts."""
+    layer = _ShardedExpertLayer(local_experts=[0, 1])
+    model = torch.nn.Sequential(layer)
+
+    record_metadata_for_reloading(model)
+    _load_experts(layer, [0, 1, 2, 3], 1.0, return_success=True)
+    freeze_load_plan(model)
+
+    plan = get_load_plan(layer)
+    assert plan is not None
+    assert len(plan) == 2
+    assert sum(plan.values()) == 2
+
+    initialize_layerwise_reload(model)
+    assert _load_experts(layer, [0, 1, 2, 3], 5.0, return_success=True) == [
+        True,
+        True,
+        False,
+        False,
+    ]
+    assert not layer.w.is_meta
+    assert torch.equal(layer.w, torch.full((2, 2), 5.0))
+
+
 class _QuietExpertLayer(torch.nn.Module):
     """An expert loader predating `return_success`, which can only ignore a
     non-local expert rather than report it."""
