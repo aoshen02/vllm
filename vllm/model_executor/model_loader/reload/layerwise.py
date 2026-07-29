@@ -18,6 +18,7 @@ from .meta import capture_layer_to_meta, materialize_layer, restore_layer_on_met
 from .plan import (
     freeze_load_plan,
     get_load_plan,
+    get_reloadable_modules,
     install_load_recorder,
     install_load_source_dispatch,
     make_load_key,
@@ -38,6 +39,7 @@ __all__ = [
     "record_metadata_for_reloading",
     "freeze_load_plan",
     "initialize_layerwise_reload",
+    "abort_layerwise_reload",
     "validate_layerwise_reload",
     "finalize_layerwise_processing",
     "finalize_layerwise_reload",
@@ -55,6 +57,12 @@ LAYERWISE_INFO: WeakKeyDictionary[torch.nn.Module, LayerReloadingInfo] = (
 
 # Global set used to track loading for logging purposes only
 LOADING_LAYERS: WeakSet[torch.nn.Module] = WeakSet()
+
+# A non-owner reload must never write through a module shared from another
+# model root. Values retain the original loader only for one transaction.
+EXTERNAL_LOADERS: WeakKeyDictionary[
+    torch.nn.Module, list[tuple[torch.Tensor, bool, Callable, Callable]]
+] = WeakKeyDictionary()
 
 
 def get_layerwise_info(layer: torch.nn.Module) -> LayerReloadingInfo:
@@ -107,31 +115,45 @@ def initialize_layerwise_reload(model: torch.nn.Module):
     3. Run quantization processing if applicable
     4. Copy processed values back to original tensor storage
     """
+    reloadable, external = get_reloadable_modules(model)
+    _seal_external_loaders(model, reloadable, external)
+
     # disable torchao reloading to avoid infinite recursion
-    model._original_do_torchao_reload = getattr(model, "_do_torchao_reload", False)
+    original_torchao_reload = getattr(model, "_do_torchao_reload", False)
+    model._original_do_torchao_reload = original_torchao_reload
     model._do_torchao_reload = False
 
-    for layer in model.modules():
-        info = get_layerwise_info(layer)
+    try:
+        for layer in reloadable:
+            info = get_layerwise_info(layer)
 
-        # Armed by online quantization before any plan existed, so its storage
-        # is ready but the contract still has to be picked up.
-        if info.can_load():
-            info.expected_loads = get_load_plan(layer) or info.expected_loads
-            info.observed_loads.clear()
-            info.applied = False
-            continue
+            # Armed by online quantization before any plan existed, so its storage
+            # is ready but the contract still has to be picked up.
+            if info.can_load():
+                info.expected_loads = get_load_plan(layer) or info.expected_loads
+                info.observed_loads.clear()
+                info.applied = False
+                continue
 
-        # Save current tensors for later copying
-        info.kernel_tensors = get_layer_params_buffers(layer)
-        # snapshot now: restore_layer_on_meta drops alias buffers from the live set
-        info.kernel_non_persistent_buffers = set(layer._non_persistent_buffers_set)
+            # Save current tensors for later copying
+            info.kernel_tensors = get_layer_params_buffers(layer)
+            # snapshot now: restore_layer_on_meta drops alias buffers from the live set
+            info.kernel_non_persistent_buffers = set(layer._non_persistent_buffers_set)
 
-        # Restore layer parameters/buffers onto meta device
-        restore_layer_on_meta(layer, info)
+            # Restore layer parameters/buffers onto meta device
+            restore_layer_on_meta(layer, info)
 
-        # Wrap weight loaders to buffer loading
-        initialize_online_processing(layer)
+            # Wrap weight loaders to buffer loading
+            initialize_online_processing(layer)
+    except Exception:
+        _restore_external_loaders(model)
+        model._do_torchao_reload = original_torchao_reload
+        raise
+
+
+def abort_layerwise_reload(model: torch.nn.Module) -> None:
+    """Release temporary guards after a failed reload transaction."""
+    _restore_external_loaders(model)
 
 
 def initialize_online_processing(layer: torch.nn.Module):
@@ -253,7 +275,8 @@ def validate_layerwise_reload(model: torch.nn.Module) -> None:
     """Fail closed on a missing application, but not an extra one, because an
     EP rank loads a filtered set from disk yet is offered every expert."""
     missing: list[str] = []
-    for layer in model.modules():
+    reloadable, _ = get_reloadable_modules(model)
+    for layer in reloadable:
         info = get_layerwise_info(layer)
         if not info.can_load():
             continue
@@ -283,6 +306,21 @@ def finalize_layerwise_processing(
     *,
     fail_on_incomplete: bool = True,
 ):
+    """Finalize a layerwise reload and always restore external loader guards."""
+    try:
+        _finalize_layerwise_processing(
+            model, model_config, fail_on_incomplete=fail_on_incomplete
+        )
+    finally:
+        _restore_external_loaders(model)
+
+
+def _finalize_layerwise_processing(
+    model: torch.nn.Module,
+    model_config: ModelConfig,
+    *,
+    fail_on_incomplete: bool = True,
+):
     """
     Apply processing to any layers which were not layerwise processed during loading.
     This includes attention layers and layers which have weight elements which are not
@@ -303,7 +341,8 @@ def finalize_layerwise_processing(
 
     deferred_attn: list[tuple[torch.nn.Module, LayerReloadingInfo]] = []
 
-    for layer in model.modules():
+    reloadable, _ = get_reloadable_modules(model)
+    for layer in reloadable:
         info = get_layerwise_info(layer)
         if not info.can_load():
             info.reset()
@@ -351,6 +390,67 @@ def finalize_layerwise_processing(
 
 def finalize_layerwise_reload(*args, **kwargs):
     finalize_layerwise_processing(*args, **kwargs)
+
+
+def _seal_external_loaders(
+    model: torch.nn.Module,
+    reloadable: list[torch.nn.Module],
+    external: list[torch.nn.Module],
+) -> None:
+    _restore_external_loaders(model)
+    owned_tensors = {
+        id(tensor)
+        for layer in reloadable
+        for tensor in get_loadable_layer_tensors(layer).values()
+    }
+    external_tensors: list[torch.Tensor] = []
+    seen_tensors: set[int] = set()
+    for layer in external:
+        if get_layerwise_info(layer).can_load():
+            raise RuntimeError(
+                "Cannot start a reload while a shared module belongs to an "
+                "active transaction in another model root"
+            )
+        for tensor in get_loadable_layer_tensors(layer).values():
+            tensor_id = id(tensor)
+            if tensor_id in owned_tensors:
+                raise RuntimeError(
+                    "A tensor is registered by both the reload root and another "
+                    "model root"
+                )
+            if tensor_id not in seen_tensors:
+                seen_tensors.add(tensor_id)
+                external_tensors.append(tensor)
+
+    sealed: list[tuple[torch.Tensor, bool, Callable, Callable]] = []
+    EXTERNAL_LOADERS[model] = sealed
+    try:
+        for tensor in external_tensors:
+            had_loader = hasattr(tensor, "weight_loader")
+            original = _get_weight_loader(tensor)
+
+            def reject(*args, **kwargs):
+                raise RuntimeError(
+                    "A reload attempted to write a module owned by another model root"
+                )
+
+            tensor.weight_loader = reject
+            sealed.append((tensor, had_loader, original, reject))
+    except Exception:
+        _restore_external_loaders(model)
+        raise
+
+
+def _restore_external_loaders(model: torch.nn.Module) -> None:
+    for tensor, had_loader, original, reject in reversed(
+        EXTERNAL_LOADERS.pop(model, [])
+    ):
+        if getattr(tensor, "weight_loader", None) is not reject:
+            continue
+        if had_loader:
+            tensor.weight_loader = original
+        else:
+            del tensor.weight_loader
 
 
 def _finalize_attention_layer(

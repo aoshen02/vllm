@@ -18,6 +18,7 @@ __all__ = [
     "record_metadata_for_reloading",
     "freeze_load_plan",
     "initialize_layerwise_reload",
+    "abort_layerwise_reload",
     "validate_layerwise_reload",
     "finalize_layerwise_processing",
     "finalize_layerwise_reload",
@@ -26,6 +27,7 @@ __all__ = [
 ]
 
 from .layerwise import (
+    abort_layerwise_reload,
     finalize_layerwise_processing,
     finalize_layerwise_reload,
     freeze_load_plan,

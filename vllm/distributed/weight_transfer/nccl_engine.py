@@ -162,6 +162,15 @@ class NCCLWeightTransferEngine(
             update_info: NCCL update info containing parameter names, dtypes, shapes,
                         and packed flag
         """
+        try:
+            self._receive_weights(update_info)
+        except BaseException:
+            from vllm.model_executor.model_loader.reload import abort_layerwise_reload
+
+            abort_layerwise_reload(self.model)
+            raise
+
+    def _receive_weights(self, update_info: NCCLWeightTransferUpdateInfo) -> None:
         if self.model_update_group is None:
             raise RuntimeError(
                 "NCCL weight transfer not initialized. "

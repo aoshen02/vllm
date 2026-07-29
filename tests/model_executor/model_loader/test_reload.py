@@ -15,6 +15,7 @@ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.linear import QKVParallelLinear
 from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
 from vllm.model_executor.model_loader.reload.layerwise import (
+    abort_layerwise_reload,
     finalize_layerwise_processing,
     finalize_layerwise_reload,
     initialize_layerwise_reload,
@@ -31,6 +32,7 @@ from vllm.model_executor.model_loader.reload.meta import (
 from vllm.model_executor.model_loader.reload.plan import (
     freeze_load_plan,
     get_load_plan,
+    get_reloadable_modules,
     load_source,
 )
 from vllm.model_executor.model_loader.reload.types import LayerReloadingInfo
@@ -1079,6 +1081,236 @@ def test_incomplete_update_defers_then_fails_closed():
 
     with pytest.raises(RuntimeError, match="'k'"):
         finalize_layerwise_processing(model, model_config=None)
+
+
+def test_reload_skips_and_seals_externally_owned_modules():
+    """A reload root must not stage or write through a module shared by another."""
+    target_shared = torch.nn.Module()
+    target_shared.weight = torch.nn.Parameter(torch.full((4,), 3.0))
+    target_shared.weight.weight_loader = default_weight_loader
+    target = torch.nn.Module()
+    target.shared = target_shared
+    _initial_load(
+        target,
+        lambda: target.shared.weight.weight_loader(
+            target.shared.weight, target.shared.weight.detach().clone()
+        ),
+        source="target.shared.weight",
+    )
+
+    draft_shared = torch.nn.Module()
+    draft_shared.weight = torch.nn.Parameter(torch.zeros(4))
+    draft_shared.weight.weight_loader = default_weight_loader
+    draft_local = torch.nn.Module()
+    draft_local.weight = torch.nn.Parameter(torch.zeros(4))
+    draft_local.weight.weight_loader = default_weight_loader
+    draft = torch.nn.Module()
+    draft.shared = draft_shared
+    draft.local = draft_local
+    _initial_load(
+        draft,
+        lambda: [
+            draft.shared.weight.weight_loader(draft.shared.weight, torch.ones(4)),
+            draft.local.weight.weight_loader(draft.local.weight, torch.ones(4)),
+        ],
+        source="draft.weight",
+    )
+
+    # Sharing happens after both startup contracts are frozen.
+    draft.shared = target.shared
+    target_storage = target.shared.weight.untyped_storage().data_ptr()
+    target_value = target.shared.weight.detach().clone()
+    target_loader = target.shared.weight.weight_loader
+
+    initialize_layerwise_reload(draft)
+
+    assert not target.shared.weight.is_meta
+    assert target.shared.weight.untyped_storage().data_ptr() == target_storage
+    with pytest.raises(RuntimeError, match="owned by another model root"):
+        draft.shared.weight.weight_loader(draft.shared.weight, torch.full((4,), 9.0))
+
+    with load_source("draft.weight"):
+        draft.local.weight.weight_loader(draft.local.weight, torch.full((4,), 7.0))
+    finalize_layerwise_processing(draft, model_config=None)
+
+    assert torch.equal(target.shared.weight, target_value)
+    assert target.shared.weight.untyped_storage().data_ptr() == target_storage
+    assert target.shared.weight.weight_loader is target_loader
+    target.shared.weight.weight_loader(target.shared.weight, torch.full((4,), 5.0))
+    assert torch.equal(target.shared.weight, torch.full((4,), 5.0))
+    assert torch.equal(draft.local.weight, torch.full((4,), 7.0))
+
+    # The owner retains its own startup contract; this is not validator bypass.
+    initialize_layerwise_reload(target)
+    with pytest.raises(RuntimeError, match="target.shared.weight"):
+        finalize_layerwise_processing(target, model_config=None)
+
+
+def test_reload_restores_a_tied_external_tensor_once():
+    """A shared tensor reachable from two external modules keeps its loader."""
+    target = torch.nn.Module()
+    target.group = torch.nn.Module()
+    target.group.left = torch.nn.Module()
+    target.group.left.weight = torch.nn.Parameter(torch.full((4,), 3.0))
+    target.group.left.weight.weight_loader = default_weight_loader
+    target.group.right = torch.nn.Module()
+    target.group.right.weight = target.group.left.weight
+    _initial_load(
+        target,
+        lambda: target.group.left.weight.weight_loader(
+            target.group.left.weight, target.group.left.weight.detach().clone()
+        ),
+        source="target.group.left.weight",
+    )
+
+    draft = torch.nn.Module()
+    draft.group = torch.nn.Module()
+    draft.group.weight = torch.nn.Parameter(torch.zeros(4))
+    draft.group.weight.weight_loader = default_weight_loader
+    _initial_load(
+        draft,
+        lambda: draft.group.weight.weight_loader(draft.group.weight, torch.ones(4)),
+        source="draft.group.weight",
+    )
+    draft.group = target.group
+    target_loader = target.group.left.weight.weight_loader
+
+    initialize_layerwise_reload(draft)
+    finalize_layerwise_processing(draft, model_config=None)
+
+    assert target.group.left.weight.weight_loader is target_loader
+    assert target.group.right.weight.weight_loader is target_loader
+    target.group.left.weight.weight_loader(
+        target.group.left.weight, torch.full((4,), 8.0)
+    )
+    assert torch.equal(target.group.right.weight, torch.full((4,), 8.0))
+
+
+def test_reload_rejects_a_tensor_registered_by_two_roots():
+    """An ambiguous cross-root tensor must fail before either root is staged."""
+    target = torch.nn.Module()
+    target.shared = torch.nn.Module()
+    target.shared.weight = torch.nn.Parameter(torch.full((4,), 3.0))
+    target.shared.weight.weight_loader = default_weight_loader
+    _initial_load(
+        target,
+        lambda: target.shared.weight.weight_loader(
+            target.shared.weight, target.shared.weight.detach().clone()
+        ),
+        source="target.shared.weight",
+    )
+
+    draft = torch.nn.Module()
+    draft.shared = torch.nn.Module()
+    draft.shared.weight = torch.nn.Parameter(torch.zeros(4))
+    draft.shared.weight.weight_loader = default_weight_loader
+    draft.local = torch.nn.Module()
+    draft.local.weight = torch.nn.Parameter(torch.zeros(4))
+    draft.local.weight.weight_loader = default_weight_loader
+    _initial_load(
+        draft,
+        lambda: [
+            draft.shared.weight.weight_loader(draft.shared.weight, torch.ones(4)),
+            draft.local.weight.weight_loader(draft.local.weight, torch.ones(4)),
+        ],
+        source="draft.weight",
+    )
+
+    draft.shared = target.shared
+    draft.local.weight = target.shared.weight
+    target_loader = target.shared.weight.weight_loader
+    draft._do_torchao_reload = True
+
+    with pytest.raises(RuntimeError, match="registered by both"):
+        initialize_layerwise_reload(draft)
+
+    assert target.shared.weight.weight_loader is target_loader
+    assert not target.shared.weight.is_meta
+    assert draft._do_torchao_reload
+
+
+def test_outer_load_plan_owns_nested_initialized_models():
+    """A nested model becomes owned by the root that freezes its checkpoint."""
+    inner = torch.nn.Module()
+    inner.weight = torch.nn.Parameter(torch.zeros(4))
+    inner.weight.weight_loader = default_weight_loader
+    _initial_load(
+        inner,
+        lambda: inner.weight.weight_loader(inner.weight, torch.ones(4)),
+        source="inner.weight",
+    )
+
+    outer = torch.nn.Module()
+    outer.language_model = inner
+    outer.vision = torch.nn.Module()
+    outer.vision.weight = torch.nn.Parameter(torch.zeros(4))
+    outer.vision.weight.weight_loader = default_weight_loader
+    record_metadata_for_reloading(outer)
+    freeze_load_plan(outer)
+
+    reloadable, external = get_reloadable_modules(outer)
+    assert inner in reloadable
+    assert inner not in external
+    assert outer.vision in reloadable
+
+
+def test_freezing_an_aliasing_root_preserves_the_original_owner():
+    """A second root must not steal a module it receives through sharing."""
+    target = torch.nn.Module()
+    target.shared = torch.nn.Module()
+    target.shared.weight = torch.nn.Parameter(torch.zeros(4))
+    target.shared.weight.weight_loader = default_weight_loader
+    _initial_load(
+        target,
+        lambda: target.shared.weight.weight_loader(target.shared.weight, torch.ones(4)),
+        source="target.shared.weight",
+    )
+
+    draft = torch.nn.Module()
+    draft.shared = target.shared
+    record_metadata_for_reloading(draft)
+    freeze_load_plan(draft)
+
+    target_reloadable, target_external = get_reloadable_modules(target)
+    draft_reloadable, draft_external = get_reloadable_modules(draft)
+    assert target.shared in target_reloadable
+    assert not target_external
+    assert target.shared in draft_external
+    assert target.shared not in draft_reloadable
+
+
+def test_abort_layerwise_reload_restores_external_loader_guards():
+    """A failed transport must not strand another root behind a guard."""
+    target = torch.nn.Module()
+    target.shared = torch.nn.Module()
+    target.shared.weight = torch.nn.Parameter(torch.full((4,), 3.0))
+    target.shared.weight.weight_loader = default_weight_loader
+    _initial_load(
+        target,
+        lambda: target.shared.weight.weight_loader(
+            target.shared.weight, target.shared.weight.detach().clone()
+        ),
+        source="target.shared.weight",
+    )
+
+    draft = torch.nn.Module()
+    draft.shared = torch.nn.Module()
+    draft.shared.weight = torch.nn.Parameter(torch.zeros(4))
+    draft.shared.weight.weight_loader = default_weight_loader
+    _initial_load(
+        draft,
+        lambda: draft.shared.weight.weight_loader(draft.shared.weight, torch.ones(4)),
+        source="draft.shared.weight",
+    )
+    draft.shared = target.shared
+    target_loader = target.shared.weight.weight_loader
+
+    initialize_layerwise_reload(draft)
+    abort_layerwise_reload(draft)
+
+    assert target.shared.weight.weight_loader is target_loader
+    target.shared.weight.weight_loader(target.shared.weight, torch.full((4,), 6.0))
+    assert torch.equal(target.shared.weight, torch.full((4,), 6.0))
 
 
 def test_reload_without_contract_fails_closed():

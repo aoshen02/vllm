@@ -9,7 +9,7 @@ from collections.abc import Callable, Hashable, Iterable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from functools import wraps
-from weakref import WeakKeyDictionary
+from weakref import WeakKeyDictionary, ref
 
 import torch
 
@@ -26,6 +26,7 @@ LoadPlan = Counter[LoadKey]
 _NON_SELECTOR_ARGS = frozenset({"param", "self", "return_success"})
 
 _PLANS: WeakKeyDictionary[torch.nn.Module, LoadPlan] = WeakKeyDictionary()
+_OWNERS: WeakKeyDictionary[torch.nn.Module, ref[torch.nn.Module]] = WeakKeyDictionary()
 # Separate from _PLANS so a layer that arms itself mid-load (online
 # quantization does) cannot mistake an in-progress recording for a contract.
 _RECORDING: WeakKeyDictionary[torch.nn.Module, LoadPlan] = WeakKeyDictionary()
@@ -99,6 +100,36 @@ def get_load_plan(layer: torch.nn.Module) -> LoadPlan | None:
     return _PLANS.get(layer)
 
 
+def get_reloadable_modules(
+    model: torch.nn.Module,
+) -> tuple[list[torch.nn.Module], list[torch.nn.Module]]:
+    """Partition a root into owned and externally owned modules."""
+    reloadable: list[torch.nn.Module] = []
+    external: list[torch.nn.Module] = []
+    seen_owners: dict[torch.nn.Module, torch.nn.Module | None] = {}
+
+    def visit(layer: torch.nn.Module, inherited_owner: torch.nn.Module | None) -> None:
+        owner = _OWNERS.get(layer)
+        owner_root = owner() if owner is not None else inherited_owner
+        if layer in seen_owners:
+            if seen_owners[layer] is not owner_root:
+                raise RuntimeError(
+                    "A module with no recorded reload owner is reachable from "
+                    "multiple model roots"
+                )
+            return
+        seen_owners[layer] = owner_root
+        if owner_root is not None and owner_root is not model:
+            external.append(layer)
+        else:
+            reloadable.append(layer)
+        for child in layer.children():
+            visit(child, owner_root)
+
+    visit(model, None)
+    return reloadable, external
+
+
 def install_load_recorder(model: torch.nn.Module) -> None:
     """Instrument loaders so the initial load becomes the contract, until
     `freeze_load_plan` removes them again."""
@@ -145,7 +176,16 @@ def _make_recorder(
 def freeze_load_plan(model: torch.nn.Module) -> None:
     """Freeze the recording as the contract and remove the recorders,
     idempotently and safely on a model that was never instrumented."""
+    model_modules = set(model.modules())
     for layer in model.modules():
+        owner_ref = _OWNERS.get(layer)
+        owner = owner_ref() if owner_ref is not None else None
+        # An enclosing model's checkpoint owns a nested model too, so it may
+        # supersede the nested model's earlier standalone initialization. A
+        # distinct root can only reach this layer through sharing and must not
+        # steal its owner's reload contract.
+        if owner is None or owner is model or owner in model_modules:
+            _OWNERS[layer] = ref(model)
         _unwrap_recorders(layer)
         if plan := _RECORDING.pop(layer, None):
             _PLANS[layer] = plan
