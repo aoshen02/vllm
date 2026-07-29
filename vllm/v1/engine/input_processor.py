@@ -99,6 +99,15 @@ class InputProcessor:
                 self.tokenizer,
             )
 
+            if (
+                params.trace_decode_token_ids is not None
+                and not self.use_v2_model_runner
+            ):
+                raise ValueError(
+                    "trace_decode_token_ids is only supported by the V2 model "
+                    "runner. Set VLLM_USE_V2_MODEL_RUNNER=1 to enable it."
+                )
+
             if params.thinking_token_budget is not None:
                 if (
                     self.vllm_config.reasoning_config is None
