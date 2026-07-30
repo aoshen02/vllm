@@ -13,23 +13,10 @@ from typing_extensions import TypeVar
 from vllm.logger import init_logger
 from vllm.logprobs import PromptLogprobs, SampleLogprobs
 from vllm.lora.request import LoRARequest
+from vllm.sampling_support import SamplingSupport
 from vllm.v1.metrics.stats import RequestStateStats
 
 logger = init_logger(__name__)
-
-
-@dataclass
-class SamplingMask:
-    """CSR token support sets aligned with completion token IDs.
-
-    Args:
-        token_ids: Flattened token IDs from every support set.
-        offsets: Start offsets for each support set, including the final end
-            offset.
-    """
-
-    token_ids: GenericSequence[int]
-    offsets: GenericSequence[int]
 
 
 @dataclass
@@ -44,7 +31,7 @@ class CompletionOutput:
             output text.
         logprobs: The log probabilities of the top probability words at each
             position if the logprobs are requested.
-        sampling_mask: The post-processing token support set for each generated
+        sampling_support: The post-processing token support set for each generated
             token, if requested.
         finish_reason: The reason why the sequence is finished.
         stop_reason: The stop string or token id that caused the completion
@@ -62,7 +49,7 @@ class CompletionOutput:
     finish_reason: str | None = None
     stop_reason: int | str | None = None
     lora_request: LoRARequest | None = None
-    sampling_mask: SamplingMask | None = None
+    sampling_support: SamplingSupport | None = None
 
     def finished(self) -> bool:
         return self.finish_reason is not None
@@ -73,7 +60,7 @@ class CompletionOutput:
             f"text={self.text!r}, "
             f"token_ids={self.token_ids}, "
             f"routed_experts={self.routed_experts}, "
-            f"sampling_mask={self.sampling_mask}, "
+            f"sampling_support={self.sampling_support}, "
             f"cumulative_logprob={self.cumulative_logprob}, "
             f"logprobs={self.logprobs}, "
             f"finish_reason={self.finish_reason}, "

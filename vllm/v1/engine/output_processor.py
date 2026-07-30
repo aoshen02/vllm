@@ -17,7 +17,7 @@ from vllm.outputs import (
     PoolingOutput,
     PoolingRequestOutput,
     RequestOutput,
-    SamplingMask,
+    SamplingSupport,
 )
 from vllm.sampling_params import RequestOutputKind
 from vllm.tokenizers import TokenizerLike
@@ -409,10 +409,10 @@ class RequestState:
         if delta and logprobs:
             logprobs = logprobs[-len(token_ids) :]
 
-        sampling_mask = None
+        sampling_support = None
         if finished and self.sampling_mask_chunks:
             merged = SamplingMaskLists.merge(self.sampling_mask_chunks)
-            sampling_mask = SamplingMask(merged.token_ids, merged.offsets)
+            sampling_support = SamplingSupport(merged.token_ids, merged.offsets)
 
         # Concatenate routed experts on finish
         routed_experts = None
@@ -424,7 +424,7 @@ class RequestState:
             text=text,
             token_ids=token_ids,
             routed_experts=routed_experts,
-            sampling_mask=sampling_mask,
+            sampling_support=sampling_support,
             logprobs=logprobs,
             cumulative_logprob=self.logprobs_processor.cumulative_logprob,
             finish_reason=str(finish_reason) if finished else None,
