@@ -22,9 +22,8 @@ from vllm.v1.worker.gpu.sample.logprob import (
     LogprobTokenIdsState,
     compute_topk_scores,
 )
-from vllm.v1.worker.gpu.sample.output import SamplerOutput
+from vllm.v1.worker.gpu.sample.output import SamplerOutput, SamplingMaskTensors
 from vllm.v1.worker.gpu.sample.penalties import PenaltiesState
-from vllm.v1.worker.gpu.sample.sampling_mask import compact_sampling_mask
 from vllm.v1.worker.gpu.sample.states import NO_LOGPROBS, SamplingStates
 from vllm.v1.worker.gpu.states import RequestState
 
@@ -110,7 +109,11 @@ class Sampler:
         )
         sampling_mask_tensors = None
         if self.enable_return_sampling_mask:
-            sampling_mask_tensors = compact_sampling_mask(processed_logits)
+            keep = torch.isfinite(processed_logits)
+            sampling_mask_tensors = SamplingMaskTensors(
+                keep=keep,
+                counts=keep.sum(dim=-1, dtype=torch.int32),
+            )
 
         if return_logprobs:
             if self.logprobs_mode in PROCESSED_LOGPROBS_MODES:
