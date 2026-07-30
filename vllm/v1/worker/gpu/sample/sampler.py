@@ -6,7 +6,6 @@ import torch
 
 import vllm.envs as envs
 from vllm.config.model import PROCESSED_LOGPROBS_MODES, LogprobsMode
-from vllm.logger import init_logger
 from vllm.sampling_params import SamplingParams
 from vllm.v1.sample.ops.topk_topp_sampler import (
     apply_top_k_top_p,
@@ -27,8 +26,6 @@ from vllm.v1.worker.gpu.sample.penalties import PenaltiesState
 from vllm.v1.worker.gpu.sample.sampling_mask import compact_sampling_mask
 from vllm.v1.worker.gpu.sample.states import NO_LOGPROBS, SamplingStates
 from vllm.v1.worker.gpu.states import RequestState
-
-logger = init_logger(__name__)
 
 
 class Sampler:
@@ -54,12 +51,10 @@ class Sampler:
         self.bad_words_state = BadWordsState(req_states)
         self.logprob_token_ids_state = LogprobTokenIdsState(max_num_reqs, device)
         self.num_speculative_tokens = num_speculative_tokens
-        self.use_flashinfer = flashinfer_sampler_supported()
         self.enable_return_sampling_mask = enable_return_sampling_mask
-        if enable_return_sampling_mask and self.use_flashinfer:
-            logger.info_once(
-                "FlashInfer sampling is disabled when returning sampling masks."
-            )
+        self.use_flashinfer = (
+            not enable_return_sampling_mask and flashinfer_sampler_supported()
+        )
 
     def add_request(
         self, req_idx: int, prompt_len: int, sampling_params: SamplingParams
@@ -254,12 +249,11 @@ class Sampler:
         use_flashinfer = self.use_flashinfer and not (
             # Don't use FI sampler if no requests use top_k/top_p, if there are
             # any greedy requests or per-request seeds, if post-processed
-            # logprobs are requested, or for sampling distribution replay.
+            # logprobs are requested.
             (top_k is None and top_p is None)
             or (return_logprobs and self.logprobs_mode in PROCESSED_LOGPROBS_MODES)
             or self.sampling_states.any_greedy(idx_mapping_np)
             or self.sampling_states.any_explicit_seed(idx_mapping_np)
-            or self.enable_return_sampling_mask
         )
 
         # Sample the next token.
