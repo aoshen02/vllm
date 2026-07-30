@@ -223,6 +223,7 @@ fn request_output(
         request_id: request_id.to_string(),
         new_token_ids,
         new_logprobs: None,
+        new_sampling_mask: None,
         new_prompt_logprobs_tensors: None,
         pooling_output: None,
         finish_reason,
@@ -474,6 +475,7 @@ fn multipart_logprob_output_frames(request_id: &str) -> Vec<bytes::Bytes> {
                 ndarray_value("<i4", &[2], Value::from(3)),
                 Value::Nil,
             ]),
+            Value::Nil,
             Value::Nil,
             Value::Nil,
             Value::from(EngineCoreFinishReason::Length as u8),
@@ -2593,6 +2595,7 @@ fn python_msgpack_fixtures_match_rust_encoding() {
                             8,
                         ],
                         new_logprobs: None,
+                        new_sampling_mask: None,
                         new_prompt_logprobs_tensors: None,
                         pooling_output: None,
                         finish_reason: Some(
