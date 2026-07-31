@@ -415,13 +415,12 @@ class InputProcessor:
         if trace is None:
             return
 
-        from vllm.v1.worker.gpu.sample.trace_replay import MAX_TRACE_LEN
-
         trace_len = len(trace)
-        if trace_len > MAX_TRACE_LEN:
+        max_trace_len = self.scheduler_config.max_trace_replay_tokens
+        if trace_len > max_trace_len:
             raise ValueError(
                 f"trace_decode_token_ids is too long: {trace_len}. "
-                f"The maximum is {MAX_TRACE_LEN}."
+                f"The configured maximum is {max_trace_len}."
             )
 
         prompt_len = length_from_prompt_token_ids_or_embeds(

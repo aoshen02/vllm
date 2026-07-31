@@ -7,10 +7,6 @@ from vllm.sampling_params import SamplingParams
 from vllm.triton_utils import tl, triton
 from vllm.v1.worker.gpu.buffer_utils import StagedWriteTensor, UvaBackedTensor
 
-# Upper bound on the length of a single replayed trace. Traces longer than this
-# are rejected at admission (see ``TraceReplayState.add_request``).
-MAX_TRACE_LEN = 8192
-
 
 class TraceReplayState:
     """Per-request state for inference trace-replay.
@@ -23,9 +19,10 @@ class TraceReplayState:
     synchronization or async placeholder handling is needed.
     """
 
-    def __init__(self, max_num_reqs: int, device: torch.device):
+    def __init__(self, max_num_reqs: int, device: torch.device, max_trace_len: int):
         self.max_num_reqs = max_num_reqs
         self.device = device
+        self.max_trace_len = max_trace_len
         self.trace_token_ids: StagedWriteTensor | None = None
         self.trace_len = UvaBackedTensor(max_num_reqs, dtype=torch.int32)
         # CPU mirror used to skip the kernel launch when no request replays.
@@ -34,15 +31,15 @@ class TraceReplayState:
     def add_request(self, req_idx: int, sampling_params: SamplingParams) -> None:
         trace = sampling_params.trace_decode_token_ids
         if trace:
-            if len(trace) > MAX_TRACE_LEN:
+            if len(trace) > self.max_trace_len:
                 raise ValueError(
                     f"trace_decode_token_ids is too long: {len(trace)}. "
-                    f"The max length is {MAX_TRACE_LEN}."
+                    f"The configured maximum is {self.max_trace_len}."
                 )
             self.trace_len.np[req_idx] = len(trace)
             if self.trace_token_ids is None:
                 self.trace_token_ids = StagedWriteTensor(
-                    (self.max_num_reqs, MAX_TRACE_LEN),
+                    (self.max_num_reqs, self.max_trace_len),
                     dtype=torch.int32,
                     device=self.device,
                 )
@@ -83,7 +80,7 @@ class TraceReplayState:
 def _trace_replay_kernel(
     sampled_ptr,  # [num_reqs], int64, mutated in place
     idx_mapping_ptr,  # [num_reqs] batch_idx -> req_state_idx; negative means skip
-    trace_token_ids_ptr,  # [max_num_reqs, MAX_TRACE_LEN], int32
+    trace_token_ids_ptr,  # [max_num_reqs, max_trace_len], int32
     trace_token_ids_stride,
     trace_len_ptr,  # [max_num_reqs], int32
     total_len_ptr,  # [max_num_reqs], int32

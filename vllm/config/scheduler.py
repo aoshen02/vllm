@@ -67,6 +67,9 @@ class SchedulerConfig:
     In real usage, this should be set in `EngineArgs.create_engine_config`.
     """
 
+    max_trace_replay_tokens: int = Field(default=8192, ge=1)
+    """Maximum number of tokens accepted in a trace-replay request."""
+
     long_prefill_token_threshold: int = Field(default=0, ge=0)
     """For chunked prefill, a request is considered long if the prompt is
     longer than this number of tokens. 0 disables the cap (default)."""
