@@ -33,7 +33,7 @@ class TraceReplayState:
 
     def add_request(self, req_idx: int, sampling_params: SamplingParams) -> None:
         trace = sampling_params.trace_decode_token_ids
-        if trace:
+        if trace is not None:
             if len(trace) > MAX_TRACE_LEN:
                 raise ValueError(
                     f"trace_decode_token_ids is too long: {len(trace)}. "
