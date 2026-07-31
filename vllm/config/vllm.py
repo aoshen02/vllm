@@ -932,6 +932,7 @@ class VllmConfig:
             self.model_config.enable_return_routed_experts
         ):
             return
+
         if self.parallel_config.pipeline_parallel_size > 1:
             raise ValueError(
                 "--enable-return-routed-experts is incompatible with "
@@ -945,6 +946,7 @@ class VllmConfig:
                 "--enable-return-routed-experts is incompatible with "
                 "context parallelism (DCP/PCP > 1)."
             )
+
         kv_transfer_config = self.kv_transfer_config
         if kv_transfer_config is None or not kv_transfer_config.is_kv_transfer_instance:
             return

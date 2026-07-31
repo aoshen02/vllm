@@ -96,8 +96,8 @@ def shared_routing_mmap_path(instance_id: str) -> str:
     return f"/dev/shm/vllm_routed_experts_{instance_id}.mmap"
 
 
-class RoutedExpertsWorkerWriter:
-    """Worker-side writer for the scheduler-shared routed-experts slot buffer."""
+class RoutedExpertsShmWriter:
+    """Publish worker-side routed experts to the scheduler-owned SHM buffer."""
 
     def __init__(
         self,

@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, NamedTuple
 import torch
 
 from vllm.model_executor.layers.fused_moe.routed_experts_capture.shared_region import (
-    RoutedExpertsWorkerWriter,
+    RoutedExpertsShmWriter,
 )
 
 if TYPE_CHECKING:
@@ -40,7 +40,7 @@ class RoutedExpertsWriteTask:
     """Copy and publish one step of routed-experts output."""
 
     routed_experts_tensors: RoutedExpertsTensors
-    writer: RoutedExpertsWorkerWriter
+    shm_writer: RoutedExpertsShmWriter
     _routed_experts_tensors_cpu: RoutedExpertsTensors | None = field(
         init=False, default=None
     )
@@ -58,7 +58,7 @@ class RoutedExpertsWriteTask:
         )
         routing_data = self._routed_experts_tensors_cpu.routing_data.numpy()
         slot_mapping = self._routed_experts_tensors_cpu.slot_mapping.numpy()
-        self.writer.store_batch(
+        self.shm_writer.store_batch(
             routing_data,
             slot_mapping,
         )
