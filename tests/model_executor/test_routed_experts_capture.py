@@ -62,17 +62,17 @@ def test_multiple_full_attention_groups_use_hashable_warning_args():
 def test_routed_experts_write_task_publishes_copied_tensors():
     routing_data = torch.tensor([[[1, 2]], [[3, 4]]], dtype=torch.int32)
     slot_mapping = torch.tensor([5, 9], dtype=torch.int64)
-    shm_writer = Mock()
+    writer = Mock()
     output = SimpleNamespace(routed_experts_slots=None)
     write_task = RoutedExpertsWriteTask(
         routed_experts_tensors=RoutedExpertsTensors(routing_data, slot_mapping),
-        shm_writer=shm_writer,
+        writer=writer,
     )
 
     write_task.start_copy()
     write_task.finalize(output)
 
-    stored_routing, stored_slots = shm_writer.store_batch.call_args.args
+    stored_routing, stored_slots = writer.store_batch.call_args.args
     assert stored_routing.tolist() == routing_data.tolist()
     assert stored_slots.tolist() == slot_mapping.tolist()
     assert output.routed_experts_slots.tolist() == slot_mapping.tolist()
@@ -288,14 +288,14 @@ def test_capture_state_write_task_owns_immutable_snapshot():
 
 def test_capture_state_close_releases_resources():
     capturer = Mock()
-    shm_writer = Mock()
-    state = RoutedExpertsCaptureState(capturer, shm_writer, full_attn_group_id=0)
+    writer = Mock()
+    state = RoutedExpertsCaptureState(capturer, writer, full_attn_group_id=0)
 
     state.close()
 
-    shm_writer.close.assert_called_once_with()
+    writer.close.assert_called_once_with()
     assert state.capturer is None
-    assert state.shm_writer is None
+    assert state.writer is None
 
 
 @pytest.mark.parametrize(("rank", "creates_writer"), [(0, True), (1, False)])
@@ -308,8 +308,8 @@ def test_capture_state_create_uses_explicit_dependencies(
 
     model = Mock()
     capturer = Mock()
-    shm_writer = Mock()
-    writer_factory = Mock(return_value=shm_writer)
+    writer = Mock()
+    writer_factory = Mock(return_value=writer)
     bind = Mock()
     monkeypatch.setattr(state_module, "require_full_attn_group_id", lambda _: 2)
     monkeypatch.setattr(
@@ -322,7 +322,7 @@ def test_capture_state_create_uses_explicit_dependencies(
         "get_routing_slot_shape_and_dtype",
         lambda *_: ((16, 4, 2), "uint8"),
     )
-    monkeypatch.setattr(state_module, "RoutedExpertsShmWriter", writer_factory)
+    monkeypatch.setattr(state_module, "RoutedExpertsWorkerWriter", writer_factory)
     vllm_config = SimpleNamespace(
         instance_id="instance",
         parallel_config=SimpleNamespace(rank=rank, data_parallel_rank=3),

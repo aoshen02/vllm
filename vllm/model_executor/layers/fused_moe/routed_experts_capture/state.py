@@ -23,7 +23,7 @@ from vllm.model_executor.layers.fused_moe.routed_experts_capture.common import (
     require_full_attn_group_id,
 )
 from vllm.model_executor.layers.fused_moe.routed_experts_capture.shared_region import (
-    RoutedExpertsShmWriter,
+    RoutedExpertsWorkerWriter,
 )
 
 if TYPE_CHECKING:
@@ -37,11 +37,11 @@ class RoutedExpertsCaptureState:
     def __init__(
         self,
         capturer: RoutedExpertsCapturer,
-        shm_writer: RoutedExpertsShmWriter | None,
+        writer: RoutedExpertsWorkerWriter | None,
         full_attn_group_id: int,
     ) -> None:
         self.capturer: RoutedExpertsCapturer | None = capturer
-        self.shm_writer = shm_writer
+        self.writer = writer
         self.full_attn_group_id = full_attn_group_id
 
     @classmethod
@@ -59,22 +59,22 @@ class RoutedExpertsCaptureState:
         )
         bind_routed_experts_capturer(model, capturer)
 
-        shm_writer = None
+        writer = None
         parallel_config = vllm_config.parallel_config
         if parallel_config.rank == get_routed_experts_output_rank():
             slot_shape, slot_dtype = get_routing_slot_shape_and_dtype(
                 vllm_config, kv_cache_config
             )
-            shm_writer = RoutedExpertsShmWriter(
+            writer = RoutedExpertsWorkerWriter(
                 instance_id=vllm_config.instance_id,
                 slot_shape=slot_shape,
                 dtype=slot_dtype,
             )
-        return cls(capturer, shm_writer, full_attn_group_id)
+        return cls(capturer, writer, full_attn_group_id)
 
     @property
     def can_write(self) -> bool:
-        return self.shm_writer is not None
+        return self.writer is not None
 
     def clear(self) -> None:
         if self.capturer is not None:
@@ -89,8 +89,8 @@ class RoutedExpertsCaptureState:
         slot_mapping: torch.Tensor,
         num_tokens: int,
     ) -> RoutedExpertsWriteTask | None:
-        shm_writer = self.shm_writer
-        if shm_writer is None:
+        writer = self.writer
+        if writer is None:
             return None
         tensors = RoutedExpertsTensors(
             routing_data=self.get_device_buffer()[:num_tokens].clone(),
@@ -98,7 +98,7 @@ class RoutedExpertsCaptureState:
         )
         return RoutedExpertsWriteTask(
             routed_experts_tensors=tensors,
-            shm_writer=shm_writer,
+            writer=writer,
         )
 
     def store_batch(
@@ -106,11 +106,11 @@ class RoutedExpertsCaptureState:
         routing_data: np.ndarray,
         slot_mapping: np.ndarray,
     ) -> None:
-        assert self.shm_writer is not None, "routed-experts SHM writer is unavailable"
-        self.shm_writer.store_batch(routing_data, slot_mapping)
+        assert self.writer is not None, "routed-experts writer is unavailable"
+        self.writer.store_batch(routing_data, slot_mapping)
 
     def close(self) -> None:
-        if self.shm_writer is not None:
-            self.shm_writer.close()
-            self.shm_writer = None
+        if self.writer is not None:
+            self.writer.close()
+            self.writer = None
         self.capturer = None

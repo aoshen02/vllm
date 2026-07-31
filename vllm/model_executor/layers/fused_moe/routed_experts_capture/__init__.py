@@ -24,7 +24,7 @@ from vllm.model_executor.layers.fused_moe.routed_experts_capture.manager import 
     RoutedExpertsManager,
 )
 from vllm.model_executor.layers.fused_moe.routed_experts_capture.shared_region import (
-    RoutedExpertsShmWriter,
+    RoutedExpertsWorkerWriter,
 )
 from vllm.model_executor.layers.fused_moe.routed_experts_capture.state import (
     RoutedExpertsCaptureState,
@@ -35,7 +35,7 @@ __all__ = [
     "RoutedExpertsCapturer",
     "RoutedExpertsManager",
     "RoutedExpertsTensors",
-    "RoutedExpertsShmWriter",
+    "RoutedExpertsWorkerWriter",
     "RoutedExpertsWriteTask",
     "bind_routed_experts_capturer",
     "get_routed_experts_output_rank",
