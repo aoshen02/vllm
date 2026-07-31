@@ -107,3 +107,47 @@ class RoutedExpertsCapturer:
     def get_device_buffer(self) -> torch.Tensor:
         """Return the shared device buffer for the model runner D2H copy."""
         return self.device_buffer
+
+
+def bind_routed_experts_capturer(
+    model: torch.nn.Module,
+    capturer: RoutedExpertsCapturer,
+) -> None:
+    """Attach a routed-experts capturer to the model's MoE routers."""
+    from vllm.model_executor.layers.fused_moe.layer import MoERunner
+    from vllm.model_executor.layers.fused_moe.modular_kernel import (
+        FusedMoEExpertsMonolithic,
+    )
+    from vllm.model_executor.layers.fused_moe.router.base_router import (
+        BaseRouter,
+    )
+
+    for module in model.modules():
+        if not isinstance(module, MoERunner):
+            continue
+        layer_id = module.layer_id
+
+        def _capture_fn(
+            topk_ids: torch.Tensor,
+            _layer_id: int = layer_id,
+            _capturer: RoutedExpertsCapturer = capturer,
+        ) -> None:
+            _capturer.capture(_layer_id, topk_ids)
+
+        quant_method = module._quant_method
+        moe_kernel = getattr(quant_method, "moe_kernel", None)
+        impl = getattr(moe_kernel, "impl", None)
+        fused_experts = getattr(impl, "fused_experts", None)
+        if quant_method.is_monolithic:
+            if not (
+                isinstance(fused_experts, FusedMoEExpertsMonolithic)
+                and fused_experts.supports_routing_replay_capture()
+            ):
+                raise ValueError(
+                    "--enable-return-routed-experts is not supported with "
+                    f"monolithic MoE kernel {type(fused_experts).__name__}; "
+                    "routed expert IDs would be silently all-zero."
+                )
+            fused_experts.set_capture_fn(_capture_fn)
+        elif isinstance(module.router, BaseRouter):
+            module.router.set_capture_fn(_capture_fn)
