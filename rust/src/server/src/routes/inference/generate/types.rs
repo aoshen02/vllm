@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use validator::Validate;
+use vllm_engine_core_client::protocol::sampling_mask::SamplingMask;
 use vllm_text::SamplingParams;
 
 use crate::routes::openai::utils::types::{ChatLogProbs, Normalizable, StreamOptions, Usage};
@@ -40,6 +41,7 @@ impl Normalizable for GenerateRequest {}
 pub(super) struct GenerateResponseChoice {
     pub index: u32,
     pub logprobs: Option<ChatLogProbs>,
+    pub sampling_mask: Option<SamplingMask>,
     pub finish_reason: Option<String>,
     pub token_ids: Vec<u32>,
 }
@@ -50,6 +52,7 @@ pub(super) struct GenerateResponseChoice {
 pub(super) struct GenerateResponseStreamChoice {
     pub index: u32,
     pub logprobs: Option<ChatLogProbs>,
+    pub sampling_mask: Option<SamplingMask>,
     pub finish_reason: Option<String>,
     pub token_ids: Vec<u32>,
 }

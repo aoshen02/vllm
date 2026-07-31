@@ -241,6 +241,7 @@ def encode_output_frames(obj, *, size_threshold: int = 256) -> list[bytes]:
         if (
             isinstance(value, tuple)
             and len(value) == 3
+            and isinstance(value[0], str)
             and value[0] in ("int32", "int64", "float32")
         ):
             dtype, shape, payload = value
@@ -267,13 +268,14 @@ def engine_output_wire(
     request_id: str,
     *,
     new_logprobs=None,
+    new_sampling_mask=None,
     new_prompt_logprobs_tensors=None,
 ):
     return [
         request_id,
         [7, 8],
         new_logprobs,
-        None,
+        new_sampling_mask,
         new_prompt_logprobs_tensors,
         None,
         int(FinishReason.LENGTH),
@@ -303,6 +305,28 @@ multipart_logprobs = engine_outputs_wire(
             np.array([[1, 2, 3], [4, 5, 6]], dtype=np.int64),
             np.array([[1, 2, 3], [4, 5, 6]], dtype=np.float32),
             np.array([1, 2], dtype=np.int64),
+            None,
+        ),
+    )
+)
+
+inline_sampling_mask = engine_outputs_wire(
+    engine_output_wire(
+        "req-1",
+        new_sampling_mask=(
+            np.array([1, 2, 3, 4], dtype=np.int32),
+            np.array([0, 3, 4], dtype=np.int64),
+            None,
+        ),
+    )
+)
+
+multipart_sampling_mask = engine_outputs_wire(
+    engine_output_wire(
+        "req-1",
+        new_sampling_mask=(
+            np.array([1, 2, 3, 4], dtype=np.int32),
+            np.array([0, 3, 4], dtype=np.int64),
             None,
         ),
     )
@@ -426,6 +450,13 @@ print(
     " ".join(
         frame.hex()
         for frame in encode_output_frames(multipart_logprobs, size_threshold=1)
+    )
+)
+print(" ".join(frame.hex() for frame in encode_output_frames(inline_sampling_mask)))
+print(
+    " ".join(
+        frame.hex()
+        for frame in encode_output_frames(multipart_sampling_mask, size_threshold=1)
     )
 )
 print(" ".join(frame.hex() for frame in encode_output_frames(inline_prompt_logprobs)))

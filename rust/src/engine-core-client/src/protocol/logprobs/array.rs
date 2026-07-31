@@ -66,7 +66,7 @@ where
     })
 }
 
-pub(super) fn decode_array1_u32<Frame>(
+pub(crate) fn decode_array1_u32<Frame>(
     value: WireNdArray,
     field: &str,
     frames: &[Frame],
@@ -95,6 +95,36 @@ where
         ScalarType::F32 => unreachable!("scalar validation should reject f32"),
     };
     Ok(data)
+}
+
+pub(crate) fn decode_array1_u64<Frame>(
+    value: WireNdArray,
+    field: &str,
+    frames: &[Frame],
+) -> Result<Vec<u64>>
+where
+    Frame: AsRef<[u8]>,
+{
+    let (shape, bytes, scalar, endianness) =
+        decode_array_metadata(value, field, frames, &[ScalarType::I32, ScalarType::I64])?;
+    if shape.len() != 1 {
+        return Err(decode_error(
+            field,
+            &format!("expected rank-1 array, got rank {}", shape.len()),
+        ));
+    }
+
+    match scalar {
+        ScalarType::I32 => decode_i32_vec(&bytes, endianness, field)?
+            .into_iter()
+            .map(|value| convert_to_u64(value, field))
+            .try_collect(),
+        ScalarType::I64 => decode_i64_vec(&bytes, endianness, field)?
+            .into_iter()
+            .map(|value| convert_to_u64(value, field))
+            .try_collect(),
+        ScalarType::F32 => unreachable!("scalar validation should reject f32"),
+    }
 }
 
 pub(super) fn decode_array2_f32<Frame>(
@@ -301,6 +331,18 @@ where
         decode_error(
             field,
             &format!("expected non-negative token id/rank that fits in u32, got {value}"),
+        )
+    })
+}
+
+fn convert_to_u64<I>(value: I, field: &str) -> Result<u64>
+where
+    I: TryInto<u64> + std::fmt::Display + Copy,
+{
+    value.try_into().map_err(|_| {
+        decode_error(
+            field,
+            &format!("expected non-negative offset that fits in u64, got {value}"),
         )
     })
 }

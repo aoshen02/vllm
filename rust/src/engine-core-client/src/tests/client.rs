@@ -31,6 +31,7 @@ use crate::protocol::output::{
 };
 use crate::protocol::request::{EngineCoreRequest, EngineCoreRequestType};
 use crate::protocol::sampling::EngineCoreSamplingParams;
+use crate::protocol::sampling_mask::MaybeWireSamplingMask;
 use crate::protocol::stats::SchedulerStats;
 use crate::protocol::tensor::{WireArrayData, WireTensor};
 use crate::protocol::utility::{UtilityOutput, UtilityResultEnvelope};
@@ -139,6 +140,25 @@ fn expect_prompt_logprobs(actual: &MaybeWireLogprobs) {
         }
     "#]]
     .assert_debug_eq(actual.as_direct().expect("prompt logprobs resolved"));
+}
+
+fn expect_sampling_mask(actual: &MaybeWireSamplingMask) {
+    expect_test::expect![[r#"
+        SamplingMask {
+            token_ids: [
+                1,
+                2,
+                3,
+                4,
+            ],
+            offsets: [
+                0,
+                3,
+                4,
+            ],
+        }
+    "#]]
+    .assert_debug_eq(actual.as_direct().expect("sampling mask resolved"));
 }
 
 fn sample_request() -> EngineCoreRequest {
@@ -2511,6 +2531,10 @@ fn python_msgpack_fixtures_match_rust_encoding() {
     let outputs_hex = lines.next().expect("missing outputs fixture line");
     let inline_logprobs_frames = lines.next().expect("missing inline logprobs fixture line");
     let multipart_logprobs_frames = lines.next().expect("missing multipart logprobs fixture line");
+    let inline_sampling_mask_frames =
+        lines.next().expect("missing inline sampling mask fixture line");
+    let multipart_sampling_mask_frames =
+        lines.next().expect("missing multipart sampling mask fixture line");
     let inline_prompt_frames = lines.next().expect("missing inline prompt logprobs fixture line");
     let multipart_prompt_frames =
         lines.next().expect("missing multipart prompt logprobs fixture line");
@@ -2645,6 +2669,24 @@ fn python_msgpack_fixtures_match_rust_encoding() {
             .new_logprobs
             .as_ref()
             .expect("multipart logprobs decoded"),
+    );
+
+    let inline_sampling_mask =
+        decode_engine_core_outputs(&decode_frames(inline_sampling_mask_frames)).unwrap();
+    expect_sampling_mask(
+        inline_sampling_mask.as_request_batch().unwrap().outputs[0]
+            .new_sampling_mask
+            .as_ref()
+            .expect("inline sampling mask decoded"),
+    );
+
+    let multipart_sampling_mask =
+        decode_engine_core_outputs(&decode_frames(multipart_sampling_mask_frames)).unwrap();
+    expect_sampling_mask(
+        multipart_sampling_mask.as_request_batch().unwrap().outputs[0]
+            .new_sampling_mask
+            .as_ref()
+            .expect("multipart sampling mask decoded"),
     );
 
     let inline_prompt = decode_engine_core_outputs(&decode_frames(inline_prompt_frames)).unwrap();

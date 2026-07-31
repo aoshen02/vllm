@@ -142,6 +142,7 @@ async fn generate_chunk_stream(
                 usage.cached_token_count = usage.cached_token_count.max(output.cached_token_count);
 
                 let token_ids = output.token_ids;
+                let sampling_mask = output.sampling_mask;
                 usage.output_token_count = usage.output_token_count.saturating_add(token_ids.len());
                 let finish_reason = output.finish_reason;
 
@@ -181,6 +182,7 @@ async fn generate_chunk_stream(
                     choices: vec![GenerateResponseStreamChoice {
                         index: 0,
                         logprobs,
+                        sampling_mask,
                         finish_reason: finish_reason.map(|reason| reason.as_str().to_string()),
                         token_ids,
                     }],
@@ -269,6 +271,7 @@ fn collect_generate(
         choices: vec![GenerateResponseChoice {
             index: 0,
             logprobs,
+            sampling_mask: collected.sampling_mask,
             finish_reason: Some(finish_reason),
             token_ids: collected.token_ids,
         }],
@@ -398,6 +401,7 @@ mod tests {
     use std::sync::Arc;
 
     use futures::{TryStreamExt as _, stream};
+    use vllm_engine_core_client::protocol::sampling_mask::SamplingMask;
     use vllm_llm::GeneratePromptInfo;
 
     use super::*;
@@ -410,6 +414,7 @@ mod tests {
                 prompt_info: None,
                 token_ids: Vec::new(),
                 logprobs: None,
+                sampling_mask: None,
                 finish_reason: None,
                 cached_token_count: 0,
                 kv_transfer_params: None,
@@ -423,6 +428,7 @@ mod tests {
                 }),
                 token_ids: vec![33],
                 logprobs: None,
+                sampling_mask: None,
                 finish_reason: Some(FinishReason::stop_eos()),
                 cached_token_count: 2,
                 kv_transfer_params: None,
@@ -485,6 +491,7 @@ mod tests {
             prompt_logprobs: None,
             token_ids: vec![3],
             logprobs: None,
+            sampling_mask: None,
             finish_reason: FinishReason::stop_eos(),
             usage: vllm_llm::TokenUsage {
                 prompt_token_count: prompt_token_ids.len(),
@@ -520,5 +527,42 @@ mod tests {
             },
         )
         .expect_err("multi-token prompt without payload is an engine failure");
+    }
+
+    #[test]
+    fn collect_generate_returns_sampling_mask() {
+        let response = collect_generate(
+            CollectedGenerateOutput {
+                request_id: "raw-1".to_string(),
+                prompt_token_ids: vec![1],
+                prompt_logprobs: None,
+                token_ids: vec![7, 8],
+                logprobs: None,
+                sampling_mask: Some(SamplingMask {
+                    token_ids: vec![3, 5, 7],
+                    offsets: vec![0, 2, 3],
+                }),
+                finish_reason: FinishReason::stop_eos(),
+                usage: TokenUsage {
+                    prompt_token_count: 1,
+                    output_token_count: 2,
+                    cached_token_count: 0,
+                },
+                kv_transfer_params: None,
+                ec_transfer_params: None,
+            },
+            "raw-1".to_string(),
+            ApiServerOptions::default(),
+            ResponseOptions::default(),
+        )
+        .expect("collect response");
+
+        assert_eq!(
+            response.choices[0].sampling_mask,
+            Some(SamplingMask {
+                token_ids: vec![3, 5, 7],
+                offsets: vec![0, 2, 3],
+            })
+        );
     }
 }

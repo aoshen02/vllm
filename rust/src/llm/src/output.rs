@@ -12,6 +12,7 @@ use futures::{Stream, StreamExt as _, pin_mut};
 use serde::{Deserialize, Serialize};
 use vllm_engine_core_client::protocol::logprobs::Logprobs;
 use vllm_engine_core_client::protocol::output::{EngineCoreFinishReason, StopReason};
+use vllm_engine_core_client::protocol::sampling_mask::SamplingMask;
 use vllm_engine_core_client::{AbortCause, EngineCoreOutputStream};
 
 use crate::error::Result;
@@ -37,6 +38,7 @@ pub struct CollectedGenerateOutput {
     pub prompt_logprobs: Option<Logprobs>,
     pub token_ids: Vec<u32>,
     pub logprobs: Option<Logprobs>,
+    pub sampling_mask: Option<SamplingMask>,
     pub finish_reason: FinishReason,
     pub usage: TokenUsage,
     /// Connector-specific KV transfer parameters for disaggregated serving.
@@ -146,6 +148,8 @@ pub struct GenerateOutput {
     pub token_ids: Vec<u32>,
     /// Sample logprobs for the generated positions in this step.
     pub logprobs: Option<Logprobs>,
+    /// Candidate token IDs in the sampling distribution for this step.
+    pub sampling_mask: Option<SamplingMask>,
     /// Terminal finish reason, when this is the final output for the request.
     pub finish_reason: Option<FinishReason>,
     /// Number of prompt tokens served from cache, when reported by prefill stats.
@@ -198,6 +202,7 @@ impl GenerateOutput {
             }),
             token_ids,
             logprobs: None,
+            sampling_mask: None,
             finish_reason,
             cached_token_count: 0,
             kv_transfer_params: None,
@@ -271,6 +276,7 @@ impl Stream for GenerateOutputStream {
         }
 
         let logprobs = raw.new_logprobs.map(|value| value.into_direct().unwrap());
+        let sampling_mask = raw.new_sampling_mask.map(|value| value.into_direct().unwrap());
         let cached_token_count = raw
             .prefill_stats
             .as_ref()
@@ -287,6 +293,7 @@ impl Stream for GenerateOutputStream {
             prompt_info: self.pending_prompt_info.take(),
             token_ids: raw.new_token_ids,
             logprobs,
+            sampling_mask,
             finish_reason,
             cached_token_count,
             kv_transfer_params: raw.kv_transfer_params,
@@ -359,6 +366,21 @@ impl<T: Stream<Item = Result<GenerateOutput>> + Send> T {
                             existing.logprobs = Some(step_logprobs);
                         }
                     }
+                    if let Some(step_sampling_mask) = output.sampling_mask {
+                        if let Some(collected_sampling_mask) = existing.sampling_mask.as_mut() {
+                            let token_id_offset = collected_sampling_mask.token_ids.len() as u64;
+                            collected_sampling_mask.token_ids.extend(step_sampling_mask.token_ids);
+                            collected_sampling_mask.offsets.extend(
+                                step_sampling_mask
+                                    .offsets
+                                    .into_iter()
+                                    .skip(1)
+                                    .map(|offset| token_id_offset + offset),
+                            );
+                        } else {
+                            existing.sampling_mask = Some(step_sampling_mask);
+                        }
+                    }
                 } else {
                     collected = Some(CollectedGenerateOutput {
                         request_id: output.request_id,
@@ -366,6 +388,7 @@ impl<T: Stream<Item = Result<GenerateOutput>> + Send> T {
                         prompt_logprobs: prompt_logprobs.take(),
                         token_ids: output.token_ids,
                         logprobs: output.logprobs,
+                        sampling_mask: output.sampling_mask,
                         finish_reason: FinishReason::Error,
                         usage: TokenUsage {
                             prompt_token_count: prompt_token_ids.as_ref().map_or(0, Vec::len),

@@ -10,8 +10,9 @@ use serde_repr::{Deserialize_repr, Serialize_repr};
 use serde_tuple::{Deserialize_tuple, Serialize_tuple};
 
 use super::utility::UtilityOutput;
-use crate::error::{Error, Result, ext_value_decode};
+use crate::error::{Error, Result, bail_ext_value_decode, ext_value_decode};
 use crate::protocol::logprobs::MaybeWireLogprobs;
+use crate::protocol::sampling_mask::{MaybeWireSamplingMask, validate as validate_sampling_mask};
 use crate::protocol::stats::{PrefillStats, SchedulerStats};
 use crate::protocol::{OpaqueValue, decode_msgpack};
 
@@ -85,10 +86,9 @@ pub struct EngineCoreOutput {
     /// output.
     #[serde(default)]
     pub new_logprobs: Option<MaybeWireLogprobs>,
-    /// Sampling-replay support for the newly generated positions. The Rust
-    /// frontend preserves this tuple slot but does not consume it yet.
+    /// Sampling-replay candidate IDs for the newly generated positions.
     #[serde(default)]
-    pub new_sampling_mask: Option<OpaqueValue>,
+    pub new_sampling_mask: Option<MaybeWireSamplingMask>,
     /// Decoded prompt logprobs for the scored prompt positions emitted in this
     /// output.
     #[serde(default)]
@@ -133,6 +133,21 @@ impl EngineCoreOutput {
         self.new_logprobs = (self.new_logprobs.take())
             .map(|value| value.resolve(frames, "new_logprobs"))
             .transpose()?;
+        self.new_sampling_mask = (self.new_sampling_mask.take())
+            .map(|value| value.resolve(frames, "new_sampling_mask"))
+            .transpose()?;
+        if let Some(mask) = &self.new_sampling_mask {
+            let mask = mask.as_direct().expect("sampling mask was resolved");
+            if mask.offsets.len() != self.new_token_ids.len() + 1 {
+                bail_ext_value_decode!(
+                    "new_sampling_mask.offsets: expected {} entries for {} generated tokens, got {}",
+                    self.new_token_ids.len() + 1,
+                    self.new_token_ids.len(),
+                    mask.offsets.len()
+                );
+            }
+            validate_sampling_mask(mask, "new_sampling_mask")?;
+        }
         self.new_prompt_logprobs_tensors = (self.new_prompt_logprobs_tensors.take())
             .map(|value| value.resolve(frames, "new_prompt_logprobs_tensors"))
             .transpose()?;
