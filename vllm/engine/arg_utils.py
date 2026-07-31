@@ -529,6 +529,7 @@ class EngineArgs:
     max_num_scheduled_tokens: int | None = None
     long_prefill_token_threshold: int = SchedulerConfig.long_prefill_token_threshold
     max_num_seqs: int | None = None
+    max_trace_replay_tokens: int = SchedulerConfig.max_trace_replay_tokens
     max_logprobs: int = ModelConfig.max_logprobs
     logprobs_mode: LogprobsMode = ModelConfig.logprobs_mode
     use_fp64_gumbel: bool = ModelConfig.use_fp64_gumbel
@@ -1466,6 +1467,10 @@ class EngineArgs:
             },
         )
         scheduler_group.add_argument(
+            "--max-trace-replay-tokens",
+            **scheduler_kwargs["max_trace_replay_tokens"],
+        )
+        scheduler_group.add_argument(
             "--long-prefill-token-threshold",
             **scheduler_kwargs["long_prefill_token_threshold"],
         )
@@ -2242,6 +2247,7 @@ class EngineArgs:
             max_num_batched_tokens=self.max_num_batched_tokens,
             max_num_scheduled_tokens=self.max_num_scheduled_tokens,
             max_num_seqs=self.max_num_seqs,
+            max_trace_replay_tokens=self.max_trace_replay_tokens,
             max_model_len=model_config.max_model_len,
             enable_chunked_prefill=self.enable_chunked_prefill,
             disable_chunked_mm_input=self.disable_chunked_mm_input,

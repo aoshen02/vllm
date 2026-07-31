@@ -323,6 +323,8 @@ class InputProcessor:
             prompt_embeds = None
             prompt_is_token_ids = None
 
+        self._validate_trace_replay_length(prompt_token_ids, prompt_embeds, params)
+
         sampling_params = None
         pooling_params = None
         if isinstance(params, SamplingParams):
@@ -400,6 +402,36 @@ class InputProcessor:
             trace_headers=trace_headers,
             resumable=resumable,
         )
+
+    def _validate_trace_replay_length(
+        self,
+        prompt_token_ids: list[int] | None,
+        prompt_embeds: Any,
+        params: SamplingParams | PoolingParams,
+    ) -> None:
+        if not isinstance(params, SamplingParams):
+            return
+        trace = params.trace_decode_token_ids
+        if trace is None:
+            return
+
+        trace_len = len(trace)
+        max_trace_len = self.scheduler_config.max_trace_replay_tokens
+        if trace_len > max_trace_len:
+            raise ValueError(
+                f"trace_decode_token_ids is too long: {trace_len}. "
+                f"The configured maximum is {max_trace_len}."
+            )
+
+        prompt_len = length_from_prompt_token_ids_or_embeds(
+            prompt_token_ids, prompt_embeds
+        )
+        if prompt_len + trace_len > self.model_config.max_model_len:
+            raise ValueError(
+                "trace_decode_token_ids exceeds the model context length: "
+                f"prompt ({prompt_len}) + trace ({trace_len}) > "
+                f"max_model_len ({self.model_config.max_model_len})."
+            )
 
     def _validate_prompt_len(
         self,
