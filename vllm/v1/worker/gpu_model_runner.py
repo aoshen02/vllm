@@ -7662,8 +7662,6 @@ class GPUModelRunner(
             "Initializing routed experts capturer, enable_return_routed_experts: %s",
             self.model_config.enable_return_routed_experts,
         )
-        if self.routed_experts_capture is not None:
-            self.routed_experts_capture.close()
         routed_experts_capture = RoutedExpertsCaptureState.create(
             model=self.model,
             vllm_config=self.vllm_config,

@@ -286,7 +286,7 @@ def test_capture_state_write_task_owns_immutable_snapshot():
     assert torch.equal(tensors.slot_mapping, torch.tensor([21, 22, 23]))
 
 
-def test_capture_state_close_releases_resources():
+def test_capture_state_close_releases_writer():
     capturer = Mock()
     writer = Mock()
     state = RoutedExpertsCaptureState(capturer, writer, full_attn_group_id=0)
@@ -294,7 +294,7 @@ def test_capture_state_close_releases_resources():
     state.close()
 
     writer.close.assert_called_once_with()
-    assert state.capturer is None
+    assert state.capturer is capturer
     assert state.writer is None
 
 

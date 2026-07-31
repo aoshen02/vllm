@@ -289,8 +289,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.req_states.max_model_len = max_model_len
 
     def init_routed_experts_capturer(self) -> None:
-        if self.routed_experts_capture is not None:
-            self.routed_experts_capture.close()
         self.routed_experts_capture = RoutedExpertsCaptureState.create(
             model=self.model,
             vllm_config=self.vllm_config,

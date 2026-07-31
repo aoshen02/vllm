@@ -40,7 +40,7 @@ class RoutedExpertsCaptureState:
         writer: RoutedExpertsWorkerWriter | None,
         full_attn_group_id: int,
     ) -> None:
-        self.capturer: RoutedExpertsCapturer | None = capturer
+        self.capturer = capturer
         self.writer = writer
         self.full_attn_group_id = full_attn_group_id
 
@@ -77,11 +77,9 @@ class RoutedExpertsCaptureState:
         return self.writer is not None
 
     def clear(self) -> None:
-        if self.capturer is not None:
-            self.capturer.clear_buffer()
+        self.capturer.clear_buffer()
 
     def get_device_buffer(self) -> torch.Tensor:
-        assert self.capturer is not None, "routed-experts capture state is closed"
         return self.capturer.get_device_buffer()
 
     def make_write_task(
@@ -113,4 +111,3 @@ class RoutedExpertsCaptureState:
         if self.writer is not None:
             self.writer.close()
             self.writer = None
-        self.capturer = None
