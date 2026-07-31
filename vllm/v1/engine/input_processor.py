@@ -115,12 +115,6 @@ class InputProcessor:
                         "bound sampling mask size, reduce transfer overhead, "
                         "and avoid potential OOMs"
                     )
-                if params.logprobs is None:
-                    raise ValueError(
-                        "sampling distribution replay requires logprobs to be "
-                        "set so that nucleus-normalized log-probabilities are "
-                        "returned for importance ratio computation"
-                    )
             if params.thinking_token_budget is not None:
                 if (
                     self.vllm_config.reasoning_config is None
