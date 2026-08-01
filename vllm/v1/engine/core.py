@@ -57,6 +57,7 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.single_type_kv_cache_manager import register_all_kvcache_specs
 from vllm.v1.engine import (
     EEP_NOTIFICATION_CALL_ID,
+    ArtifactRequestToFinalize,
     EEPNotificationType,
     EngineCoreOutput,
     EngineCoreOutputs,
@@ -218,7 +219,11 @@ class EngineCore:
         self.is_pooling_model = vllm_config.model_config.runner_type == "pooling"
 
         self.request_block_hasher: Callable[[Request], list[BlockHash]] | None = None
-        if vllm_config.cache_config.enable_prefix_caching or kv_connector is not None:
+        if (
+            vllm_config.cache_config.enable_prefix_caching
+            or kv_connector is not None
+            or vllm_config.artifact_config.enable_routed_experts
+        ):
             caching_hash_fn = get_hash_fn_by_name(
                 vllm_config.cache_config.prefix_caching_hash_algo
             )
@@ -489,6 +494,12 @@ class EngineCore:
         # specific finish reason, TBD whether we propagate that
         # (i.e. client-aborted vs stop criteria met).
         self.scheduler.finish_requests(request_ids, RequestStatus.FINISHED_ABORTED)
+
+    def finalize_artifact_requests(
+        self, requests: list[ArtifactRequestToFinalize]
+    ) -> None:
+        """Finalize artifacts for requests stopped by the frontend."""
+        self.scheduler.finalize_artifact_requests(requests)
 
     @contextmanager
     def log_error_detail(self, scheduler_output: SchedulerOutput):
@@ -961,6 +972,7 @@ class EngineCore:
 
     def set_weight_version(self, weight_version: str) -> None:
         self._weight_version = weight_version
+        self.scheduler.set_weight_version(weight_version)
 
     def get_weight_version(self) -> str:
         """Return the latest committed weight version."""

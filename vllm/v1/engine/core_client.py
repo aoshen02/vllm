@@ -37,6 +37,7 @@ from vllm.utils.network_utils import (
 from vllm.v1.engine import (
     EEP_NOTIFICATION_CALL_ID,
     FT_STATUS_CALL_ID,
+    ArtifactRequestToFinalize,
     EEPNotificationType,
     EngineCoreOutputs,
     EngineCoreReadyResponse,
@@ -194,6 +195,11 @@ class EngineCoreClient(ABC):
     def abort_requests(self, request_ids: list[str]) -> None:
         raise NotImplementedError
 
+    def finalize_artifact_requests(
+        self, requests: list[ArtifactRequestToFinalize]
+    ) -> None:
+        raise NotImplementedError
+
     def add_lora(self, lora_request: LoRARequest) -> bool:
         raise NotImplementedError
 
@@ -268,6 +274,11 @@ class EngineCoreClient(ABC):
     async def abort_requests_async(self, request_ids: list[str]) -> None:
         raise NotImplementedError
 
+    async def finalize_artifact_requests_async(
+        self, requests: list[ArtifactRequestToFinalize]
+    ) -> None:
+        raise NotImplementedError
+
     async def add_lora_async(self, lora_request: LoRARequest) -> bool:
         raise NotImplementedError
 
@@ -331,6 +342,12 @@ class InprocClient(EngineCoreClient):
     def abort_requests(self, request_ids: list[str]) -> None:
         if len(request_ids) > 0:
             self.engine_core.abort_requests(request_ids)
+
+    def finalize_artifact_requests(
+        self, requests: list[ArtifactRequestToFinalize]
+    ) -> None:
+        if requests:
+            self.engine_core.finalize_artifact_requests(requests)
 
     def shutdown(self, timeout: float | None = None) -> None:
         self.engine_core.shutdown()
@@ -910,6 +927,12 @@ class SyncMPClient(MPClient):
         if request_ids and not self.resources.engine_dead:
             self._send_input(EngineCoreRequestType.ABORT, request_ids)
 
+    def finalize_artifact_requests(
+        self, requests: list[ArtifactRequestToFinalize]
+    ) -> None:
+        if requests and not self.resources.engine_dead:
+            self.call_utility("finalize_artifact_requests", requests)
+
     def profile(self, is_start: bool = True, profile_prefix: str | None = None) -> None:
         self.call_utility("profile", is_start, profile_prefix)
 
@@ -1150,6 +1173,12 @@ class AsyncMPClient(MPClient):
     async def abort_requests_async(self, request_ids: list[str]) -> None:
         if request_ids and not self.resources.engine_dead:
             await self._send_input(EngineCoreRequestType.ABORT, request_ids)
+
+    async def finalize_artifact_requests_async(
+        self, requests: list[ArtifactRequestToFinalize]
+    ) -> None:
+        if requests and not self.resources.engine_dead:
+            await self.call_utility_async("finalize_artifact_requests", requests)
 
     async def pause_scheduler_async(
         self, mode: PauseMode = "abort", clear_cache: bool = True
@@ -1600,6 +1629,21 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
                 by_engine[engine].append(req_id)
         for engine, req_ids in by_engine.items():
             await self._abort_requests(req_ids, engine)
+
+    async def finalize_artifact_requests_async(
+        self, requests: list[ArtifactRequestToFinalize]
+    ) -> None:
+        if not requests or self.resources.engine_dead:
+            return
+        by_engine = defaultdict[EngineIdentity, list[ArtifactRequestToFinalize]](list)
+        for request in requests:
+            request_id, _, _ = request
+            if engine := self.reqs_in_flight.get(request_id):
+                by_engine[engine].append(request)
+        for engine, engine_requests in by_engine.items():
+            await self._call_utility_async(
+                "finalize_artifact_requests", engine_requests, engine=engine
+            )
 
     async def _abort_requests(
         self, request_ids: list[str], engine: EngineIdentity

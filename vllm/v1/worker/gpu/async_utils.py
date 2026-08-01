@@ -5,10 +5,8 @@ import contextlib
 import numpy as np
 import torch
 
+from vllm.distributed.artifact_connector import ArtifactWriteTask
 from vllm.model_executor.layers.fused_moe.all2all_utils import get_ep_all2all_manager
-from vllm.model_executor.layers.fused_moe.routed_experts_capture import (
-    RoutedExpertsWriteTask,
-)
 from vllm.v1.outputs import (
     AsyncModelRunnerOutput,
     LogprobsTensors,
@@ -27,7 +25,7 @@ class AsyncOutput(AsyncModelRunnerOutput):
         main_stream: torch.cuda.Stream,
         copy_stream: torch.cuda.Stream,
         check_ep_fault: bool = False,
-        routed_experts_write_task: RoutedExpertsWriteTask | None = None,
+        artifact_write_task: ArtifactWriteTask | None = None,
     ):
         # NOTE(woosuk): We must retain references to the GPU tensors,
         # as the copy operations are performed on a different CUDA stream than
@@ -35,7 +33,7 @@ class AsyncOutput(AsyncModelRunnerOutput):
         self.model_runner_output = model_runner_output
         self.sampler_output = sampler_output
         self.num_sampled_tokens = num_sampled_tokens
-        self.routed_experts_write_task = routed_experts_write_task
+        self.artifact_write_task = artifact_write_task
         # Blocking (sleep) event to avoid busy-polling the CUDA driver lock.
         self.copy_event = torch.cuda.Event(blocking=True)
         self._has_fault: torch.Tensor | None = None
@@ -57,8 +55,8 @@ class AsyncOutput(AsyncModelRunnerOutput):
                 k: v.to_cpu_nonblocking() if v is not None else None
                 for k, v in self.model_runner_output.prompt_logprobs_dict.items()
             }
-            if self.routed_experts_write_task is not None:
-                self.routed_experts_write_task.start_copy()
+            if self.artifact_write_task is not None:
+                self.artifact_write_task.start_copy()
             if check_ep_fault:
                 has_fault = get_ep_all2all_manager().query_fault()
                 self._has_fault = has_fault.to("cpu", non_blocking=True)
@@ -94,9 +92,9 @@ class AsyncOutput(AsyncModelRunnerOutput):
                 f"Mask: {mask.cpu().tolist()}"
             )
 
-        if self.routed_experts_write_task is not None:
-            self.routed_experts_write_task.finalize(self.model_runner_output)
-            self.routed_experts_write_task = None
+        if self.artifact_write_task is not None:
+            self.artifact_write_task.finalize()
+            self.artifact_write_task = None
         return self.model_runner_output
 
 

@@ -27,7 +27,12 @@ from vllm.tracing import (
     instrument_manual,
 )
 from vllm.utils import length_from_prompt_token_ids_or_embeds
-from vllm.v1.engine import EngineCoreOutput, EngineCoreRequest, FinishReason
+from vllm.v1.engine import (
+    ArtifactRequestToFinalize,
+    EngineCoreOutput,
+    EngineCoreRequest,
+    FinishReason,
+)
 from vllm.v1.engine.detokenizer import IncrementalDetokenizer
 from vllm.v1.engine.logprobs import LogprobsProcessor
 from vllm.v1.engine.parallel_sampling import ParentRequest
@@ -110,6 +115,7 @@ class RequestOutputCollector:
 class OutputProcessorOutput:
     request_outputs: list[RequestOutput | PoolingRequestOutput]
     reqs_to_abort: list[str]
+    artifact_reqs_to_finalize: list[ArtifactRequestToFinalize]
 
 
 @dataclass
@@ -176,8 +182,8 @@ class RequestState:
 
         self.stats = RequestStateStats(arrival_time=arrival_time) if log_stats else None
 
-        # Routed experts accumulation (prompt + sample chunks)
-        self.routed_experts_chunks: list[np.ndarray] = []
+        self.routed_experts: np.ndarray | None = None
+        self.artifact_finalize_requested = False
 
         # Stream Interval
         self.stream_interval = stream_interval
@@ -406,16 +412,11 @@ class RequestState:
         if delta and logprobs:
             logprobs = logprobs[-len(token_ids) :]
 
-        # Concatenate routed experts on finish
-        routed_experts = None
-        if finished and self.routed_experts_chunks:
-            routed_experts = np.concatenate(self.routed_experts_chunks, axis=0)
-
         return CompletionOutput(
             index=self.request_index,
             text=text,
             token_ids=token_ids,
-            routed_experts=routed_experts,
+            routed_experts=self.routed_experts if finished else None,
             logprobs=logprobs,
             cumulative_logprob=self.logprobs_processor.cumulative_logprob,
             finish_reason=str(finish_reason) if finished else None,
@@ -436,6 +437,7 @@ class OutputProcessor:
         log_stats: bool,
         stream_interval: int = 1,
         tracing_enabled: bool = False,
+        finalize_artifacts: bool = False,
     ):
         self.log_stats = log_stats
         self.tokenizer = tokenizer
@@ -445,6 +447,7 @@ class OutputProcessor:
         self.external_req_ids: defaultdict[str, list[str]] = defaultdict(list)
         self.lora_states = LoRARequestStates(log_stats)
         self.tracing_enabled = tracing_enabled
+        self.finalize_artifacts = finalize_artifacts
 
     def get_num_unfinished_requests(self):
         return len(self.request_states)
@@ -616,11 +619,20 @@ class OutputProcessor:
 
         request_outputs: list[RequestOutput | PoolingRequestOutput] = []
         reqs_to_abort: list[str] = []
+        artifact_reqs_to_finalize: list[ArtifactRequestToFinalize] = []
         for engine_core_output in engine_core_outputs:
             req_id = engine_core_output.request_id
             req_state = self.request_states.get(req_id)
             if req_state is None:
                 # Ignore output for already-aborted request.
+                continue
+            if (
+                req_state.artifact_finalize_requested
+                and not engine_core_output.artifact_finalized
+            ):
+                # Ignore frames already in flight when the frontend found the
+                # stop string, including a stale terminal frame. Only the ACK
+                # for the requested artifact boundary may finish the request.
                 continue
 
             # 1) Compute stats for this iteration.
@@ -635,9 +647,9 @@ class OutputProcessor:
             kv_transfer_params = engine_core_output.kv_transfer_params
             ec_transfer_params = engine_core_output.ec_transfer_params
             if engine_core_output.routed_experts is not None:
-                req_state.routed_experts_chunks.append(
-                    engine_core_output.routed_experts
-                )
+                if req_state.routed_experts is not None:
+                    raise RuntimeError("received duplicate terminal artifact output")
+                req_state.routed_experts = engine_core_output.routed_experts
 
             if req_state.is_prefilling:
                 if engine_core_output.prefill_stats is not None:
@@ -659,6 +671,21 @@ class OutputProcessor:
                 if stop_string:
                     finish_reason = FinishReason.STOP
                     stop_reason = stop_string
+                    if self.finalize_artifacts and not engine_core_output.finished:
+                        req_state.artifact_finalize_requested = True
+                        artifact_reqs_to_finalize.append(
+                            (
+                                req_id,
+                                req_state.prompt_len
+                                + req_state.detokenizer.num_output_tokens()
+                                - 1,
+                                stop_string,
+                            )
+                        )
+                        # Emit this chunk as non-terminal. Artifact finalization
+                        # supplies the terminal output and materialized value.
+                        finish_reason = None
+                        stop_reason = None
 
                 # 3) Compute sample and prompt logprobs for request,
                 # if required.
@@ -708,6 +735,7 @@ class OutputProcessor:
         return OutputProcessorOutput(
             request_outputs=request_outputs,
             reqs_to_abort=reqs_to_abort,
+            artifact_reqs_to_finalize=artifact_reqs_to_finalize,
         )
 
     def _finish_request(self, req_state: RequestState) -> None:

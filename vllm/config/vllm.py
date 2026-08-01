@@ -27,6 +27,7 @@ from vllm.triton_utils import HAS_TRITON
 from vllm.utils import random_uuid
 from vllm.utils.hashing import safe_hash
 
+from .artifact import ArtifactConfig
 from .attention import AttentionConfig
 from .cache import CacheConfig
 from .compilation import CompilationConfig, CompilationMode, CUDAGraphMode
@@ -353,6 +354,8 @@ class VllmConfig:
     """Model weight offloading configuration."""
     attention_config: AttentionConfig = Field(default_factory=AttentionConfig)
     """Attention configuration."""
+    artifact_config: ArtifactConfig = Field(default_factory=ArtifactConfig)
+    """Execution artifact configuration."""
     mamba_config: MambaConfig = Field(default_factory=MambaConfig)
     """Mamba configuration."""
     kernel_config: KernelConfig = Field(default_factory=KernelConfig)
@@ -926,11 +929,9 @@ class VllmConfig:
         # This is the same for all backends
         self.kv_transfer_config.kv_role = "kv_both"
 
-    def _verify_return_routed_experts_compatibility(self) -> None:
-        """Reject configurations unsupported by routed-experts capture."""
-        if self.model_config is None or not (
-            self.model_config.enable_return_routed_experts
-        ):
+    def _verify_artifact_compatibility(self) -> None:
+        """Reject configurations unsupported by enabled artifacts."""
+        if self.model_config is None or not self.artifact_config.enable_routed_experts:
             return
 
         if self.parallel_config.pipeline_parallel_size > 1:
@@ -945,6 +946,14 @@ class VllmConfig:
             raise ValueError(
                 "--enable-return-routed-experts is incompatible with "
                 "context parallelism (DCP/PCP > 1)."
+            )
+
+        shm_root = os.path.realpath(self.artifact_config.shm_dir)
+        if os.path.commonpath((shm_root, "/dev/shm")) != "/dev/shm":
+            raise ValueError(
+                "--enable-return-routed-experts with the SHM artifact backend "
+                "requires shm_dir under /dev/shm; got "
+                f"{self.artifact_config.shm_dir!r}."
             )
 
         kv_transfer_config = self.kv_transfer_config
@@ -1613,7 +1622,7 @@ class VllmConfig:
         # before the HMA check below, which inspects the connector class.
         self._post_init_kv_transfer_config()
 
-        self._verify_return_routed_experts_compatibility()
+        self._verify_artifact_compatibility()
 
         # Hybrid KV cache manager (HMA) runtime rules:
         # - Explicit enable (--no-disable-kv-cache-manager): error if runtime
@@ -2162,7 +2171,7 @@ class VllmConfig:
             f"quantization={self.model_config.quantization}, "
             f"quantization_config={self.model_config.quantization_config}, "  # noqa
             f"enforce_eager={self.model_config.enforce_eager}, "
-            f"enable_return_routed_experts={self.model_config.enable_return_routed_experts}, "  # noqa
+            f"artifact_config={self.artifact_config!r}, "
             f"kv_cache_dtype={self.cache_config.cache_dtype}, "
             f"device_config={self.device_config.device}, "
             f"structured_outputs_config={self.structured_outputs_config!r}, "

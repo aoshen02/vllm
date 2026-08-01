@@ -11,27 +11,14 @@ import torch
 from vllm.config import VllmConfig
 from vllm.config.compilation import CompilationMode
 from vllm.distributed.eplb.eplb_state import EplbLayerState
-from vllm.distributed.kv_transfer.kv_connector.v1.sidecar import (
-    KVConnectorSidecarBlockMap,
-    KVConnectorSidecarConfig,
-    KVConnectorSidecarTransferPlan,
-)
 from vllm.model_executor.layers.fused_moe.config import RoutingMethodType
 from vllm.model_executor.layers.fused_moe.routed_experts_capture import (
     RoutedExpertsCapturer,
     RoutedExpertsCaptureState,
-    RoutedExpertsManager,
-    RoutedExpertsTensors,
     RoutedExpertsWriteTask,
     bind_routed_experts_capturer,
-    require_full_attn_group_id,
 )
 from vllm.model_executor.layers.fused_moe.router.base_router import BaseRouter
-from vllm.v1.kv_cache_interface import (
-    FullAttentionSpec,
-    KVCacheConfig,
-    KVCacheGroupSpec,
-)
 
 pytestmark = pytest.mark.cpu_test
 
@@ -40,93 +27,46 @@ _CAPTURER_MODULE = (
 )
 
 
-def test_multiple_full_attention_groups_use_hashable_warning_args():
-    kv_cache_spec = FullAttentionSpec(
-        block_size=16,
-        num_kv_heads=1,
-        head_size=1,
-        dtype=torch.float32,
-    )
-    kv_cache_config = KVCacheConfig(
-        num_blocks=1,
-        kv_cache_tensors=[],
-        kv_cache_groups=[
-            KVCacheGroupSpec(["layer.0"], kv_cache_spec),
-            KVCacheGroupSpec(["layer.1"], kv_cache_spec),
-        ],
-    )
-
-    assert require_full_attn_group_id(kv_cache_config) == 0
-
-
 def test_routed_experts_write_task_publishes_copied_tensors():
     routing_data = torch.tensor([[[1, 2]], [[3, 4]]], dtype=torch.int32)
-    slot_mapping = torch.tensor([5, 9], dtype=torch.int64)
-    writer = Mock()
-    output = SimpleNamespace(routed_experts_slots=None)
+    sink = Mock()
     write_task = RoutedExpertsWriteTask(
-        routed_experts_tensors=RoutedExpertsTensors(routing_data, slot_mapping),
-        writer=writer,
+        routing_data=routing_data,
+        request_ids=("request",),
+        query_start_locs=np.array([0, 2]),
+        token_starts=np.array([7]),
+        artifact_sink=sink,
     )
 
     write_task.start_copy()
-    write_task.finalize(output)
+    write_task.finalize()
 
-    stored_routing, stored_slots = writer.store_batch.call_args.args
+    request_id, token_start, stored_routing = sink.call_args.args
+    assert request_id == "request"
+    assert token_start == 7
     assert stored_routing.tolist() == routing_data.tolist()
-    assert stored_slots.tolist() == slot_mapping.tolist()
-    assert output.routed_experts_slots.tolist() == slot_mapping.tolist()
 
 
-def test_routed_experts_manager_applies_public_sidecar_transfers():
-    manager = RoutedExpertsManager.__new__(RoutedExpertsManager)
-    manager.routed_experts_by_offload_block = np.zeros(
-        (2, 2, 2, 1, 1),
-        dtype=np.uint8,
-    )
-    manager._blocks_view = np.arange(6, dtype=np.uint8).reshape(3, 2, 1, 1)
-    stores = KVConnectorSidecarBlockMap(
-        gpu_block_ids=np.array([0, 1]),
-        connector_block_ids=np.array([1, 1]),
-        connector_block_offsets=np.array([0, 1]),
+def test_routed_experts_write_task_splits_logical_requests():
+    routing_data = torch.arange(10, dtype=torch.int32).reshape(5, 1, 2)
+    sink = Mock()
+    write_task = RoutedExpertsWriteTask(
+        routing_data=routing_data,
+        request_ids=("request-a", "request-b"),
+        query_start_locs=np.array([0, 2, 5]),
+        token_starts=np.array([4, 9]),
+        artifact_sink=sink,
     )
 
-    manager.apply_offload_transfers(KVConnectorSidecarTransferPlan(store=stores))
+    write_task.start_copy()
+    write_task.finalize()
 
-    np.testing.assert_array_equal(
-        manager.routed_experts_by_offload_block[1, 0],
-        np.array([0, 1], dtype=np.uint8).reshape(2, 1, 1),
-    )
-    np.testing.assert_array_equal(
-        manager.routed_experts_by_offload_block[1, 1],
-        np.array([2, 3], dtype=np.uint8).reshape(2, 1, 1),
-    )
-
-    manager._blocks_view[2].fill(0)
-    loads = KVConnectorSidecarBlockMap(
-        gpu_block_ids=np.array([2]),
-        connector_block_ids=np.array([1]),
-        connector_block_offsets=np.array([1]),
-    )
-    manager.apply_offload_transfers(KVConnectorSidecarTransferPlan(load=loads))
-    np.testing.assert_array_equal(
-        manager._blocks_view[2],
-        np.array([2, 3], dtype=np.uint8).reshape(2, 1, 1),
-    )
-
-
-@pytest.mark.parametrize(
-    "sidecar_config",
-    [
-        KVConnectorSidecarConfig(0, 1),
-        KVConnectorSidecarConfig(1, 0),
-    ],
-)
-def test_routed_experts_manager_rejects_invalid_sidecar_layout(
-    sidecar_config: KVConnectorSidecarConfig,
-):
-    with pytest.raises(ValueError, match="sidecar block counts must be positive"):
-        RoutedExpertsManager(Mock(), Mock(), sidecar_config)
+    assert sink.call_count == 2
+    first, second = sink.call_args_list
+    assert first.args[0:2] == ("request-a", 4)
+    assert second.args[0:2] == ("request-b", 9)
+    np.testing.assert_array_equal(first.args[2], routing_data[:2].numpy())
+    np.testing.assert_array_equal(second.args[2], routing_data[2:].numpy())
 
 
 def _capturer_with_buffer(
@@ -266,81 +206,49 @@ def test_bind_routed_experts_capturer(monkeypatch):
 def test_capture_state_write_task_owns_immutable_snapshot():
     capturer = _capturer_with_buffer(max_tokens=4, num_layers=2)
     capturer.device_buffer.copy_(torch.arange(16).reshape(4, 2, 2))
-    state = RoutedExpertsCaptureState(capturer, Mock(), full_attn_group_id=1)
-    slot_mappings = torch.tensor(
-        [[11, 12, 13, 14], [21, 22, 23, 24]], dtype=torch.int64
+    state = RoutedExpertsCaptureState(capturer)
+    sink = Mock()
+
+    write_task = state.make_write_task(
+        3,
+        request_ids=("request",),
+        query_start_locs=np.array([0, 3]),
+        token_starts=np.array([4]),
+        artifact_sink=sink,
     )
 
-    write_task = state.make_write_task(slot_mappings[1], 3)
-
-    assert write_task is not None
-    tensors = write_task.routed_experts_tensors
-    assert torch.equal(tensors.routing_data, capturer.device_buffer[:3])
-    assert torch.equal(tensors.slot_mapping, torch.tensor([21, 22, 23]))
+    assert torch.equal(write_task.routing_data, capturer.device_buffer[:3])
     capturer.clear_buffer()
-    slot_mappings.fill_(-1)
     assert torch.equal(
-        tensors.routing_data,
+        write_task.routing_data,
         torch.arange(12, dtype=torch.int32).reshape(3, 2, 2),
     )
-    assert torch.equal(tensors.slot_mapping, torch.tensor([21, 22, 23]))
 
 
-def test_capture_state_close_releases_writer():
-    capturer = Mock()
-    writer = Mock()
-    state = RoutedExpertsCaptureState(capturer, writer, full_attn_group_id=0)
-
-    state.close()
-
-    writer.close.assert_called_once_with()
-    assert state.capturer is capturer
-    assert state.writer is None
-
-
-@pytest.mark.parametrize(("rank", "creates_writer"), [(0, True), (1, False)])
-def test_capture_state_create_uses_explicit_dependencies(
-    monkeypatch, rank, creates_writer
-):
+def test_capture_state_create_uses_explicit_dependencies(monkeypatch):
     from vllm.model_executor.layers.fused_moe.routed_experts_capture import (
         state as state_module,
     )
 
     model = Mock()
     capturer = Mock()
-    writer = Mock()
-    writer_factory = Mock(return_value=writer)
     bind = Mock()
-    monkeypatch.setattr(state_module, "require_full_attn_group_id", lambda _: 2)
     monkeypatch.setattr(
         state_module, "RoutedExpertsCapturer", Mock(return_value=capturer)
     )
     monkeypatch.setattr(state_module, "bind_routed_experts_capturer", bind)
-    monkeypatch.setattr(state_module, "get_routed_experts_output_rank", lambda: 0)
-    monkeypatch.setattr(
-        state_module,
-        "get_routing_slot_shape_and_dtype",
-        lambda *_: ((16, 4, 2), "uint8"),
-    )
-    monkeypatch.setattr(state_module, "RoutedExpertsWorkerWriter", writer_factory)
     vllm_config = SimpleNamespace(
         instance_id="instance",
-        parallel_config=SimpleNamespace(rank=rank, data_parallel_rank=3),
+        parallel_config=SimpleNamespace(rank=0, data_parallel_rank=3),
     )
-    kv_cache_config = Mock()
-
     state = RoutedExpertsCaptureState.create(
         model=model,
         vllm_config=vllm_config,
-        kv_cache_config=kv_cache_config,
         max_num_batched_tokens=32,
     )
 
     assert state.capturer is capturer
-    assert state.full_attn_group_id == 2
-    assert state.can_write is creates_writer
     bind.assert_called_once_with(model, capturer)
-    assert writer_factory.called is creates_writer
 
 
 def test_bind_routed_experts_capturer_only_visits_target_model(monkeypatch):
@@ -409,7 +317,6 @@ def test_v2_model_runner_accepts_routed_experts(monkeypatch):
     monkeypatch.setattr("importlib.metadata.entry_points", lambda **_: ())
     config = SimpleNamespace(
         model_config=SimpleNamespace(
-            enable_return_routed_experts=True,
             use_mla=False,
             logits_processors=None,
             enable_prompt_embeds=False,
@@ -452,13 +359,17 @@ def test_routed_experts_reject_unsupported_parallelism(parallel_field, error):
     )
     setattr(parallel_config, parallel_field, 2)
     config = SimpleNamespace(
-        model_config=SimpleNamespace(enable_return_routed_experts=True),
+        model_config=SimpleNamespace(),
         parallel_config=parallel_config,
+        artifact_config=SimpleNamespace(
+            enable_routed_experts=True,
+            shm_dir="/dev/shm/vllm-artifacts",
+        ),
         kv_transfer_config=None,
     )
 
     with pytest.raises(ValueError, match=error):
-        VllmConfig._verify_return_routed_experts_compatibility(config)
+        VllmConfig._verify_artifact_compatibility(config)
 
 
 def test_routed_experts_capturer_single_dp_no_metadata():

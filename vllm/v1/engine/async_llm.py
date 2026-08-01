@@ -143,6 +143,7 @@ class AsyncLLM(EngineClient):
             log_stats=self.log_stats,
             stream_interval=self.vllm_config.scheduler_config.stream_interval,
             tracing_enabled=tracing_endpoint is not None,
+            finalize_artifacts=self.vllm_config.artifact_config.enable_routed_experts,
         )
 
         # EngineCore (starts the engine in background process).
@@ -689,6 +690,10 @@ class AsyncLLM(EngineClient):
                         if processed_outputs.reqs_to_abort:
                             await engine_core.abort_requests_async(
                                 processed_outputs.reqs_to_abort
+                            )
+                        if processed_outputs.artifact_reqs_to_finalize:
+                            await engine_core.finalize_artifact_requests_async(
+                                processed_outputs.artifact_reqs_to_finalize
                             )
 
                     output_processor.update_scheduler_stats(outputs.scheduler_stats)

@@ -13,7 +13,7 @@ if TYPE_CHECKING:
     from vllm.distributed.ec_transfer.ec_connector.base import ECConnectorBase
     from vllm.distributed.kv_transfer.kv_connector.v1 import KVConnectorBase_V1
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
-    from vllm.v1.engine import EngineCoreOutputs
+    from vllm.v1.engine import ArtifactRequestToFinalize, EngineCoreOutputs
     from vllm.v1.kv_cache_interface import KVCacheConfig
     from vllm.v1.metrics.stats import SchedulerStats
     from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
@@ -166,6 +166,13 @@ class SchedulerInterface(ABC):
         raise NotImplementedError
 
     @abstractmethod
+    def finalize_artifact_requests(
+        self, requests: list["ArtifactRequestToFinalize"]
+    ) -> None:
+        """Finalize artifacts at frontend-resolved stop boundaries."""
+        raise NotImplementedError
+
+    @abstractmethod
     def get_num_unfinished_requests(self) -> int:
         """Number of unfinished requests in the scheduler's internal queue."""
         raise NotImplementedError
@@ -219,6 +226,11 @@ class SchedulerInterface(ABC):
                 will only reset the KV prefix cache when there is no running request
                 taking KV cache.
         """
+        raise NotImplementedError
+
+    @abstractmethod
+    def set_weight_version(self, weight_version: str) -> None:
+        """Update versioned scheduler-side cache namespaces."""
         raise NotImplementedError
 
     @abstractmethod

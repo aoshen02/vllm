@@ -26,6 +26,9 @@ from vllm.v1.serial_utils import UtilityResult
 # - "keep": Freeze requests in queue; they resume on resume_generation().
 PauseMode = Literal["abort", "wait", "keep"]
 
+# (request_id, accepted_token_end, stop_reason)
+ArtifactRequestToFinalize = tuple[str, int, str]
+
 # These are possible values of RequestOutput.finish_reason,
 # so form part of the external API.
 FINISH_REASON_STRINGS = ("stop", "length", "abort", "error", "repetition")
@@ -206,6 +209,7 @@ class EngineCoreOutput(
     prefill_stats: PrefillStats | None = None
 
     routed_experts: np.ndarray | None = None
+    artifact_finalized: bool = False
     # The number of NaNs in logits.
     # A value greater than 0 indicates that the output is corrupted.
     num_nans_in_logits: int = 0
