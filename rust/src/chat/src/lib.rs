@@ -261,6 +261,28 @@ impl ChatLlm {
         self.processor.backend.multimodal_model_info().is_some()
     }
 
+    /// Resolve OpenAI-style content parts into [`MmFeatures`] for a
+    /// token-level generate request. `prompt_token_ids` is mutated in
+    /// place to expand placeholder tokens.
+    pub async fn resolve_content_parts(
+        &self,
+        parts: &[ChatContentPart],
+        prompt_token_ids: &mut Vec<u32>,
+    ) -> Result<MmFeatures> {
+        let info = self
+            .processor
+            .backend
+            .multimodal_model_info()
+            .ok_or(Error::UnsupportedMultimodalRenderer)?;
+        let model_dtype = self
+            .processor
+            .model_dtype
+            .ok_or(Error::UnsupportedMultimodalRenderer)?;
+        let media_parts = multimodal::content_parts_to_media_parts(parts)?;
+        info.prepare_multimodal(media_parts, prompt_token_ids, model_dtype)
+            .await
+    }
+
     /// Effective tool-call parser name for this model, if parsing is enabled.
     pub fn tool_call_parser_name(&self) -> Option<&str> {
         match &self.tool_call_parser {
