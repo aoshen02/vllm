@@ -250,7 +250,7 @@ class SchedulerOutput:
 
     # EC Cache Connector metadata
     ec_connector_metadata: ECConnectorMetadata | None = None
-    # Artifact work for the authoritative routed-experts worker.
+    # Artifact work for the authoritative worker.
     artifact_connector_metadata: ArtifactConnectorMetadata | None = None
     # EC Cache Manager metadata
     ec_manager_metadata: EncoderCacheManagerMetadata | None = None

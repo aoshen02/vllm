@@ -565,10 +565,6 @@ class OpenAIServingCompletion(GenerateBaseServing):
                 else:
                     logprobs = None
 
-                # Encode routed_experts for transport. JSON can't carry raw
-                # bytes, so we write the ndarray as a ``.npy`` byte stream
-                # and base64-encode it. ``pybase64`` is ~3x faster than the
-                # stdlib ``base64`` on large payloads thanks to SIMD.
                 routed_experts_b64 = (
                     numpy2base64(output.routed_experts)
                     if output.routed_experts is not None

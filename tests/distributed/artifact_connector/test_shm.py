@@ -6,6 +6,7 @@ import multiprocessing
 import os
 import time
 from collections import defaultdict
+from dataclasses import dataclass
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -25,10 +26,11 @@ from vllm.distributed.artifact_connector.protocol import (
     ArtifactFinalizeResult,
 )
 from vllm.distributed.artifact_connector.request_core import (
-    ArtifactKeySpace,
-    decode_artifact_array,
-    encode_artifact_array,
+    RoutedExpertsRequestCore,
+    decode_routed_experts_array,
+    encode_routed_experts_array,
     materialize_routed_experts,
+    routed_experts_key,
 )
 from vllm.distributed.artifact_connector.shm import (
     LocalSharedMemoryArtifactReader,
@@ -51,11 +53,14 @@ pytestmark = pytest.mark.cpu_test
 def _make_vllm_config(tmp_path):
     return SimpleNamespace(
         artifact_config=SimpleNamespace(
+            enabled=True,
+            enable_routed_experts=True,
             shm_dir=str(tmp_path),
             max_shm_bytes=1 << 20,
             shm_ttl_seconds=60,
         ),
-        parallel_config=SimpleNamespace(data_parallel_rank=0),
+        parallel_config=SimpleNamespace(data_parallel_rank=0, rank=0),
+        cache_config=SimpleNamespace(prefix_caching_hash_algo="sha256"),
         model_config=SimpleNamespace(
             hf_text_config=SimpleNamespace(
                 num_hidden_layers=3,
@@ -79,15 +84,71 @@ def _make_worker_connector(tmp_path, *, max_bytes: int = 1 << 20):
     return connector, logical
 
 
+def test_non_writer_rank_still_initializes_capture(monkeypatch, tmp_path):
+    from vllm.model_executor.layers.fused_moe import routed_experts_capture
+
+    config = _make_vllm_config(tmp_path)
+    config.parallel_config.rank = 1
+    capture_state = Mock()
+    create_capture = Mock(return_value=capture_state)
+    monkeypatch.setattr(
+        routed_experts_capture.RoutedExpertsCaptureState,
+        "create",
+        create_capture,
+    )
+
+    connector = ArtifactWorkerConnector.create(config, Mock(), 32)
+
+    assert connector is not None
+    create_capture.assert_called_once()
+    assert connector.start_step(ArtifactConnectorMetadata()) is None
+    capture_state.clear.assert_called_once_with()
+    assert (
+        connector.make_write_task(
+            1,
+            request_ids=("request",),
+            query_start_locs=np.array([0, 1]),
+            token_starts=np.array([0]),
+        )
+        is None
+    )
+    connector.shutdown()
+
+
+@dataclass
+class _CoreHarness:
+    store: LocalSharedMemoryArtifactStore
+    buffer: RoutedExpertsArtifactBuffer
+    core: RoutedExpertsRequestCore
+    logical: np.ndarray
+
+    def close(self) -> None:
+        self.store.close()
+
+
+def _make_core_harness(tmp_path, *, max_bytes: int = 1 << 20) -> _CoreHarness:
+    store = LocalSharedMemoryArtifactStore(
+        str(tmp_path),
+        "instance",
+        0,
+        max_bytes=max_bytes,
+        ttl_seconds=60,
+    )
+    buffer = RoutedExpertsArtifactBuffer(np.dtype("uint8"), (3, 2))
+    logical = np.arange(12 * 3 * 2, dtype=np.uint8).reshape(12, 3, 2)
+    return _CoreHarness(
+        store=store,
+        buffer=buffer,
+        core=RoutedExpertsRequestCore(store, buffer),
+        logical=logical,
+    )
+
+
 def _block_key(
     block_hash: bytes,
     weight_version: str = "default",
 ) -> str:
-    key_space = ArtifactKeySpace(
-        np.dtype("uint8"),
-        (3, 2),
-    )
-    return key_space.block_key(block_hash, 4, weight_version)
+    return routed_experts_key(block_hash, weight_version)
 
 
 def _request(
@@ -101,9 +162,28 @@ def _request(
         request_attempt_id=request_attempt_id,
         weight_version="default",
         block_hashes=[bytes([index]) * 32 for index in range(3)],
+        tail_block_hash=b"t" * 32 if token_end % 4 else None,
         token_end=token_end,
         hash_block_size=4,
     )
+
+
+def _scheduler_request(
+    request_id: str,
+    block_hashes: list[bytes],
+    *,
+    num_tokens: int = 10,
+):
+    request = Mock()
+    request.request_id = request_id
+    request.block_hashes = block_hashes
+    request.num_tokens = num_tokens
+    request.all_token_ids = list(range(num_tokens))
+    request.mm_features = []
+    request.lora_request = None
+    request.cache_salt = None
+    request.prompt_embeds = None
+    return request
 
 
 def _commit_request(request: ArtifactFinalizeRequest) -> ArtifactCommitRequest | None:
@@ -120,16 +200,16 @@ def _commit_request(request: ArtifactFinalizeRequest) -> ArtifactCommitRequest |
 
 
 def _prepare_and_finalize(
-    connector: ArtifactWorkerConnector,
+    harness: _CoreHarness,
     request: ArtifactFinalizeRequest,
     logical: np.ndarray,
 ):
-    connector.buffer.capture(request.request_id, 0, logical[: request.token_end])
+    harness.buffer.capture(request.request_id, 0, logical[: request.token_end])
     commit = _commit_request(request)
     if commit is not None:
-        prepared = connector.request_core.prepare_commit(commit)
-        connector.request_core.publish_commits([prepared])
-    return connector.request_core.finalize(request)
+        prepared = harness.core.prepare_commit(commit)
+        harness.core.publish_commits([prepared])
+    return harness.core.finalize(request)
 
 
 def _read_in_child(root: str, store_id: str, keys: list[str], result_queue) -> None:
@@ -139,32 +219,70 @@ def _read_in_child(root: str, store_id: str, keys: list[str], result_queue) -> N
 
 def test_object_envelope_round_trip():
     array = np.arange(24, dtype=np.uint8).reshape(4, 3, 2)
-    payload = encode_artifact_array(
+    payload = encode_routed_experts_array(
         key="key",
         kind="block",
-        field_profile_id="profile",
         array=array,
         source_token_start=0,
     )
 
-    decoded, header = decode_artifact_array(payload, expected_key="key")
+    decoded, header = decode_routed_experts_array(payload, expected_key="key")
 
     np.testing.assert_array_equal(decoded, array)
     assert header["shape"] == [4, 3, 2]
 
 
 def test_object_envelope_rejects_corruption():
-    payload = encode_artifact_array(
+    payload = encode_routed_experts_array(
         key="key",
         kind="tail",
-        field_profile_id="profile",
         array=np.zeros((2, 1), dtype=np.uint8),
         source_token_start=0,
     )
     corrupted = payload[:-1] + bytes([payload[-1] ^ 1])
 
     with pytest.raises(ArtifactCorruptionError, match="checksum"):
-        decode_artifact_array(corrupted, expected_key="key")
+        decode_routed_experts_array(corrupted, expected_key="key")
+
+
+@pytest.mark.parametrize(
+    ("expected_shape", "expected_dtype", "error"),
+    [
+        ((3, 1), np.dtype("uint8"), "shape"),
+        ((3, 2), np.dtype("uint16"), "dtype"),
+    ],
+)
+def test_materialize_rejects_model_schema_mismatch(
+    tmp_path, expected_shape, expected_dtype, error
+):
+    harness = _make_core_harness(tmp_path)
+    request = _request("request-a", "a" * 32, token_end=4)
+    keys = _prepare_and_finalize(harness, request, harness.logical)
+
+    with pytest.raises(ArtifactCorruptionError, match=error):
+        materialize_routed_experts(
+            harness.store,
+            keys,
+            expected_shape_per_token=expected_shape,
+            expected_dtype=expected_dtype,
+        )
+    harness.close()
+
+
+@pytest.mark.parametrize("expected_token_end", [9, 12])
+def test_materialize_rejects_terminal_range_mismatch(tmp_path, expected_token_end):
+    harness = _make_core_harness(tmp_path)
+    request = _request("request-a", "a" * 32, token_end=10)
+    keys = _prepare_and_finalize(harness, request, harness.logical)
+
+    with pytest.raises(ArtifactCorruptionError, match="terminal token range"):
+        materialize_routed_experts(
+            harness.store,
+            keys,
+            expected_token_end=expected_token_end,
+            hash_block_size=4,
+        )
+    harness.close()
 
 
 def test_logical_buffer_survives_recompute_and_release():
@@ -193,39 +311,40 @@ def test_logical_buffer_encodes_router_ids_to_artifact_dtype():
 
 
 def test_core_returns_ordered_keys_and_shm_value(tmp_path):
-    connector, logical = _make_worker_connector(tmp_path)
+    harness = _make_core_harness(tmp_path)
     request = _request("request-a", "a" * 32)
 
-    keys = _prepare_and_finalize(connector, request, logical)
+    keys = _prepare_and_finalize(harness, request, harness.logical)
 
     assert len(keys) == 3
-    assert "/block/" in keys[0]
-    assert "/block/" in keys[1]
-    assert "/tail/" in keys[2]
+    assert keys[:2] == [
+        _block_key(block_hash) for block_hash in request.block_hashes[:2]
+    ]
+    assert keys[2] == _block_key(request.tail_block_hash)  # type: ignore[arg-type]
     np.testing.assert_array_equal(
-        materialize_routed_experts(connector.store, keys),
-        logical[:10],
+        materialize_routed_experts(harness.store, keys),
+        harness.logical[:10],
     )
-    connector.shutdown()
+    harness.close()
 
 
 def test_exact_block_request_has_no_tail(tmp_path):
-    connector, logical = _make_worker_connector(tmp_path)
+    harness = _make_core_harness(tmp_path)
     request = _request("request-a", "a" * 32, token_end=8)
 
-    keys = _prepare_and_finalize(connector, request, logical)
+    keys = _prepare_and_finalize(harness, request, harness.logical)
 
     assert len(keys) == 2
-    assert all("/block/" in key for key in keys)
+    assert keys == [_block_key(block_hash) for block_hash in request.block_hashes[:2]]
     np.testing.assert_array_equal(
-        materialize_routed_experts(connector.store, keys), logical[:8]
+        materialize_routed_experts(harness.store, keys), harness.logical[:8]
     )
-    connector.shutdown()
+    harness.close()
 
 
 def test_finalize_recovers_tail_from_released_full_block(tmp_path):
-    connector, logical = _make_worker_connector(tmp_path)
-    connector.buffer.capture("request-a", 0, logical[:8])
+    harness = _make_core_harness(tmp_path)
+    harness.buffer.capture("request-a", 0, harness.logical[:8])
     commit = ArtifactCommitRequest(
         request_id="request-a",
         weight_version="default",
@@ -233,24 +352,22 @@ def test_finalize_recovers_tail_from_released_full_block(tmp_path):
         block_start=0,
         hash_block_size=4,
     )
-    prepared = connector.request_core.prepare_commit(commit)
-    connector.request_core.publish_commits([prepared])
+    prepared = harness.core.prepare_commit(commit)
+    harness.core.publish_commits([prepared])
 
     request = _request("request-a", "attempt-a", token_end=6)
-    keys = connector.request_core.finalize(request)
+    keys = harness.core.finalize(request)
 
     assert len(keys) == 2
-    assert "/block/" in keys[0]
-    assert "/tail/" in keys[1]
     np.testing.assert_array_equal(
-        materialize_routed_experts(connector.store, keys), logical[:6]
+        materialize_routed_experts(harness.store, keys), harness.logical[:6]
     )
-    connector.shutdown()
+    harness.close()
 
 
 def test_same_metadata_commit_then_earlier_finalize(tmp_path):
     connector, logical = _make_worker_connector(tmp_path)
-    connector.buffer.capture("request-a", 0, logical[:8])
+    connector._capture_step("request-a", 0, logical[:8])
     finalize = _request("request-a", "attempt-a", token_end=6)
     commit = ArtifactCommitRequest(
         request_id="request-a",
@@ -267,7 +384,7 @@ def test_same_metadata_commit_then_earlier_finalize(tmp_path):
 
     assert output is not None
     np.testing.assert_array_equal(
-        materialize_routed_experts(connector.store, output.results[0].keys),
+        materialize_routed_experts(connector._store, output.results[0].keys),
         logical[:6],
     )
     connector.shutdown()
@@ -275,25 +392,25 @@ def test_same_metadata_commit_then_earlier_finalize(tmp_path):
 
 @pytest.mark.parametrize("token_end", [1, 4, 5, 8, 9, 12])
 def test_key_count_is_ceiling_of_executed_tokens(tmp_path, token_end):
-    connector, logical = _make_worker_connector(tmp_path)
+    harness = _make_core_harness(tmp_path)
     request = _request(
         f"request-{token_end}",
         f"{token_end:032x}",
         token_end=token_end,
     )
 
-    keys = _prepare_and_finalize(connector, request, logical)
+    keys = _prepare_and_finalize(harness, request, harness.logical)
 
     assert len(keys) == (token_end + 3) // 4
-    connector.shutdown()
+    harness.close()
 
 
 def test_worker_batches_commits_and_reports_keys_per_request(tmp_path):
     connector, logical = _make_worker_connector(tmp_path)
     first = _request("request-a", "a" * 32, token_end=4)
     second = _request("request-b", "b" * 32, token_end=8)
-    connector.buffer.capture(first.request_id, 0, logical[:4])
-    connector.buffer.capture(second.request_id, 0, logical[:8])
+    connector._capture_step(first.request_id, 0, logical[:4])
+    connector._capture_step(second.request_id, 0, logical[:8])
     commits = [_commit_request(first), _commit_request(second)]
 
     output = connector.start_step(
@@ -307,53 +424,53 @@ def test_worker_batches_commits_and_reports_keys_per_request(tmp_path):
 
 
 def test_cached_blocks_are_reused_without_put(tmp_path):
-    connector, logical = _make_worker_connector(tmp_path)
+    harness = _make_core_harness(tmp_path)
     first = _request("request-a", "a" * 32, token_end=8)
-    first_keys = _prepare_and_finalize(connector, first, logical)
+    first_keys = _prepare_and_finalize(harness, first, harness.logical)
     second = _request(
         "request-b",
         "b" * 32,
         token_end=10,
     )
-    connector.buffer.capture(second.request_id, 8, logical[8:10])
-    connector.store.put = Mock(wraps=connector.store.put)
+    harness.buffer.capture(second.request_id, 8, harness.logical[8:10])
+    harness.store.put = Mock(wraps=harness.store.put)
 
-    keys = connector.request_core.finalize(second)
+    keys = harness.core.finalize(second)
 
-    assert connector.store.put.call_count == 1
-    assert len(connector.store.put.call_args.args[0]) == 1
+    assert harness.store.put.call_count == 1
+    assert len(harness.store.put.call_args.args[0]) == 1
     assert keys[:2] == first_keys
     np.testing.assert_array_equal(
-        materialize_routed_experts(connector.store, keys), logical[:10]
+        materialize_routed_experts(harness.store, keys), harness.logical[:10]
     )
-    connector.shutdown()
+    harness.close()
 
 
 def test_missing_cached_block_fails_closed(tmp_path):
-    connector, _ = _make_worker_connector(tmp_path)
+    harness = _make_core_harness(tmp_path)
     request = _request(
         "request-a",
         "a" * 32,
         token_end=4,
     )
 
-    keys = connector.request_core.finalize(request)
+    keys = harness.core.finalize(request)
     with pytest.raises(RuntimeError, match="does not exist"):
-        materialize_routed_experts(connector.store, keys)
-    connector.shutdown()
+        materialize_routed_experts(harness.store, keys)
+    harness.close()
 
 
 def test_reader_materializes_from_another_process(tmp_path):
-    connector, logical = _make_worker_connector(tmp_path)
+    harness = _make_core_harness(tmp_path)
     request = _request("request-a", "a" * 32)
-    keys = _prepare_and_finalize(connector, request, logical)
+    keys = _prepare_and_finalize(harness, request, harness.logical)
     context = multiprocessing.get_context("spawn")
     result_queue = context.Queue()
     process = context.Process(
         target=_read_in_child,
         args=(
             str(tmp_path),
-            connector.store.store_id,
+            harness.store.store_id,
             keys,
             result_queue,
         ),
@@ -366,8 +483,8 @@ def test_reader_materializes_from_another_process(tmp_path):
         process.join(timeout=5)
 
     assert process.exitcode == 0
-    np.testing.assert_array_equal(np.asarray(result_queue.get()), logical[:10])
-    connector.shutdown()
+    np.testing.assert_array_equal(np.asarray(result_queue.get()), harness.logical[:10])
+    harness.close()
 
 
 def test_store_capacity_failure_raises(tmp_path):
@@ -387,7 +504,9 @@ def test_store_capacity_failure_raises(tmp_path):
             ]
         )
 
-    assert store.exists(["small", "large"]) == [True, False]
+    assert store.get(["small"]) == [b"1234"]
+    with pytest.raises(ArtifactNotFoundError):
+        store.get(["large"])
     store.close()
 
 
@@ -532,120 +651,34 @@ def test_writer_lock_retries_if_collector_unlinks_open_inode(tmp_path, monkeypat
         os.close(fd)
 
 
-def test_scheduler_connector_checks_shm_existence(tmp_path):
-    store = LocalSharedMemoryArtifactStore(
-        str(tmp_path),
-        "instance",
-        0,
-        max_bytes=100,
-        ttl_seconds=60,
-    )
+def test_kv_hit_does_not_read_artifact_backend(tmp_path):
     connector = _make_scheduler_connector(tmp_path)
-    key = _block_key(b"a" * 32)
-    store.put([ArtifactObject(key, b"payload")])
-
-    connector.ensure_prefix_ready(
-        block_hashes=[b"a" * 32],
-        cached_token_end=4,
-        hash_block_size=4,
-        weight_version="default",
-    )
-    store._path(key).unlink()
-    with pytest.raises(RuntimeError, match="missing a routed-experts artifact"):
-        connector.ensure_prefix_ready(
-            block_hashes=[b"a" * 32],
-            cached_token_end=4,
-            hash_block_size=4,
-            weight_version="default",
-        )
-    connector.shutdown()
-    store.close()
-
-
-def test_partial_kv_hit_requires_covering_full_artifact_block(tmp_path):
-    store = LocalSharedMemoryArtifactStore(
-        str(tmp_path),
-        "instance",
-        0,
-        max_bytes=100,
-        ttl_seconds=60,
-    )
-    connector = _make_scheduler_connector(tmp_path)
-    block_hash = b"a" * 32
-    with pytest.raises(RuntimeError, match="missing a routed-experts artifact"):
-        connector.request_started(
-            request_id="missing",
-            block_hashes=[block_hash],
-            cached_token_end=1,
-            hash_block_size=4,
-        )
-
-    key = _block_key(block_hash)
-    store.put([ArtifactObject(key, b"payload")])
+    request = Mock(request_id="request-a")
     connector.request_started(
-        request_id="ready",
-        block_hashes=[block_hash],
+        request=request,
         cached_token_end=1,
-        hash_block_size=4,
-    )
-    connector.request_progress(
-        request_id="ready",
-        block_hashes=[block_hash],
-        accepted_token_end=4,
         hash_block_size=4,
     )
 
     assert connector.build_connector_meta() is None
     connector.shutdown()
-    store.close()
-
-
-def test_scheduler_and_worker_derive_the_same_block_key(tmp_path):
-    scheduler = _make_scheduler_connector(tmp_path)
-    worker = ArtifactWorkerConnector(_make_vllm_config(tmp_path), Mock())
-    block_hash = b"a" * 32
-
-    assert _block_key(block_hash) == worker.request_core.key_space.block_key(
-        block_hash,
-        4,
-        "default",
-    )
-    scheduler.shutdown()
-    worker.shutdown()
-
-
-def test_logical_key_space_has_no_store_identity():
-    first = ArtifactKeySpace(
-        dtype=np.dtype("uint8"),
-        shape_per_token=(3, 2),
-    )
-    second = ArtifactKeySpace(
-        dtype=np.dtype("uint8"),
-        shape_per_token=(3, 2),
-    )
-
-    assert first.block_key(b"a" * 32, 4, "default") == second.block_key(
-        b"a" * 32, 4, "default"
-    )
 
 
 def test_abort_keeps_completed_blocks_and_cancels_finalize(tmp_path):
     connector = _make_scheduler_connector(tmp_path)
+    request = _scheduler_request("request-a", [b"a" * 32], num_tokens=4)
     connector.request_started(
-        request_id="request-a",
-        block_hashes=[b"a" * 32],
+        request=request,
         cached_token_end=0,
         hash_block_size=4,
     )
     connector.request_progress(
-        request_id="request-a",
-        block_hashes=[b"a" * 32],
+        request=request,
         accepted_token_end=4,
         hash_block_size=4,
     )
     connector.request_finished(
-        request_id="request-a",
-        block_hashes=[b"a" * 32],
+        request=request,
         token_end=4,
         hash_block_size=4,
     )
@@ -661,15 +694,14 @@ def test_abort_keeps_completed_blocks_and_cancels_finalize(tmp_path):
 
 def test_abort_does_not_wait_for_already_sent_block_commit(tmp_path):
     connector = _make_scheduler_connector(tmp_path)
+    request = _scheduler_request("request-a", [b"a" * 32], num_tokens=4)
     connector.request_started(
-        request_id="request-a",
-        block_hashes=[b"a" * 32],
+        request=request,
         cached_token_end=0,
         hash_block_size=4,
     )
     connector.request_progress(
-        request_id="request-a",
-        block_hashes=[b"a" * 32],
+        request=request,
         accepted_token_end=4,
         hash_block_size=4,
     )
@@ -681,23 +713,6 @@ def test_abort_does_not_wait_for_already_sent_block_commit(tmp_path):
 
     assert connector.build_connector_meta() is None
     connector.shutdown()
-
-
-def test_reconstructed_scheduler_discovers_ready_blocks(tmp_path):
-    worker = ArtifactWorkerConnector(_make_vllm_config(tmp_path), Mock())
-    logical = np.arange(12 * 3 * 2, dtype=np.uint8).reshape(12, 3, 2)
-    request = _request("request-a", "a" * 32, token_end=4)
-    _prepare_and_finalize(worker, request, logical)
-    scheduler = _make_scheduler_connector(tmp_path)
-
-    scheduler.ensure_prefix_ready(
-        block_hashes=request.block_hashes,
-        cached_token_end=4,
-        hash_block_size=4,
-        weight_version="default",
-    )
-    scheduler.shutdown()
-    worker.shutdown()
 
 
 def test_scheduler_finalizes_only_the_accepted_range():
@@ -721,8 +736,7 @@ def test_scheduler_finalizes_only_the_accepted_range():
     scheduler._free_request(request, artifact_token_end=9)
 
     scheduler.artifact_connector.request_finished.assert_called_once_with(
-        request_id="request-a",
-        block_hashes=[b"a" * 32, b"b" * 32, b"c" * 32],
+        request=request,
         token_end=9,
         hash_block_size=4,
     )
@@ -799,49 +813,16 @@ def test_weight_version_selects_distinct_artifact_keys(tmp_path):
     connector.shutdown()
 
 
-def test_weight_version_prevents_cross_version_prefix_hit(tmp_path):
-    connector = _make_scheduler_connector(tmp_path)
-    store = LocalSharedMemoryArtifactStore(
-        str(tmp_path),
-        "instance",
-        0,
-        max_bytes=100,
-        ttl_seconds=60,
-    )
-    block_hash = b"a" * 32
-    old_key = _block_key(block_hash)
-    store.put([ArtifactObject(old_key, b"payload")])
-    connector.ensure_prefix_ready(
-        block_hashes=[block_hash],
-        cached_token_end=4,
-        hash_block_size=4,
-        weight_version="default",
-    )
-
-    connector.set_weight_version("step-42")
-
-    with pytest.raises(RuntimeError, match="weight_version=step-42"):
-        connector.ensure_prefix_ready(
-            block_hashes=[block_hash],
-            cached_token_end=4,
-            hash_block_size=4,
-            weight_version="step-42",
-        )
-    connector.shutdown()
-    store.close()
-
-
 def test_inflight_request_keeps_admission_weight_version(tmp_path):
     connector = _make_scheduler_connector(tmp_path)
+    request = _scheduler_request("old-request", [b"a" * 32], num_tokens=4)
     connector.request_started(
-        request_id="old-request",
-        block_hashes=[b"a" * 32],
+        request=request,
         cached_token_end=0,
         hash_block_size=4,
     )
     connector.request_progress(
-        request_id="old-request",
-        block_hashes=[b"a" * 32],
+        request=request,
         accepted_token_end=4,
         hash_block_size=4,
     )
@@ -867,15 +848,14 @@ def test_engine_core_propagates_weight_version_to_artifact_connector():
 def test_scheduler_releases_inline_terminal_output_after_ack(tmp_path):
     scheduler = object.__new__(Scheduler)
     scheduler.artifact_connector = _make_scheduler_connector(tmp_path)
+    request = _scheduler_request("request-a", [b"a" * 32, b"b" * 32], num_tokens=7)
     scheduler.artifact_connector.request_started(
-        request_id="request-a",
-        block_hashes=[b"a" * 32, b"b" * 32],
+        request=request,
         cached_token_end=0,
         hash_block_size=4,
     )
     scheduler.artifact_connector.request_finished(
-        request_id="request-a",
-        block_hashes=[b"a" * 32, b"b" * 32],
+        request=request,
         token_end=6,
         hash_block_size=4,
     )
@@ -891,7 +871,9 @@ def test_scheduler_releases_inline_terminal_output_after_ack(tmp_path):
     scheduler.finished_req_ids_dict = defaultdict(set)
     outputs: dict[int, list[EngineCoreOutput]] = defaultdict(list)
     routed_experts = np.zeros((6, 3, 2), dtype=np.uint8)
-    scheduler.artifact_connector.materialize = Mock(return_value=routed_experts)
+    scheduler.artifact_connector.consume_output = Mock(
+        return_value=[("request-a", routed_experts)]
+    )
 
     scheduler._release_artifact_outputs(
         ArtifactConnectorOutput(
@@ -907,7 +889,6 @@ def test_scheduler_releases_inline_terminal_output_after_ack(tmp_path):
     )
 
     assert terminal_output.routed_experts is routed_experts
-    assert terminal_output.artifact_finalized
     assert scheduler.finished_req_ids_dict[3] == {"request-a"}
     scheduler.artifact_connector.shutdown()
 
@@ -915,15 +896,14 @@ def test_scheduler_releases_inline_terminal_output_after_ack(tmp_path):
 def test_scheduler_fails_on_materialization_error(tmp_path):
     scheduler = object.__new__(Scheduler)
     scheduler.artifact_connector = _make_scheduler_connector(tmp_path)
+    request = _scheduler_request("request-a", [b"a" * 32], num_tokens=4)
     scheduler.artifact_connector.request_started(
-        request_id="request-a",
-        block_hashes=[b"a" * 32],
+        request=request,
         cached_token_end=0,
         hash_block_size=4,
     )
     scheduler.artifact_connector.request_finished(
-        request_id="request-a",
-        block_hashes=[b"a" * 32],
+        request=request,
         token_end=4,
         hash_block_size=4,
     )
@@ -952,6 +932,6 @@ def test_scheduler_fails_on_materialization_error(tmp_path):
             outputs,
         )
 
-    assert not terminal_output.artifact_finalized
+    assert terminal_output.routed_experts is None
     assert outputs[3] == []
     scheduler.artifact_connector.shutdown()

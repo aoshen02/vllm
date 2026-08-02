@@ -23,33 +23,35 @@ def _config(
     spec_name: str | None = None,
 ):
     extra_config = {} if spec_name is None else {"spec_name": spec_name}
-    config: Any = VllmConfig.__new__(VllmConfig)
-    config.model_config = SimpleNamespace()
-    config.parallel_config = SimpleNamespace(
-        pipeline_parallel_size=pp,
-        decode_context_parallel_size=dcp,
-        prefill_context_parallel_size=pcp,
+    return SimpleNamespace(
+        model_config=SimpleNamespace(),
+        use_v2_model_runner=True,
+        parallel_config=SimpleNamespace(
+            pipeline_parallel_size=pp,
+            decode_context_parallel_size=dcp,
+            prefill_context_parallel_size=pcp,
+        ),
+        artifact_config=ArtifactConfig(
+            enable_routed_experts=True,
+            shm_dir=shm_dir,
+        ),
+        kv_transfer_config=(
+            None
+            if connector is None
+            else SimpleNamespace(
+                is_kv_transfer_instance=True,
+                kv_connector=connector,
+                kv_role=role,
+                kv_connector_extra_config=extra_config,
+            )
+        ),
     )
-    config.artifact_config = ArtifactConfig(
-        enable_routed_experts=True,
-        shm_dir=shm_dir,
-    )
-    config.kv_transfer_config = (
-        None
-        if connector is None
-        else SimpleNamespace(
-            is_kv_transfer_instance=True,
-            kv_connector=connector,
-            kv_role=role,
-            kv_connector_extra_config=extra_config,
-        )
-    )
-    return config
 
 
 def test_artifact_config_defaults_to_shm():
     config = ArtifactConfig()
 
+    assert not config.enabled
     assert not config.enable_routed_experts
     assert config.backend == "shm"
     assert config.shm_dir == "/dev/shm/vllm-artifacts"
@@ -58,7 +60,16 @@ def test_artifact_config_defaults_to_shm():
 def test_legacy_routed_experts_flag_updates_artifact_config():
     args = EngineArgs(enable_return_routed_experts=True)
 
+    assert args.artifact_config.enabled
     assert args.artifact_config.enable_routed_experts
+
+
+def test_artifact_connector_requires_model_runner_v2():
+    config = _config()
+    config.use_v2_model_runner = False
+
+    with pytest.raises(ValueError, match="requires Model Runner V2"):
+        VllmConfig._verify_artifact_compatibility(config)
 
 
 @pytest.mark.parametrize(
@@ -72,7 +83,7 @@ def test_legacy_routed_experts_flag_updates_artifact_config():
 )
 def test_artifact_connector_rejects_unsupported_topology(kwargs, error):
     with pytest.raises(ValueError, match=error):
-        _config(**kwargs)._verify_artifact_compatibility()
+        VllmConfig._verify_artifact_compatibility(_config(**kwargs))
 
 
 @pytest.mark.parametrize(
@@ -88,20 +99,24 @@ def test_artifact_connector_rejects_unsupported_topology(kwargs, error):
 def test_artifact_connector_is_independent_of_kv_connector_implementation(
     connector, spec_name
 ):
-    _config(
-        connector=connector,
-        spec_name=spec_name,
-    )._verify_artifact_compatibility()
+    VllmConfig._verify_artifact_compatibility(
+        _config(
+            connector=connector,
+            spec_name=spec_name,
+        )
+    )
 
 
 @pytest.mark.parametrize("role", ["kv_producer", "kv_consumer"])
 def test_artifact_connector_rejects_pd_disaggregation(role):
     with pytest.raises(ValueError, match="kv_role=kv_both"):
-        _config(
-            connector="OffloadingConnector",
-            role=role,
-            spec_name="CPUOffloadingSpec",
-        )._verify_artifact_compatibility()
+        VllmConfig._verify_artifact_compatibility(
+            _config(
+                connector="OffloadingConnector",
+                role=role,
+                spec_name="CPUOffloadingSpec",
+            )
+        )
 
 
 def test_artifact_guards_are_inactive_when_capture_is_disabled():

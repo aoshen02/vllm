@@ -33,7 +33,7 @@ class AsyncOutput(AsyncModelRunnerOutput):
         self.model_runner_output = model_runner_output
         self.sampler_output = sampler_output
         self.num_sampled_tokens = num_sampled_tokens
-        self.artifact_write_task = artifact_write_task
+        self._artifact_write_task = artifact_write_task
         # Blocking (sleep) event to avoid busy-polling the CUDA driver lock.
         self.copy_event = torch.cuda.Event(blocking=True)
         self._has_fault: torch.Tensor | None = None
@@ -55,8 +55,8 @@ class AsyncOutput(AsyncModelRunnerOutput):
                 k: v.to_cpu_nonblocking() if v is not None else None
                 for k, v in self.model_runner_output.prompt_logprobs_dict.items()
             }
-            if self.artifact_write_task is not None:
-                self.artifact_write_task.start_copy()
+            if self._artifact_write_task is not None:
+                self._artifact_write_task.start_copy()
             if check_ep_fault:
                 has_fault = get_ep_all2all_manager().query_fault()
                 self._has_fault = has_fault.to("cpu", non_blocking=True)
@@ -92,9 +92,9 @@ class AsyncOutput(AsyncModelRunnerOutput):
                 f"Mask: {mask.cpu().tolist()}"
             )
 
-        if self.artifact_write_task is not None:
-            self.artifact_write_task.finalize()
-            self.artifact_write_task = None
+        if self._artifact_write_task is not None:
+            self._artifact_write_task.finalize()
+            self._artifact_write_task = None
         return self.model_runner_output
 
 

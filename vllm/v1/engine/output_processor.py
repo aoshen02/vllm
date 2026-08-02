@@ -183,7 +183,7 @@ class RequestState:
         self.stats = RequestStateStats(arrival_time=arrival_time) if log_stats else None
 
         self.routed_experts: np.ndarray | None = None
-        self.artifact_finalize_requested = False
+        self.artifact_finalize_request: tuple[int, str] | None = None
 
         # Stream Interval
         self.stream_interval = stream_interval
@@ -626,13 +626,14 @@ class OutputProcessor:
             if req_state is None:
                 # Ignore output for already-aborted request.
                 continue
+            artifact_finalize_request = req_state.artifact_finalize_request
             if (
-                req_state.artifact_finalize_requested
-                and not engine_core_output.artifact_finalized
+                artifact_finalize_request is not None
+                and engine_core_output.routed_experts is None
             ):
                 # Ignore frames already in flight when the frontend found the
-                # stop string, including a stale terminal frame. Only the ACK
-                # for the requested artifact boundary may finish the request.
+                # stop string. A terminal artifact frame is authoritative and
+                # is clipped to the frontend-resolved boundary below.
                 continue
 
             # 1) Compute stats for this iteration.
@@ -649,7 +650,20 @@ class OutputProcessor:
             if engine_core_output.routed_experts is not None:
                 if req_state.routed_experts is not None:
                     raise RuntimeError("received duplicate terminal artifact output")
-                req_state.routed_experts = engine_core_output.routed_experts
+                routed_experts = engine_core_output.routed_experts
+                if artifact_finalize_request is not None:
+                    token_end, frontend_stop_reason = artifact_finalize_request
+                    if len(routed_experts) < token_end:
+                        raise RuntimeError(
+                            "terminal artifact does not cover the frontend stop "
+                            f"boundary: expected={token_end}, "
+                            f"actual={len(routed_experts)}"
+                        )
+                    routed_experts = routed_experts[:token_end]
+                    new_token_ids = []
+                    finish_reason = FinishReason.STOP
+                    stop_reason = frontend_stop_reason
+                req_state.routed_experts = routed_experts
 
             if req_state.is_prefilling:
                 if engine_core_output.prefill_stats is not None:
@@ -665,31 +679,52 @@ class OutputProcessor:
                 assert req_state.detokenizer is not None
                 assert req_state.logprobs_processor is not None
                 # 2) Detokenize the token ids into text and perform stop checks.
-                stop_string = req_state.detokenizer.update(
-                    new_token_ids, finish_reason == FinishReason.STOP
+                stop_string = (
+                    None
+                    if artifact_finalize_request is not None
+                    else req_state.detokenizer.update(
+                        new_token_ids, finish_reason == FinishReason.STOP
+                    )
                 )
                 if stop_string:
                     finish_reason = FinishReason.STOP
                     stop_reason = stop_string
-                    if self.finalize_artifacts and not engine_core_output.finished:
-                        req_state.artifact_finalize_requested = True
-                        artifact_reqs_to_finalize.append(
-                            (
-                                req_id,
-                                req_state.prompt_len
-                                + req_state.detokenizer.num_output_tokens()
-                                - 1,
+                    if self.finalize_artifacts and not req_state.streaming_input:
+                        token_end = (
+                            req_state.prompt_len
+                            + req_state.detokenizer.num_output_tokens()
+                            - 1
+                        )
+                        if engine_core_output.finished:
+                            routed_experts = req_state.routed_experts
+                            actual_token_end = (
+                                len(routed_experts) if routed_experts is not None else 0
+                            )
+                            if actual_token_end < token_end:
+                                raise RuntimeError(
+                                    "terminal artifact does not cover the frontend "
+                                    f"stop boundary: expected={token_end}, "
+                                    f"actual={actual_token_end}"
+                                )
+                            assert routed_experts is not None
+                            req_state.routed_experts = routed_experts[:token_end]
+                        else:
+                            req_state.artifact_finalize_request = (
+                                token_end,
                                 stop_string,
                             )
-                        )
-                        # Emit this chunk as non-terminal. Artifact finalization
-                        # supplies the terminal output and materialized value.
-                        finish_reason = None
-                        stop_reason = None
+                            artifact_reqs_to_finalize.append(
+                                (req_id, token_end, stop_string)
+                            )
+                            # Emit this chunk as non-terminal. Artifact finalization
+                            # supplies the terminal output and materialized value.
+                            finish_reason = None
+                            stop_reason = None
 
                 # 3) Compute sample and prompt logprobs for request,
                 # if required.
-                req_state.logprobs_processor.update_from_output(engine_core_output)
+                if artifact_finalize_request is None:
+                    req_state.logprobs_processor.update_from_output(engine_core_output)
 
             # 4) Create and handle RequestOutput objects.
             if request_output := req_state.make_request_output(

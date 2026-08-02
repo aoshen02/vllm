@@ -222,7 +222,7 @@ class EngineCore:
         if (
             vllm_config.cache_config.enable_prefix_caching
             or kv_connector is not None
-            or vllm_config.artifact_config.enable_routed_experts
+            or vllm_config.artifact_config.enabled
         ):
             caching_hash_fn = get_hash_fn_by_name(
                 vllm_config.cache_config.prefix_caching_hash_algo

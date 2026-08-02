@@ -12,11 +12,15 @@ from vllm.config import VllmConfig
 from vllm.config.compilation import CompilationMode
 from vllm.distributed.eplb.eplb_state import EplbLayerState
 from vllm.model_executor.layers.fused_moe.config import RoutingMethodType
-from vllm.model_executor.layers.fused_moe.routed_experts_capture import (
-    RoutedExpertsCapturer,
-    RoutedExpertsCaptureState,
+from vllm.model_executor.layers.fused_moe.routed_experts_capture.async_output import (
     RoutedExpertsWriteTask,
+)
+from vllm.model_executor.layers.fused_moe.routed_experts_capture.capturer import (
+    RoutedExpertsCapturer,
     bind_routed_experts_capturer,
+)
+from vllm.model_executor.layers.fused_moe.routed_experts_capture.state import (
+    RoutedExpertsCaptureState,
 )
 from vllm.model_executor.layers.fused_moe.router.base_router import BaseRouter
 
@@ -247,7 +251,7 @@ def test_capture_state_create_uses_explicit_dependencies(monkeypatch):
         max_num_batched_tokens=32,
     )
 
-    assert state.capturer is capturer
+    assert state._capturer is capturer
     bind.assert_called_once_with(model, capturer)
 
 
@@ -341,35 +345,6 @@ def test_v2_model_runner_accepts_routed_experts(monkeypatch):
     unsupported = VllmConfig._get_v2_model_runner_unsupported_features(config)
 
     assert unsupported == []
-
-
-@pytest.mark.parametrize(
-    ("parallel_field", "error"),
-    [
-        ("pipeline_parallel_size", "pipeline parallelism"),
-        ("decode_context_parallel_size", "context parallelism"),
-        ("prefill_context_parallel_size", "context parallelism"),
-    ],
-)
-def test_routed_experts_reject_unsupported_parallelism(parallel_field, error):
-    parallel_config = SimpleNamespace(
-        pipeline_parallel_size=1,
-        decode_context_parallel_size=1,
-        prefill_context_parallel_size=1,
-    )
-    setattr(parallel_config, parallel_field, 2)
-    config = SimpleNamespace(
-        model_config=SimpleNamespace(),
-        parallel_config=parallel_config,
-        artifact_config=SimpleNamespace(
-            enable_routed_experts=True,
-            shm_dir="/dev/shm/vllm-artifacts",
-        ),
-        kv_transfer_config=None,
-    )
-
-    with pytest.raises(ValueError, match=error):
-        VllmConfig._verify_artifact_compatibility(config)
 
 
 def test_routed_experts_capturer_single_dp_no_metadata():

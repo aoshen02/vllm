@@ -344,7 +344,7 @@ class Scheduler(SchedulerInterface):
         self.artifact_connector: ArtifactSchedulerConnector | None = None
         self._pending_artifact_outputs: dict[str, tuple[int, EngineCoreOutput]] = {}
 
-        if vllm_config.artifact_config.enable_routed_experts:
+        if vllm_config.artifact_config.enabled:
             self.artifact_connector = ArtifactSchedulerConnector(vllm_config)
 
         self._pause_state: PauseState = PauseState.UNPAUSED
@@ -1047,8 +1047,7 @@ class Scheduler(SchedulerInterface):
 
                 if self.artifact_connector is not None:
                     self.artifact_connector.request_started(
-                        request_id=request_id,
-                        block_hashes=request.block_hashes,
+                        request=request,
                         cached_token_end=num_computed_tokens,
                         hash_block_size=self.hash_block_size,
                     )
@@ -1823,8 +1822,7 @@ class Scheduler(SchedulerInterface):
                 )
                 if accepted_token_end > 0:
                     self.artifact_connector.request_progress(
-                        request_id=req_id,
-                        block_hashes=request.block_hashes,
+                        request=request,
                         accepted_token_end=accepted_token_end,
                         hash_block_size=self.hash_block_size,
                     )
@@ -2334,8 +2332,7 @@ class Scheduler(SchedulerInterface):
                 self.artifact_connector.request_aborted(request.request_id)
             else:
                 self.artifact_connector.request_finished(
-                    request_id=request.request_id,
-                    block_hashes=request.block_hashes,
+                    request=request,
                     token_end=artifact_token_end,
                     hash_block_size=self.hash_block_size,
                 )
@@ -2368,24 +2365,20 @@ class Scheduler(SchedulerInterface):
         if self.artifact_connector is None:
             raise RuntimeError("received artifact output while connector is disabled")
 
-        self.artifact_connector.update_connector_output(artifact_output)
-        for finalize_result in artifact_output.results:
-            pending = self._pending_artifact_outputs.pop(
-                finalize_result.request_id, None
-            )
+        for request_id, routed_experts in self.artifact_connector.consume_output(
+            artifact_output
+        ):
+            pending = self._pending_artifact_outputs.pop(request_id, None)
             if pending is None:
                 raise RuntimeError(
                     "missing pending terminal output for artifact request: "
-                    f"{finalize_result.request_id}"
+                    f"{request_id}"
                 )
             client_index, engine_core_output = pending
-            engine_core_output.routed_experts = self.artifact_connector.materialize(
-                finalize_result.keys
-            )
-            engine_core_output.artifact_finalized = True
+            engine_core_output.routed_experts = routed_experts
             outputs[client_index].append(engine_core_output)
             if self.finished_req_ids_dict is not None:
-                self.finished_req_ids_dict[client_index].add(finalize_result.request_id)
+                self.finished_req_ids_dict[client_index].add(request_id)
 
     def _free_blocks(self, request: Request):
         assert request.is_finished()

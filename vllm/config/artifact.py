@@ -30,3 +30,8 @@ class ArtifactConfig:
 
     Inactive stores may coexist and consume node SHM during this period.
     """
+
+    @property
+    def enabled(self) -> bool:
+        """Whether any execution artifact is enabled."""
+        return self.enable_routed_experts

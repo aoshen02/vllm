@@ -23,13 +23,13 @@ if TYPE_CHECKING:
 
 
 class RoutedExpertsCaptureState:
-    """Own worker capture resources shared by both model runners."""
+    """Own worker capture resources used by the artifact connector."""
 
     def __init__(
         self,
         capturer: RoutedExpertsCapturer,
     ) -> None:
-        self.capturer = capturer
+        self._capturer = capturer
 
     @classmethod
     def create(
@@ -47,10 +47,7 @@ class RoutedExpertsCaptureState:
         return cls(capturer)
 
     def clear(self) -> None:
-        self.capturer.clear_buffer()
-
-    def get_device_buffer(self) -> torch.Tensor:
-        return self.capturer.get_device_buffer()
+        self._capturer.clear_buffer()
 
     def make_write_task(
         self,
@@ -62,7 +59,7 @@ class RoutedExpertsCaptureState:
         artifact_sink: Callable[[str, int, np.ndarray], None],
     ) -> RoutedExpertsWriteTask:
         return RoutedExpertsWriteTask(
-            routing_data=self.get_device_buffer()[:num_tokens].clone(),
+            routing_data=self._capturer.get_device_buffer()[:num_tokens].clone(),
             request_ids=request_ids,
             query_start_locs=query_start_locs,
             token_starts=token_starts,

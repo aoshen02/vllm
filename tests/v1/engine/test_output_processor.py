@@ -1059,16 +1059,14 @@ def test_stop_string_waits_for_artifact_terminal_output():
     assert not stale.request_outputs
     assert request_id in output_processor.request_states
 
-    full_routed_experts = np.arange(4 * 3 * 2, dtype=np.uint8).reshape(4, 3, 2)
+    full_routed_experts = np.arange(5 * 3 * 2, dtype=np.uint8).reshape(5, 3, 2)
     processed = output_processor.process_outputs(
         [
             EngineCoreOutput(
                 request_id=request_id,
-                new_token_ids=[],
-                finish_reason=FinishReason.STOP,
-                stop_reason="STOP",
+                new_token_ids=[9],
+                finish_reason=FinishReason.LENGTH,
                 routed_experts=full_routed_experts,
-                artifact_finalized=True,
             )
         ]
     )
@@ -1078,8 +1076,10 @@ def test_stop_string_waits_for_artifact_terminal_output():
     assert len(processed.request_outputs) == 1
     final_output = processed.request_outputs[0]
     assert final_output.finished
+    assert final_output.outputs[0].finish_reason == "stop"
+    assert final_output.outputs[0].stop_reason == "STOP"
     np.testing.assert_array_equal(
-        final_output.outputs[0].routed_experts, full_routed_experts
+        final_output.outputs[0].routed_experts, full_routed_experts[:4]
     )
     assert not output_processor.has_unfinished_requests()
 

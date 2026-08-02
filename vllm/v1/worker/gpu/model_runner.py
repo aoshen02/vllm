@@ -296,12 +296,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     def init_artifacts(self) -> None:
         """Initialize configured artifact capture and storage."""
         assert self._artifact_connector is None
-        if self.vllm_config.parallel_config.rank == 0:
-            self._artifact_connector = ArtifactWorkerConnector.create(
-                vllm_config=self.vllm_config,
-                model=self.model,
-                max_num_batched_tokens=(self.scheduler_config.max_num_batched_tokens),
-            )
+        self._artifact_connector = ArtifactWorkerConnector.create(
+            vllm_config=self.vllm_config,
+            model=self.model,
+            max_num_batched_tokens=self.scheduler_config.max_num_batched_tokens,
+        )
 
     @staticmethod
     def _attach_artifact_output(

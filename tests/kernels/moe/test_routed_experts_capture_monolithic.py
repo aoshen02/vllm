@@ -391,7 +391,7 @@ def test_routed_experts_capturer_e2e_via_monolithic_experts() -> None:
     non-monolithic path) and the capturer routes per-layer based on the
     closed-over ``layer_id``.
     """
-    from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
+    from vllm.model_executor.layers.fused_moe.routed_experts_capture.capturer import (
         RoutedExpertsCapturer,
     )
 

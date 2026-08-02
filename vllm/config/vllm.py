@@ -931,8 +931,11 @@ class VllmConfig:
 
     def _verify_artifact_compatibility(self) -> None:
         """Reject configurations unsupported by enabled artifacts."""
-        if self.model_config is None or not self.artifact_config.enable_routed_experts:
+        if self.model_config is None or not self.artifact_config.enabled:
             return
+
+        if not self.use_v2_model_runner:
+            raise ValueError("Artifact Connector requires Model Runner V2.")
 
         if self.parallel_config.pipeline_parallel_size > 1:
             raise ValueError(

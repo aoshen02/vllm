@@ -8,14 +8,13 @@ import errno
 import fcntl
 import hashlib
 import os
+import re
 import stat
 import threading
 import time
 import uuid
 from contextlib import suppress
 from pathlib import Path
-
-import regex as re
 
 from vllm.distributed.artifact_connector.store import (
     ArtifactCapacityError,
@@ -66,20 +65,6 @@ class LocalSharedMemoryArtifactReader:
             os.close(fd)
             raise ArtifactCorruptionError(f"invalid artifact mode: {path}")
         return fd
-
-    def exists(self, keys: list[str]) -> list[bool]:
-        results: list[bool] = []
-        for key in keys:
-            path = self._path(key)
-            try:
-                fd = self._open_regular_file(path)
-            except FileNotFoundError:
-                results.append(False)
-                continue
-            else:
-                os.close(fd)
-                results.append(True)
-        return results
 
     def get(self, keys: list[str]) -> list[bytes]:
         payloads: list[bytes] = []

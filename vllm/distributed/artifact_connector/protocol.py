@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Scheduler/worker protocol for execution-artifact publication."""
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Protocol
 
@@ -20,19 +21,20 @@ class ArtifactCommitRequest:
 
     request_id: str
     weight_version: str
-    block_hashes: list[bytes]
+    block_hashes: Sequence[bytes]
     block_start: int
     hash_block_size: int
 
 
 @dataclass(frozen=True)
 class ArtifactFinalizeRequest:
-    """One terminal request whose staged routing must be made immutable."""
+    """One terminal request whose staged artifacts must be made immutable."""
 
     request_id: str
     request_attempt_id: str
     weight_version: str
-    block_hashes: list[bytes]
+    block_hashes: Sequence[bytes]
+    tail_block_hash: bytes | None
     token_end: int
     hash_block_size: int
 

@@ -276,12 +276,6 @@ class ServingTokens(GenerateBaseServing):
             else:
                 logprobs = None
 
-            # Encode routed_experts for transport. JSON can't carry raw
-            # bytes, so we write the ndarray as a ``.npy`` byte stream
-            # and base64-encode it. ``pybase64`` is ~3x faster than the
-            # stdlib ``base64`` on large payloads thanks to SIMD.
-            # This is the only base64 hop in the pipeline -- the
-            # engine<->API-server link is binary msgpack + zmq.
             routed_experts_b64 = (
                 numpy2base64(output.routed_experts)
                 if output.routed_experts is not None
@@ -389,7 +383,11 @@ class ServingTokens(GenerateBaseServing):
                     finish_reason = output.finish_reason
                     self._raise_if_error(finish_reason, request_id)
 
-                    if not delta_token_ids:
+                    if (
+                        not delta_token_ids
+                        and finish_reason is None
+                        and output.routed_experts is None
+                    ):
                         continue
 
                     if sampling_params.logprobs is not None:

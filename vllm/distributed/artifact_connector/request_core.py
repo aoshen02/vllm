@@ -25,6 +25,7 @@ from vllm.distributed.artifact_connector.store import (
 )
 
 if TYPE_CHECKING:
+    from vllm.config import VllmConfig
     from vllm.distributed.artifact_connector.buffer import (
         RoutedExpertsArtifactBuffer,
     )
@@ -47,11 +48,47 @@ def _digest(*parts: bytes) -> str:
     return digest.hexdigest()
 
 
-def encode_artifact_array(
+def get_num_experts_per_token(hf_config: Any) -> int:
+    """Resolve the number of experts selected per token."""
+    num_experts_per_token = getattr(hf_config, "num_experts_per_tok", None)
+    if num_experts_per_token is None:
+        num_experts_per_token = getattr(hf_config, "top_k_experts", None)
+    if num_experts_per_token is None:
+        raise ValueError(
+            "Cannot determine the number of experts selected per token: "
+            "HF config has neither 'num_experts_per_tok' nor 'top_k_experts'"
+        )
+    return num_experts_per_token
+
+
+def get_num_experts(hf_config: Any) -> int:
+    """Resolve the global logical expert count from the HF config."""
+    for attribute_name in ("num_experts", "n_routed_experts", "num_local_experts"):
+        num_experts = getattr(hf_config, attribute_name, None)
+        if num_experts is not None:
+            return num_experts
+    raise ValueError(
+        "Could not resolve num_experts from model config. Expected one of "
+        "'num_experts', 'n_routed_experts', or 'num_local_experts'."
+    )
+
+
+def get_routing_shape_and_dtype(
+    vllm_config: VllmConfig,
+) -> tuple[tuple[int, int], str]:
+    """Return the logical per-token routing shape and dtype."""
+    hf_config = vllm_config.model_config.hf_text_config
+    num_layers = hf_config.num_hidden_layers
+    moe_top_k = get_num_experts_per_token(hf_config)
+    num_experts = get_num_experts(hf_config)
+    dtype = "uint8" if num_experts <= 256 else "uint16"
+    return (num_layers, moe_top_k), dtype
+
+
+def encode_routed_experts_array(
     *,
     key: str,
     kind: str,
-    field_profile_id: str,
     array: np.ndarray,
     source_token_start: int,
 ) -> bytes:
@@ -63,7 +100,6 @@ def encode_artifact_array(
         "key": key,
         "kind": kind,
         "field": _FIELD_NAME,
-        "field_profile_id": field_profile_id,
         "dtype": contiguous.dtype.str,
         "shape": list(contiguous.shape),
         "source_token_start": source_token_start,
@@ -75,11 +111,10 @@ def encode_artifact_array(
     return _HEADER_LENGTH.pack(len(encoded_header)) + encoded_header + raw
 
 
-def decode_artifact_array(
+def decode_routed_experts_array(
     payload: bytes,
     *,
     expected_key: str,
-    expected_profile_id: str | None = None,
 ) -> tuple[np.ndarray, dict[str, Any]]:
     """Decode and validate one self-describing immutable array object."""
     if len(payload) < _HEADER_LENGTH.size:
@@ -103,12 +138,6 @@ def decode_artifact_array(
         or header.get("field") != _FIELD_NAME
     ):
         raise ArtifactCorruptionError("artifact object identity mismatch")
-    if (
-        expected_profile_id is not None
-        and header.get("field_profile_id") != expected_profile_id
-    ):
-        raise ArtifactCorruptionError("artifact field profile mismatch")
-
     raw = payload[header_end:]
     if header.get("payload_sha256") != hashlib.sha256(raw).hexdigest():
         raise ArtifactCorruptionError("artifact payload checksum mismatch")
@@ -134,65 +163,19 @@ def decode_artifact_array(
     return array, header
 
 
-class ArtifactKeySpace:
-    """Derive backend-independent immutable keys for one artifact field."""
-
-    def __init__(
-        self,
-        dtype: np.dtype[Any],
-        shape_per_token: tuple[int, ...],
-    ) -> None:
-        self.dtype = np.dtype(dtype)
-        self.shape_per_token = shape_per_token
-
-    def profile_id(self, hash_block_size: int, weight_version: str) -> str:
-        profile = {
-            "schema_version": _SCHEMA_VERSION,
-            "field": _FIELD_NAME,
-            "dtype": self.dtype.str,
-            "shape_per_token": list(self.shape_per_token),
-            "hash_block_size": hash_block_size,
-            "weight_version": weight_version,
-        }
-        return hashlib.sha256(_canonical_json(profile)).hexdigest()
-
-    def block_key(
-        self, block_hash: bytes, hash_block_size: int, weight_version: str
-    ) -> str:
-        profile_id = self.profile_id(hash_block_size, weight_version)
-        digest = _digest(
-            b"vllm.artifact.field-block.v3",
-            profile_id.encode(),
-            block_hash,
-        )
-        return f"vllm-artifact/{_FIELD_NAME}/block/{digest}"
-
-    def tail_key(
-        self,
-        *,
-        request_id: str,
-        request_attempt_id: str,
-        source_start: int,
-        source_end: int,
-        hash_block_size: int,
-        weight_version: str,
-    ) -> str:
-        digest = _digest(
-            b"vllm.artifact.field-tail.v3",
-            self.profile_id(hash_block_size, weight_version).encode(),
-            request_id.encode(),
-            request_attempt_id.encode(),
-            source_start.to_bytes(8, "big"),
-            source_end.to_bytes(8, "big"),
-        )
-        return f"vllm-artifact/{_FIELD_NAME}/tail/{digest}"
+def routed_experts_key(block_hash: bytes, weight_version: str) -> str:
+    """Derive an R3 key from only model version and KV-compatible hash."""
+    return f"vllm-artifact/{_digest(weight_version.encode(), block_hash)}"
 
 
 def materialize_routed_experts(
     store: ArtifactReader,
     artifact_keys: list[str],
     *,
-    expected_profile_id: str | None = None,
+    expected_shape_per_token: tuple[int, ...] | None = None,
+    expected_dtype: np.dtype[Any] | None = None,
+    expected_token_end: int | None = None,
+    hash_block_size: int | None = None,
 ) -> np.ndarray:
     """Read ordered keys and materialize complete routed-experts rows."""
     if not artifact_keys:
@@ -206,23 +189,29 @@ def materialize_routed_experts(
     next_start = 0
     shape_per_token: tuple[int, ...] | None = None
     dtype: np.dtype[Any] | None = None
-    profile_id: str | None = expected_profile_id
     for key, payload in zip(artifact_keys, payloads, strict=True):
-        array, header = decode_artifact_array(
+        array, header = decode_routed_experts_array(
             payload,
             expected_key=key,
-            expected_profile_id=profile_id,
         )
-        current_profile = str(header["field_profile_id"])
-        if profile_id is None:
-            profile_id = current_profile
-        elif current_profile != profile_id:
-            raise ArtifactCorruptionError("artifact key list mixes field profiles")
         source_start = int(header["source_token_start"])
         if source_start != next_start:
             raise ArtifactCorruptionError(
                 "artifact keys do not cover one contiguous logical range"
             )
+        if expected_token_end is not None:
+            if hash_block_size is None or hash_block_size <= 0:
+                raise ValueError("hash_block_size must be positive")
+            expected_rows = min(hash_block_size, expected_token_end - next_start)
+            expected_kind = "block" if expected_rows == hash_block_size else "tail"
+            if expected_rows <= 0 or len(array) != expected_rows:
+                raise ArtifactCorruptionError(
+                    "artifact object does not match the terminal token range"
+                )
+            if header["kind"] != expected_kind:
+                raise ArtifactCorruptionError(
+                    "artifact object kind does not match the terminal token range"
+                )
         if shape_per_token is None:
             shape_per_token = array.shape[1:]
             dtype = array.dtype
@@ -230,7 +219,19 @@ def materialize_routed_experts(
             raise ArtifactCorruptionError("artifact key list mixes array schemas")
         next_start += array.shape[0]
         arrays.append(array)
-    return np.concatenate(arrays, axis=0)
+    if (
+        expected_shape_per_token is not None
+        and shape_per_token != expected_shape_per_token
+    ):
+        raise ArtifactCorruptionError("artifact shape does not match the model")
+    if expected_dtype is not None and dtype != expected_dtype:
+        raise ArtifactCorruptionError("artifact dtype does not match the model")
+    result = np.concatenate(arrays, axis=0)
+    if expected_token_end is not None and len(result) != expected_token_end:
+        raise ArtifactCorruptionError(
+            "artifact keys do not cover the terminal token range"
+        )
+    return result
 
 
 @dataclass(frozen=True)
@@ -240,7 +241,7 @@ class PreparedCommit:
     objects: list[ArtifactObject]
 
 
-class ArtifactRequestCore:
+class RoutedExpertsRequestCore:
     """Encode immutable R3 objects and produce terminal key lists."""
 
     def __init__(
@@ -248,12 +249,8 @@ class ArtifactRequestCore:
         store: ArtifactStore,
         source: RoutedExpertsArtifactBuffer,
     ) -> None:
-        self.store = store
-        self.source = source
-        self.key_space = ArtifactKeySpace(
-            source.dtype,
-            source.shape_per_token,
-        )
+        self._store = store
+        self._source = source
 
     def prepare_commit(self, request: ArtifactCommitRequest) -> PreparedCommit:
         if (
@@ -265,37 +262,29 @@ class ArtifactRequestCore:
         block_end = request.block_start + (
             len(request.block_hashes) * request.hash_block_size
         )
-        field_profile_id = self.key_space.profile_id(
-            request.hash_block_size, request.weight_version
-        )
-        array = self.source.read(
+        array = self._source.read(
             request.request_id,
             request.block_start,
             block_end,
         )
         if (
-            array.dtype != self.source.dtype
-            or array.shape[1:] != self.source.shape_per_token
+            array.dtype != self._source.dtype
+            or array.shape[1:] != self._source.shape_per_token
         ):
             raise RuntimeError("routed-experts capture profile changed")
 
         objects: list[ArtifactObject] = []
         for block_offset, block_hash in enumerate(request.block_hashes):
             source_start = request.block_start + block_offset * request.hash_block_size
-            key = self.key_space.block_key(
-                block_hash,
-                request.hash_block_size,
-                request.weight_version,
-            )
+            key = routed_experts_key(block_hash, request.weight_version)
             local_start = source_start - request.block_start
             block_array = array[local_start : local_start + request.hash_block_size]
             objects.append(
                 ArtifactObject(
                     key=key,
-                    payload=encode_artifact_array(
+                    payload=encode_routed_experts_array(
                         key=key,
                         kind="block",
-                        field_profile_id=field_profile_id,
                         array=block_array,
                         source_token_start=source_start,
                     ),
@@ -309,20 +298,19 @@ class ArtifactRequestCore:
 
     def publish_commits(self, commits: list[PreparedCommit]) -> None:
         objects = [obj for commit in commits for obj in commit.objects]
-        self.store.put(objects)
+        self._store.put(objects)
         for commit in commits:
-            self.source.release_through(commit.request_id, commit.block_end)
+            self._source.release_through(commit.request_id, commit.block_end)
 
     def _put_tail(
         self,
         request: ArtifactFinalizeRequest,
         *,
-        field_profile_id: str,
         source_start: int,
         source_end: int,
     ) -> str:
         try:
-            array = self.source.read(
+            array = self._source.read(
                 request.request_id,
                 source_start,
                 source_end,
@@ -335,20 +323,15 @@ class ArtifactRequestCore:
             if block_index >= len(request.block_hashes):
                 raise
             block_hash = request.block_hashes[block_index]
-            block_key = self.key_space.block_key(
-                block_hash,
-                request.hash_block_size,
-                request.weight_version,
-            )
-            payloads = self.store.get([block_key])
+            block_key = routed_experts_key(block_hash, request.weight_version)
+            payloads = self._store.get([block_key])
             if len(payloads) != 1:
                 raise RuntimeError(
                     "artifact backend returned the wrong object count"
                 ) from buffer_error
-            block, header = decode_artifact_array(
+            block, header = decode_routed_experts_array(
                 payloads[0],
                 expected_key=block_key,
-                expected_profile_id=field_profile_id,
             )
             if (
                 header["kind"] != "block"
@@ -360,22 +343,16 @@ class ArtifactRequestCore:
                     "artifact block cannot reconstruct the terminal tail"
                 ) from buffer_error
             array = block[: source_end - source_start]
-        key = self.key_space.tail_key(
-            request_id=request.request_id,
-            request_attempt_id=request.request_attempt_id,
-            source_start=source_start,
-            source_end=source_end,
-            hash_block_size=request.hash_block_size,
-            weight_version=request.weight_version,
-        )
-        self.store.put(
+        if request.tail_block_hash is None:
+            raise RuntimeError("terminal artifact is missing its partial block hash")
+        key = routed_experts_key(request.tail_block_hash, request.weight_version)
+        self._store.put(
             [
                 ArtifactObject(
                     key=key,
-                    payload=encode_artifact_array(
+                    payload=encode_routed_experts_array(
                         key=key,
                         kind="tail",
-                        field_profile_id=field_profile_id,
                         array=array,
                         source_token_start=source_start,
                     ),
@@ -387,9 +364,6 @@ class ArtifactRequestCore:
     def finalize(self, request: ArtifactFinalizeRequest) -> list[str]:
         if request.token_end <= 0:
             raise ValueError(f"invalid artifact token range: [0, {request.token_end})")
-        field_profile_id = self.key_space.profile_id(
-            request.hash_block_size, request.weight_version
-        )
         full_end = (
             request.token_end // request.hash_block_size * request.hash_block_size
         )
@@ -401,9 +375,8 @@ class ArtifactRequestCore:
                 f"actual={len(request.block_hashes)}"
             )
         keys = [
-            self.key_space.block_key(
+            routed_experts_key(
                 request.block_hashes[block_index],
-                request.hash_block_size,
                 request.weight_version,
             )
             for block_index in range(full_block_count)
@@ -412,11 +385,10 @@ class ArtifactRequestCore:
             keys.append(
                 self._put_tail(
                     request,
-                    field_profile_id=field_profile_id,
                     source_start=full_end,
                     source_end=request.token_end,
                 )
             )
 
-        self.source.discard(request.request_id)
+        self._source.discard(request.request_id)
         return keys

@@ -664,7 +664,7 @@ class Worker(WorkerBase):
         with self._maybe_get_memory_pool_context(tag="kv_cache"):
             self.model_runner.initialize_kv_cache(kv_cache_config)
 
-        if self.vllm_config.artifact_config.enable_routed_experts:
+        if self.vllm_config.artifact_config.enabled:
             if self.use_v2_model_runner:
                 from vllm.v1.worker.gpu.model_runner import (
                     GPUModelRunner as GPUModelRunnerV2,

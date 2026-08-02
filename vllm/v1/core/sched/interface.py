@@ -165,7 +165,6 @@ class SchedulerInterface(ABC):
         """
         raise NotImplementedError
 
-    @abstractmethod
     def finalize_artifact_requests(
         self, requests: list["ArtifactRequestToFinalize"]
     ) -> None:
@@ -228,10 +227,9 @@ class SchedulerInterface(ABC):
         """
         raise NotImplementedError
 
-    @abstractmethod
     def set_weight_version(self, weight_version: str) -> None:
         """Update versioned scheduler-side cache namespaces."""
-        raise NotImplementedError
+        return None
 
     @abstractmethod
     def reset_encoder_cache(self) -> None:

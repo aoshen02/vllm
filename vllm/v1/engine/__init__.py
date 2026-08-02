@@ -209,7 +209,6 @@ class EngineCoreOutput(
     prefill_stats: PrefillStats | None = None
 
     routed_experts: np.ndarray | None = None
-    artifact_finalized: bool = False
     # The number of NaNs in logits.
     # A value greater than 0 indicates that the output is corrupted.
     num_nans_in_logits: int = 0

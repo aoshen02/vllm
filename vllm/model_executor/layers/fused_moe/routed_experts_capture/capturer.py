@@ -6,11 +6,11 @@
 import torch
 
 from vllm.config import VllmConfig
-from vllm.distributed.parallel_state import get_tp_group
-from vllm.forward_context import get_forward_context
-from vllm.model_executor.layers.fused_moe.routed_experts_capture.common import (
+from vllm.distributed.artifact_connector.request_core import (
     get_num_experts_per_token,
 )
+from vllm.distributed.parallel_state import get_tp_group
+from vllm.forward_context import get_forward_context
 from vllm.platforms import current_platform
 
 
