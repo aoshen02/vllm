@@ -8,6 +8,8 @@ use serde_json::{Map, Value};
 use validator::Validate;
 use vllm_text::SamplingParams;
 
+use vllm_chat::ChatContentPart;
+
 use crate::routes::openai::utils::types::{ChatLogProbs, Normalizable, StreamOptions, Usage};
 
 /// vLLM-compatible request type for the token-in/token-out generate API.
@@ -26,6 +28,9 @@ pub struct GenerateRequest {
     pub priority: i32,
     pub kv_transfer_params: Option<HashMap<String, Value>>,
     pub ec_transfer_params: Option<HashMap<String, Value>>,
+    /// OpenAI-style content parts for raw multimodal input.
+    /// The generate server resolves media internally.
+    pub content_parts: Option<Vec<ChatContentPart>>,
     #[serde(flatten)]
     pub other: Map<String, Value>,
 }
