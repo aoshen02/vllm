@@ -54,34 +54,12 @@ class TrtLlmMxfp4ExpertsBase:
         self.local_num_experts = moe_config.num_local_experts
         self.ep_rank = moe_config.moe_parallel_config.ep_rank
 
-        # MXFP4-specific TRTLLM parameters from quant_config
-        device = torch.accelerator.current_device_index()
-        if quant_config.gemm1_alpha is not None:
-            self.gemm1_alpha = torch.tensor(
-                [quant_config.gemm1_alpha] * self.local_num_experts,
-                dtype=torch.float32,
-                device=device,
-            )
-        else:
-            self.gemm1_alpha = None
-
-        if quant_config.gemm1_beta is not None:
-            self.gemm1_beta = torch.tensor(
-                [quant_config.gemm1_beta] * self.local_num_experts,
-                dtype=torch.float32,
-                device=device,
-            )
-        else:
-            self.gemm1_beta = None
-
-        if quant_config.gemm1_clamp_limit is not None:
-            self.gemm1_clamp_limit = torch.tensor(
-                [quant_config.gemm1_clamp_limit] * self.local_num_experts,
-                dtype=torch.float32,
-                device=device,
-            )
-        else:
-            self.gemm1_clamp_limit = None
+        # Per-expert SwiGLU constants; storage must stay stable across
+        # reloads because CUDA graphs may capture their addresses.
+        self.gemm1_alpha: torch.Tensor | None = None
+        self.gemm1_beta: torch.Tensor | None = None
+        self.gemm1_clamp_limit: torch.Tensor | None = None
+        self.refresh_after_weight_reload()
 
         # SITU (SituGLU) TRTLLM-Gen kernel computes
         #   left  = alpha * tanh(x0 / alpha) * sigmoid(x0)   # gate (x0)
@@ -89,6 +67,7 @@ class TrtLlmMxfp4ExpertsBase:
         # which matches vLLM's situ_and_mul with (beta, linear_beta), so map
         # situ beta -> gatedActAlpha (gemm1_alpha) and situ linear_beta ->
         # gatedActBeta (gemm1_beta). Both must be > 0.
+        device = torch.accelerator.current_device_index()
         if moe_config.activation == MoEActivation.SITU:
             situ_beta = moe_config.activation_situ_beta
             situ_linear_beta = moe_config.activation_situ_linear_beta
@@ -114,6 +93,40 @@ class TrtLlmMxfp4ExpertsBase:
             self.gemm1_clamp_limit = None
 
         self.max_capture_size = moe_config.max_capture_size
+
+    def refresh_after_weight_reload(
+        self, fresh_config: FusedMoEQuantConfig | None = None
+    ) -> None:
+        """Rewrite the activation constants in place (see FusedMoEExperts)."""
+        values = (
+            self.quant_config.gemm1_alpha,
+            self.quant_config.gemm1_beta,
+            self.quant_config.gemm1_clamp_limit,
+        )
+        device = torch.accelerator.current_device_index()
+        for name, value in zip(
+            ("gemm1_alpha", "gemm1_beta", "gemm1_clamp_limit"), values
+        ):
+            if value is None:
+                assert getattr(self, name, None) is None, (
+                    f"{name} changed from set to unset across a reload; "
+                    "refresh must never rebind graph-visible storage."
+                )
+                continue
+            tensor = getattr(self, name, None)
+            if isinstance(tensor, torch.Tensor):
+                tensor.fill_(float(value))
+            else:
+                setattr(
+                    self,
+                    name,
+                    torch.full(
+                        (self.local_num_experts,),
+                        float(value),
+                        dtype=torch.float32,
+                        device=device,
+                    ),
+                )
 
     @staticmethod
     def _supports_current_device() -> bool:

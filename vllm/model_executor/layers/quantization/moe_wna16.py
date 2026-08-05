@@ -384,14 +384,18 @@ class MoeWNA16Method(FusedMoEMethodBase):
         assert self.experts_cls is not None
         self.moe_quant_config = self.get_fused_moe_quant_config(layer)
         assert self.moe_quant_config is not None
-        self.moe_kernel = make_wna16_moe_kernel(
-            moe_quant_config=self.moe_quant_config,
-            moe_config=self.moe,
-            experts_cls=self.experts_cls,
-            backend=self.wna16_backend,
-            layer=layer,
-            routing_tables=layer._expert_routing_tables(),
-        )
+        if (
+            self.moe_kernel is None
+            or self.wna16_backend != WNA16MoEBackend.FLASHINFER_TRTLLM
+        ):
+            self.moe_kernel = make_wna16_moe_kernel(
+                moe_quant_config=self.moe_quant_config,
+                moe_config=self.moe,
+                experts_cls=self.experts_cls,
+                backend=self.wna16_backend,
+                layer=layer,
+                routing_tables=layer._expert_routing_tables(),
+            )
 
     def process_weights_after_loading(self, layer: RoutedExperts) -> None:
         has_zp = self.quant_config.has_zp

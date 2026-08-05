@@ -503,6 +503,15 @@ class FusedMoEExperts(ABC):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:  # noqa: B027
         pass
 
+    def refresh_after_weight_reload(  # noqa: B027
+        self, fresh_config: FusedMoEQuantConfig | None = None
+    ) -> None:
+        """Rewrite runtime-derived tensors in place (never rebind) after a
+        weight reload, reading scale-dependent values from `fresh_config`
+        (this reload's just-loaded scales) instead of the kernel's own
+        not-yet-updated `quant_config`."""
+        pass
+
     @staticmethod
     def is_monolithic() -> bool:
         raise NotImplementedError("Implemented by subclasses.")
@@ -1645,6 +1654,11 @@ class FusedMoEKernel:
 
     def supports_lora(self) -> bool:
         return self.fused_experts.supports_lora()
+
+    def refresh_after_weight_reload(
+        self, fresh_config: FusedMoEQuantConfig | None = None
+    ) -> None:
+        self.impl.fused_experts.refresh_after_weight_reload(fresh_config)
 
     def _post_init_setup(self):
         """

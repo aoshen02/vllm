@@ -674,17 +674,29 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             layer.w13_weight.is_shuffled = True
             layer.w2_weight.is_shuffled = True
 
-        self.moe_quant_config = self.get_fused_moe_quant_config(layer)
-        assert self.moe_quant_config is not None
-        assert self.experts_cls is not None
-        self.moe_kernel = make_fp8_moe_kernel(
-            moe_quant_config=self.moe_quant_config,
-            moe_config=self.moe,
-            fp8_backend=self.fp8_backend,
-            experts_cls=self.experts_cls,
-            routing_tables=layer._expert_routing_tables(),
-            layer=layer,
-        )
+        # TRTLLM experts implement refresh_after_weight_reload, so keep the
+        # kernel across reloads (CUDA graphs may have captured its tensors)
+        # and refresh derived state in place; other backends keep the
+        # legacy rebuild until their refresh implementations exist.
+        if (
+            self.moe_kernel is None
+            or self.fp8_backend != Fp8MoeBackend.FLASHINFER_TRTLLM
+        ):
+            self.moe_quant_config = self.get_fused_moe_quant_config(layer)
+            assert self.moe_quant_config is not None
+            assert self.experts_cls is not None
+            self.moe_kernel = make_fp8_moe_kernel(
+                moe_quant_config=self.moe_quant_config,
+                moe_config=self.moe,
+                fp8_backend=self.fp8_backend,
+                experts_cls=self.experts_cls,
+                routing_tables=layer._expert_routing_tables(),
+                layer=layer,
+            )
+        else:
+            self.moe_kernel.refresh_after_weight_reload(
+                self.get_fused_moe_quant_config(layer)
+            )
 
     def process_weights_after_loading(self, layer: RoutedExperts) -> None:
         # Allow for accessing weights and scales in standard way.

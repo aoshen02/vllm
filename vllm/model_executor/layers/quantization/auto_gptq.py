@@ -765,19 +765,23 @@ class AutoGPTQMoEMethod(FusedMoEMethodBase):
         """Build the FusedMoEKernel for this layer."""
 
         self.moe_quant_config = self.get_fused_moe_quant_config(layer)
-        self.moe_kernel = make_wna16_moe_kernel(
-            moe_quant_config=self.moe_quant_config,
-            moe_config=self.moe,
-            experts_cls=self.experts_cls,
-            backend=self.wna16_moe_backend,
-            layer=layer,
-            is_k_full=self.is_k_full,
-            w13_g_idx=getattr(layer, "w13_g_idx", None),
-            w2_g_idx=getattr(layer, "w2_g_idx", None),
-            w13_g_idx_sort_indices=getattr(layer, "w13_g_idx_sort_indices", None),
-            w2_g_idx_sort_indices=getattr(layer, "w2_g_idx_sort_indices", None),
-            routing_tables=layer._expert_routing_tables(),
-        )
+        if (
+            self.moe_kernel is None
+            or self.wna16_moe_backend != WNA16MoEBackend.FLASHINFER_TRTLLM
+        ):
+            self.moe_kernel = make_wna16_moe_kernel(
+                moe_quant_config=self.moe_quant_config,
+                moe_config=self.moe,
+                experts_cls=self.experts_cls,
+                backend=self.wna16_moe_backend,
+                layer=layer,
+                is_k_full=self.is_k_full,
+                w13_g_idx=getattr(layer, "w13_g_idx", None),
+                w2_g_idx=getattr(layer, "w2_g_idx", None),
+                w13_g_idx_sort_indices=getattr(layer, "w13_g_idx_sort_indices", None),
+                w2_g_idx_sort_indices=getattr(layer, "w2_g_idx_sort_indices", None),
+                routing_tables=layer._expert_routing_tables(),
+            )
 
     def get_fused_moe_quant_config(self, layer: RoutedExperts) -> FusedMoEQuantConfig:
         if self.wna16_moe_backend == WNA16MoEBackend.HUMMING:

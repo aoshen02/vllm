@@ -103,10 +103,18 @@ class TrtLlmNvFp4ExpertsBase:
             beta = getattr(moe_config, "swiglu_beta", None)
 
         if moe_config.is_act_and_mul:
+            # Keep the unfolded values: process_weights_after_loading folds
+            # them by each reload's g1_alphas and must never fold twice.
+            self._gemm1_clamp_limit_raw = clamp
+            self._gemm1_alpha_raw = alpha
+            self._gemm1_beta_raw = beta
             self.gemm1_clamp_limit = _per_expert(clamp)
             self.gemm1_alpha = _per_expert(alpha)
             self.gemm1_beta = _per_expert(beta)
         else:
+            self._gemm1_clamp_limit_raw = None
+            self._gemm1_alpha_raw = None
+            self._gemm1_beta_raw = None
             self.gemm1_clamp_limit = None
             self.gemm1_alpha = None
             self.gemm1_beta = None
@@ -128,6 +136,9 @@ class TrtLlmNvFp4ExpertsBase:
                 "TRTLLM SiTuGlu requires activation_situ_linear_beta > 0 "
                 "(the private cubin has no up-passthrough path)"
             )
+            self._gemm1_alpha_raw = situ_beta
+            self._gemm1_beta_raw = situ_linear_beta
+            self._gemm1_clamp_limit_raw = None
             self.gemm1_alpha = _per_expert(situ_beta)
             self.gemm1_beta = _per_expert(situ_linear_beta)
             self.gemm1_clamp_limit = None
@@ -140,63 +151,70 @@ class TrtLlmNvFp4ExpertsBase:
             clamp,
         )
 
+    def _publish_per_expert(
+        self, layer: torch.nn.Module, name: str, value: torch.Tensor
+    ) -> None:
+        """Register `value` on first load; copy it into the existing
+        parameter on reloads so graph-captured storage keeps its address
+        (registered on the layer so EPLB rearranges it with the experts)."""
+        existing = getattr(layer, name, None)
+        if isinstance(existing, torch.nn.Parameter):
+            assert (
+                existing.shape == value.shape
+                and existing.dtype == value.dtype
+                and existing.device == value.device
+            ), f"{name} changed shape/dtype/device across a weight reload"
+            existing.data.copy_(value)
+        else:
+            layer.register_parameter(
+                name, torch.nn.Parameter(value, requires_grad=False)
+            )
+        setattr(self, name, getattr(layer, name))
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         layer.w13_weight_scale_2.data.mul_(layer.w13_input_scale)
         layer.w2_weight_scale_2.data.mul_(layer.w2_input_scale)
-        # Recompute g1_scale_c since g1_alphas was just fused in-place.
-        # Register as a layer parameter so EPLB rearranges it alongside
-        # other expert weights.
-        assert self.quant_config.g1_alphas is not None
-        assert self.quant_config.a2_gscale is not None
+        # Read this load's scales from the layer, not self.quant_config: on
+        # reloads the config references storage that is only updated by the
+        # later copy-back.
+        g1_alphas = layer.w13_weight_scale_2.data
+        a2_gscale = 1.0 / layer.w2_input_scale.data
         if self.moe_config.is_act_and_mul:
-            g1_scale_c = self.quant_config.g1_alphas * self.quant_config.a2_gscale
+            g1_scale_c = g1_alphas * a2_gscale
         else:
-            g1_scale_c = self.quant_config.a2_gscale.clone()
-        layer.register_parameter(
-            "g1_scale_c",
-            torch.nn.Parameter(g1_scale_c, requires_grad=False),
-        )
-        self.g1_scale_c = layer.g1_scale_c
+            g1_scale_c = a2_gscale.clone()
+        self._publish_per_expert(layer, "g1_scale_c", g1_scale_c)
 
-        # Pre-fold the per-expert g1_alphas (= output1_scale_gate_scalar)
-        # division so the TRTLLM kernel receives the raw-GEMM-space clamp
-        # directly. g1_alphas is set once here in process_weights_after_loading
-        # (via the in-place mul above) and never changes again, so this is a
-        # static, per-expert constant. Register on the layer so EPLB
-        # rearranges it alongside the other expert tensors.
-        # SITU alpha/beta act on the dequantized gate/up (tanh clamps), not the
-        # raw GEMM1 accumulator, so they are registered as-is without the
+        def _per_expert(val: float) -> torch.Tensor:
+            return torch.full(
+                (self.local_num_experts,),
+                float(val),
+                dtype=torch.float32,
+                device=g1_alphas.device,
+            )
+
+        # SITU alpha/beta act on the dequantized gate/up (tanh clamps), not
+        # the raw GEMM1 accumulator, so they are published as-is without the
         # g1_alphas fold used by the SwiGLU-OAI clamp/beta below.
-        if self.gemm1_clamp_limit is not None and not self.is_situ:
-            gemm1_clamp_limit = self.gemm1_clamp_limit / self.quant_config.g1_alphas
-            layer.register_parameter(
+        if self._gemm1_clamp_limit_raw is not None and not self.is_situ:
+            self._publish_per_expert(
+                layer,
                 "gemm1_clamp_limit",
-                torch.nn.Parameter(gemm1_clamp_limit, requires_grad=False),
+                _per_expert(self._gemm1_clamp_limit_raw) / g1_alphas,
             )
-            self.gemm1_clamp_limit = layer.gemm1_clamp_limit
 
-        # beta shifts the raw GEMM1 accumulator, so fold by g1_alphas like the
-        # clamp limit. alpha is applied to the dequantized gate, so it stays
-        # raw. Register both on the layer so EPLB rearranges them with the
-        # other per-expert tensors.
-        if self.gemm1_beta is not None:
-            gemm1_beta = (
-                self.gemm1_beta
-                if self.is_situ
-                else self.gemm1_beta / self.quant_config.g1_alphas
-            )
-            layer.register_parameter(
+        if self._gemm1_beta_raw is not None:
+            beta = _per_expert(self._gemm1_beta_raw)
+            self._publish_per_expert(
+                layer,
                 "gemm1_beta",
-                torch.nn.Parameter(gemm1_beta, requires_grad=False),
+                beta if self.is_situ else beta / g1_alphas,
             )
-            self.gemm1_beta = layer.gemm1_beta
 
-        if self.gemm1_alpha is not None:
-            layer.register_parameter(
-                "gemm1_alpha",
-                torch.nn.Parameter(self.gemm1_alpha, requires_grad=False),
+        if self._gemm1_alpha_raw is not None:
+            self._publish_per_expert(
+                layer, "gemm1_alpha", _per_expert(self._gemm1_alpha_raw)
             )
-            self.gemm1_alpha = layer.gemm1_alpha
 
     @staticmethod
     def _supports_current_device() -> bool:

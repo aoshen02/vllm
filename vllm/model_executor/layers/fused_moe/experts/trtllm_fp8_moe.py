@@ -59,34 +59,42 @@ class TrtLlmFp8ExpertsBase:
         self.moe_config = moe_config
         self.quant_config = quant_config
 
-        # Per-expert SwiGLU parameters from quant_config (MXFP8 + Swiglu only).
+        # Per-expert SwiGLU constants; storage must stay stable across
+        # reloads because CUDA graphs may capture their addresses.
+        self.gemm1_alpha: torch.Tensor | None = None
+        self.gemm1_beta: torch.Tensor | None = None
+        self.gemm1_clamp_limit: torch.Tensor | None = None
+        # Call the base explicitly: overrides need a fresh config that
+        # does not exist at construction time.
+        TrtLlmFp8ExpertsBase.refresh_after_weight_reload(self)
+
+    def refresh_after_weight_reload(
+        self, fresh_config: FusedMoEQuantConfig | None = None
+    ) -> None:
+        """Rewrite SwiGLU constants in place (see FusedMoEExperts)."""
         device = torch.accelerator.current_device_index()
-        if quant_config.gemm1_alpha is not None:
-            self.gemm1_alpha = torch.tensor(
-                [quant_config.gemm1_alpha] * self.local_num_experts,
-                dtype=torch.float32,
-                device=device,
-            )
-        else:
-            self.gemm1_alpha = None
-
-        if quant_config.gemm1_beta is not None:
-            self.gemm1_beta = torch.tensor(
-                [quant_config.gemm1_beta] * self.local_num_experts,
-                dtype=torch.float32,
-                device=device,
-            )
-        else:
-            self.gemm1_beta = None
-
-        if quant_config.gemm1_clamp_limit is not None:
-            self.gemm1_clamp_limit = torch.tensor(
-                [quant_config.gemm1_clamp_limit] * self.local_num_experts,
-                dtype=torch.float32,
-                device=device,
-            )
-        else:
-            self.gemm1_clamp_limit = None
+        for name in ("gemm1_alpha", "gemm1_beta", "gemm1_clamp_limit"):
+            value = getattr(self.quant_config, name)
+            tensor = getattr(self, name)
+            if value is None:
+                assert tensor is None, (
+                    f"{name} changed from set to unset across a reload; "
+                    "refresh must never rebind graph-visible storage."
+                )
+                continue
+            if tensor is None:
+                setattr(
+                    self,
+                    name,
+                    torch.full(
+                        (self.local_num_experts,),
+                        float(value),
+                        dtype=torch.float32,
+                        device=device,
+                    ),
+                )
+            else:
+                tensor.fill_(float(value))
 
     @staticmethod
     def activation_format() -> mk.FusedMoEActivationFormat:
@@ -277,22 +285,49 @@ class TrtLlmFp8ExpertsMonolithic(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsMonolit
 
         # Make additional scales for per-tensor interface.
         if self.quant_config.is_per_tensor:
-            w1_scale = self.quant_config.w1_scale
-            assert w1_scale is not None
-            a1_scale = self.quant_config.a1_scale
-            assert a1_scale is not None
-            w2_scale = self.quant_config.w2_scale
-            assert w2_scale is not None
-            a2_scale = self.quant_config.a2_scale
-            assert a2_scale is not None
-
-            self._g1_alphas = (w1_scale * a1_scale).squeeze()
-            self._g2_alphas = (w2_scale * a2_scale).squeeze()
-            self._g1_scale_c = (
-                self._g1_alphas / self.quant_config.a2_scale
-                if moe_config.is_act_and_mul
-                else torch.ones_like(self._g1_alphas) / self.quant_config.a2_scale
+            g1_alphas, g2_alphas, g1_scale_c = self._compute_output_scales(
+                self.quant_config
             )
+            self._g1_alphas = g1_alphas
+            self._g2_alphas = g2_alphas
+            self._g1_scale_c = g1_scale_c
+
+    def _compute_output_scales(
+        self, config: FusedMoEQuantConfig
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        w1_scale = config.w1_scale
+        assert w1_scale is not None
+        a1_scale = config.a1_scale
+        assert a1_scale is not None
+        w2_scale = config.w2_scale
+        assert w2_scale is not None
+        a2_scale = config.a2_scale
+        assert a2_scale is not None
+
+        g1_alphas = (w1_scale * a1_scale).squeeze()
+        g2_alphas = (w2_scale * a2_scale).squeeze()
+        g1_scale_c = (
+            g1_alphas / a2_scale
+            if self.moe_config.is_act_and_mul
+            else torch.ones_like(g1_alphas) / a2_scale
+        )
+        return g1_alphas, g2_alphas, g1_scale_c
+
+    def refresh_after_weight_reload(
+        self, fresh_config: FusedMoEQuantConfig | None = None
+    ) -> None:
+        super().refresh_after_weight_reload(fresh_config)
+        if self.quant_config.is_per_tensor:
+            # self.quant_config is only updated by the later copy-back, so
+            # the derived scales must come from the caller's fresh config.
+            assert fresh_config is not None, (
+                "per-tensor TRTLLM FP8 refresh requires the fresh quant "
+                "config of the current reload"
+            )
+            g1_alphas, g2_alphas, g1_scale_c = self._compute_output_scales(fresh_config)
+            self._g1_alphas.copy_(g1_alphas)
+            self._g2_alphas.copy_(g2_alphas)
+            self._g1_scale_c.copy_(g1_scale_c)
 
     @staticmethod
     def _supports_quant_scheme(

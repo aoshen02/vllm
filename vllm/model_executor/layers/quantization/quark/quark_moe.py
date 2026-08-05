@@ -42,6 +42,7 @@ from vllm.model_executor.layers.fused_moe.oracle.int8 import (
 )
 from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import (
     TRITON_BACKENDS,
+    TRTLLM_BACKENDS,
     Mxfp4MoeBackend,
     backend_to_kernel_cls,
     convert_gpt_oss_weight_to_mxfp4_moe_kernel_format,
@@ -51,6 +52,7 @@ from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import (
     select_mxfp4_moe_backend,
 )
 from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import (
+    NvFp4MoeBackend,
     convert_to_nvfp4_moe_kernel_format,
     make_nvfp4_moe_kernel,
     make_nvfp4_moe_quant_config,
@@ -451,13 +453,21 @@ class QuarkW8A8Fp8MoEMethod(QuarkMoEMethod):
         self.moe_quant_config = self.get_fused_moe_quant_config(layer)
         assert self.moe_quant_config is not None
         assert self.experts_cls is not None
-        self.moe_kernel = make_fp8_moe_kernel(
-            moe_quant_config=self.moe_quant_config,
-            moe_config=self.moe,
-            fp8_backend=self.fp8_backend,
-            experts_cls=self.experts_cls,
-            routing_tables=layer._expert_routing_tables(),
-        )
+        if (
+            self.moe_kernel is None
+            or self.fp8_backend != Fp8MoeBackend.FLASHINFER_TRTLLM
+        ):
+            self.moe_kernel = make_fp8_moe_kernel(
+                moe_quant_config=self.moe_quant_config,
+                moe_config=self.moe,
+                fp8_backend=self.fp8_backend,
+                experts_cls=self.experts_cls,
+                routing_tables=layer._expert_routing_tables(),
+            )
+        else:
+            self.moe_kernel.refresh_after_weight_reload(
+                self.get_fused_moe_quant_config(layer)
+            )
 
     def get_fused_moe_quant_config(self, layer: RoutedExperts) -> FusedMoEQuantConfig:
         return make_fp8_moe_quant_config(
@@ -1330,16 +1340,18 @@ class QuarkOCP_MX_MoEMethod(QuarkMoEMethod):
 
         torch.accelerator.empty_cache()
 
-        # Build quant config and kernel
         self.moe_quant_config = self.get_fused_moe_quant_config(layer)
         if self.moe_quant_config is not None and self.experts_cls is not None:
-            self.moe_kernel = make_mxfp4_moe_kernel(
-                moe_quant_config=self.moe_quant_config,
-                moe_config=self.moe,
-                mxfp4_backend=self.mxfp4_backend,
-                experts_cls=self.experts_cls,
-                routing_tables=layer._expert_routing_tables(),
-            )
+            if self.moe_kernel is None or self.mxfp4_backend not in TRTLLM_BACKENDS:
+                self.moe_kernel = make_mxfp4_moe_kernel(
+                    moe_quant_config=self.moe_quant_config,
+                    moe_config=self.moe,
+                    mxfp4_backend=self.mxfp4_backend,
+                    experts_cls=self.experts_cls,
+                    routing_tables=layer._expert_routing_tables(),
+                )
+            else:
+                self.moe_kernel.refresh_after_weight_reload()
 
     def get_fused_moe_quant_config(
         self, layer: RoutedExperts
@@ -1641,18 +1653,21 @@ class QuarkNvfp4MoEMethod(QuarkMoEMethod):
         replace_parameter(layer, "w2_weight_scale_2", w2_scale_2)
         replace_parameter(layer, "w2_input_scale_2", a2_scale)
 
-        # Setup modular kernel.
         self.moe_quant_config = self.get_fused_moe_quant_config(layer)
         if self.moe_quant_config:
             assert self.experts_cls is not None
-            self.moe_kernel = make_nvfp4_moe_kernel(
-                moe_quant_config=self.moe_quant_config,
-                moe_config=self.moe,
-                experts_cls=self.experts_cls,
-                backend=self.nvfp4_backend,
-                routing_tables=layer._expert_routing_tables(),
-                layer=layer,
-            )
+            if (
+                self.moe_kernel is None
+                or self.nvfp4_backend != NvFp4MoeBackend.FLASHINFER_TRTLLM
+            ):
+                self.moe_kernel = make_nvfp4_moe_kernel(
+                    moe_quant_config=self.moe_quant_config,
+                    moe_config=self.moe,
+                    experts_cls=self.experts_cls,
+                    backend=self.nvfp4_backend,
+                    routing_tables=layer._expert_routing_tables(),
+                    layer=layer,
+                )
 
     def get_fused_moe_quant_config(
         self, layer: torch.nn.Module

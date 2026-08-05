@@ -461,13 +461,17 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
                 "is_k_full": self.is_k_full,
             }
 
-        self.moe_kernel = make_wna16_moe_kernel(
-            moe_quant_config=self.moe_quant_config,
-            moe_config=self.moe,
-            experts_cls=self.experts_cls,
-            routing_tables=layer._expert_routing_tables(),
-            **marlin_args,
-        )
+        if (
+            self.moe_kernel is None
+            or self.wna16_backend != WNA16MoEBackend.FLASHINFER_TRTLLM
+        ):
+            self.moe_kernel = make_wna16_moe_kernel(
+                moe_quant_config=self.moe_quant_config,
+                moe_config=self.moe,
+                experts_cls=self.experts_cls,
+                routing_tables=layer._expert_routing_tables(),
+                **marlin_args,
+            )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         # Process weights using the shared oracle infrastructure

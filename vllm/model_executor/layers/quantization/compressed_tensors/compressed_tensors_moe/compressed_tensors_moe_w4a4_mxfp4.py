@@ -25,6 +25,7 @@ from vllm.model_executor.layers.fused_moe.experts.xpu_moe import (
     XPUExpertsMxFp4,
 )
 from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import (
+    TRTLLM_BACKENDS,
     Mxfp4MoeBackend,
     make_mxfp4_moe_kernel,
     make_mxfp4_moe_quant_config,
@@ -201,13 +202,16 @@ class CompressedTensorsW4A4Mxfp4MoEMethod(CompressedTensorsMoEMethod):
 
         self.moe_quant_config = self.get_fused_moe_quant_config(layer)
         if self.moe_quant_config is not None:
-            self.moe_kernel = make_mxfp4_moe_kernel(
-                moe_quant_config=self.moe_quant_config,
-                moe_config=self.moe,
-                experts_cls=self.experts_cls,
-                mxfp4_backend=self.mxfp4_backend,
-                routing_tables=layer._expert_routing_tables(),
-            )
+            if self.moe_kernel is None or self.mxfp4_backend not in TRTLLM_BACKENDS:
+                self.moe_kernel = make_mxfp4_moe_kernel(
+                    moe_quant_config=self.moe_quant_config,
+                    moe_config=self.moe,
+                    experts_cls=self.experts_cls,
+                    mxfp4_backend=self.mxfp4_backend,
+                    routing_tables=layer._expert_routing_tables(),
+                )
+            else:
+                self.moe_kernel.refresh_after_weight_reload()
 
     def apply(
         self,

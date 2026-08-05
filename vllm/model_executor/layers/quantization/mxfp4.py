@@ -154,7 +154,6 @@ class GptOssMxfp4MoEMethod(FusedMoEMethodBase):
 
         self.max_capture_size = moe.max_capture_size
 
-        self._cache_permute_indices: dict[torch.Size, torch.Tensor] = {}
         self.moe_kernel: mk.FusedMoEKernel | None = None
 
         # Used for triton kernel precision configs
@@ -349,7 +348,10 @@ class GptOssMxfp4MoEMethod(FusedMoEMethodBase):
                 w2_weight_scale=w2_scale,
                 w13_bias=w13_bias,
                 w2_bias=w2_bias,
-                _cache_permute_indices=self._cache_permute_indices,
+                # Fresh memo per conversion: persisting it across reloads
+                # would hand back CUDA tensors whose pages sleep level 2
+                # has discarded.
+                _cache_permute_indices={},
             )
         )
 
@@ -375,19 +377,22 @@ class GptOssMxfp4MoEMethod(FusedMoEMethodBase):
             replace_parameter(layer, "w13_bias", w13_bias)
             replace_parameter(layer, "w2_bias", w2_bias)
 
-        # Build quant config
-        self.moe_quant_config = self.get_fused_moe_quant_config(layer)
-
-        # Build kernel (modular or monolithic)
-        if self.moe_quant_config is not None and self.experts_cls is not None:
-            self.moe_kernel = make_mxfp4_moe_kernel(
-                moe_quant_config=self.moe_quant_config,
-                moe_config=self.moe,
-                mxfp4_backend=self.mxfp4_backend,
-                experts_cls=self.experts_cls,
-                routing_tables=layer._expert_routing_tables(),
-                layer=layer,
-            )
+        # Build the kernel once and refresh derived state in place on
+        # reloads (CUDA graphs may have captured its tensors); TRITON keeps
+        # the legacy rebuild since its precision configs live on the method.
+        if self.moe_kernel is None or self.mxfp4_backend in TRITON_BACKENDS:
+            self.moe_quant_config = self.get_fused_moe_quant_config(layer)
+            if self.moe_quant_config is not None and self.experts_cls is not None:
+                self.moe_kernel = make_mxfp4_moe_kernel(
+                    moe_quant_config=self.moe_quant_config,
+                    moe_config=self.moe,
+                    mxfp4_backend=self.mxfp4_backend,
+                    experts_cls=self.experts_cls,
+                    routing_tables=layer._expert_routing_tables(),
+                    layer=layer,
+                )
+        else:
+            self.moe_kernel.refresh_after_weight_reload()
 
     def process_weights_after_loading(self, layer: RoutedExperts) -> None:
         w13 = layer.w13_weight
@@ -531,7 +536,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
         self.max_capture_size = moe.max_capture_size
 
-        self._cache_permute_indices: dict[torch.Size, torch.Tensor] = {}
         self.moe_kernel: mk.FusedMoEKernel | None = None
 
         # Used for triton kernel precision configs
@@ -738,7 +742,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     w2_weight_scale=w2_scale,
                     w13_bias=w13_bias,
                     w2_bias=w2_bias,
-                    _cache_permute_indices=self._cache_permute_indices,
+                    _cache_permute_indices={},
                 )
             )
 
@@ -772,19 +776,22 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             replace_parameter(layer, "w13_bias", w13_bias)
             replace_parameter(layer, "w2_bias", w2_bias)
 
-        # Build quant config
-        self.moe_quant_config = self.get_fused_moe_quant_config(layer)
-
-        # Build kernel (modular or monolithic)
-        if self.moe_quant_config is not None and self.experts_cls is not None:
-            self.moe_kernel = make_mxfp4_moe_kernel(
-                moe_quant_config=self.moe_quant_config,
-                moe_config=self.moe,
-                mxfp4_backend=self.mxfp4_backend,
-                experts_cls=self.experts_cls,
-                routing_tables=layer._expert_routing_tables(),
-                layer=layer,
-            )
+        # Build the kernel once and refresh derived state in place on
+        # reloads (CUDA graphs may have captured its tensors); TRITON keeps
+        # the legacy rebuild since its precision configs live on the method.
+        if self.moe_kernel is None or self.mxfp4_backend in TRITON_BACKENDS:
+            self.moe_quant_config = self.get_fused_moe_quant_config(layer)
+            if self.moe_quant_config is not None and self.experts_cls is not None:
+                self.moe_kernel = make_mxfp4_moe_kernel(
+                    moe_quant_config=self.moe_quant_config,
+                    moe_config=self.moe,
+                    mxfp4_backend=self.mxfp4_backend,
+                    experts_cls=self.experts_cls,
+                    routing_tables=layer._expert_routing_tables(),
+                    layer=layer,
+                )
+        else:
+            self.moe_kernel.refresh_after_weight_reload()
 
     def _convert_k3_situ_weight_to_kernel_format(
         self, layer: RoutedExperts

@@ -426,6 +426,7 @@ class _Fp8OnlineMoEBase(OnlineMoEMethodBase):
         w2_input_scale: torch.Tensor | None,
     ) -> None:
         from vllm.model_executor.layers.fused_moe.oracle.fp8 import (
+            Fp8MoeBackend,
             convert_to_fp8_moe_kernel_format,
             make_fp8_moe_kernel,
         )
@@ -452,14 +453,22 @@ class _Fp8OnlineMoEBase(OnlineMoEMethodBase):
         self.moe_quant_config = self.get_fused_moe_quant_config(layer)
         if self.moe_quant_config:
             assert self.experts_cls is not None
-            self.moe_kernel = make_fp8_moe_kernel(
-                moe_quant_config=self.moe_quant_config,
-                moe_config=self.moe,
-                fp8_backend=self.fp8_backend,
-                experts_cls=self.experts_cls,
-                routing_tables=layer._expert_routing_tables(),
-                layer=layer,
-            )
+            if (
+                self.moe_kernel is None
+                or self.fp8_backend != Fp8MoeBackend.FLASHINFER_TRTLLM
+            ):
+                self.moe_kernel = make_fp8_moe_kernel(
+                    moe_quant_config=self.moe_quant_config,
+                    moe_config=self.moe,
+                    fp8_backend=self.fp8_backend,
+                    experts_cls=self.experts_cls,
+                    routing_tables=layer._expert_routing_tables(),
+                    layer=layer,
+                )
+            else:
+                self.moe_kernel.refresh_after_weight_reload(
+                    self.get_fused_moe_quant_config(layer)
+                )
 
     def get_fused_moe_quant_config(
         self, layer: torch.nn.Module
