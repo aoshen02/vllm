@@ -104,6 +104,14 @@ class GenerateRequest(BaseModel):
     features: MultiModalFeatures | None = None
     """Multimodal hashes and placeholder positions (populated for MM inputs)."""
 
+    content_parts: list[dict[str, Any]] | None = None
+    """OpenAI-style content parts for raw multimodal input.
+    Reuses the same format as chat completion message content parts
+    (``image_url``, ``input_audio``, ``video_url``, ``image_embeds``,
+    ``audio_embeds``, etc.). The generate server resolves these
+    internally — no pixel data transfer needed. Mutually exclusive
+    with ``features``."""
+
     sampling_params: SamplingParams
     """The sampling parameters for the model."""
 
@@ -113,6 +121,7 @@ class GenerateRequest(BaseModel):
     stream_options: StreamOptions | None = None
     cache_salt: str | None = Field(
         default=None,
+        min_length=1,
         description=(
             "If specified, the prefix cache will be salted with the provided "
             "string to prevent an attacker to guess prompts in multi-user "
