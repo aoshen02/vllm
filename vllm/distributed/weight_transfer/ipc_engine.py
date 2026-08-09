@@ -27,7 +27,6 @@ if TYPE_CHECKING:
     from vllm.config import VllmConfig
 from vllm.distributed.weight_transfer.packed_tensor import (
     DEFAULT_PACKED_BUFFER_SIZE_BYTES,
-    PackedBufferImporter,
     packed_ipc_consumer,
     packed_ipc_producer,
 )
@@ -144,9 +143,7 @@ class IPCWeightTransferEngine(
         # Set from the trainer-supplied init info at the handshake; defaults are
         # only for the (unreachable) receive-before-init case.
         self.packed = False
-        # Shared across all chunks of every packed transfer this engine
-        # receives; see PackedBufferImporter for the refcount contract.
-        self._packed_importer = PackedBufferImporter()
+        self._packed_buffer: list[torch.Tensor | None] = [None]
 
     def init_transfer_engine(self, init_info: IPCWeightTransferInitInfo) -> None:
         """
@@ -174,12 +171,7 @@ class IPCWeightTransferEngine(
         )
 
         finalize_layerwise_reload(self.model, self.model_config)
-        # Every reduce_tensor call is a fresh export with its own refcount
-        # slot, so releasing once per update always balances this update's
-        # export and lets the trainer reclaim its staging buffer. Callers
-        # that skip finish are still covered by the replace-on-next-export
-        # path inside the importer.
-        self._packed_importer.close()
+        self._packed_buffer = [None]
 
     def receive_weights(self, update_info: IPCWeightTransferUpdateInfo) -> None:
         """
@@ -212,7 +204,7 @@ class IPCWeightTransferEngine(
                 dtype_names=update_info.dtype_names,
                 tensor_sizes=update_info.tensor_sizes,
                 device_index=device_index,
-                importer=self._packed_importer,
+                packed_buffer=self._packed_buffer,
             )
         else:
             assert isinstance(update_info.ipc_handles, list)
@@ -247,7 +239,7 @@ class IPCWeightTransferEngine(
             self.model.load_weights(weights)
 
     def shutdown(self) -> None:
-        self._packed_importer.close()
+        self._packed_buffer = [None]
 
     @staticmethod
     def trainer_send_weights(*args: Any, **kwargs: Any) -> None:
