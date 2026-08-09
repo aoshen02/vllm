@@ -520,6 +520,7 @@ def _ipc_consumer_worker(cmd_q, ack_q, result_q, done_event, device_index):
     try:
         torch.accelerator.set_device_index(device_index)
         all_results = []
+        packed_buffer = [None]
         while True:
             cd = cmd_q.get()
             if cd is None:
@@ -531,6 +532,7 @@ def _ipc_consumer_worker(cmd_q, ack_q, result_q, done_event, device_index):
                 dtype_names=cd["dtype_names"],
                 tensor_sizes=cd["tensor_sizes"],
                 device_index=device_index,
+                packed_buffer=packed_buffer,
             )
             # .cpu() forces a GPU→CPU copy off the shared IPC buffer, so
             # the producer is free to overwrite it once we ack.
@@ -745,4 +747,5 @@ class TestPackedIpcRoundtrip:
                 dtype_names=c.dtype_names,
                 tensor_sizes=c.tensor_sizes,
                 device_index=torch.cuda.current_device(),
+                packed_buffer=[None],
             )
