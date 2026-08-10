@@ -2435,10 +2435,7 @@ class Scheduler(SchedulerInterface):
             )
             return True
 
-        reset_result = self.connector.reset_cache()
-        if reset_result is False or (
-            self.artifact_connector is not None and reset_result is not True
-        ):
+        if self.connector.reset_cache() is False:
             return False
 
         if self.log_stats:

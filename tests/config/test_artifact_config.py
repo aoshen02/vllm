@@ -25,10 +25,11 @@ def _config(
     role: str = "kv_both",
     spec_name: str | None = None,
     prefix_caching: bool = True,
+    runner_type: str = "generate",
 ):
     extra_config = {} if spec_name is None else {"spec_name": spec_name}
     return SimpleNamespace(
-        model_config=SimpleNamespace(),
+        model_config=SimpleNamespace(runner_type=runner_type),
         cache_config=SimpleNamespace(enable_prefix_caching=prefix_caching),
         use_v2_model_runner=True,
         parallel_config=SimpleNamespace(
@@ -144,6 +145,11 @@ def test_artifact_connector_requires_model_runner_v2():
 
     with pytest.raises(ValueError, match="requires Model Runner V2"):
         VllmConfig._verify_artifact_compatibility(config)
+
+
+def test_artifact_connector_rejects_pooling_runner():
+    with pytest.raises(ValueError, match="only supports generate runners"):
+        VllmConfig._verify_artifact_compatibility(_config(runner_type="pooling"))
 
 
 @pytest.mark.parametrize(

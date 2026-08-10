@@ -215,6 +215,7 @@ def test_routed_experts_capturer_narrows_snapshot(output_dtype):
     assert capturer.device_buffer[:2, 0, :].tolist() == topk.tolist()
     assert output.dtype == output_dtype
     assert output[:, 0, :].tolist() == topk.tolist()
+    assert output.data_ptr() != capturer.device_buffer.data_ptr()
 
 
 def test_routed_experts_capturer_dp_naive_concatenated_all_ranks():
@@ -292,7 +293,7 @@ def test_mrv2_async_output_finishes_pending_artifact_output():
     ).get_output()
 
     pending.to_cpu_nonblocking.assert_called_once_with()
-    pending.finish.assert_called_once_with(set())
+    pending.finish.assert_called_once_with()
     assert output.artifact_connector_output is artifact_output
 
 
@@ -326,6 +327,24 @@ def test_model_runner_shutdown_cleans_gpu_before_artifact_error(monkeypatch):
     assert runner.speculator is None
     assert not hasattr(runner, "model")
     torch.accelerator.empty_cache.assert_called_once_with()
+
+
+def test_model_runner_shutdown_closes_artifact_after_gpu_error(monkeypatch):
+    pytest.importorskip("vllm.vllm_flash_attn", exc_type=ImportError)
+    import vllm.v1.worker.gpu.model_runner as model_runner
+
+    monkeypatch.setattr(
+        torch.accelerator,
+        "synchronize",
+        Mock(side_effect=RuntimeError("GPU cleanup failed")),
+    )
+    runner = model_runner.GPUModelRunner.__new__(model_runner.GPUModelRunner)
+    runner.artifact_connector = Mock()
+
+    with pytest.raises(RuntimeError, match="GPU cleanup failed"):
+        runner.shutdown()
+
+    runner.artifact_connector.close.assert_called_once_with()
 
 
 def test_model_runner_initializes_capture(monkeypatch):
@@ -384,7 +403,8 @@ def test_artifact_worker_connector_binds_capture_on_non_output_rank(monkeypatch)
         vllm_config=config,
     )
     bind.assert_called_once_with(model, capturer)
-    assert connector.capture_routed_experts(3) is None
+    connector.begin_step(Mock())
+    assert connector.capture_step(3) is None
     capturer.get_routing_data.assert_not_called()
 
 

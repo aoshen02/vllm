@@ -218,8 +218,27 @@ def test_non_output_rank_skips_capture_snapshot():
     worker._store = None
     worker._capturer = Mock()
 
-    assert worker.capture_routed_experts(1) is None
+    worker._step_metadata = Mock()
+    worker._pending_capture = None
+
+    assert worker.capture_step(1) is None
     worker._capturer.get_routing_data.assert_not_called()
+
+
+def test_worker_encapsulates_step_output(tmp_path):
+    worker = _make_worker(tmp_path, 1)
+    worker._capturer = Mock()
+    worker._pending_capture = None
+    metadata = ArtifactConnectorMetadata(0, _BLOCK_SIZE, [], {})
+
+    worker.begin_step(metadata)
+    worker.capture_step(1)
+    output = worker.prepare_output([], Mock())
+
+    assert output is not None
+    worker._capturer.get_routing_data.assert_called_once_with(1)
+    assert worker.prepare_output([], Mock()) is None
+    worker.close()
 
 
 def _process_output(worker, metadata, rows, request_ids, num_rejected):
@@ -1369,20 +1388,6 @@ def test_scheduler_preserves_artifacts_if_remote_kv_reset_fails():
     scheduler.artifact_connector = Mock()
     scheduler.connector = Mock()
     scheduler.connector.reset_cache.return_value = False
-    scheduler.log_stats = False
-
-    assert not scheduler.reset_prefix_cache(reset_connector=True)
-    scheduler.artifact_connector.reset.assert_not_called()
-
-
-def test_scheduler_fails_closed_if_connector_reset_is_unsupported():
-    scheduler = object.__new__(Scheduler)
-    scheduler.running = []
-    scheduler.kv_cache_manager = Mock()
-    scheduler.kv_cache_manager.reset_prefix_cache.return_value = True
-    scheduler.artifact_connector = Mock()
-    scheduler.connector = Mock()
-    scheduler.connector.reset_cache.return_value = None
     scheduler.log_stats = False
 
     assert not scheduler.reset_prefix_cache(reset_connector=True)

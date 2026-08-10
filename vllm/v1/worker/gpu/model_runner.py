@@ -31,7 +31,6 @@ import vllm.envs as envs
 from vllm.compilation.counter import compilation_counter
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
-from vllm.distributed.artifact_connector.connector import ArtifactConnectorMetadata
 from vllm.distributed.artifact_connector.worker import ArtifactWorkerConnector
 from vllm.distributed.parallel_state import (
     get_dcp_group,
@@ -1493,9 +1492,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             aux_hidden_states = None
             output_intermediate_tensors = model_output
 
-        routed_experts = None
         if not dummy_run and self.artifact_connector is not None:
-            routed_experts = self.artifact_connector.capture_routed_experts(num_toks)
+            self.artifact_connector.capture_step(num_toks)
 
         finished_req_ids = scheduler_output.finished_req_ids
         self.execute_model_state = ExecuteModelState(
@@ -1505,8 +1503,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             hidden_states=hidden_states,
             aux_hidden_states=aux_hidden_states,
             finished_req_ids=finished_req_ids,
-            routed_experts=routed_experts,
-            artifact_metadata=scheduler_output.artifact_connector_metadata,
         )
 
         if not self.is_last_pp_rank:
@@ -1529,8 +1525,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         hidden_states = self.execute_model_state.hidden_states
         aux_hidden_states = self.execute_model_state.aux_hidden_states
         finished_req_ids = self.execute_model_state.finished_req_ids
-        routed_experts = self.execute_model_state.routed_experts
-        artifact_metadata = self.execute_model_state.artifact_metadata
         self.execute_model_state = None
 
         if not self.is_last_pp_rank:
@@ -1588,16 +1582,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             sampled_token_ids=None,  # type: ignore
             prompt_logprobs_dict=prompt_logprobs_dict,  # type: ignore[arg-type]
         )
-        pending_artifact_output = (
-            self.artifact_connector.prepare_output(
-                artifact_metadata,
-                routed_experts,
-                model_runner_output.req_ids,
-                num_rejected,
+        pending_artifact_output = None
+        if self.artifact_connector is not None:
+            pending_artifact_output = self.artifact_connector.prepare_output(
+                model_runner_output.req_ids, num_rejected
             )
-            if self.artifact_connector is not None
-            else None
-        )
         # Start async output copy here so that it can overlap with speculator proposal.
         async_output = AsyncOutput(
             model_runner_output=model_runner_output,
@@ -1796,8 +1785,6 @@ class ExecuteModelState(NamedTuple):
     hidden_states: torch.Tensor | None
     aux_hidden_states: list[torch.Tensor] | None
     finished_req_ids: set[str]
-    routed_experts: torch.Tensor | None
-    artifact_metadata: ArtifactConnectorMetadata | None
 
 
 def sort_batch_req_ids(

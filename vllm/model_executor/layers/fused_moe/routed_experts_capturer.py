@@ -167,7 +167,7 @@ class RoutedExpertsCapturer:
 
     def get_routing_data(self, num_tokens: int) -> torch.Tensor:
         """Return a stable snapshot of the current routing data."""
-        return self.device_buffer[:num_tokens].to(self.output_dtype)
+        return self.device_buffer[:num_tokens].to(self.output_dtype, copy=True)
 
 
 def bind_routed_experts_capturer(

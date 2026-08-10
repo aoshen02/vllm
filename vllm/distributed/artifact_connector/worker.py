@@ -116,6 +116,10 @@ class ArtifactWorkerConnector:
         self._requests: dict[_RequestKey, _WorkerRequestState] = {}
         self._generation = -1
         self._lock = Lock()
+        self._step_metadata: ArtifactConnectorMetadata | None = None
+        self._pending_capture: tuple[ArtifactConnectorMetadata, torch.Tensor] | None = (
+            None
+        )
 
         # Every TP rank participates in capture collectives, but only the
         # executor output rank owns the artifact data plane.
@@ -125,11 +129,13 @@ class ArtifactWorkerConnector:
         shape_per_token, dtype = get_routing_shape_and_dtype(vllm_config)
         self._shape_per_token = shape_per_token
         self._dtype: np.dtype[Any] = np.dtype(dtype)
-        scheduler_block_size, block_size = resolve_kv_cache_block_sizes(
+        scheduler_block_size, hash_block_size = resolve_kv_cache_block_sizes(
             kv_cache_config, vllm_config
         )
-        hashes_per_kv_block = scheduler_block_size // block_size
-        block_nbytes = block_size * int(np.prod(shape_per_token)) * self._dtype.itemsize
+        hashes_per_kv_block = scheduler_block_size // hash_block_size
+        block_nbytes = (
+            hash_block_size * int(np.prod(shape_per_token)) * self._dtype.itemsize
+        )
         max_bytes = vllm_config.artifact_config.max_shm_bytes
         if max_bytes is None:
             kv_transfer_config = vllm_config.kv_transfer_config
@@ -152,27 +158,31 @@ class ArtifactWorkerConnector:
         self._buffer = RoutedExpertsArtifactBuffer(
             self._dtype,
             shape_per_token,
-            block_size,
+            hash_block_size,
             vllm_config.scheduler_config.max_num_seqs,
             max_num_batched_tokens,
         )
 
-    def capture_routed_experts(self, num_tokens: int) -> torch.Tensor | None:
-        """Return a stable routed-experts snapshot for the current step."""
-        if self._store is None:
-            return None
-        return self._capturer.get_routing_data(num_tokens)
+    def capture_step(self, num_tokens: int) -> None:
+        """Capture one step without exposing Artifact internals to the runner."""
+        metadata = self._step_metadata
+        if metadata is None or self._store is None:
+            return
+        self._pending_capture = (
+            metadata,
+            self._capturer.get_routing_data(num_tokens),
+        )
 
     def prepare_output(
         self,
-        metadata: ArtifactConnectorMetadata | None,
-        routed_experts: torch.Tensor | None,
         request_ids: list[str],
         num_rejected: torch.Tensor,
     ) -> PendingArtifactOutput | None:
-        # Warmup runs capture without scheduler metadata.
-        if metadata is None or routed_experts is None or self._store is None:
+        capture = self._pending_capture
+        self._pending_capture = None
+        if capture is None:
             return None
+        metadata, routed_experts = capture
         with self._lock:
             for request in metadata.requests:
                 key = (request.request_id, request.epoch)
@@ -409,6 +419,7 @@ class ArtifactWorkerConnector:
         return chunks[0].copy() if len(chunks) == 1 else np.concatenate(chunks)
 
     def begin_step(self, metadata: ArtifactConnectorMetadata | None) -> None:
+        self._step_metadata = metadata
         if self._buffer is None or metadata is None:
             return
         with self._lock:

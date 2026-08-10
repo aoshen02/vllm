@@ -985,6 +985,8 @@ class VllmConfig:
                 "Artifact Connector requires Model Runner V2; set "
                 "VLLM_USE_V2_MODEL_RUNNER=1."
             )
+        if self.model_config.runner_type != "generate":
+            raise ValueError("Artifact Connector only supports generate runners.")
         if self.parallel_config.pipeline_parallel_size > 1:
             raise ValueError(
                 "--enable-return-routed-experts is incompatible with "
