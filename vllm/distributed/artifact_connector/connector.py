@@ -5,7 +5,8 @@
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Iterator, Mapping, Sequence
+import os
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, overload
 
@@ -64,7 +65,6 @@ class ArtifactRequestMetadata:
     block_hashes: Sequence[bytes]
     block_hash_start: int = 0
     epoch: int = 0
-    kv_block_ids: Sequence[int] = ()
 
 
 @dataclass
@@ -84,14 +84,13 @@ class ArtifactRequestOutput:
 @dataclass
 class ArtifactConnectorOutput:
     requests: dict[str, ArtifactRequestOutput]
-    invalid_requests: set[tuple[str, int]] = field(default_factory=set)
 
 
 @dataclass
 class _RequestState:
     emit_cursor: int
+    hash_seed: bytes
     epoch: int = 0
-    sent_kv_block_ids: bool = False
     packed_hashes: bytearray = field(default_factory=bytearray)
     num_hashes: int = 0
     hash_size: int = 0
@@ -120,16 +119,14 @@ class ArtifactSchedulerConnector:
         assert 0 <= prompt_start < request.num_prompt_tokens
         self._states[request.request_id] = _RequestState(
             self._resume_emit_cursors.pop(request.request_id, prompt_start),
+            b"" if self._reuse_kv_hashes else os.urandom(16),
         )
 
     def build_connector_meta(
         self,
         scheduler_output: SchedulerOutput,
         requests: dict[str, Request],
-        kv_block_ids: Mapping[str, Sequence[int]] | None = None,
     ) -> ArtifactConnectorMetadata:
-        if kv_block_ids is None:
-            kv_block_ids = {}
         for request_id in scheduler_output.preempted_req_ids or ():
             self.request_restarted(requests[request_id])
         token_starts = {
@@ -159,15 +156,11 @@ class ArtifactSchedulerConnector:
             else:
                 num_hashes = (token_starts[request_id] + num_tokens) // self._block_size
                 new_hashes = [
-                    hashlib.sha256(f"{request_id}:{i}".encode()).digest()
+                    hashlib.sha256(state.hash_seed + i.to_bytes(8, "little")).digest()
                     for i in range(state.num_hashes, num_hashes)
                 ]
             block_hash_start = state.num_hashes
             block_hashes = self._pack_block_hashes(state, new_hashes)
-            request_kv_block_ids = kv_block_ids.get(request_id, ())
-            state.sent_kv_block_ids = state.sent_kv_block_ids or bool(
-                request_kv_block_ids
-            )
             metadata.append(
                 ArtifactRequestMetadata(
                     request_id=request_id,
@@ -181,7 +174,6 @@ class ArtifactSchedulerConnector:
                     block_hashes=block_hashes,
                     block_hash_start=block_hash_start,
                     epoch=state.epoch,
-                    kv_block_ids=request_kv_block_ids,
                 )
             )
         finished_requests = self._finished_requests
@@ -192,10 +184,6 @@ class ArtifactSchedulerConnector:
             metadata,
             finished_requests,
         )
-
-    def needs_kv_block_ids(self, request_id: str) -> bool:
-        state = self._states.get(request_id)
-        return state is not None and not state.sent_kv_block_ids
 
     def take_output(
         self,
@@ -209,11 +197,6 @@ class ArtifactSchedulerConnector:
             return None
         request_id = request.request_id
         state = self._states[request_id]
-        if output is not None and any(
-            request_id == invalid_request_id
-            for invalid_request_id, _ in output.invalid_requests
-        ):
-            return None
         if output is None or request_id not in output.requests:
             raise RuntimeError(f"artifact worker output is missing {request_id}")
         request_output = output.requests[request_id]
@@ -279,40 +262,27 @@ class ArtifactSchedulerConnector:
     def request_restarted(
         self,
         request: Request,
-        *,
-        num_valid_tokens: int | None = None,
     ) -> None:
         """Start a fresh worker epoch while preserving delivered output."""
         request_id = request.request_id
         state = self._states.get(request_id)
         if state is None:
             return
-        if num_valid_tokens is None:
-            num_valid_blocks = (
-                len(request.block_hashes) if self._reuse_kv_hashes else state.num_hashes
-            )
-        else:
-            num_valid_blocks = num_valid_tokens // self._block_size
+        num_valid_blocks = (
+            len(request.block_hashes) if self._reuse_kv_hashes else state.num_hashes
+        )
         if num_valid_blocks < state.num_hashes:
             del state.packed_hashes[num_valid_blocks * state.hash_size :]
             state.num_hashes = num_valid_blocks
         elif num_valid_blocks > state.num_hashes:
-            new_hashes: Sequence[bytes]
-            if self._reuse_kv_hashes:
-                new_hashes = request.block_hashes[state.num_hashes : num_valid_blocks]
-                if len(new_hashes) != num_valid_blocks - state.num_hashes:
-                    raise RuntimeError("KV block-hash history is incomplete")
-            else:
-                new_hashes = [
-                    hashlib.sha256(f"{request_id}:{i}".encode()).digest()
-                    for i in range(state.num_hashes, num_valid_blocks)
-                ]
+            new_hashes = request.block_hashes[state.num_hashes : num_valid_blocks]
+            if len(new_hashes) != num_valid_blocks - state.num_hashes:
+                raise RuntimeError("KV block-hash history is incomplete")
             self._pack_block_hashes(state, new_hashes)
         self._finished_requests[(request_id, state.epoch)] = PackedBlockHashes(
             bytes(state.packed_hashes), state.hash_size or 1
         )
         state.epoch += 1
-        state.sent_kv_block_ids = False
         state.packed_hashes.clear()
         state.num_hashes = 0
         state.hash_size = 0

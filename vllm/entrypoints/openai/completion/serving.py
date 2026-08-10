@@ -419,6 +419,11 @@ class OpenAIServingCompletion(GenerateBaseServing):
                                     if request.return_token_ids
                                     else None
                                 ),
+                                routed_experts=(
+                                    numpy2base64(output.routed_experts)
+                                    if output.routed_experts is not None
+                                    else None
+                                ),
                             )
                         ],
                     )

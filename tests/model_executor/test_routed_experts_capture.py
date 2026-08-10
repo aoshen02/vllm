@@ -201,7 +201,7 @@ def test_routed_experts_capturer_single_dp_no_metadata():
     assert capturer.device_buffer[3, 0, 0].item() == -1
 
 
-@pytest.mark.parametrize("output_dtype", [torch.uint8, torch.uint16])
+@pytest.mark.parametrize("output_dtype", [torch.uint8, torch.uint16, torch.int32])
 def test_routed_experts_capturer_narrows_snapshot(output_dtype):
     capturer = _capturer_with_buffer(dtype=torch.int32)
     capturer.output_dtype = output_dtype
@@ -353,12 +353,10 @@ def test_model_runner_initializes_capture(monkeypatch):
     assert runner.artifact_connector is connector
 
 
-def test_artifact_worker_connector_owns_capture(monkeypatch):
+def test_artifact_worker_connector_binds_capture_on_non_output_rank(monkeypatch):
     import vllm.distributed.artifact_connector.worker as artifact_worker
 
-    snapshot = torch.tensor([1, 2, 3])
     capturer = Mock()
-    capturer.get_routing_data.return_value = snapshot
     constructor = Mock(return_value=capturer)
     bind = Mock()
     monkeypatch.setattr(artifact_worker, "RoutedExpertsCapturer", constructor)
@@ -386,8 +384,8 @@ def test_artifact_worker_connector_owns_capture(monkeypatch):
         vllm_config=config,
     )
     bind.assert_called_once_with(model, capturer)
-    assert connector.capture_routed_experts(3) is snapshot
-    capturer.get_routing_data.assert_called_once_with(3)
+    assert connector.capture_routed_experts(3) is None
+    capturer.get_routing_data.assert_not_called()
 
 
 def test_artifact_worker_connector_shm_capacity(monkeypatch, tmp_path):

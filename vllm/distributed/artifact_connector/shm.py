@@ -54,8 +54,6 @@ class ArtifactNotFoundError(ArtifactStoreError):
 class ArtifactReader(Protocol):
     """Byte-object reads used to materialize artifacts."""
 
-    def get(self, keys: list[str]) -> list[bytes]: ...
-
     def get_concatenated(
         self,
         keys: list[str],
@@ -95,44 +93,29 @@ class BackgroundArtifactStore:
     def _run(self) -> None:
         while True:
             objects = self._queue.get()
-            num_batches = 1
             try:
                 if objects is None:
                     return
-                pending = objects
-                while True:
-                    try:
-                        next_objects = self._queue.get_nowait()
-                    except queue.Empty:
-                        break
-                    assert next_objects is not None
-                    pending.extend(next_objects)
-                    num_batches += 1
                 if self._error is None:
-                    self._store.put(pending)
+                    self._store.put(objects)
             except BaseException as error:
                 self._error = error
             finally:
-                for _ in range(num_batches):
-                    self._queue.task_done()
+                self._queue.task_done()
 
     def _raise_if_failed(self) -> None:
         if self._error is not None:
             raise ArtifactStoreError("artifact publication failed") from self._error
 
     def put(self, objects: list[ArtifactObject]) -> None:
+        if not objects:
+            return
         with self._state_lock:
             if self._closed:
                 raise RuntimeError("artifact store is closed")
             self._raise_if_failed()
-            if objects:
-                self._queue.put(objects)
-                self._raise_if_failed()
-
-    def get(self, keys: list[str]) -> list[bytes]:
-        self._queue.join()
-        self._raise_if_failed()
-        return self._store.get(keys)
+            self._queue.put(objects)
+            self._raise_if_failed()
 
     def get_concatenated(
         self,
@@ -163,12 +146,6 @@ def make_shm_store_id(instance_id: str, dp_rank: int) -> str:
     return hashlib.sha256(f"{instance_id}:{dp_rank}".encode()).hexdigest()[:32]
 
 
-@dataclass
-class _Entry:
-    offset: int
-    size: int
-
-
 class LocalSharedMemoryArtifactStore:
     """Bounded immutable SHM store that fails closed after an eviction."""
 
@@ -179,24 +156,30 @@ class LocalSharedMemoryArtifactStore:
         dp_rank: int,
         *,
         max_bytes: int,
+        object_nbytes: int,
         ttl_seconds: int,
     ) -> None:
-        if max_bytes <= 0:
-            raise ValueError("artifact SHM capacity must be positive")
+        if object_nbytes <= 0:
+            raise ValueError("artifact object size must be positive")
+        if max_bytes < object_nbytes:
+            raise ValueError("artifact SHM must fit at least one object")
         self.store_id = make_shm_store_id(instance_id, dp_rank)
         self.root = Path(root) / self.store_id
         self.arena_path = self.root / "arena.bin"
-        self.max_bytes = max_bytes
+        self.object_nbytes = object_nbytes
+        self.num_slots = max_bytes // object_nbytes
+        self.max_bytes = self.num_slots * object_nbytes
         self.ttl_seconds = ttl_seconds
         self._lock = threading.Lock()
-        self._used_bytes = 0
-        self._lru: OrderedDict[str, _Entry] = OrderedDict()
-        self._free: list[tuple[int, int]] = []
-        self._next_offset = 0
+        self._lru: OrderedDict[str, int] = OrderedDict()
+        self._free_slots: list[int] = []
+        self._next_slot = 0
         self._arena_fd: int | None = None
         self._arena: mmap.mmap | None = None
 
         root_path = Path(root)
+        if root_path.resolve() == Path("/dev/shm"):
+            raise ValueError("artifact SHM root must be below /dev/shm")
         self._prepare_directory(root_path)
         self._gc_stale_store_dirs(root_path)
         self._writer_lock_fd: int | None = self._acquire_writer_lock()
@@ -350,68 +333,28 @@ class LocalSharedMemoryArtifactStore:
             raise
         self._arena_fd = fd
 
-    def _release(self, entry: _Entry) -> None:
-        self._free.append((entry.offset, entry.size))
-        self._free.sort()
-        merged: list[tuple[int, int]] = []
-        for offset, size in self._free:
-            if merged and merged[-1][0] + merged[-1][1] == offset:
-                previous_offset, previous_size = merged[-1]
-                merged[-1] = (previous_offset, previous_size + size)
-            else:
-                merged.append((offset, size))
-        self._free = merged
-
-    def _evict_to_fit(self, additional_bytes: int, protected: set[str]) -> None:
-        if self._used_bytes + additional_bytes <= self.max_bytes:
+    def _evict_to_fit(self, additional_slots: int, protected: set[str]) -> None:
+        if len(self._lru) + additional_slots <= self.num_slots:
             return
-        protected_bytes = sum(
-            self._lru[object_id].size
-            for object_id in protected
-            if object_id in self._lru
-        )
-        if protected_bytes + additional_bytes > self.max_bytes:
+        protected_slots = sum(key in self._lru for key in protected)
+        if protected_slots + additional_slots > self.num_slots:
             raise ArtifactCapacityError(
                 "artifact SHM cannot retain the requested batch: "
-                f"retained={protected_bytes}, requested={additional_bytes}, "
-                f"limit={self.max_bytes}"
+                f"retained={protected_slots}, requested={additional_slots}, "
+                f"limit={self.num_slots} objects"
             )
-        while self._used_bytes + additional_bytes > self.max_bytes:
+        while len(self._lru) + additional_slots > self.num_slots:
             victim = next(
                 object_id for object_id in self._lru if object_id not in protected
             )
-            entry = self._lru.pop(victim)
-            self._used_bytes -= entry.size
-            self._release(entry)
+            self._free_slots.append(self._lru.pop(victim))
 
-    def _compact(self) -> None:
-        assert self._arena is not None
-        cursor = 0
-        for entry in sorted(self._lru.values(), key=lambda entry: entry.offset):
-            if entry.offset != cursor:
-                payload = self._arena[entry.offset : entry.offset + entry.size]
-                self._arena[cursor : cursor + entry.size] = payload
-                entry.offset = cursor
-            cursor += entry.size
-        self._free.clear()
-        self._next_offset = cursor
-
-    def _allocate(self, size: int) -> int:
-        for index, (offset, available) in enumerate(self._free):
-            if available < size:
-                continue
-            if available == size:
-                self._free.pop(index)
-            else:
-                self._free[index] = (offset + size, available - size)
-            return offset
-        if self._next_offset + size > self.max_bytes:
-            self._compact()
-        if self._next_offset + size > self.max_bytes:
-            raise ArtifactCapacityError("artifact SHM arena is fragmented")
-        offset = self._next_offset
-        self._next_offset += size
-        return offset
+    def _allocate_slot(self) -> int:
+        if self._free_slots:
+            return self._free_slots.pop()
+        slot = self._next_slot
+        self._next_slot += 1
+        return slot
 
     def put(self, objects: list[ArtifactObject]) -> None:
         if not objects:
@@ -422,34 +365,20 @@ class LocalSharedMemoryArtifactStore:
             for obj in objects:
                 if not obj.key or "\x00" in obj.key:
                     raise ValueError("artifact object key must be a non-empty string")
+                if len(obj.payload) != self.object_nbytes:
+                    raise ArtifactCorruptionError("artifact object has an invalid size")
                 unique.setdefault(obj.key, obj)
             protected = set(unique)
-            additional_bytes = sum(
-                len(obj.payload)
-                for object_id, obj in unique.items()
-                if object_id not in self._lru
-            )
-            self._evict_to_fit(additional_bytes, protected)
+            additional_slots = sum(object_id not in self._lru for object_id in unique)
+            self._evict_to_fit(additional_slots, protected)
             for object_id, obj in unique.items():
                 if object_id in self._lru:
                     self._lru.move_to_end(object_id)
                     continue
-                offset = self._allocate(len(obj.payload))
-                self._arena[offset : offset + len(obj.payload)] = obj.payload
-                self._lru[object_id] = _Entry(offset, len(obj.payload))
-                self._used_bytes += len(obj.payload)
-
-    def get(self, keys: list[str]) -> list[bytes]:
-        assert self._arena is not None
-        with self._lock:
-            entries = self._lookup(keys)
-            payloads = [
-                self._arena[entry.offset : entry.offset + entry.size]
-                for entry in entries
-            ]
-            for key in keys:
-                self._lru.move_to_end(key)
-            return payloads
+                slot = self._allocate_slot()
+                offset = slot * self.object_nbytes
+                self._arena[offset : offset + self.object_nbytes] = obj.payload
+                self._lru[object_id] = slot
 
     def get_concatenated(
         self,
@@ -458,15 +387,15 @@ class LocalSharedMemoryArtifactStore:
         object_size: int,
     ) -> bytes:
         assert self._arena is not None
+        if object_size != self.object_nbytes:
+            raise ArtifactCorruptionError("artifact object has an invalid size")
         with self._lock:
             entries = self._lookup(keys)
-            if any(entry.size != object_size for entry in entries):
-                raise ArtifactCorruptionError("artifact object has an invalid size")
             arena = memoryview(self._arena)
             try:
                 payload = b"".join(
-                    arena[entry.offset : entry.offset + object_size]
-                    for entry in entries
+                    arena[slot * self.object_nbytes : (slot + 1) * self.object_nbytes]
+                    for slot in entries
                 )
             finally:
                 arena.release()
@@ -474,14 +403,14 @@ class LocalSharedMemoryArtifactStore:
                 self._lru.move_to_end(key)
             return payload
 
-    def _lookup(self, keys: list[str]) -> list[_Entry]:
+    def _lookup(self, keys: list[str]) -> list[int]:
         try:
             return [self._lru[key] for key in keys]
         except KeyError as error:
             raise ArtifactNotFoundError(
                 "artifact object does not exist; the object may have been "
-                f"evicted from SHM (used={self._used_bytes}, "
-                f"limit={self.max_bytes}). Increase "
+                f"evicted from SHM (used={len(self._lru)}, "
+                f"limit={self.num_slots} objects). Increase "
                 "artifact_config.max_shm_bytes when a KV cache hit requires it."
             ) from error
 

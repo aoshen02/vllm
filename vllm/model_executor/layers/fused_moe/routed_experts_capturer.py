@@ -32,15 +32,22 @@ def _get_routed_experts_shape(vllm_config: VllmConfig) -> tuple[int, int, int]:
     return num_layers, num_experts, num_experts_per_tok
 
 
+def get_routed_experts_dtype_name(num_experts: int) -> str:
+    if num_experts <= 256:
+        return "uint8"
+    if num_experts <= 65536:
+        return "uint16"
+    return "int32"
+
+
 class RoutedExpertsCapturer:
     """Worker-side capturer for routed experts, lives on GPU.
 
     Layer-level hooks call :meth:`capture` inside the forward pass. Routing
     rows owned by this DP rank are written into a preallocated device buffer.
 
-    The capture buffer uses the narrowest unsigned dtype that can represent
-    every logical expert ID. SP all-gather operates on the router's native
-    dtype before writing into this buffer.
+    The device buffer uses ``int32``. Stable snapshots use the narrowest dtype
+    that can represent every logical expert ID.
 
     Invariants:
         - One instance per worker; shape is fixed at init and covers the
@@ -56,7 +63,7 @@ class RoutedExpertsCapturer:
         num_layers, num_experts, num_experts_per_tok = _get_routed_experts_shape(
             vllm_config
         )
-        self.output_dtype = torch.uint8 if num_experts <= 256 else torch.uint16
+        self.output_dtype = getattr(torch, get_routed_experts_dtype_name(num_experts))
         logger.info(
             "RoutedExpertsCapturer: allocating buffer with "
             "max_tokens=%d, num_layers=%d, num_experts_per_tok=%d "

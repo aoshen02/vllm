@@ -24,10 +24,12 @@ def _config(
     connector: str | None = None,
     role: str = "kv_both",
     spec_name: str | None = None,
+    prefix_caching: bool = True,
 ):
     extra_config = {} if spec_name is None else {"spec_name": spec_name}
     return SimpleNamespace(
         model_config=SimpleNamespace(),
+        cache_config=SimpleNamespace(enable_prefix_caching=prefix_caching),
         use_v2_model_runner=True,
         parallel_config=SimpleNamespace(
             pipeline_parallel_size=pp,
@@ -44,6 +46,7 @@ def _config(
             else SimpleNamespace(
                 is_kv_transfer_instance=True,
                 kv_connector=connector,
+                kv_connector_module_path=None,
                 kv_role=role,
                 kv_connector_extra_config=extra_config,
             )
@@ -58,6 +61,13 @@ def test_artifact_config_defaults():
     assert not config.enable_return_routed_experts
     assert config.shm_dir == "/dev/shm/vllm-artifacts"
     assert config.max_shm_bytes is None
+
+
+def test_artifact_capture_changes_compilation_hash():
+    disabled = ArtifactConfig()
+    enabled = ArtifactConfig(enable_return_routed_experts=True)
+
+    assert disabled.compute_hash() != enabled.compute_hash()
 
 
 def test_legacy_routed_experts_flag_updates_artifact_config():
@@ -142,6 +152,7 @@ def test_artifact_connector_requires_model_runner_v2():
         ({"pp": 2}, "pipeline parallelism"),
         ({"dcp": 2}, "context parallelism"),
         ({"pcp": 2}, "context parallelism"),
+        ({"shm_dir": "/dev/shm"}, "requires shm_dir under /dev/shm"),
         ({"shm_dir": "/tmp/artifacts"}, "requires shm_dir under /dev/shm"),
     ],
 )
@@ -150,25 +161,39 @@ def test_artifact_connector_rejects_unsupported_topology(kwargs, error):
         VllmConfig._verify_artifact_compatibility(_config(**kwargs))
 
 
-@pytest.mark.parametrize(
-    ("connector", "spec_name"),
-    [
-        ("OffloadingConnector", "CPUOffloadingSpec"),
-        ("OffloadingConnector", "TieringOffloadingSpec"),
-        ("OffloadingConnector", "OutOfTreeOffloadingSpec"),
-        ("NixlConnector", None),
-        ("MooncakeConnector", None),
-    ],
-)
-def test_artifact_connector_is_independent_of_kv_connector_implementation(
-    connector, spec_name
-):
+def test_artifact_connector_supports_cpu_kv_offload():
     config = _config(
-        connector=connector,
-        spec_name=spec_name,
+        connector="OffloadingConnector",
+        spec_name="CPUOffloadingSpec",
     )
     config.artifact_config.max_shm_bytes = 1 << 20
     VllmConfig._verify_artifact_compatibility(config)
+
+
+@pytest.mark.parametrize("spec_name", ["TieringOffloadingSpec", "ExternalSpec"])
+def test_artifact_connector_rejects_non_cpu_offloading_spec(spec_name):
+    config = _config(connector="OffloadingConnector", spec_name=spec_name)
+    config.artifact_config.max_shm_bytes = 1 << 20
+
+    with pytest.raises(ValueError, match="built-in CPUOffloadingSpec"):
+        VllmConfig._verify_artifact_compatibility(config)
+
+
+@pytest.mark.parametrize(
+    "extra_config",
+    [
+        {"spec_module_path": "external_spec"},
+        {"eviction_policy": "ExternalPolicy"},
+        {"cache_policy_module_path": "external_policy"},
+    ],
+)
+def test_artifact_connector_rejects_external_cpu_offload_components(extra_config):
+    config = _config(connector="OffloadingConnector")
+    config.kv_transfer_config.kv_connector_extra_config.update(extra_config)
+    config.artifact_config.max_shm_bytes = 1 << 20
+
+    with pytest.raises(ValueError, match="built-in CPUOffloadingSpec"):
+        VllmConfig._verify_artifact_compatibility(config)
 
 
 def test_artifact_connector_requires_explicit_capacity_with_kv_connector():
@@ -178,9 +203,41 @@ def test_artifact_connector_requires_explicit_capacity_with_kv_connector():
         )
 
 
-def test_artifact_connector_rejects_multi_connector():
-    with pytest.raises(ValueError, match="does not support MultiConnector"):
-        VllmConfig._verify_artifact_compatibility(_config(connector="MultiConnector"))
+def test_artifact_connector_requires_prefix_caching_with_kv_connector():
+    config = _config(connector="OffloadingConnector", prefix_caching=False)
+    config.artifact_config.max_shm_bytes = 1 << 20
+
+    with pytest.raises(ValueError, match="requires prefix caching"):
+        VllmConfig._verify_artifact_compatibility(config)
+
+
+@pytest.mark.parametrize(
+    "connector",
+    [
+        "NixlConnector",
+        "MooncakeConnector",
+        "MooncakeStoreConnector",
+        "LMCacheConnectorV1",
+        "HF3FSKVConnector",
+        "MultiConnector",
+        "SimpleCPUOffloadConnector",
+    ],
+)
+def test_artifact_connector_rejects_other_kv_connectors(connector):
+    config = _config(connector=connector)
+    config.artifact_config.max_shm_bytes = 1 << 20
+
+    with pytest.raises(ValueError, match="only supports the built-in"):
+        VllmConfig._verify_artifact_compatibility(config)
+
+
+def test_artifact_connector_rejects_external_offloading_connector():
+    config = _config(connector="OffloadingConnector")
+    config.kv_transfer_config.kv_connector_module_path = "external_connector"
+    config.artifact_config.max_shm_bytes = 1 << 20
+
+    with pytest.raises(ValueError, match="built-in OffloadingConnector"):
+        VllmConfig._verify_artifact_compatibility(config)
 
 
 @pytest.mark.parametrize("role", ["kv_producer", "kv_consumer"])

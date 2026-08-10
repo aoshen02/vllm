@@ -11,7 +11,6 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
-import torch.distributed
 
 from vllm.config import VllmConfig
 from vllm.distributed.artifact_connector.connector import (
@@ -31,8 +30,6 @@ from vllm.distributed.artifact_connector.shm import (
     BackgroundArtifactStore,
     LocalSharedMemoryArtifactStore,
 )
-from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
-from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorBase_V1
 from vllm.distributed.parallel_state import get_tp_group
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
     RoutedExpertsCapturer,
@@ -44,25 +41,12 @@ if TYPE_CHECKING:
     from vllm.v1.kv_cache_interface import KVCacheConfig
 
 _RequestKey = tuple[str, int]
-_PendingAssembly = tuple[str, int, int, list[tuple[int, np.ndarray]]]
-
-
-def _kv_connector_reports_load_errors(vllm_config: VllmConfig) -> bool:
-    config = vllm_config.kv_transfer_config
-    if config is None or not config.is_kv_transfer_instance:
-        return False
-    connector_cls = KVConnectorFactory.get_connector_class(config)
-    return (
-        connector_cls.get_block_ids_with_load_errors
-        is not KVConnectorBase_V1.get_block_ids_with_load_errors
-    )
 
 
 @dataclass
 class _WorkerRequestState:
     block_hashes: list[bytes] = field(default_factory=list)
     artifact_keys: list[str] = field(default_factory=list)
-    kv_block_ids: set[int] = field(default_factory=set)
     pending_blocks: list[tuple[int, np.ndarray]] = field(default_factory=list)
     capture_cursor: int | None = None
     emit_cursor: int | None = None
@@ -77,10 +61,10 @@ class PendingArtifactOutput:
     def __init__(
         self,
         connector: ArtifactWorkerConnector,
-        metadata: ArtifactConnectorMetadata | None,
-        routed_experts: torch.Tensor | None,
+        metadata: ArtifactConnectorMetadata,
+        routed_experts: torch.Tensor,
         request_ids: list[str],
-        num_rejected: torch.Tensor | None,
+        num_rejected: torch.Tensor,
     ) -> None:
         self._connector = connector
         self._metadata = metadata
@@ -91,18 +75,12 @@ class PendingArtifactOutput:
         self._num_rejected_cpu: np.ndarray | None = None
 
     def to_cpu_nonblocking(self) -> None:
-        if self._routed_experts is None:
-            return
-        assert self._num_rejected is not None
         self._routed_experts_cpu = self._routed_experts.to(
             "cpu", non_blocking=True
         ).numpy()
         self._num_rejected_cpu = self._num_rejected.to("cpu", non_blocking=True).numpy()
 
-    def finish(self, invalid_block_ids: set[int]) -> ArtifactConnectorOutput:
-        invalid_block_ids = self._connector.sync_invalid_block_ids(invalid_block_ids)
-        if self._metadata is None:
-            return ArtifactConnectorOutput({})
+    def finish(self) -> ArtifactConnectorOutput:
         assert self._routed_experts_cpu is not None
         assert self._num_rejected_cpu is not None
         try:
@@ -111,7 +89,6 @@ class PendingArtifactOutput:
                 self._routed_experts_cpu,
                 self._request_ids,
                 self._num_rejected_cpu,
-                invalid_block_ids,
             )
         finally:
             self._connector.output_finished(self._metadata)
@@ -139,10 +116,6 @@ class ArtifactWorkerConnector:
         self._requests: dict[_RequestKey, _WorkerRequestState] = {}
         self._generation = -1
         self._lock = Lock()
-        self._sync_invalid_blocks = (
-            get_tp_group().world_size > 1
-            and _kv_connector_reports_load_errors(vllm_config)
-        )
 
         # Every TP rank participates in capture collectives, but only the
         # executor output rank owns the artifact data plane.
@@ -171,6 +144,7 @@ class ArtifactWorkerConnector:
                 vllm_config.instance_id,
                 vllm_config.parallel_config.data_parallel_rank,
                 max_bytes=max_bytes,
+                object_nbytes=block_nbytes,
                 ttl_seconds=vllm_config.artifact_config.shm_ttl_seconds,
             ),
             max_pending_batches=2 * vllm_config.scheduler_config.max_num_seqs,
@@ -183,21 +157,11 @@ class ArtifactWorkerConnector:
             max_num_batched_tokens,
         )
 
-    def capture_routed_experts(self, num_tokens: int) -> torch.Tensor:
+    def capture_routed_experts(self, num_tokens: int) -> torch.Tensor | None:
         """Return a stable routed-experts snapshot for the current step."""
+        if self._store is None:
+            return None
         return self._capturer.get_routing_data(num_tokens)
-
-    def sync_invalid_block_ids(self, block_ids: set[int]) -> set[int]:
-        if not self._sync_invalid_blocks:
-            return block_ids
-        tp_group = get_tp_group()
-        gathered: list[set[int] | None] = [None] * tp_group.world_size
-        torch.distributed.all_gather_object(
-            gathered,
-            block_ids,
-            group=tp_group.cpu_group,
-        )
-        return set().union(*(ids or () for ids in gathered))
 
     def prepare_output(
         self,
@@ -207,12 +171,8 @@ class ArtifactWorkerConnector:
         num_rejected: torch.Tensor,
     ) -> PendingArtifactOutput | None:
         # Warmup runs capture without scheduler metadata.
-        if metadata is None or routed_experts is None:
+        if metadata is None or routed_experts is None or self._store is None:
             return None
-        if self._store is None:
-            if not self._sync_invalid_blocks:
-                return None
-            return PendingArtifactOutput(self, None, None, [], None)
         with self._lock:
             for request in metadata.requests:
                 key = (request.request_id, request.epoch)
@@ -231,27 +191,17 @@ class ArtifactWorkerConnector:
         routed_experts: np.ndarray,
         request_ids: list[str],
         num_rejected: np.ndarray,
-        invalid_block_ids: set[int] | None = None,
     ) -> ArtifactConnectorOutput:
         with self._lock:
             if metadata.generation != self._generation:
                 return ArtifactConnectorOutput({})
-            outputs, invalid_requests, pending_assemblies = self._process_output(
+            outputs = self._process_output(
                 metadata,
                 routed_experts,
                 request_ids,
                 num_rejected,
-                invalid_block_ids or set(),
             )
-        for request_id, token_start, token_end, segments in pending_assemblies:
-            outputs[request_id] = ArtifactRequestOutput(
-                token_start,
-                self._assemble_segments(token_start, token_end, segments),
-            )
-        with self._lock:
-            if metadata.generation != self._generation:
-                return ArtifactConnectorOutput({})
-        return ArtifactConnectorOutput(outputs, invalid_requests)
+        return ArtifactConnectorOutput(outputs)
 
     def _process_output(
         self,
@@ -259,16 +209,8 @@ class ArtifactWorkerConnector:
         routed_experts: np.ndarray,
         request_ids: list[str],
         num_rejected: np.ndarray,
-        invalid_block_ids: set[int],
-    ) -> tuple[
-        dict[str, ArtifactRequestOutput],
-        set[_RequestKey],
-        list[_PendingAssembly],
-    ]:
+    ) -> dict[str, ArtifactRequestOutput]:
         assert self._store is not None and self._buffer is not None
-        if routed_experts.shape[1:] != self._shape_per_token:
-            raise RuntimeError("routed-experts capture profile changed")
-        routed_experts = routed_experts.astype(self._dtype, copy=False)
         by_request = {request.request_id: request for request in metadata.requests}
         captured: list[
             tuple[
@@ -282,13 +224,6 @@ class ArtifactWorkerConnector:
         commit_batches: list[tuple[Sequence[str], list[tuple[int, np.ndarray]]]] = []
         committed_rows: list[np.ndarray] = []
         outputs: dict[str, ArtifactRequestOutput] = {}
-        pending_assemblies: list[_PendingAssembly] = []
-        invalid_requests: set[tuple[str, int]] = set()
-        if invalid_block_ids:
-            for state in self._requests.values():
-                if state.kv_block_ids.intersection(invalid_block_ids):
-                    state.finished = True
-                    state.finished_block_hashes = None
         offset = 0
         for request_index, request_id in enumerate(request_ids):
             request = by_request.get(request_id)
@@ -297,10 +232,6 @@ class ArtifactWorkerConnector:
             end = offset + request.num_tokens
             key = (request_id, request.epoch)
             state = self._requests[key]
-            if state.finished and state.finished_block_hashes is None:
-                invalid_requests.add(key)
-                offset = end
-                continue
             artifact_keys = state.artifact_keys
             valid_end = end - int(num_rejected[request_index])
             rows = routed_experts[offset:valid_end]
@@ -339,7 +270,7 @@ class ArtifactWorkerConnector:
                 if state.emit_cursor is not None
                 else request.emit_start,
             )
-            completed = self._buffer._capture(key, capture_start, rows)
+            completed = self._buffer.capture(key, capture_start, rows)
             state.capture_cursor = capture_start + len(rows)
             pending, ready = self._take_available_blocks(
                 state,
@@ -417,13 +348,14 @@ class ArtifactWorkerConnector:
                 complete_segments.append(
                     (cursor, self._buffer.read(key, cursor, capture_start))
                 )
-            pending_assemblies.append(
-                (request.request_id, emit_start, token_end, complete_segments)
+            outputs[request.request_id] = ArtifactRequestOutput(
+                emit_start,
+                self._assemble_segments(emit_start, token_end, complete_segments),
             )
             state.emit_cursor = token_end
         for rows in committed_rows:
             self._buffer.release_block(rows)
-        return outputs, invalid_requests, pending_assemblies
+        return outputs
 
     def _take_available_blocks(
         self,
@@ -514,7 +446,6 @@ class ArtifactWorkerConnector:
     def _merge_block_hashes(self, request: ArtifactRequestMetadata) -> None:
         key = (request.request_id, request.epoch)
         state = self._requests.setdefault(key, _WorkerRequestState())
-        state.kv_block_ids.update(request.kv_block_ids)
         block_hashes = state.block_hashes
         start = request.block_hash_start
         if start > len(block_hashes):

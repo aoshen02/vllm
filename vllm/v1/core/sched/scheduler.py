@@ -1228,20 +1228,10 @@ class Scheduler(SchedulerInterface):
             scheduler_output.kv_connector_metadata = meta
 
         if self.artifact_connector is not None:
-            artifact_kv_block_ids = (
-                {
-                    request_id: self.kv_cache_manager.get_block_ids(request_id)[0]
-                    for request_id in scheduler_output.num_scheduled_tokens
-                    if self.artifact_connector.needs_kv_block_ids(request_id)
-                }
-                if self.connector is not None
-                else {}
-            )
             scheduler_output.artifact_connector_metadata = (
                 self.artifact_connector.build_connector_meta(
                     scheduler_output,
                     self.requests,
-                    artifact_kv_block_ids,
                 )
             )
 
@@ -1696,14 +1686,6 @@ class Scheduler(SchedulerInterface):
                 kv_connector_output.invalid_block_ids,
                 num_scheduled_tokens,
             )
-            if self.artifact_connector is not None and self.recompute_kv_load_failures:
-                for request_id in failed_kv_load_req_ids:
-                    failed_request = self.requests[request_id]
-                    self.artifact_connector.request_restarted(
-                        failed_request,
-                        num_valid_tokens=failed_request.num_computed_tokens,
-                    )
-
         # NOTE(woosuk): As len(num_scheduled_tokens) can be up to 1K or more,
         # the below loop can be a performance bottleneck. We should do our best
         # to avoid expensive operations inside the loop.
@@ -2453,7 +2435,10 @@ class Scheduler(SchedulerInterface):
             )
             return True
 
-        if self.connector.reset_cache() is not True:
+        reset_result = self.connector.reset_cache()
+        if reset_result is False or (
+            self.artifact_connector is not None and reset_result is not True
+        ):
             return False
 
         if self.log_stats:

@@ -30,3 +30,11 @@ class ArtifactConfig:
     def enabled(self) -> bool:
         """Whether any execution artifact is enabled."""
         return self.enable_return_routed_experts
+
+    def compute_hash(self) -> str:
+        """Hash Artifact settings that alter the model forward graph."""
+        from vllm.config.utils import hash_factors
+
+        return hash_factors(
+            {"enable_return_routed_experts": self.enable_return_routed_experts}
+        )

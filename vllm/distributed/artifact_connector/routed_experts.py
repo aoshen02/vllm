@@ -16,6 +16,9 @@ from vllm.distributed.artifact_connector.shm import (
     ArtifactReader,
     ArtifactStore,
 )
+from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
+    get_routed_experts_dtype_name,
+)
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -79,11 +82,6 @@ class RoutedExpertsArtifactBuffer:
         if rows.shape[1:] != self.shape_per_token:
             raise RuntimeError("routed-experts capture profile changed")
         rows = rows.astype(self.dtype, copy=False)
-        return self._capture(request_id, token_start, rows)
-
-    def _capture(
-        self, request_id: Hashable, token_start: int, rows: np.ndarray
-    ) -> list[tuple[int, np.ndarray]]:
         if token_start < 0:
             raise ValueError("artifact token start must be non-negative")
 
@@ -171,17 +169,14 @@ class RoutedExpertsArtifactBuffer:
         if slot is not None:
             self._free_retained_slots.append(slot)
 
-    def _release(self, request_id: Hashable) -> None:
-        tail = self._requests.pop(request_id)
-        self._free_slots.append(tail.slot)
-
     def discard(self, request_id: Hashable) -> None:
-        if request_id in self._requests:
-            self._release(request_id)
+        tail = self._requests.pop(request_id, None)
+        if tail is not None:
+            self._free_slots.append(tail.slot)
 
     def reset(self) -> None:
-        for request_id in list(self._requests):
-            self._release(request_id)
+        self._free_slots.extend(tail.slot for tail in self._requests.values())
+        self._requests.clear()
         self._free_slots.extend(self._completed_slots.values())
         self._completed_slots.clear()
         self._retained_slots.clear()
@@ -198,12 +193,8 @@ def get_routing_shape_and_dtype(
             model_config.get_total_num_hidden_layers(),
             model_config.get_num_experts_per_tok(),
         ),
-        "uint8" if num_experts <= 256 else "uint16",
+        get_routed_experts_dtype_name(num_experts),
     )
-
-
-def routed_experts_key(block_hash: bytes, artifact_namespace: str) -> str:
-    return f"vllm-artifact/{artifact_namespace}/{block_hash.hex()}"
 
 
 def routed_experts_keys(
