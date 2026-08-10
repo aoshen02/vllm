@@ -25,7 +25,6 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 _SAFE_STORE_ID = re.compile(r"^[a-f0-9]{32,64}$")
-_ARTIFACT_KEY_PREFIX = "vllm-artifact/"
 
 
 @dataclass(frozen=True)
@@ -172,21 +171,6 @@ class _Entry:
 
 class LocalSharedMemoryArtifactStore:
     """Bounded immutable SHM store that fails closed after an eviction."""
-
-    @staticmethod
-    def _object_id(key: str) -> str:
-        if not key or "\x00" in key:
-            raise ValueError("artifact object key must be a non-empty string")
-        if key.startswith(_ARTIFACT_KEY_PREFIX):
-            digest = key[len(_ARTIFACT_KEY_PREFIX) :]
-            if len(digest) == 64 and digest == digest.lower():
-                try:
-                    int(digest, 16)
-                except ValueError:
-                    pass
-                else:
-                    return digest
-        return hashlib.sha256(key.encode()).hexdigest()
 
     def __init__(
         self,
@@ -436,7 +420,9 @@ class LocalSharedMemoryArtifactStore:
         with self._lock:
             unique: dict[str, ArtifactObject] = {}
             for obj in objects:
-                unique.setdefault(self._object_id(obj.key), obj)
+                if not obj.key or "\x00" in obj.key:
+                    raise ValueError("artifact object key must be a non-empty string")
+                unique.setdefault(obj.key, obj)
             protected = set(unique)
             additional_bytes = sum(
                 len(obj.payload)
@@ -456,13 +442,13 @@ class LocalSharedMemoryArtifactStore:
     def get(self, keys: list[str]) -> list[bytes]:
         assert self._arena is not None
         with self._lock:
-            object_ids, entries = self._lookup(keys)
+            entries = self._lookup(keys)
             payloads = [
                 self._arena[entry.offset : entry.offset + entry.size]
                 for entry in entries
             ]
-            for object_id in object_ids:
-                self._lru.move_to_end(object_id)
+            for key in keys:
+                self._lru.move_to_end(key)
             return payloads
 
     def get_concatenated(
@@ -473,7 +459,7 @@ class LocalSharedMemoryArtifactStore:
     ) -> bytes:
         assert self._arena is not None
         with self._lock:
-            object_ids, entries = self._lookup(keys)
+            entries = self._lookup(keys)
             if any(entry.size != object_size for entry in entries):
                 raise ArtifactCorruptionError("artifact object has an invalid size")
             arena = memoryview(self._arena)
@@ -484,14 +470,13 @@ class LocalSharedMemoryArtifactStore:
                 )
             finally:
                 arena.release()
-            for object_id in object_ids:
-                self._lru.move_to_end(object_id)
+            for key in keys:
+                self._lru.move_to_end(key)
             return payload
 
-    def _lookup(self, keys: list[str]) -> tuple[list[str], list[_Entry]]:
-        object_ids = [self._object_id(key) for key in keys]
+    def _lookup(self, keys: list[str]) -> list[_Entry]:
         try:
-            entries = [self._lru[object_id] for object_id in object_ids]
+            return [self._lru[key] for key in keys]
         except KeyError as error:
             raise ArtifactNotFoundError(
                 "artifact object does not exist; the object may have been "
@@ -499,7 +484,6 @@ class LocalSharedMemoryArtifactStore:
                 f"limit={self.max_bytes}). Increase "
                 "artifact_config.max_shm_bytes when a KV cache hit requires it."
             ) from error
-        return object_ids, entries
 
     def close(self) -> None:
         arena = self._arena

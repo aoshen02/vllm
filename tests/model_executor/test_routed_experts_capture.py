@@ -38,6 +38,7 @@ def _capturer_with_buffer(
     c = RoutedExpertsCapturer.__new__(RoutedExpertsCapturer)
     c.dp_rank = dp_rank
     c.tp_size = tp_size
+    c.output_dtype = torch.uint8
     c.device_buffer = torch.full(
         (max_tokens, num_layers, num_experts_per_tok),
         -1,
@@ -200,16 +201,20 @@ def test_routed_experts_capturer_single_dp_no_metadata():
     assert capturer.device_buffer[3, 0, 0].item() == -1
 
 
-@pytest.mark.parametrize("dtype", [torch.uint8, torch.uint16])
-def test_routed_experts_capturer_narrows_router_ids(dtype):
-    capturer = _capturer_with_buffer(dtype=dtype)
+@pytest.mark.parametrize("output_dtype", [torch.uint8, torch.uint16])
+def test_routed_experts_capturer_narrows_snapshot(output_dtype):
+    capturer = _capturer_with_buffer(dtype=torch.int32)
+    capturer.output_dtype = output_dtype
     topk = torch.tensor([[1, 2], [254, 255]], dtype=torch.int64)
     ctx = SimpleNamespace(dp_metadata=None)
     with patch(f"{_REC_MODULE}.get_forward_context", return_value=ctx):
         capturer.capture(layer_id=0, topk_ids=topk)
 
-    assert capturer.device_buffer.dtype == dtype
+    output = capturer.get_routing_data(2)
+    assert capturer.device_buffer.dtype == torch.int32
     assert capturer.device_buffer[:2, 0, :].tolist() == topk.tolist()
+    assert output.dtype == output_dtype
+    assert output[:, 0, :].tolist() == topk.tolist()
 
 
 def test_routed_experts_capturer_dp_naive_concatenated_all_ranks():
@@ -361,7 +366,7 @@ def test_artifact_worker_connector_owns_capture(monkeypatch):
     monkeypatch.setattr(
         artifact_worker,
         "get_tp_group",
-        lambda: SimpleNamespace(is_first_rank=False),
+        lambda: SimpleNamespace(is_first_rank=False, world_size=1),
     )
 
     config = SimpleNamespace(

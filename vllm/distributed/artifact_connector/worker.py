@@ -25,12 +25,14 @@ from vllm.distributed.artifact_connector.routed_experts import (
     get_routing_shape_and_dtype,
     materialize_routed_experts,
     publish_routed_experts,
-    routed_experts_key,
+    routed_experts_keys,
 )
 from vllm.distributed.artifact_connector.shm import (
     BackgroundArtifactStore,
     LocalSharedMemoryArtifactStore,
 )
+from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
+from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorBase_V1
 from vllm.distributed.parallel_state import get_tp_group
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
     RoutedExpertsCapturer,
@@ -42,6 +44,18 @@ if TYPE_CHECKING:
     from vllm.v1.kv_cache_interface import KVCacheConfig
 
 _RequestKey = tuple[str, int]
+_PendingAssembly = tuple[str, int, int, list[tuple[int, np.ndarray]]]
+
+
+def _kv_connector_reports_load_errors(vllm_config: VllmConfig) -> bool:
+    config = vllm_config.kv_transfer_config
+    if config is None or not config.is_kv_transfer_instance:
+        return False
+    connector_cls = KVConnectorFactory.get_connector_class(config)
+    return (
+        connector_cls.get_block_ids_with_load_errors
+        is not KVConnectorBase_V1.get_block_ids_with_load_errors
+    )
 
 
 @dataclass
@@ -126,7 +140,8 @@ class ArtifactWorkerConnector:
         self._generation = -1
         self._lock = Lock()
         self._sync_invalid_blocks = (
-            vllm_config.kv_transfer_config is not None and get_tp_group().world_size > 1
+            get_tp_group().world_size > 1
+            and _kv_connector_reports_load_errors(vllm_config)
         )
 
         # Every TP rank participates in capture collectives, but only the
@@ -221,13 +236,22 @@ class ArtifactWorkerConnector:
         with self._lock:
             if metadata.generation != self._generation:
                 return ArtifactConnectorOutput({})
-            return self._process_output(
+            outputs, invalid_requests, pending_assemblies = self._process_output(
                 metadata,
                 routed_experts,
                 request_ids,
                 num_rejected,
                 invalid_block_ids or set(),
             )
+        for request_id, token_start, token_end, segments in pending_assemblies:
+            outputs[request_id] = ArtifactRequestOutput(
+                token_start,
+                self._assemble_segments(token_start, token_end, segments),
+            )
+        with self._lock:
+            if metadata.generation != self._generation:
+                return ArtifactConnectorOutput({})
+        return ArtifactConnectorOutput(outputs, invalid_requests)
 
     def _process_output(
         self,
@@ -236,7 +260,11 @@ class ArtifactWorkerConnector:
         request_ids: list[str],
         num_rejected: np.ndarray,
         invalid_block_ids: set[int],
-    ) -> ArtifactConnectorOutput:
+    ) -> tuple[
+        dict[str, ArtifactRequestOutput],
+        set[_RequestKey],
+        list[_PendingAssembly],
+    ]:
         assert self._store is not None and self._buffer is not None
         if routed_experts.shape[1:] != self._shape_per_token:
             raise RuntimeError("routed-experts capture profile changed")
@@ -254,6 +282,7 @@ class ArtifactWorkerConnector:
         commit_batches: list[tuple[Sequence[str], list[tuple[int, np.ndarray]]]] = []
         committed_rows: list[np.ndarray] = []
         outputs: dict[str, ArtifactRequestOutput] = {}
+        pending_assemblies: list[_PendingAssembly] = []
         invalid_requests: set[tuple[str, int]] = set()
         if invalid_block_ids:
             for state in self._requests.values():
@@ -275,12 +304,35 @@ class ArtifactWorkerConnector:
             artifact_keys = state.artifact_keys
             valid_end = end - int(num_rejected[request_index])
             rows = routed_experts[offset:valid_end]
-            capture_start = min(
-                request.token_start,
-                state.capture_cursor
-                if state.capture_cursor is not None
-                else request.token_start,
-            )
+            capture_start = request.token_start
+            capture_cursor = state.capture_cursor
+            if capture_cursor is None:
+                block_start = capture_start // metadata.block_size * metadata.block_size
+                if block_start < capture_start:
+                    if capture_start > len(artifact_keys) * metadata.block_size:
+                        raise RuntimeError("artifact capture has an unbacked token gap")
+                    cached_rows = self._materialize(
+                        block_start,
+                        capture_start,
+                        artifact_keys,
+                        metadata.block_size,
+                    )
+                    rows = np.concatenate((cached_rows, rows))
+                    capture_start = block_start
+            elif capture_start < capture_cursor:
+                rows = rows[min(capture_cursor - capture_start, len(rows)) :]
+                capture_start = capture_cursor
+            elif capture_start > capture_cursor:
+                if capture_start > len(artifact_keys) * metadata.block_size:
+                    raise RuntimeError("artifact capture has an unbacked token gap")
+                cached_rows = self._materialize(
+                    capture_cursor,
+                    capture_start,
+                    artifact_keys,
+                    metadata.block_size,
+                )
+                rows = np.concatenate((cached_rows, rows))
+                capture_start = capture_cursor
             emit_start = max(
                 request.emit_start,
                 state.emit_cursor
@@ -346,39 +398,32 @@ class ArtifactWorkerConnector:
                         ),
                     )
                 )
-            segments.extend(local_segments)
-            tail_cursor = emit_start
-            for start, segment in sorted(segments, key=lambda item: item[0]):
-                if tail_cursor >= capture_start:
-                    break
-                if start > tail_cursor:
-                    gap_end = min(start, capture_start)
-                    segments.append(
-                        (
-                            tail_cursor,
-                            self._buffer.read(key, tail_cursor, gap_end),
-                        )
-                    )
-                    tail_cursor = gap_end
-                if start <= tail_cursor:
-                    tail_cursor = max(tail_cursor, start + len(segment))
-            if tail_cursor < capture_start:
-                segments.append(
-                    (
-                        tail_cursor,
-                        self._buffer.read(key, tail_cursor, capture_start),
-                    )
-                )
             segments.append((capture_start, rows))
-            output_rows = self._assemble_segments(emit_start, token_end, segments)
-            outputs[request.request_id] = ArtifactRequestOutput(
-                emit_start,
-                output_rows,
+            segments.extend(local_segments)
+            segments.sort(key=lambda item: item[0])
+            complete_segments: list[tuple[int, np.ndarray]] = []
+            cursor = emit_start
+            for start, segment in segments:
+                if cursor < capture_start and start > cursor:
+                    gap_end = min(start, capture_start)
+                    complete_segments.append(
+                        (cursor, self._buffer.read(key, cursor, gap_end))
+                    )
+                    cursor = gap_end
+                complete_segments.append((start, segment))
+                if start <= cursor:
+                    cursor = max(cursor, start + len(segment))
+            if cursor < capture_start:
+                complete_segments.append(
+                    (cursor, self._buffer.read(key, cursor, capture_start))
+                )
+            pending_assemblies.append(
+                (request.request_id, emit_start, token_end, complete_segments)
             )
             state.emit_cursor = token_end
         for rows in committed_rows:
             self._buffer.release_block(rows)
-        return ArtifactConnectorOutput(outputs, invalid_requests)
+        return outputs, invalid_requests, pending_assemblies
 
     def _take_available_blocks(
         self,
@@ -416,7 +461,7 @@ class ArtifactWorkerConnector:
                 return rows[local_start:local_end].copy()
         cursor = token_start
         chunks = []
-        for segment_start, rows in sorted(segments, key=lambda item: item[0]):
+        for segment_start, rows in segments:
             segment_end = segment_start + len(rows)
             if segment_end <= cursor:
                 continue
@@ -476,19 +521,22 @@ class ArtifactWorkerConnector:
             raise RuntimeError(
                 f"artifact block-hash delta is missing for {request.request_id}"
             )
-        overlap = min(len(request.block_hashes), len(block_hashes) - start)
-        if (
-            list(request.block_hashes[:overlap])
-            != block_hashes[start : start + overlap]
-        ):
-            raise RuntimeError(
-                f"artifact block-hash history changed for {request.request_id}"
-            )
-        new_hashes = request.block_hashes[overlap:]
+        if start < len(block_hashes):
+            overlap = min(len(request.block_hashes), len(block_hashes) - start)
+            if (
+                list(request.block_hashes[:overlap])
+                != block_hashes[start : start + overlap]
+            ):
+                raise RuntimeError(
+                    f"artifact block-hash history changed for {request.request_id}"
+                )
+            new_hashes = request.block_hashes[overlap:]
+        else:
+            new_hashes = request.block_hashes
+        new_hashes = list(new_hashes)
         block_hashes.extend(new_hashes)
         state.artifact_keys.extend(
-            routed_experts_key(block_hash, str(self._generation))
-            for block_hash in new_hashes
+            routed_experts_keys(new_hashes, str(self._generation))
         )
 
     def _finish_request(
@@ -500,11 +548,17 @@ class ArtifactWorkerConnector:
     ) -> None:
         assert self._store is not None and self._buffer is not None
         if block_hashes is not None:
-            state.block_hashes = list(block_hashes)
-            state.artifact_keys = [
-                routed_experts_key(block_hash, str(self._generation))
-                for block_hash in block_hashes
-            ]
+            num_existing_hashes = len(state.block_hashes)
+            if (
+                num_existing_hashes > len(block_hashes)
+                or list(block_hashes[:num_existing_hashes]) != state.block_hashes
+            ):
+                raise RuntimeError("artifact block-hash history changed")
+            new_hashes = list(block_hashes[num_existing_hashes:])
+            state.block_hashes.extend(new_hashes)
+            state.artifact_keys.extend(
+                routed_experts_keys(new_hashes, str(self._generation))
+            )
             pending, ready = self._take_available_blocks(state, [], block_size)
             publish_routed_experts(
                 self._store,
@@ -528,7 +582,7 @@ class ArtifactWorkerConnector:
     ) -> np.ndarray:
         assert self._store is not None
         first_block = token_start // block_size
-        last_block = token_end // block_size
+        last_block = (token_end + block_size - 1) // block_size
         stored = materialize_routed_experts(
             self._store,
             list(artifact_keys[first_block:last_block]),
@@ -536,7 +590,8 @@ class ArtifactWorkerConnector:
             dtype=self._dtype,
             rows_per_object=block_size,
         )
-        return stored[token_start - first_block * block_size :]
+        local_start = token_start - first_block * block_size
+        return stored[local_start : local_start + token_end - token_start]
 
     def close(self) -> None:
         if self._store is not None:

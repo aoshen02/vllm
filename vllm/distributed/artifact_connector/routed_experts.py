@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import math
 from collections.abc import Hashable, Sequence
 from dataclasses import dataclass
@@ -204,11 +203,14 @@ def get_routing_shape_and_dtype(
 
 
 def routed_experts_key(block_hash: bytes, artifact_namespace: str) -> str:
-    digest = hashlib.sha256()
-    digest.update(artifact_namespace.encode())
-    digest.update(b"\0")
-    digest.update(block_hash)
-    return f"vllm-artifact/{digest.hexdigest()}"
+    return f"vllm-artifact/{artifact_namespace}/{block_hash.hex()}"
+
+
+def routed_experts_keys(
+    block_hashes: Sequence[bytes], artifact_namespace: str
+) -> list[str]:
+    prefix = f"vllm-artifact/{artifact_namespace}/"
+    return [prefix + block_hash.hex() for block_hash in block_hashes]
 
 
 def materialize_routed_experts(

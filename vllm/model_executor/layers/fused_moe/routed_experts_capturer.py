@@ -56,7 +56,7 @@ class RoutedExpertsCapturer:
         num_layers, num_experts, num_experts_per_tok = _get_routed_experts_shape(
             vllm_config
         )
-        dtype = torch.uint8 if num_experts <= 256 else torch.uint16
+        self.output_dtype = torch.uint8 if num_experts <= 256 else torch.uint16
         logger.info(
             "RoutedExpertsCapturer: allocating buffer with "
             "max_tokens=%d, num_layers=%d, num_experts_per_tok=%d "
@@ -72,7 +72,7 @@ class RoutedExpertsCapturer:
                 num_layers,
                 num_experts_per_tok,
             ),
-            dtype=dtype,
+            dtype=torch.int32,
             device=current_platform.device_type,
         )
         self.dp_rank = vllm_config.parallel_config.data_parallel_rank
@@ -160,7 +160,7 @@ class RoutedExpertsCapturer:
 
     def get_routing_data(self, num_tokens: int) -> torch.Tensor:
         """Return a stable snapshot of the current routing data."""
-        return self.device_buffer[:num_tokens].clone()
+        return self.device_buffer[:num_tokens].to(self.output_dtype)
 
 
 def bind_routed_experts_capturer(

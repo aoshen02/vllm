@@ -37,8 +37,10 @@ from vllm.distributed.artifact_connector.shm import (
 )
 from vllm.distributed.artifact_connector.worker import (
     ArtifactWorkerConnector,
+    _kv_connector_reports_load_errors,
     _WorkerRequestState,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorBase_V1
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler
 
@@ -310,6 +312,113 @@ def test_worker_data_plane_publishes_blocks_and_reuses_prefix(tmp_path):
     output = _process_output(worker, second, logical[8:], ["second"], np.array([0]))
     assert output is not None
     np.testing.assert_array_equal(output.requests["second"].rows, logical)
+    worker.close()
+
+
+def test_worker_reuses_prefix_when_execution_starts_inside_block(tmp_path):
+    worker = _make_worker(tmp_path, 2)
+    hashes = [b"a" * 32, b"b" * 32]
+    logical = np.arange(8 * 3 * 2, dtype=np.uint8).reshape(8, 3, 2)
+    first = ArtifactConnectorMetadata(
+        0,
+        _BLOCK_SIZE,
+        [ArtifactRequestMetadata("first", 0, 8, 0, True, hashes)],
+        {},
+    )
+    _process_output(worker, first, logical, ["first"], np.array([0]))
+
+    second = ArtifactConnectorMetadata(
+        0,
+        _BLOCK_SIZE,
+        [ArtifactRequestMetadata("second", 7, 1, 0, True, hashes)],
+        {("first", 0): hashes},
+    )
+    output = _process_output(worker, second, logical[7:], ["second"], np.array([0]))
+
+    np.testing.assert_array_equal(output.requests["second"].rows, logical)
+    worker.close()
+
+
+def test_worker_fills_capture_gap_from_published_artifact(tmp_path):
+    worker = _make_worker(tmp_path, 2)
+    hashes = [b"a" * 32, b"b" * 32]
+    logical = np.arange(8 * 3 * 2, dtype=np.uint8).reshape(8, 3, 2)
+    producer = ArtifactConnectorMetadata(
+        0,
+        _BLOCK_SIZE,
+        [ArtifactRequestMetadata("producer", 0, 8, 0, True, hashes)],
+        {},
+    )
+    _process_output(worker, producer, logical, ["producer"], np.array([0]))
+
+    first = ArtifactConnectorMetadata(
+        0,
+        _BLOCK_SIZE,
+        [ArtifactRequestMetadata("consumer", 0, 4, 0, False, hashes)],
+        {("producer", 0): hashes},
+    )
+    _process_output(worker, first, logical[:4], ["consumer"], np.array([0]))
+    second = ArtifactConnectorMetadata(
+        0,
+        _BLOCK_SIZE,
+        [ArtifactRequestMetadata("consumer", 7, 1, 0, True, hashes)],
+        {},
+    )
+    output = _process_output(worker, second, logical[7:], ["consumer"], np.array([0]))
+
+    np.testing.assert_array_equal(output.requests["consumer"].rows, logical)
+    worker.close()
+
+
+def test_worker_rejects_unbacked_capture_gap(tmp_path):
+    worker = _make_worker(tmp_path, 1)
+    logical = np.arange(4 * 3 * 2, dtype=np.uint8).reshape(4, 3, 2)
+    first = ArtifactConnectorMetadata(
+        0,
+        _BLOCK_SIZE,
+        [ArtifactRequestMetadata("request", 0, 1, 0, False, [])],
+        {},
+    )
+    _process_output(worker, first, logical[:1], ["request"], np.array([0]))
+    second = ArtifactConnectorMetadata(
+        0,
+        _BLOCK_SIZE,
+        [ArtifactRequestMetadata("request", 2, 1, 0, False, [])],
+        {},
+    )
+
+    with pytest.raises(RuntimeError, match="unbacked token gap"):
+        _process_output(worker, second, logical[2:3], ["request"], np.array([0]))
+    worker.close()
+
+
+def test_worker_drops_overlapping_capture_rows(tmp_path):
+    worker = _make_worker(tmp_path, 1)
+    logical = np.arange(4 * 3 * 2, dtype=np.uint8).reshape(4, 3, 2)
+    first = ArtifactConnectorMetadata(
+        0,
+        _BLOCK_SIZE,
+        [ArtifactRequestMetadata("request", 0, 3, 0, False, [])],
+        {},
+    )
+    _process_output(worker, first, logical[:3], ["request"], np.array([0]))
+    stale_overlap = logical[2:].copy()
+    stale_overlap[0] += 100
+    second = ArtifactConnectorMetadata(
+        0,
+        _BLOCK_SIZE,
+        [ArtifactRequestMetadata("request", 2, 2, 0, True, [b"a" * 32])],
+        {},
+    )
+    output = _process_output(
+        worker,
+        second,
+        stale_overlap,
+        ["request"],
+        np.array([0]),
+    )
+
+    np.testing.assert_array_equal(output.requests["request"].rows, logical)
     worker.close()
 
 
@@ -655,6 +764,27 @@ def test_worker_unions_invalid_blocks_across_tp(monkeypatch):
     )
 
     assert worker.sync_invalid_block_ids({7}) == {7, 9}
+
+
+@pytest.mark.parametrize("reports_load_errors", [False, True])
+def test_detects_kv_connector_load_error_reporting(monkeypatch, reports_load_errors):
+    class Connector:
+        get_block_ids_with_load_errors = (
+            (lambda self: {1})
+            if reports_load_errors
+            else KVConnectorBase_V1.get_block_ids_with_load_errors
+        )
+
+    monkeypatch.setattr(
+        "vllm.distributed.artifact_connector.worker."
+        "KVConnectorFactory.get_connector_class",
+        lambda config: Connector,
+    )
+    config = SimpleNamespace(
+        kv_transfer_config=SimpleNamespace(is_kv_transfer_instance=True)
+    )
+
+    assert _kv_connector_reports_load_errors(config) is reports_load_errors
 
 
 def test_worker_excludes_rejected_speculative_rows(tmp_path):
@@ -1128,13 +1258,33 @@ def test_scheduler_connector_sends_only_new_block_hashes(tmp_path):
     )
     request.block_hashes.append(b"b" * 32)
     second = connector.build_connector_meta(
-        scheduler_output, {request.request_id: request}
+        _step_output([request.request_id], [4], [4]),
+        {request.request_id: request},
     )
 
     assert list(first.requests[0].block_hashes) == [b"a" * 32]
     assert first.requests[0].block_hash_start == 0
     assert list(second.requests[0].block_hashes) == [b"b" * 32]
     assert second.requests[0].block_hash_start == 1
+
+
+def test_scheduler_connector_defers_unscheduled_block_hashes(tmp_path):
+    connector = _make_connector(tmp_path)
+    block_hashes = [bytes([i]) * 32 for i in range(4)]
+    request = _scheduler_request("request", block_hashes, num_tokens=16)
+    connector.request_started(request)
+
+    first = connector.build_connector_meta(
+        _step_output([request.request_id], [0], [4]),
+        {request.request_id: request},
+    )
+    second = connector.build_connector_meta(
+        _step_output([request.request_id], [4], [4]),
+        {request.request_id: request},
+    )
+
+    assert list(first.requests[0].block_hashes) == block_hashes[:1]
+    assert list(second.requests[0].block_hashes) == block_hashes[1:2]
 
 
 def test_scheduler_connector_sends_kv_block_ids_once_per_epoch(tmp_path):

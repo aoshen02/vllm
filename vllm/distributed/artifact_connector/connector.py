@@ -147,9 +147,15 @@ class ArtifactSchedulerConnector:
             if state is None or request is None:
                 continue
             if self._reuse_kv_hashes:
-                if state.num_hashes > len(request.block_hashes):
+                num_hashes = min(
+                    len(request.block_hashes),
+                    (token_starts[request_id] + num_tokens) // self._block_size,
+                )
+                if state.num_hashes > num_hashes:
                     raise RuntimeError("KV block-hash history shrank")
-                new_hashes: Sequence[bytes] = request.block_hashes[state.num_hashes :]
+                new_hashes: Sequence[bytes] = request.block_hashes[
+                    state.num_hashes : num_hashes
+                ]
             else:
                 num_hashes = (token_starts[request_id] + num_tokens) // self._block_size
                 new_hashes = [
