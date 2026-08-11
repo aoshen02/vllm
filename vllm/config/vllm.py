@@ -1038,13 +1038,40 @@ class VllmConfig:
             )
 
         kv_transfer_config = self.kv_transfer_config
+        if kv_transfer_config is None or not kv_transfer_config.is_kv_transfer_instance:
+            return
+        if kv_transfer_config.kv_role != "kv_both":
+            raise ValueError(
+                "--enable-return-routed-experts with KV transfer requires "
+                "kv_role=kv_both; PD disaggregation is not supported."
+            )
+        if not self.cache_config.enable_prefix_caching:
+            raise ValueError(
+                "Artifact Connector with KV transfer requires prefix caching."
+            )
         if (
-            kv_transfer_config is not None
-            and kv_transfer_config.is_kv_transfer_instance
+            kv_transfer_config.kv_connector != "OffloadingConnector"
+            or kv_transfer_config.kv_connector_module_path is not None
         ):
             raise ValueError(
-                "--enable-return-routed-experts is incompatible with KV "
-                "connectors (PD disaggregation and KV cache offload)."
+                "Artifact Connector only supports the built-in "
+                "OffloadingConnector for KV transfer."
+            )
+        extra_config = kv_transfer_config.kv_connector_extra_config
+        if (
+            extra_config.get("spec_name", "CPUOffloadingSpec") != "CPUOffloadingSpec"
+            or extra_config.get("spec_module_path") is not None
+            or extra_config.get("eviction_policy", "lru") not in {"lru", "arc"}
+            or extra_config.get("cache_policy_module_path") is not None
+        ):
+            raise ValueError(
+                "Artifact Connector only supports the built-in CPUOffloadingSpec "
+                "with a built-in cache policy."
+            )
+        if self.artifact_config.max_shm_bytes is None:
+            raise ValueError(
+                "artifact_config.max_shm_bytes must be set when using "
+                "an Artifact Connector with a KV Connector."
             )
 
     def _verify_kv_transfer_compat(self) -> None:

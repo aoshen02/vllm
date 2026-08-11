@@ -167,10 +167,59 @@ def test_artifact_connector_rejects_unsupported_topology(kwargs, error):
         VllmConfig._verify_artifact_compatibility(_config(**kwargs))
 
 
+def test_artifact_connector_supports_cpu_kv_offload():
+    config = _config(
+        connector="OffloadingConnector",
+        spec_name="CPUOffloadingSpec",
+    )
+    config.artifact_config.max_shm_bytes = 1 << 20
+    VllmConfig._verify_artifact_compatibility(config)
+
+
+@pytest.mark.parametrize("spec_name", ["TieringOffloadingSpec", "ExternalSpec"])
+def test_artifact_connector_rejects_non_cpu_offloading_spec(spec_name):
+    config = _config(connector="OffloadingConnector", spec_name=spec_name)
+    config.artifact_config.max_shm_bytes = 1 << 20
+
+    with pytest.raises(ValueError, match="built-in CPUOffloadingSpec"):
+        VllmConfig._verify_artifact_compatibility(config)
+
+
+@pytest.mark.parametrize(
+    "extra_config",
+    [
+        {"spec_module_path": "external_spec"},
+        {"eviction_policy": "ExternalPolicy"},
+        {"cache_policy_module_path": "external_policy"},
+    ],
+)
+def test_artifact_connector_rejects_external_cpu_offload_components(extra_config):
+    config = _config(connector="OffloadingConnector")
+    config.kv_transfer_config.kv_connector_extra_config.update(extra_config)
+    config.artifact_config.max_shm_bytes = 1 << 20
+
+    with pytest.raises(ValueError, match="built-in CPUOffloadingSpec"):
+        VllmConfig._verify_artifact_compatibility(config)
+
+
+def test_artifact_connector_requires_explicit_capacity_with_kv_connector():
+    with pytest.raises(ValueError, match="max_shm_bytes must be set"):
+        VllmConfig._verify_artifact_compatibility(
+            _config(connector="OffloadingConnector")
+        )
+
+
+def test_artifact_connector_requires_prefix_caching_with_kv_connector():
+    config = _config(connector="OffloadingConnector", prefix_caching=False)
+    config.artifact_config.max_shm_bytes = 1 << 20
+
+    with pytest.raises(ValueError, match="requires prefix caching"):
+        VllmConfig._verify_artifact_compatibility(config)
+
+
 @pytest.mark.parametrize(
     "connector",
     [
-        "OffloadingConnector",
         "NixlConnector",
         "MooncakeConnector",
         "MooncakeStoreConnector",
@@ -182,9 +231,31 @@ def test_artifact_connector_rejects_unsupported_topology(kwargs, error):
 )
 def test_artifact_connector_rejects_other_kv_connectors(connector):
     config = _config(connector=connector)
+    config.artifact_config.max_shm_bytes = 1 << 20
 
-    with pytest.raises(ValueError, match="incompatible with KV connectors"):
+    with pytest.raises(ValueError, match="only supports the built-in"):
         VllmConfig._verify_artifact_compatibility(config)
+
+
+def test_artifact_connector_rejects_external_offloading_connector():
+    config = _config(connector="OffloadingConnector")
+    config.kv_transfer_config.kv_connector_module_path = "external_connector"
+    config.artifact_config.max_shm_bytes = 1 << 20
+
+    with pytest.raises(ValueError, match="built-in OffloadingConnector"):
+        VllmConfig._verify_artifact_compatibility(config)
+
+
+@pytest.mark.parametrize("role", ["kv_producer", "kv_consumer"])
+def test_artifact_connector_rejects_pd_disaggregation(role):
+    with pytest.raises(ValueError, match="kv_role=kv_both"):
+        VllmConfig._verify_artifact_compatibility(
+            _config(
+                connector="OffloadingConnector",
+                role=role,
+                spec_name="CPUOffloadingSpec",
+            )
+        )
 
 
 def test_artifact_guards_are_inactive_when_capture_is_disabled():

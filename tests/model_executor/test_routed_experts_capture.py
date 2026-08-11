@@ -453,6 +453,10 @@ def test_artifact_worker_connector_shm_capacity(monkeypatch, tmp_path):
     artifact_worker.ArtifactWorkerConnector(**kwargs)
     assert store_constructor.call_args.kwargs["max_bytes"] == 2560
 
+    config.kv_transfer_config = SimpleNamespace(is_kv_transfer_instance=True)
+    with pytest.raises(AssertionError):
+        artifact_worker.ArtifactWorkerConnector(**kwargs)
+
 
 def test_v2_model_runner_accepts_routed_experts(monkeypatch):
     monkeypatch.setattr("importlib.metadata.entry_points", lambda **_: ())

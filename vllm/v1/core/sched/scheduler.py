@@ -2396,6 +2396,17 @@ class Scheduler(SchedulerInterface):
         Otherwise, this method will only reset the KV prefix cache when there
         is no running requests taking KV cache.
         """
+        if (
+            not reset_connector
+            and self.artifact_connector is not None
+            and self.connector is not None
+        ):
+            logger.warning(
+                "Artifact capture requires resetting local and connector KV "
+                "caches together. Retry with reset_connector=True."
+            )
+            return False
+
         if reset_running_requests:
             # For logging.
             timestamp = time.monotonic()
