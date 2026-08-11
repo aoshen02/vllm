@@ -183,6 +183,7 @@ class DeepseekV4MegaMoEExperts(nn.Module):
     ):
         super().__init__()
         self.prefix = prefix
+        self.routed_experts_capture_fn: Callable[[torch.Tensor], None] | None = None
         self.num_experts = num_experts
         self.num_local_experts = num_local_experts
         self.experts_start_idx = experts_start_idx
@@ -436,6 +437,15 @@ class DeepseekV4MegaMoEExperts(nn.Module):
     def update_expert_map(self) -> None:
         pass
 
+    @property
+    def layer_id(self) -> int:
+        return extract_layer_index(self.prefix)
+
+    def set_routed_experts_capture_fn(
+        self, capture_fn: Callable[[torch.Tensor], None] | None
+    ) -> None:
+        self.routed_experts_capture_fn = capture_fn
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -463,6 +473,9 @@ class DeepseekV4MegaMoEExperts(nn.Module):
             is_padding = get_forward_context().is_padding
             if is_padding is not None:
                 is_padding = is_padding[:num_tokens]
+
+        if self.routed_experts_capture_fn is not None:
+            self.routed_experts_capture_fn(topk_ids)
 
         # EPLB: map logical expert IDs to physical replicas and record load.
         eplb_state = self.eplb_state

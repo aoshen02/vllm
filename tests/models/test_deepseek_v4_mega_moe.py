@@ -44,6 +44,49 @@ def test_deepseek_v4_mega_moe_ue8m0_uint8_to_float():
     assert decoded[3].item() == 2.0
 
 
+def test_deepseek_v4_mega_moe_capture_precedes_eplb(monkeypatch):
+    experts = DeepseekV4MegaMoEExperts.__new__(DeepseekV4MegaMoEExperts)
+    torch.nn.Module.__init__(experts)
+    experts.prefix = "model.layers.3.ffn.experts"
+    experts.max_num_tokens = 4
+    experts.routed_experts_capture_fn = None
+    experts.get_symm_buffer = lambda: object()
+    experts.eplb_state = SimpleNamespace(
+        logical_to_physical_map=torch.empty(1),
+        expert_load_view=torch.empty(1),
+        logical_replica_count=torch.empty(1),
+        should_record_tensor=torch.empty(1),
+        num_unpadded_tokens_tensors=None,
+    )
+
+    topk_ids = torch.tensor([[1, 2], [3, 4]])
+    captured: list[torch.Tensor] = []
+    experts.set_routed_experts_capture_fn(captured.append)
+
+    class MappingReached(Exception):
+        pass
+
+    def map_ids(**kwargs):
+        assert captured == [topk_ids]
+        raise MappingReached
+
+    monkeypatch.setattr(
+        "vllm.models.deepseek_v4.nvidia.model.eplb_map_to_physical_and_record",
+        map_ids,
+    )
+    monkeypatch.setattr(
+        "vllm.utils.deep_gemm._import_deep_gemm", lambda: SimpleNamespace()
+    )
+
+    with pytest.raises(MappingReached):
+        experts(
+            torch.empty(2, 8),
+            torch.empty(2, 2),
+            topk_ids,
+            activation_clamp=None,
+        )
+
+
 def test_deepseek_v4_mega_moe_weight_loader_uses_ep_expert_ownership():
     vllm_config = SimpleNamespace(
         scheduler_config=SimpleNamespace(max_num_batched_tokens=4),
