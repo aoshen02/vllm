@@ -6,6 +6,9 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
+    bind_routed_experts_capturer,
+)
 from vllm.models.deepseek_v4.nvidia.model import (
     DeepseekV4MegaMoEExperts,
     make_deepseek_v4_expert_params_mapping,
@@ -44,12 +47,21 @@ def test_deepseek_v4_mega_moe_ue8m0_uint8_to_float():
     assert decoded[3].item() == 2.0
 
 
-def test_deepseek_v4_mega_moe_capture_precedes_eplb(monkeypatch):
-    experts = DeepseekV4MegaMoEExperts.__new__(DeepseekV4MegaMoEExperts)
+@pytest.mark.parametrize("use_kimi", [False, True])
+def test_deep_gemm_mega_moe_capture_precedes_eplb(monkeypatch, use_kimi):
+    experts_cls = DeepseekV4MegaMoEExperts
+    if use_kimi:
+        from vllm.models.kimi_k3.nvidia.model import KimiK3MegaMoEExperts
+
+        experts_cls = KimiK3MegaMoEExperts
+
+    experts = experts_cls.__new__(experts_cls)
     torch.nn.Module.__init__(experts)
+    if use_kimi:
+        experts.synchronize_first_launch = lambda: None
     experts.prefix = "model.layers.3.ffn.experts"
     experts.max_num_tokens = 4
-    experts.routed_experts_capture_fn = None
+    experts.capture_fn = None
     experts.get_symm_buffer = lambda: object()
     experts.eplb_state = SimpleNamespace(
         logical_to_physical_map=torch.empty(1),
@@ -60,14 +72,17 @@ def test_deepseek_v4_mega_moe_capture_precedes_eplb(monkeypatch):
     )
 
     topk_ids = torch.tensor([[1, 2], [3, 4]])
-    captured: list[torch.Tensor] = []
-    experts.set_routed_experts_capture_fn(captured.append)
+    captured: list[tuple[int, torch.Tensor]] = []
+    bind_routed_experts_capturer(
+        SimpleNamespace(modules=lambda: [experts]),
+        SimpleNamespace(capture=lambda layer_id, ids: captured.append((layer_id, ids))),
+    )
 
     class MappingReached(Exception):
         pass
 
     def map_ids(**kwargs):
-        assert captured == [topk_ids]
+        assert captured == [(3, topk_ids)]
         raise MappingReached
 
     monkeypatch.setattr(

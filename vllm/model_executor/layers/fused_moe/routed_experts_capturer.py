@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 class RoutedExpertsCaptureSource(Protocol):
     layer_id: int
 
-    def set_routed_experts_capture_fn(
+    def set_capture_fn(
         self, capture_fn: Callable[[torch.Tensor], None] | None
     ) -> None: ...
 
@@ -195,9 +195,7 @@ def bind_routed_experts_capturer(
     num_bound = 0
     for module in model.modules():
         if isinstance(module, RoutedExpertsCaptureSource):
-            module.set_routed_experts_capture_fn(
-                partial(capturer.capture, module.layer_id)
-            )
+            module.set_capture_fn(partial(capturer.capture, module.layer_id))
             num_bound += 1
             continue
         if not isinstance(module, MoERunner):

@@ -183,7 +183,7 @@ class DeepseekV4MegaMoEExperts(nn.Module):
     ):
         super().__init__()
         self.prefix = prefix
-        self.routed_experts_capture_fn: Callable[[torch.Tensor], None] | None = None
+        self.capture_fn: Callable[[torch.Tensor], None] | None = None
         self.num_experts = num_experts
         self.num_local_experts = num_local_experts
         self.experts_start_idx = experts_start_idx
@@ -441,10 +441,35 @@ class DeepseekV4MegaMoEExperts(nn.Module):
     def layer_id(self) -> int:
         return extract_layer_index(self.prefix)
 
-    def set_routed_experts_capture_fn(
-        self, capture_fn: Callable[[torch.Tensor], None] | None
-    ) -> None:
-        self.routed_experts_capture_fn = capture_fn
+    def set_capture_fn(self, capture_fn: Callable[[torch.Tensor], None] | None) -> None:
+        self.capture_fn = capture_fn
+
+    def _prepare_topk_ids(
+        self, topk_ids: torch.Tensor, is_padding: torch.Tensor | None
+    ) -> torch.Tensor:
+        if self.capture_fn is not None:
+            self.capture_fn(topk_ids)
+
+        eplb_state = self.eplb_state
+        if eplb_state.logical_to_physical_map is None:
+            return topk_ids
+        assert eplb_state.expert_load_view is not None
+        assert eplb_state.logical_replica_count is not None
+        assert eplb_state.should_record_tensor is not None
+        if is_padding is not None:
+            topk_ids = torch.where(is_padding.unsqueeze(1), -1, topk_ids)
+        return eplb_map_to_physical_and_record(
+            topk_ids=topk_ids,
+            expert_load_view=eplb_state.expert_load_view,
+            logical_to_physical_map=eplb_state.logical_to_physical_map,
+            logical_replica_count=eplb_state.logical_replica_count,
+            record_enabled=eplb_state.should_record_tensor,
+            num_unpadded_tokens=eplb_state.num_unpadded_tokens_tensors[
+                dbo_current_ubatch_id()
+            ]
+            if eplb_state.num_unpadded_tokens_tensors is not None
+            else None,
+        )
 
     def forward(
         self,
@@ -474,29 +499,7 @@ class DeepseekV4MegaMoEExperts(nn.Module):
             if is_padding is not None:
                 is_padding = is_padding[:num_tokens]
 
-        if self.routed_experts_capture_fn is not None:
-            self.routed_experts_capture_fn(topk_ids)
-
-        # EPLB: map logical expert IDs to physical replicas and record load.
-        eplb_state = self.eplb_state
-        if eplb_state.logical_to_physical_map is not None:
-            assert eplb_state.expert_load_view is not None
-            assert eplb_state.logical_replica_count is not None
-            assert eplb_state.should_record_tensor is not None
-            if is_padding is not None:
-                topk_ids = torch.where(is_padding.unsqueeze(1), -1, topk_ids)
-            topk_ids = eplb_map_to_physical_and_record(
-                topk_ids=topk_ids,
-                expert_load_view=eplb_state.expert_load_view,
-                logical_to_physical_map=eplb_state.logical_to_physical_map,
-                logical_replica_count=eplb_state.logical_replica_count,
-                record_enabled=eplb_state.should_record_tensor,
-                num_unpadded_tokens=eplb_state.num_unpadded_tokens_tensors[
-                    dbo_current_ubatch_id()
-                ]
-                if eplb_state.num_unpadded_tokens_tensors is not None
-                else None,
-            )
+        topk_ids = self._prepare_topk_ids(topk_ids, is_padding)
 
         prepare_megamoe_inputs(
             hidden_states,

@@ -190,26 +190,6 @@ def test_public_binding_rejects_monolithic_without_replay_support(monkeypatch):
         )
 
 
-def test_public_binding_supports_external_capture_source():
-    class CaptureSource:
-        layer_id = 3
-        capture_fn = None
-
-        def set_routed_experts_capture_fn(self, capture_fn):
-            self.capture_fn = capture_fn
-
-    source = CaptureSource()
-    topk_ids = torch.tensor([[1, 2], [3, 4]])
-    captured = []
-    bind_routed_experts_capturer(
-        SimpleNamespace(modules=lambda: [source]),
-        SimpleNamespace(capture=lambda layer_id, ids: captured.append((layer_id, ids))),
-    )
-    assert source.capture_fn is not None
-    source.capture_fn(topk_ids)
-    assert captured == [(3, topk_ids)]
-
-
 def test_routed_experts_capturer_single_dp_no_metadata():
     """dp_metadata is None: capture writes the full topk_ids rows."""
     capturer = _capturer_with_buffer(dp_rank=0)
