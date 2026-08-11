@@ -6,7 +6,9 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from functools import partial
+from typing import Protocol, runtime_checkable
 
 import torch
 
@@ -16,6 +18,12 @@ from vllm.forward_context import get_forward_context
 from vllm.platforms import current_platform
 
 logger = logging.getLogger(__name__)
+
+
+@runtime_checkable
+class RoutedExpertsCaptureSource(Protocol):
+    layer_id: int
+    capture_fn: Callable[[torch.Tensor], None] | None
 
 
 def _get_routed_experts_shape(vllm_config: VllmConfig) -> tuple[int, int, int]:
@@ -183,6 +191,10 @@ def bind_routed_experts_capturer(
 
     num_bound = 0
     for module in model.modules():
+        if isinstance(module, RoutedExpertsCaptureSource):
+            module.capture_fn = partial(capturer.capture, module.layer_id)
+            num_bound += 1
+            continue
         if not isinstance(module, MoERunner):
             continue
         capture_fn = partial(capturer.capture, module.layer_id)
