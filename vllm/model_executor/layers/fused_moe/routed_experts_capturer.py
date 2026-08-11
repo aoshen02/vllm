@@ -23,10 +23,7 @@ logger = logging.getLogger(__name__)
 @runtime_checkable
 class RoutedExpertsCaptureSource(Protocol):
     layer_id: int
-
-    def set_capture_fn(
-        self, capture_fn: Callable[[torch.Tensor], None] | None
-    ) -> None: ...
+    capture_fn: Callable[[torch.Tensor], None] | None
 
 
 def _get_routed_experts_shape(vllm_config: VllmConfig) -> tuple[int, int, int]:
@@ -195,7 +192,7 @@ def bind_routed_experts_capturer(
     num_bound = 0
     for module in model.modules():
         if isinstance(module, RoutedExpertsCaptureSource):
-            module.set_capture_fn(partial(capturer.capture, module.layer_id))
+            module.capture_fn = partial(capturer.capture, module.layer_id)
             num_bound += 1
             continue
         if not isinstance(module, MoERunner):
