@@ -234,7 +234,13 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
         # output — moves with its neighbours. Substitute a plan that never
         # splits a request. Falls back to the shipped planner until the
         # partition count has been observed once (warmup does that).
-        if envs.VLLM_BATCH_INVARIANT:
+        #
+        # An unset tile_scheduler_metadata means this is the step's first layer
+        # of this type, i.e. exactly where the C++ planner would have run. The
+        # plan is installed onto the per-type struct so the remaining same-type
+        # layers reuse it, the same way they reuse the shipped plan; rebuilding
+        # it per layer costs ~80 us x 61 layers per step.
+        if envs.VLLM_BATCH_INVARIANT and tile_metadata.tile_scheduler_metadata is None:
             # Imported here: sparse_swa imports this module's siblings, so a
             # top-level import would be circular (hence the TYPE_CHECKING guard
             # on DeepseekSparseSWAMetadata above).
@@ -251,7 +257,8 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                 device=q.device,
             )
             if pinned is not None:
-                tile_metadata = pinned
+                tile_metadata.tile_scheduler_metadata = pinned.tile_scheduler_metadata
+                tile_metadata.num_splits = pinned.num_splits
 
         out, _ = flash_mla_with_kvcache(
             q=q,

@@ -56,11 +56,71 @@ _SCHED_META_INTS = 8
 _num_sm_parts_cache: dict[tuple[int, int], int] = {}
 
 
+# Which partition owns which request depends only on (b, num_sm_parts) — never
+# on any request's length — so it is identical for every layer in a step and for
+# every step with the same batch size. Cache it: this is a per-layer hot path,
+# and building it from a boolean mask costs a device sync (measured 610 us,
+# ~37 ms per step over 61 layers).
+_plan_cache: dict[
+    tuple[int, int, torch.device], tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+] = {}
+
+
 def record_num_sm_parts(h_q: int, s_q: int, sched: FlashMLASchedMeta) -> None:
     """Remember the partition count the kernel chose, so later steps can pin."""
     tsm = sched.tile_scheduler_metadata
     if tsm is not None:
         _num_sm_parts_cache.setdefault((h_q, s_q), int(tsm.shape[0]))
+
+
+def _plan_skeleton(
+    b: int, num_sm_parts: int, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """The batch-length-independent part of the plan: who owns what.
+
+    Returns ``(meta, owners, num_splits)`` where ``meta`` needs only its
+    end_block_idx column filled in per call.
+    """
+    key = (b, num_sm_parts, device)
+    cached = _plan_cache.get(key)
+    if cached is not None:
+        return cached
+
+    # Partition p owns requests [floor(p*b/P), floor((p+1)*b/P)). Since b <= P
+    # every span is 0 or 1 wide and lo is continuous in p, so exactly b
+    # partitions are busy and the j-th busy one owns request j. Plain host
+    # integer arithmetic — no device work and no sync.
+    owners = [
+        p
+        for p in range(num_sm_parts)
+        if (p * b) // num_sm_parts < ((p + 1) * b) // num_sm_parts
+    ]
+    meta = torch.zeros((num_sm_parts, _SCHED_META_INTS), dtype=torch.int32)
+    # Idle partitions are encoded begin_req_idx > end_req_idx, which is what the
+    # planner itself leaves behind once it runs out of requests.
+    meta[:, 0] = b
+    meta[:, 1] = b - 1
+    owner_idx = torch.tensor(owners, dtype=torch.int64)
+    req = torch.arange(b, dtype=torch.int32)
+    meta[owner_idx, 0] = req
+    meta[owner_idx, 1] = req
+    # first_block_idx (column 2), begin_split_idx and the two is_splitted flags
+    # (4..6) all stay 0: nothing is ever split.
+
+    logger.info_once(
+        "Batch-invariant sparse MLA decode: pinning the tile-scheduler plan "
+        "(num_sm_parts=%d), one request per partition, no request split.",
+        num_sm_parts,
+        scope="local",
+    )
+    skeleton = (
+        meta.to(device),
+        owner_idx.to(device),
+        # Cumulative split count; exactly one split per request.
+        torch.arange(b + 1, dtype=torch.int32, device=device),
+    )
+    _plan_cache[key] = skeleton
+    return skeleton
 
 
 def build_pinned_sched_meta(
@@ -104,33 +164,16 @@ def build_pinned_sched_meta(
         lens = cdiv(lens, _BLOCK_SIZE_TOPK) * _BLOCK_SIZE_TOPK + extra_topk_length
     num_blocks = ((lens - 1) // _BLOCK_SIZE_TOPK + 1).to(torch.int32)
 
-    meta = torch.zeros(
-        (num_sm_parts, _SCHED_META_INTS), dtype=torch.int32, device=device
-    )
-    # Idle partitions are encoded begin_req_idx > end_req_idx, which is what the
-    # planner itself leaves behind once it runs out of requests.
-    meta[:, 0] = b
-    meta[:, 1] = b - 1
-    part = torch.arange(num_sm_parts, device=device)
-    lo = (part * b) // num_sm_parts
-    hi = ((part + 1) * b) // num_sm_parts
-    owns = lo < hi
-    meta[owns, 0] = lo[owns].to(torch.int32)
-    meta[owns, 1] = (hi[owns] - 1).to(torch.int32)
-    # first_block_idx is always 0 on the sparse path (first_token_idx == 0).
-    meta[owns, 3] = num_blocks[hi[owns] - 1]
+    skeleton, owners, num_splits = _plan_skeleton(b, num_sm_parts, device)
+    # Cloned rather than written in place: the kernel reads this buffer
+    # asynchronously, and the next layer would otherwise overwrite it.
+    meta = skeleton.clone()
+    # end_block_idx (exclusive). Integer indices, so no host sync.
+    meta[owners, 3] = num_blocks
 
-    logger.info_once(
-        "Batch-invariant sparse MLA decode: pinning the tile-scheduler plan "
-        "(num_sm_parts=%d), one request per partition, no request split.",
-        num_sm_parts,
-        scope="local",
-    )
     sched = get_mla_metadata()[0]
     sched.tile_scheduler_metadata = meta
-    # Cumulative split count; exactly one split per request because nothing is
-    # ever split.
-    sched.num_splits = torch.arange(b + 1, dtype=torch.int32, device=device)
+    sched.num_splits = num_splits
     return sched
 
 
