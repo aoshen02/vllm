@@ -138,6 +138,11 @@ class ArtifactWorkerConnector:
         )
         max_bytes = vllm_config.artifact_config.max_shm_bytes
         if max_bytes is None:
+            kv_transfer_config = vllm_config.kv_transfer_config
+            assert (
+                kv_transfer_config is None
+                or not kv_transfer_config.is_kv_transfer_instance
+            )
             max_bytes = kv_cache_config.num_blocks * hashes_per_kv_block * block_nbytes
         self._store = BackgroundArtifactStore(
             LocalSharedMemoryArtifactStore(
