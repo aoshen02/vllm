@@ -64,7 +64,10 @@ def _row(gen: torch.Generator, device: torch.device, kv_tokens: int, valid: int)
     return q, idx, valid
 
 
-def _decode(q, kv, idx, topk_len, sched):
+def _decode(q, kv, idx, topk_len, sched, extra=None):
+    """``extra`` mirrors production: V4 always passes a second (cache, indices,
+    lengths) triple for the compressed KV alongside the SWA one."""
+    extra_kv, extra_idx, extra_len = extra if extra else (None, None, None)
     out, _ = flashmla.flash_mla_with_kvcache(
         q=q,
         k_cache=kv,
@@ -74,41 +77,69 @@ def _decode(q, kv, idx, topk_len, sched):
         tile_scheduler_metadata=sched,
         indices=idx,
         topk_length=topk_len,
+        extra_k_cache=extra_kv,
+        extra_indices_in_kvcache=extra_idx,
+        extra_topk_length=extra_len,
         causal=False,
         is_fp8_kvcache=True,
     )
     return out
 
 
-def _batch(device, kv_tokens, b: int, victim, victim_at: int):
+def _batch(
+    device,
+    kv_tokens,
+    b: int,
+    victim,
+    victim_at: int,
+    with_extra=False,
+    victim_extra=None,
+):
     """Batch with ``victim`` at ``victim_at``; fillers get differing lengths so
     the shipped planner sees a different total workload for every batch size."""
     gen = torch.Generator(device=device).manual_seed(9000 + b)
-    qs, idxs, lens = [], [], []
+    qs, idxs, lens, extra_idxs, extra_lens = [], [], [], [], []
     for j in range(b):
         if j == victim_at:
-            qs.append(victim[0])
-            idxs.append(victim[1])
-            lens.append(victim[2])
+            q, idx, n = victim
         else:
             q, idx, n = _row(gen, device, kv_tokens, 32 + (j * 97) % (TOPK - 32))
-            qs.append(q)
-            idxs.append(idx)
-            lens.append(n)
-    return (
+        qs.append(q)
+        idxs.append(idx)
+        lens.append(n)
+        if with_extra:
+            if j == victim_at:
+                # The victim's extra top-k must be pinned too, or its output is
+                # entitled to change and the test proves nothing.
+                _, e_idx, e_n = victim_extra
+            else:
+                # Filler extra lengths do not track the main ones: the planner
+                # rounds the main length up to a whole block before adding the
+                # extra one, so independent values exercise that rule.
+                extra_valid = 16 + (j * 61) % (TOPK - 16)
+                _, e_idx, e_n = _row(gen, device, kv_tokens, extra_valid)
+            extra_idxs.append(e_idx)
+            extra_lens.append(e_n)
+    packed = (
         torch.cat(qs),
         torch.cat(idxs),
         torch.tensor(lens, dtype=torch.int32, device=device),
     )
+    if not with_extra:
+        return packed, None
+    return packed, (
+        torch.cat(extra_idxs),
+        torch.tensor(extra_lens, dtype=torch.int32, device=device),
+    )
 
 
-def _pinned(topk_len, device):
+def _pinned(topk_len, device, extra_len=None):
     sched = build_pinned_sched_meta(
         h_q=H_Q,
         s_q=1,
         topk_length=topk_len,
-        extra_topk_length=None,
-        has_extra=False,
+        extra_topk_length=extra_len,
+        has_extra=extra_len is not None,
         device=device,
     )
     assert sched is not None, (
@@ -119,31 +150,47 @@ def _pinned(topk_len, device):
 
 
 @pytest.fixture
-def bootstrapped(monkeypatch):
+def bootstrapped():
     """Let the kernel plan once so the partition count is known, as at warmup."""
     device = torch.device("cuda:0")
     torch.manual_seed(0)
     kv = _kv_cache(64, device)
+    extra_kv = _kv_cache(64, device)
     kv_tokens = 64 * PAGE
     gen = torch.Generator(device=device).manual_seed(1)
     q, idx, n = _row(gen, device, kv_tokens, TOPK // 2)
     sched = flashmla.get_mla_metadata()[0]
     _decode(q, kv, idx, torch.tensor([n], dtype=torch.int32, device=device), sched)
     record_num_sm_parts(H_Q, 1, sched)
-    return device, kv, kv_tokens
+    return device, kv, extra_kv, kv_tokens
 
 
-def test_pinned_plan_makes_decode_batch_invariant(bootstrapped):
-    """A row's output must be bitwise identical however the batch is composed."""
-    device, kv, kv_tokens = bootstrapped
+@pytest.mark.parametrize(
+    "with_extra", [False, True], ids=["swa_only", "with_extra_kv"]
+)
+def test_pinned_plan_makes_decode_batch_invariant(bootstrapped, with_extra):
+    """A row's output must be bitwise identical however the batch is composed.
+
+    ``with_extra_kv`` is the production shape: V4 passes an SWA top-k and a
+    compressed-KV top-k together, and the planner rounds the first up to a whole
+    block before adding the second.
+    """
+    device, kv, extra_kv, kv_tokens = bootstrapped
     gen = torch.Generator(device=device).manual_seed(1234)
     victim = _row(gen, device, kv_tokens, TOPK // 2)
+    victim_extra = _row(gen, device, kv_tokens, TOPK // 4)
 
     reference = None
     for b in BATCH_SIZES:
         for victim_at in {0, (b - 1) // 2, b - 1}:
-            q, idx, topk_len = _batch(device, kv_tokens, b, victim, victim_at)
-            out = _decode(q, kv, idx, topk_len, _pinned(topk_len, device))
+            packed, extra = _batch(
+                device, kv_tokens, b, victim, victim_at, with_extra, victim_extra
+            )
+            q, idx, topk_len = packed
+            extra_len = extra[1] if extra else None
+            sched = _pinned(topk_len, device, extra_len)
+            triple = (extra_kv, extra[0], extra[1]) if extra else None
+            out = _decode(q, kv, idx, topk_len, sched, triple)
             row = out[victim_at]
             if reference is None:
                 reference = row.clone()
@@ -153,7 +200,10 @@ def test_pinned_plan_makes_decode_batch_invariant(bootstrapped):
                 )
 
 
-def test_pinned_plan_does_not_drop_work(bootstrapped):
+@pytest.mark.parametrize(
+    "with_extra", [False, True], ids=["swa_only", "with_extra_kv"]
+)
+def test_pinned_plan_does_not_drop_work(bootstrapped, with_extra):
     """Invariance must not come from computing less.
 
     Compared against the shipped planner on identical input, so the reduction
@@ -164,15 +214,22 @@ def test_pinned_plan_does_not_drop_work(bootstrapped):
     leaving a request unowned by ~64000. The gap is three orders of magnitude,
     so 8 separates the two cleanly with room for a different random draw.
     """
-    device, kv, kv_tokens = bootstrapped
+    device, kv, extra_kv, kv_tokens = bootstrapped
     tolerance_ulp = 8 * 2.0**-8
     for b in BATCH_SIZES:
         gen = torch.Generator(device=device).manual_seed(4321 + b)
         victim = _row(gen, device, kv_tokens, TOPK // 2)
-        q, idx, topk_len = _batch(device, kv_tokens, b, victim, 0)
+        victim_extra = _row(gen, device, kv_tokens, TOPK // 4)
+        packed, extra = _batch(
+            device, kv_tokens, b, victim, 0, with_extra, victim_extra
+        )
+        q, idx, topk_len = packed
+        extra_len = extra[1] if extra else None
+        triple = (extra_kv, extra[0], extra[1]) if extra else None
 
-        shipped = _decode(q, kv, idx, topk_len, flashmla.get_mla_metadata()[0])
-        pinned = _decode(q, kv, idx, topk_len, _pinned(topk_len, device))
+        shipped = _decode(q, kv, idx, topk_len, flashmla.get_mla_metadata()[0], triple)
+        sched = _pinned(topk_len, device, extra_len)
+        pinned = _decode(q, kv, idx, topk_len, sched, triple)
 
         expected = shipped.float()
         deviation = (expected - pinned.float()).abs().max().item()
