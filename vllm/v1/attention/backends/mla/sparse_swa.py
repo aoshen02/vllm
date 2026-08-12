@@ -39,6 +39,91 @@ _LAYER_TYPE_SWAONLY = "swaonly"
 _LAYER_TYPE_C4A = "c4a"
 _LAYER_TYPE_C128A = "c128a"
 
+# FlashMLA's decode planner works in units of block_size_topk over the top-k
+# list (get_decoding_sched_meta.cu). Measured: topk_length=256 yields 4 blocks.
+_BLOCK_SIZE_TOPK = 64
+# csrc/params.h DecodingSchedMeta: begin_req_idx, end_req_idx (both inclusive),
+# begin_block_idx, end_block_idx (inclusive, exclusive), begin_split_idx,
+# is_first_req_splitted, is_last_req_splitted, _pad.
+_SCHED_META_INTS = 8
+
+# num_sm_parts depends only on the arch and (h_q, s_q) — never on the batch —
+# so learning it once from the kernel's own planner is safe. Doing that beats
+# duplicating the four get_meta() formulas in sparse_decode.h.
+_num_sm_parts_cache: dict[tuple[int, int], int] = {}
+
+
+def record_num_sm_parts(h_q: int, s_q: int, sched: FlashMLASchedMeta) -> None:
+    """Remember the partition count the kernel chose, so later steps can pin."""
+    tsm = sched.tile_scheduler_metadata
+    if tsm is not None:
+        _num_sm_parts_cache.setdefault((h_q, s_q), int(tsm.shape[0]))
+
+
+def build_pinned_sched_meta(
+    h_q: int,
+    s_q: int,
+    topk_length: torch.Tensor,
+    extra_topk_length: torch.Tensor | None,
+    has_extra: bool,
+    device: torch.device,
+) -> FlashMLASchedMeta | None:
+    """A tile-scheduler plan whose reduction order does not depend on the batch.
+
+    The shipped planner sizes each partition's payload as
+    ``ceil_div(total_num_blocks, num_sm_parts)``, so a given request's KV gets
+    cut at different block boundaries depending on how much work the *other*
+    requests brought. Measured effect: a pinned row's decode output changes at
+    b>=17 on GB200.
+
+    This plan instead gives every partition a contiguous run of *whole*
+    requests, so one row's K-reduction is a single sequential pass regardless of
+    its neighbours. Returns None until ``record_num_sm_parts`` has seen a real
+    plan for this (h_q, s_q); the caller then falls back to the kernel planner
+    for that one step (warmup covers this in practice).
+    """
+    num_sm_parts = _num_sm_parts_cache.get((h_q, s_q))
+    if num_sm_parts is None:
+        return None
+
+    b = int(topk_length.shape[0])
+    if b == 0 or b > num_sm_parts:
+        # With more requests than partitions a partition must hold several
+        # requests; that is still invariant, but the >b case is untested here so
+        # stay on the shipped planner rather than guess.
+        return None
+
+    # Mirror get_decoding_sched_meta.cu's per-request block count. The extra
+    # top-k branch rounds the main length up to a whole block *before* adding
+    # the extra length, so the two cannot simply be summed.
+    lens = topk_length.clamp(min=1)
+    if has_extra and extra_topk_length is not None:
+        lens = cdiv(lens, _BLOCK_SIZE_TOPK) * _BLOCK_SIZE_TOPK + extra_topk_length
+    num_blocks = ((lens - 1) // _BLOCK_SIZE_TOPK + 1).to(torch.int32)
+
+    meta = torch.zeros(
+        (num_sm_parts, _SCHED_META_INTS), dtype=torch.int32, device=device
+    )
+    # Idle partitions are encoded begin_req_idx > end_req_idx, which is what the
+    # planner itself leaves behind once it runs out of requests.
+    meta[:, 0] = b
+    meta[:, 1] = b - 1
+    part = torch.arange(num_sm_parts, device=device)
+    lo = (part * b) // num_sm_parts
+    hi = ((part + 1) * b) // num_sm_parts
+    owns = lo < hi
+    meta[owns, 0] = lo[owns].to(torch.int32)
+    meta[owns, 1] = (hi[owns] - 1).to(torch.int32)
+    # first_block_idx is always 0 on the sparse path (first_token_idx == 0).
+    meta[owns, 3] = num_blocks[hi[owns] - 1]
+
+    sched = get_mla_metadata()[0]
+    sched.tile_scheduler_metadata = meta
+    # Cumulative split count; exactly one split per request because nothing is
+    # ever split.
+    sched.num_splits = torch.arange(b + 1, dtype=torch.int32, device=device)
+    return sched
+
 
 def _layer_type_for(compress_ratio: int) -> str:
     if compress_ratio <= 1:

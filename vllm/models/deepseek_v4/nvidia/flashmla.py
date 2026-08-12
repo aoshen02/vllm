@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, cast
 
 import torch
 
+import vllm.envs as envs
 from vllm.forward_context import get_forward_context
 from vllm.models.deepseek_v4.attention import DeepseekV4Attention
 from vllm.models.deepseek_v4.common.ops import (
@@ -228,6 +229,30 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
             "allocate one for this layer type."
         )
 
+        # The shipped planner cuts each request's KV at boundaries derived from
+        # the whole batch's block count, so a row's reduction order — and its
+        # output — moves with its neighbours. Substitute a plan that never
+        # splits a request. Falls back to the shipped planner until the
+        # partition count has been observed once (warmup does that).
+        if envs.VLLM_BATCH_INVARIANT:
+            # Imported here: sparse_swa imports this module's siblings, so a
+            # top-level import would be circular (hence the TYPE_CHECKING guard
+            # on DeepseekSparseSWAMetadata above).
+            from vllm.v1.attention.backends.mla.sparse_swa import (
+                build_pinned_sched_meta,
+            )
+
+            pinned = build_pinned_sched_meta(
+                h_q=q.shape[2],
+                s_q=q.shape[1],
+                topk_length=swa_lens,
+                extra_topk_length=topk_lens,
+                has_extra=not swa_only,
+                device=q.device,
+            )
+            if pinned is not None:
+                tile_metadata = pinned
+
         out, _ = flash_mla_with_kvcache(
             q=q,
             k_cache=swa_cache,
@@ -245,6 +270,10 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
             extra_topk_length=topk_lens,
             out=output.unsqueeze(1),
         )
+        if envs.VLLM_BATCH_INVARIANT:
+            from vllm.v1.attention.backends.mla.sparse_swa import record_num_sm_parts
+
+            record_num_sm_parts(q.shape[2], q.shape[1], tile_metadata)
 
     def _forward_prefill(
         self,
