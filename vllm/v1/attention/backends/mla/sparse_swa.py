@@ -6,6 +6,7 @@ from typing import ClassVar, cast
 import torch
 
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
+from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.warmup.jit_warmup import (
     VllmJitKernel,
@@ -30,6 +31,8 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowMLASpec,
     get_kv_quant_mode,
 )
+
+logger = init_logger(__name__)
 
 # DeepseekV4 decode layer types, keyed by compress_ratio. Each type has a distinct
 # (topk, extra_topk, extra_page_block_size) config, so they cannot share a
@@ -117,6 +120,12 @@ def build_pinned_sched_meta(
     # first_block_idx is always 0 on the sparse path (first_token_idx == 0).
     meta[owns, 3] = num_blocks[hi[owns] - 1]
 
+    logger.info_once(
+        "Batch-invariant sparse MLA decode: pinning the tile-scheduler plan "
+        "(num_sm_parts=%d), one request per partition, no request split.",
+        num_sm_parts,
+        scope="local",
+    )
     sched = get_mla_metadata()[0]
     sched.tile_scheduler_metadata = meta
     # Cumulative split count; exactly one split per request because nothing is

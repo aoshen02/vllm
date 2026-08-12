@@ -620,6 +620,12 @@ def sparse_attn_indexer(
             and logits.stride(0) % 4 == 0  # TMA 16-byte alignment
             and current_platform.has_device_capability(90)
             and not current_platform.is_device_capability_family(120)
+            # Both `num_rows <= 32` and the stride condition flip with batch
+            # composition, so leaving this enabled means a row's selected KV set
+            # can change because the batch grew — a different set of attended
+            # tokens, not a rounding difference. persistent_topk covers every
+            # num_rows at the same topk sizes, so pin to it instead.
+            and not envs.VLLM_BATCH_INVARIANT
         )
         use_persistent_topk = current_platform.is_cuda() and topk_tokens in (
             512,
