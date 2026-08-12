@@ -424,6 +424,11 @@ class ChatCompletionRequest(OpenAIBaseModel):
             "need to map generated text back to input tokens."
         ),
     )
+    routed_experts_prompt_start: int = Field(
+        default=0,
+        ge=0,
+        description="Skip the first N prompt tokens from returned routed-expert data.",
+    )
     return_token_offsets: bool | None = Field(
         default=False,
         description=(
@@ -743,6 +748,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
             extra_args=extra_args or None,
             skip_clone=True,  # Created fresh per request, safe to skip clone
             repetition_detection=self.repetition_detection,
+            routed_experts_prompt_start=self.routed_experts_prompt_start,
         )
 
     @model_validator(mode="before")

@@ -175,6 +175,11 @@ class CompletionRequest(OpenAIBaseModel):
             "need to map generated text back to input tokens."
         ),
     )
+    routed_experts_prompt_start: int = Field(
+        default=0,
+        ge=0,
+        description="Skip the first N prompt tokens from returned routed-expert data.",
+    )
     return_token_offsets: bool | None = Field(
         default=False,
         description=(
@@ -394,6 +399,7 @@ class CompletionRequest(OpenAIBaseModel):
             skip_clone=True,  # Created fresh per request, safe to skip clone
             repetition_detection=self.repetition_detection,
             thinking_token_budget=self.thinking_token_budget,
+            routed_experts_prompt_start=self.routed_experts_prompt_start,
         )
 
     @model_validator(mode="before")

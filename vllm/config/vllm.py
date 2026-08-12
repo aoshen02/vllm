@@ -1090,6 +1090,27 @@ class VllmConfig:
             "expandable_segments is automatically disabled)."
         )
 
+    def _check_capture_feature_compat(self, flag: str) -> None:
+        if self.parallel_config.pipeline_parallel_size > 1:
+            raise ValueError(
+                f"{flag} is incompatible with pipeline parallelism (PP > 1)."
+            )
+        if (
+            self.parallel_config.decode_context_parallel_size > 1
+            or self.parallel_config.prefill_context_parallel_size > 1
+        ):
+            raise ValueError(
+                f"{flag} is incompatible with context parallelism (DCP > 1 or PCP > 1)."
+            )
+        if (
+            self.kv_transfer_config is not None
+            and self.kv_transfer_config.is_kv_transfer_instance
+        ):
+            raise ValueError(
+                f"{flag} is incompatible with KV connectors "
+                "(PD disaggregation, KV cache offload)."
+            )
+
     def __post_init__(self):
         """Verify configs are valid & consistent with each other."""
 
