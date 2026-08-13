@@ -21,6 +21,9 @@ flashmla = pytest.importorskip(
     reason="sparse MLA decode needs the FlashMLA extension",
 )
 
+from vllm.config import CompilationConfig, SchedulerConfig, VllmConfig  # noqa: E402
+from vllm.config.compilation import CUDAGraphMode  # noqa: E402
+from vllm.config.vllm import set_current_vllm_config  # noqa: E402
 from vllm.v1.attention.backends.mla.sparse_swa import (  # noqa: E402
     build_pinned_sched_meta,
     record_num_sm_parts,
@@ -39,6 +42,8 @@ TOPK = 512
 BYTES_PER_TOKEN = 512 + 64 * 2 + (512 // 128) * 4
 # The kernel's own plan changes shape at b=17 on a 152-SM GB200; straddle it.
 BATCH_SIZES = [1, 2, 8, 16, 17, 33, 65]
+# The split plan is budgeted against max_num_seqs, which the fixture sets to 16.
+SPLIT_BATCH_SIZES = [1, 2, 8, 15, 16]
 
 
 def _kv_cache(num_blocks: int, device: torch.device) -> torch.Tensor:
@@ -133,7 +138,10 @@ def _batch(
     )
 
 
-def _pinned(topk_len, device, extra_len=None):
+def _pinned(topk_len, device, extra_len=None, split=False):
+    """``split`` passes the layer's top-k caps, which turns on the plan that cuts
+    a request at multiples of its own block count instead of handing it a whole
+    partition."""
     sched = build_pinned_sched_meta(
         h_q=H_Q,
         s_q=1,
@@ -141,12 +149,43 @@ def _pinned(topk_len, device, extra_len=None):
         extra_topk_length=extra_len,
         has_extra=extra_len is not None,
         device=device,
+        topk_cap=TOPK if split else None,
+        extra_topk_cap=TOPK if (split and extra_len is not None) else None,
     )
     assert sched is not None, (
         "build_pinned_sched_meta returned None; record_num_sm_parts must observe "
         "one real plan first (the engine's warmup decode does this)"
     )
+    if split:
+        # Guard against a vacuous pass: if the split budget silently collapsed
+        # to one partition per request, this parametrisation would be testing
+        # the same thing as split=False.
+        meta = sched.tile_scheduler_metadata
+        b = topk_len.shape[0]
+        busy = int((meta[:, 0] <= meta[:, 1]).sum())
+        assert busy > b, (
+            f"split plan used {busy} partitions for {b} requests; expected more "
+            "than one per request, so the split budget did not take effect"
+        )
     return sched
+
+
+@pytest.fixture(scope="module")
+def small_batch_config():
+    """Splitting needs two things from config: a max_num_seqs small enough to
+    leave partitions to spare (16 gives 152 // 16 = 9), and cudagraphs, without
+    which building the plan costs more host time than the split saves on GPU."""
+    with set_current_vllm_config(
+        VllmConfig(
+            scheduler_config=SchedulerConfig(
+                max_num_seqs=16, max_model_len=4096, is_encoder_decoder=False
+            ),
+            compilation_config=CompilationConfig(
+                cudagraph_mode=CUDAGraphMode.PIECEWISE
+            ),
+        )
+    ):
+        yield
 
 
 @pytest.fixture
@@ -165,15 +204,20 @@ def bootstrapped():
     return device, kv, extra_kv, kv_tokens
 
 
+@pytest.mark.parametrize("split", [False, True], ids=["whole_request", "split"])
 @pytest.mark.parametrize(
     "with_extra", [False, True], ids=["swa_only", "with_extra_kv"]
 )
-def test_pinned_plan_makes_decode_batch_invariant(bootstrapped, with_extra):
+def test_pinned_plan_makes_decode_batch_invariant(
+    bootstrapped, small_batch_config, with_extra, split
+):
     """A row's output must be bitwise identical however the batch is composed.
 
     ``with_extra_kv`` is the production shape: V4 passes an SWA top-k and a
     compressed-KV top-k together, and the planner rounds the first up to a whole
-    block before adding the second.
+    block before adding the second. ``split`` covers the plan that cuts a request
+    at multiples of its own block count, where the combine kernel really does
+    reduce several partials per row.
     """
     device, kv, extra_kv, kv_tokens = bootstrapped
     gen = torch.Generator(device=device).manual_seed(1234)
@@ -181,14 +225,14 @@ def test_pinned_plan_makes_decode_batch_invariant(bootstrapped, with_extra):
     victim_extra = _row(gen, device, kv_tokens, TOPK // 4)
 
     reference = None
-    for b in BATCH_SIZES:
+    for b in SPLIT_BATCH_SIZES if split else BATCH_SIZES:
         for victim_at in {0, (b - 1) // 2, b - 1}:
             packed, extra = _batch(
                 device, kv_tokens, b, victim, victim_at, with_extra, victim_extra
             )
             q, idx, topk_len = packed
             extra_len = extra[1] if extra else None
-            sched = _pinned(topk_len, device, extra_len)
+            sched = _pinned(topk_len, device, extra_len, split)
             triple = (extra_kv, extra[0], extra[1]) if extra else None
             out = _decode(q, kv, idx, topk_len, sched, triple)
             row = out[victim_at]
@@ -200,10 +244,13 @@ def test_pinned_plan_makes_decode_batch_invariant(bootstrapped, with_extra):
                 )
 
 
+@pytest.mark.parametrize("split", [False, True], ids=["whole_request", "split"])
 @pytest.mark.parametrize(
     "with_extra", [False, True], ids=["swa_only", "with_extra_kv"]
 )
-def test_pinned_plan_does_not_drop_work(bootstrapped, with_extra):
+def test_pinned_plan_does_not_drop_work(
+    bootstrapped, small_batch_config, with_extra, split
+):
     """Invariance must not come from computing less.
 
     Compared against the shipped planner on identical input, so the reduction
@@ -216,7 +263,7 @@ def test_pinned_plan_does_not_drop_work(bootstrapped, with_extra):
     """
     device, kv, extra_kv, kv_tokens = bootstrapped
     tolerance_ulp = 8 * 2.0**-8
-    for b in BATCH_SIZES:
+    for b in SPLIT_BATCH_SIZES if split else BATCH_SIZES:
         gen = torch.Generator(device=device).manual_seed(4321 + b)
         victim = _row(gen, device, kv_tokens, TOPK // 2)
         victim_extra = _row(gen, device, kv_tokens, TOPK // 4)
@@ -228,7 +275,7 @@ def test_pinned_plan_does_not_drop_work(bootstrapped, with_extra):
         triple = (extra_kv, extra[0], extra[1]) if extra else None
 
         shipped = _decode(q, kv, idx, topk_len, flashmla.get_mla_metadata()[0], triple)
-        sched = _pinned(topk_len, device, extra_len)
+        sched = _pinned(topk_len, device, extra_len, split)
         pinned = _decode(q, kv, idx, topk_len, sched, triple)
 
         expected = shipped.float()

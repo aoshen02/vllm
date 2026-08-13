@@ -6,6 +6,7 @@ from typing import ClassVar, cast
 import torch
 
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
+from vllm.config.compilation import CUDAGraphMode
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.warmup.jit_warmup import (
@@ -73,6 +74,98 @@ def record_num_sm_parts(h_q: int, s_q: int, sched: FlashMLASchedMeta) -> None:
         _num_sm_parts_cache.setdefault((h_q, s_q), int(tsm.shape[0]))
 
 
+def _split_budget(num_sm_parts: int) -> tuple[int, int]:
+    """``(max_splits_per_request, max_num_seqs)``, fixed for the server's life.
+
+    Giving each request one whole partition is invariant but leaves most SMs
+    idle: measured 1.19-1.28x the shipped planner's GPU time for b=4..17. A
+    request can instead be cut at multiples of its *own* block count, which is
+    still invariant, but only if the per-request split count is a static bound —
+    derive it from the current batch and a row's reduction order would move
+    again. The plan has exactly ``num_sm_parts`` rows (sparse_decode.h:457) and a
+    split simply *is* a partition boundary landing inside a request, so the
+    bound is ``num_sm_parts // max_num_seqs``.
+    """
+    config = get_current_vllm_config()
+    max_num_seqs = config.scheduler_config.max_num_seqs
+    if max_num_seqs <= 0 or max_num_seqs > num_sm_parts:
+        # More requests than partitions: not even one partition each.
+        return 1, max_num_seqs
+    if config.compilation_config.cudagraph_mode == CUDAGraphMode.NONE:
+        # The split plan cannot be cached — its layout follows this step's
+        # lengths — so building it costs ~670 us of kernel launches against
+        # ~86 us for the whole-request plan. Under cudagraphs those launches are
+        # captured and replayed for free, and the GPU saving (0.2 ms/step at
+        # b=8) is real; in eager the build dominates and it is a net loss.
+        return 1, max_num_seqs
+    return max(num_sm_parts // max_num_seqs, 1), max_num_seqs
+
+
+def _blocks_per_split(
+    topk_cap: int, extra_topk_cap: int | None, has_extra: bool, max_splits: int
+) -> int:
+    """Static block count per split, sized so the worst case still fits.
+
+    ``topk_cap`` / ``extra_topk_cap`` are the layer's configured top-k widths,
+    not this step's lengths — the divisor has to be a constant.
+    """
+    cap = topk_cap
+    if has_extra and extra_topk_cap:
+        cap = cdiv(cap, _BLOCK_SIZE_TOPK) * _BLOCK_SIZE_TOPK + extra_topk_cap
+    max_blocks = max(cdiv(cap, _BLOCK_SIZE_TOPK), 1)
+    return max(cdiv(max_blocks, min(max_splits, max_blocks)), 1)
+
+
+def _split_plan(
+    num_blocks: torch.Tensor,
+    b: int,
+    num_sm_parts: int,
+    blocks_per_split: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Plan that cuts each request every ``blocks_per_split`` of its own blocks.
+
+    Request j claims ``ceil(num_blocks[j] / blocks_per_split)`` consecutive
+    partitions; partition p resolves to its request by a searchsorted over the
+    running total. All device work, no host sync — the shapes are static, only
+    the values depend on this step's lengths.
+    """
+    ks = cdiv(num_blocks.to(torch.int64), blocks_per_split)
+    bounds = ks.cumsum(0)
+    part = torch.arange(num_sm_parts, device=device, dtype=torch.int64)
+    # right=True so a partition landing exactly on a boundary belongs to the
+    # next request; idle partitions resolve to j == b.
+    j = torch.searchsorted(bounds, part, right=True)
+    busy = j < b
+    jc = j.clamp(max=b - 1)
+    k = part - (bounds[jc] - ks[jc])
+    lo = k * blocks_per_split
+    hi = torch.minimum(lo + blocks_per_split, num_blocks[jc].to(torch.int64))
+
+    meta = torch.zeros(
+        (num_sm_parts, _SCHED_META_INTS), dtype=torch.int32, device=device
+    )
+    zero = torch.zeros((), dtype=torch.int64, device=device)
+    # Idle partitions are encoded begin_req_idx > end_req_idx, which is what the
+    # planner itself leaves behind once it runs out of requests.
+    meta[:, 0] = torch.where(busy, jc, b).to(torch.int32)
+    meta[:, 1] = torch.where(busy, jc, b - 1).to(torch.int32)
+    meta[:, 2] = torch.where(busy, lo, zero).to(torch.int32)
+    meta[:, 3] = torch.where(busy, hi, zero).to(torch.int32)
+    meta[:, 4] = torch.where(busy, k, zero).to(torch.int32)
+    # get_decoding_sched_meta.cu collapses both flags to the OR of its two
+    # conditions when a partition covers exactly one request, which here reduces
+    # to "this request spans more than one partition".
+    flag = (busy & (ks[jc] > 1)).to(torch.int32)
+    meta[:, 5] = flag
+    meta[:, 6] = flag
+
+    num_splits = torch.cat(
+        [torch.zeros(1, dtype=torch.int64, device=device), bounds]
+    ).to(torch.int32)
+    return meta, num_splits
+
+
 def _plan_skeleton(
     b: int, num_sm_parts: int, device: torch.device
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -130,6 +223,8 @@ def build_pinned_sched_meta(
     extra_topk_length: torch.Tensor | None,
     has_extra: bool,
     device: torch.device,
+    topk_cap: int | None = None,
+    extra_topk_cap: int | None = None,
 ) -> FlashMLASchedMeta | None:
     """A tile-scheduler plan whose reduction order does not depend on the batch.
 
@@ -139,11 +234,15 @@ def build_pinned_sched_meta(
     requests brought. Measured effect: a pinned row's decode output changes at
     b>=17 on GB200.
 
-    This plan instead gives every partition a contiguous run of *whole*
-    requests, so one row's K-reduction is a single sequential pass regardless of
-    its neighbours. Returns None until ``record_num_sm_parts`` has seen a real
-    plan for this (h_q, s_q); the caller then falls back to the kernel planner
-    for that one step (warmup covers this in practice).
+    This plan cuts a request only at multiples of ``blocks_per_split`` of its
+    *own* block count, so one row's reduction order is fixed by its own length
+    and nothing else. ``topk_cap`` / ``extra_topk_cap`` are the layer's
+    configured top-k widths; without them the plan degrades to one whole request
+    per partition, which is equally invariant but leaves most SMs idle.
+
+    Returns None until ``record_num_sm_parts`` has seen a real plan for this
+    (h_q, s_q); the caller then falls back to the kernel planner for that one
+    step (warmup covers this in practice).
     """
     num_sm_parts = _num_sm_parts_cache.get((h_q, s_q))
     if num_sm_parts is None:
@@ -164,12 +263,31 @@ def build_pinned_sched_meta(
         lens = cdiv(lens, _BLOCK_SIZE_TOPK) * _BLOCK_SIZE_TOPK + extra_topk_length
     num_blocks = ((lens - 1) // _BLOCK_SIZE_TOPK + 1).to(torch.int32)
 
-    skeleton, owners, num_splits = _plan_skeleton(b, num_sm_parts, device)
-    # Cloned rather than written in place: the kernel reads this buffer
-    # asynchronously, and the next layer would otherwise overwrite it.
-    meta = skeleton.clone()
-    # end_block_idx (exclusive). Integer indices, so no host sync.
-    meta[owners, 3] = num_blocks
+    max_splits, max_num_seqs = (1, 0) if topk_cap is None else _split_budget(
+        num_sm_parts
+    )
+    if max_splits > 1 and b <= max_num_seqs:
+        f = _blocks_per_split(topk_cap, extra_topk_cap, has_extra, max_splits)
+        logger.info_once(
+            "Batch-invariant sparse MLA decode: pinning the tile-scheduler plan "
+            "(num_sm_parts=%d), each request cut every %d of its own KV blocks, "
+            "at most %d partitions per request.",
+            num_sm_parts,
+            f,
+            max_splits,
+            scope="local",
+        )
+        meta, num_splits = _split_plan(num_blocks, b, num_sm_parts, f, device)
+    else:
+        # b > max_num_seqs should be impossible (the scheduler caps it) but the
+        # split budget is sized from max_num_seqs, so fall back rather than
+        # overrun the partition count.
+        skeleton, owners, num_splits = _plan_skeleton(b, num_sm_parts, device)
+        # Cloned rather than written in place: the kernel reads this buffer
+        # asynchronously, and the next layer would otherwise overwrite it.
+        meta = skeleton.clone()
+        # end_block_idx (exclusive). Integer indices, so no host sync.
+        meta[owners, 3] = num_blocks
 
     sched = get_mla_metadata()[0]
     sched.tile_scheduler_metadata = meta

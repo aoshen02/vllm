@@ -255,6 +255,13 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                 extra_topk_length=topk_lens,
                 has_extra=not swa_only,
                 device=q.device,
+                # Configured top-k widths, not this step's lengths: the split
+                # size has to be a constant or a row's reduction order would
+                # move with the batch again.
+                topk_cap=swa_indices.shape[-1],
+                extra_topk_cap=(
+                    topk_indices.shape[-1] if topk_indices is not None else None
+                ),
             )
             if pinned is not None:
                 tile_metadata.tile_scheduler_metadata = pinned.tile_scheduler_metadata
