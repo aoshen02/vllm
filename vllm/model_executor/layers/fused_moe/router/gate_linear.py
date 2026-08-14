@@ -4,6 +4,7 @@ import torch
 from torch.nn.parameter import Parameter
 
 import vllm._custom_ops as ops
+import vllm.envs as envs
 from vllm.config import get_current_vllm_config_or_none
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import PluggableLayer
@@ -179,6 +180,16 @@ class GateLinear(ReplicatedLinear):
     def forward(
         self, x: torch.Tensor
     ) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:
+        # Tiers 1-5 dispatch on x.shape[0], so crossing a tier boundary
+        # changes a row's scores with the batch, and none of them is
+        # structurally batch invariant (the custom ops bypass
+        # batch_invariant.py entirely; tier 5's cuBLAS may re-pick its
+        # algorithm as M changes even with CUBLAS_WORKSPACE_CONFIG pinned).
+        # F.linear routes through UnquantizedLinearMethod.apply, which calls
+        # linear_batch_invariant under this flag.
+        if envs.VLLM_BATCH_INVARIANT:
+            return self._forward_linear(x)
+
         # Tier 1: cuteDSL ll_bf16_gemm (SM90+, any dims)
         if self.allow_ll_bf16_gemm and x.shape[0] <= 16 and x.dtype == torch.bfloat16:
             from vllm.model_executor.kernels.linear.cute_dsl.ll_bf16 import (
@@ -223,6 +234,9 @@ class GateLinear(ReplicatedLinear):
             output = torch.mm(x, self.weight.T, out_dtype=torch.float32)
             return output, None
 
+        return self._forward_linear(x)
+
+    def _forward_linear(self, x: torch.Tensor) -> tuple[torch.Tensor, Parameter | None]:
         # Tier 6: F.linear (ReplicatedLinear)
         if self.out_dtype is not None and x.dtype != self.weight.dtype:
             x = x.to(self.weight.dtype)

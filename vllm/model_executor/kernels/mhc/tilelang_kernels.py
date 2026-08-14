@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
+from vllm import envs
 from vllm.platforms import current_platform
 from vllm.utils.import_utils import has_tilelang
 from vllm.utils.math_utils import cdiv
@@ -31,6 +32,12 @@ ENABLE_PDL = current_platform.is_arch_support_pdl() and current_platform.is_cuda
 def compute_num_split(block_k: int, k: int | None, grid_size: int) -> int:
     device_props = torch.cuda.get_device_properties(0)
     n_sms = device_props.multi_processor_count
+    if envs.VLLM_BATCH_INVARIANT:
+        # grid_size tracks the number of token tiles, so deriving the K-split
+        # count from it changes the cross-split reduction tree whenever the
+        # batch grows. Pin to the single-tile value, which depends only on k
+        # and the GPU.
+        grid_size = 1
     split_k = n_sms // grid_size
     if k is not None:
         # avoid split_k for small k
