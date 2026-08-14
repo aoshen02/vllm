@@ -74,6 +74,11 @@ def record_num_sm_parts(h_q: int, s_q: int, sched: FlashMLASchedMeta) -> None:
         _num_sm_parts_cache.setdefault((h_q, s_q), int(tsm.shape[0]))
 
 
+# (max_num_seqs, cudagraph_mode), captured at layer init when the vllm
+# config context is active; forward-time reads would assert during warmup.
+_split_budget_cfg: tuple[int, "CUDAGraphMode"] | None = None
+
+
 def _split_budget(num_sm_parts: int) -> tuple[int, int]:
     """``(max_splits_per_request, max_num_seqs)``, fixed for the server's life.
 
@@ -86,12 +91,18 @@ def _split_budget(num_sm_parts: int) -> tuple[int, int]:
     split simply *is* a partition boundary landing inside a request, so the
     bound is ``num_sm_parts // max_num_seqs``.
     """
-    config = get_current_vllm_config()
-    max_num_seqs = config.scheduler_config.max_num_seqs
+    if _split_budget_cfg is not None:
+        max_num_seqs, cudagraph_mode = _split_budget_cfg
+    else:
+        # Only reachable when the layer __init__ never ran (direct kernel
+        # tests); engine forward passes have no config context.
+        config = get_current_vllm_config()
+        max_num_seqs = config.scheduler_config.max_num_seqs
+        cudagraph_mode = config.compilation_config.cudagraph_mode
     if max_num_seqs <= 0 or max_num_seqs > num_sm_parts:
         # More requests than partitions: not even one partition each.
         return 1, max_num_seqs
-    if config.compilation_config.cudagraph_mode == CUDAGraphMode.NONE:
+    if cudagraph_mode == CUDAGraphMode.NONE:
         # The split plan cannot be cached — its layout follows this step's
         # lengths — so building it costs ~670 us of kernel launches against
         # ~86 us for the whole-request plan. Under cudagraphs those launches are
@@ -324,10 +335,16 @@ class DeepseekV4SWACache(torch.nn.Module, AttentionLayerBase):
         self.prefix = prefix
         self.cache_config = cache_config
         self.dtype = dtype
-        compilation_config = get_current_vllm_config().compilation_config
+        vllm_config = get_current_vllm_config()
+        compilation_config = vllm_config.compilation_config
         if prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self
+        global _split_budget_cfg
+        _split_budget_cfg = (
+            vllm_config.scheduler_config.max_num_seqs,
+            compilation_config.cudagraph_mode,
+        )
 
         # Block size is constrained by tensor sharing between SWA and C4A KV blocks.
         # Since both block types share the same physical tensor, they must use the
