@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import threading
+from typing import Literal
 from weakref import WeakValueDictionary
 
 import torch
@@ -10,6 +11,10 @@ from torch.distributed import ProcessGroup
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
+
+# Contracts for releasing communicator memory: "suspend" must preserve
+# communicator identity in place; "checkpoint" may destroy and rebuild.
+CommMemoryScope = Literal["suspend", "checkpoint"]
 
 
 class Cache:
@@ -220,17 +225,28 @@ class DeviceCommunicatorBase:
         dist.all_reduce(input_, group=self.device_group)
         return input_
 
+    def release_memory(self, scope: CommMemoryScope) -> None:
+        """Release reclaimable communicator memory (default: no-op).
+
+        ``scope`` selects the release contract:
+
+        - ``"suspend"``: identity-preserving. The communicator must remain
+          valid (topology, connections, handles embedded in captured graphs)
+          and become usable again after ``restore_memory("suspend")``.
+        - ``"checkpoint"``: prepare for a process checkpoint. State may be
+          destroyed and rebuilt by ``restore_memory("checkpoint")``.
+        """
+
+    def restore_memory(self, scope: CommMemoryScope) -> None:
+        """Restore memory released by ``release_memory`` (default: no-op)."""
+
     def checkpoint_prepare(self) -> None:
-        """Prepare reclaimable communicator state for checkpoint (default: no-op)."""
+        """Prepare reclaimable communicator state for checkpoint."""
+        self.release_memory("checkpoint")
 
     def checkpoint_restore(self) -> None:
-        """Restore communicator state after checkpoint (default: no-op)."""
-
-    def suspend(self) -> None:
-        """Release reclaimable communicator memory (default: no-op)."""
-
-    def resume(self) -> None:
-        """Restore memory released by ``suspend`` (default: no-op)."""
+        """Restore communicator state after checkpoint."""
+        self.restore_memory("checkpoint")
 
     def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
         if dim < 0:

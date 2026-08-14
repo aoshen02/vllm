@@ -21,7 +21,7 @@ from vllm.platforms import current_platform
 
 from ..utils import StatelessProcessGroup
 from .aiter_custom_all_reduce import AiterCustomAllreduce
-from .base_device_communicator import DeviceCommunicatorBase
+from .base_device_communicator import CommMemoryScope, DeviceCommunicatorBase
 
 logger = init_logger(__name__)
 
@@ -585,24 +585,27 @@ class CudaCommunicator(DeviceCommunicatorBase):
             self.all2all_manager.destroy()
             self.all2all_manager = None  # type: ignore[assignment]
 
-    def suspend(self) -> None:
-        if self.pynccl_comm is not None:
-            self.pynccl_comm.suspend()
-
-    def resume(self) -> None:
-        if self.pynccl_comm is not None:
-            self.pynccl_comm.resume()
-
-    def checkpoint_prepare(self) -> None:
-        # Only FlashInfer all-reduce and FlashInfer all2all are supported for now.
+    def release_memory(self, scope: CommMemoryScope) -> None:
+        if scope == "suspend":
+            # Identity-preserving: NCCL keeps topology/connection state.
+            # FlashInfer workspaces and all2all state are excluded here - their
+            # restore rebuilds IPC handles, which breaks captured graphs.
+            if self.pynccl_comm is not None:
+                self.pynccl_comm.suspend()
+            return
+        # scope == "checkpoint": only FlashInfer all-reduce and FlashInfer
+        # all2all are supported for now.
         from .flashinfer_all_reduce import checkpoint_prepare_fi_ar_workspaces
 
         checkpoint_prepare_fi_ar_workspaces(self.cpu_group)
         if self.all2all_manager is not None:
             self.all2all_manager.checkpoint_prepare()
 
-    def checkpoint_restore(self) -> None:
-        # Only FlashInfer all-reduce and FlashInfer all2all are supported for now.
+    def restore_memory(self, scope: CommMemoryScope) -> None:
+        if scope == "suspend":
+            if self.pynccl_comm is not None:
+                self.pynccl_comm.resume()
+            return
         from .flashinfer_all_reduce import checkpoint_restore_fi_ar_workspaces
 
         checkpoint_restore_fi_ar_workspaces(self.cpu_group)

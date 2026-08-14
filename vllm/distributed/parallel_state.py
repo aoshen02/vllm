@@ -44,6 +44,7 @@ from torch.distributed import Backend, ProcessGroup, Store
 
 import vllm.envs as envs
 from vllm.distributed.device_communicators.base_device_communicator import (
+    CommMemoryScope,
     DeviceCommunicatorBase,
 )
 from vllm.distributed.utils import (
@@ -171,18 +172,31 @@ def _apply_device_comm_memory_action(
     )
 
 
-def suspend_device_comms() -> None:
-    """Release idle device communicator memory on every group (collective).
+def release_device_comm_memory(scope: CommMemoryScope) -> None:
+    """Release reclaimable communicator memory on every group (collective).
 
-    Must run on every rank with communicators idle. Communicator suspend hooks
-    are no-ops where unsupported.
+    Must run on every rank with communicators idle. Per-communicator hooks
+    are no-ops where unsupported; see ``CommMemoryScope`` for the contract
+    each scope implies.
     """
-    _apply_device_comm_memory_action("suspend", lambda comm: comm.suspend())
+    _apply_device_comm_memory_action(scope, lambda comm: comm.release_memory(scope))
+
+
+def restore_device_comm_memory(scope: CommMemoryScope) -> None:
+    """Restore communicator memory released under ``scope`` (collective)."""
+    _apply_device_comm_memory_action(
+        f"{scope}-restore", lambda comm: comm.restore_memory(scope)
+    )
+
+
+def suspend_device_comms() -> None:
+    """Identity-preserving communicator memory release for sleep mode."""
+    release_device_comm_memory("suspend")
 
 
 def resume_device_comms() -> None:
     """Restore all suspended device communicators before reuse (collective)."""
-    _apply_device_comm_memory_action("resume", lambda comm: comm.resume())
+    restore_device_comm_memory("suspend")
 
 
 def all_reduce(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
@@ -2085,6 +2099,8 @@ def ensure_model_parallel_initialized(
 def checkpoint_prepare_distributed_state() -> None:
     """Prepare every device communicator for a process checkpoint."""
     torch.accelerator.synchronize()
+    # Call through the legacy name so subclasses overriding it keep working;
+    # the base implementation delegates to release_memory("checkpoint").
     _apply_to_device_comms(lambda comm: comm.checkpoint_prepare())
     torch.accelerator.synchronize()
 
