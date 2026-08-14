@@ -28,14 +28,73 @@ def test_cumem_capability_flags():
     # /health introspect to decide reinit / persistence behavior.
     assert CuMemBackend.is_supported() is True
     assert CuMemBackend.preserves_communicators() is True
+    assert CuMemBackend.releases_communicator_memory() is True
     assert CuMemBackend.preserves_compiled_artifacts() is False
     assert CuMemBackend.preserves_graphs_with_communicators() is False
     assert CuMemBackend.supports_durable_storage() is False
+    # ABC default: a backend must opt in to worker-driven communicator
+    # memory release (process-checkpoint mechanisms cover it themselves).
+    assert DummyBackend.releases_communicator_memory() is False
 
 
 def test_new_backend_starts_in_running_state():
     # Constructing a backend must not touch the GPU; only suspend/resume do.
     assert CuMemBackend().state() == "RUNNING"
+
+
+def test_worker_wraps_backend_with_communicator_memory_lifecycle(monkeypatch):
+    """The worker, not the backend, drives communicator memory release: suspend
+    after backend.suspend, resume exactly once on the first wake even when the
+    wake is staged across tags (weights first, then kv_cache)."""
+    from vllm.v1.worker.gpu_worker import Worker
+
+    calls: list[tuple[str, object]] = []
+
+    class Backend:
+        def suspend(self, level: int = 1) -> None:
+            calls.append(("backend.suspend", level))
+
+        def resume(self, tags: list[str] | None = None) -> None:
+            calls.append(("backend.resume", tuple(tags) if tags else None))
+
+        @classmethod
+        def releases_communicator_memory(cls) -> bool:
+            return True
+
+    class ModelRunner:
+        def post_kv_cache_wake_up(self) -> None:
+            calls.append(("model_runner.post_kv_cache_wake_up", None))
+
+    worker = object.__new__(Worker)
+    worker._sleep_mode_backend = Backend()
+    worker._comms_suspended = False
+    worker._sleep_saved_buffers = {}
+    worker._sleep_saved_draft_buffers = {}
+    worker.model_runner = ModelRunner()
+
+    monkeypatch.setattr("torch.accelerator.synchronize", lambda: None)
+    monkeypatch.setattr("torch.accelerator.get_memory_info", lambda: (0, 0))
+    monkeypatch.setattr(
+        "vllm.distributed.parallel_state.suspend_device_comms",
+        lambda: calls.append(("comms.suspend", None)),
+    )
+    monkeypatch.setattr(
+        "vllm.distributed.parallel_state.resume_device_comms",
+        lambda: calls.append(("comms.resume", None)),
+    )
+
+    worker.sleep(level=1)
+    worker.wake_up(tags=["weights"])
+    worker.wake_up(tags=["kv_cache"])
+
+    assert calls == [
+        ("backend.suspend", 1),
+        ("comms.suspend", None),
+        ("backend.resume", ("weights",)),
+        ("comms.resume", None),
+        ("backend.resume", ("kv_cache",)),
+        ("model_runner.post_kv_cache_wake_up", None),
+    ]
 
 
 def test_unknown_backend_raises():

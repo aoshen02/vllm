@@ -87,6 +87,15 @@ class SleepModeBackend(ABC):
         return False
 
     @classmethod
+    def releases_communicator_memory(cls) -> bool:
+        """If True, the worker releases reclaimable device-communicator memory
+        (e.g. NCCL via ``ncclCommSuspend``) after ``suspend`` and restores it
+        after ``resume``. Only meaningful when ``preserves_communicators`` is
+        True: backends whose mechanism already covers communicator state (e.g.
+        process checkpoint) must return False to avoid double handling."""
+        return False
+
+    @classmethod
     def preserves_compiled_artifacts(cls) -> bool:
         """If True, torch.compile / JIT kernels survive suspend/resume and need
         not be recompiled on resume."""
@@ -134,8 +143,15 @@ class CuMemBackend(SleepModeBackend):
 
     @classmethod
     def preserves_communicators(cls) -> bool:
-        # Communicator buffers (e.g. NCCL) live outside CuMemAllocator's pool, so
-        # an allocator-level sleep leaves them intact (no reinit needed on resume).
+        # Communicator identity and topology survive memory suspension, so no
+        # reinitialization is needed on resume.
+        return True
+
+    @classmethod
+    def releases_communicator_memory(cls) -> bool:
+        # Allocator-level sleep leaves NCCL buffers untouched (they live
+        # outside the pool); the worker reclaims them via communicator
+        # suspend hooks.
         return True
 
 

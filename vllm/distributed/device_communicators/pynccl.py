@@ -27,6 +27,11 @@ logger = init_logger(__name__)
 
 _NCCL_SYMM_OPS_REGISTERED = False
 
+# ncclCommSuspend flag: release dynamic GPU memory, keep topology/connection.
+_NCCL_SUSPEND_MEM = 0x01
+# ncclCommSuspend / ncclCommResume were introduced in NCCL 2.29.7 (22907).
+_NCCL_SUSPEND_MIN_VERSION = 22907
+
 
 def register_nccl_symmetric_ops(pynccl_comm):
     from vllm.distributed.device_communicators.pynccl_allocator import (
@@ -105,6 +110,7 @@ class PyNcclCommunicator:
 
         self.available = True
         self.disabled = False
+        self._suspended = False
 
         self.nccl_version = self.nccl.ncclGetRawVersion()
         if self.rank == 0:
@@ -418,6 +424,34 @@ class PyNcclCommunicator:
 
     def deregister_comm_window(self, window):
         return self.nccl.ncclCommWindowDeregister(self.comm, window)
+
+    def suspend(self):
+        """Release dynamic GPU memory, keeping topology/connection state.
+
+        Collective across the group's ranks (ncclCommSuspend has an internal
+        cross-rank barrier). Idempotent: a second suspend is a no-op, as NCCL
+        rejects suspending a suspended comm. No-op on NCCL < 2.29.7.
+        """
+        if self.disabled or self.nccl_version < _NCCL_SUSPEND_MIN_VERSION:
+            return
+        if self._suspended:
+            return
+        self.nccl.ncclCommSuspend(self.comm, _NCCL_SUSPEND_MEM)
+        self._suspended = True
+
+    def resume(self):
+        """Restore a suspended communicator (collective).
+
+        Idempotent: resuming a non-suspended comm is a no-op — NCCL raises
+        "invalid usage" otherwise, which staged wake-ups (weights first, then
+        kv_cache) would trigger. No-op on NCCL < 2.29.7.
+        """
+        if self.disabled or self.nccl_version < _NCCL_SUSPEND_MIN_VERSION:
+            return
+        if not self._suspended:
+            return
+        self.nccl.ncclCommResume(self.comm)
+        self._suspended = False
 
     def batch_isend_irecv(self, p2p_ops: list, stream=None):
         if self.disabled:
