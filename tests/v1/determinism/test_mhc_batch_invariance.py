@@ -37,15 +37,22 @@ def _set_bi(monkeypatch, value: bool) -> None:
 
 
 def _mhc_weights(device):
+    """Weights at checkpoint-realistic magnitudes.
+
+    The correctness suite's ``fn * 1e-4`` keeps mixes so small that sigmoid
+    compresses a ~10-ULP GEMM reassociation diff below one fp32 ULP of the
+    output — the negative control then can't fail. The real checkpoint has
+    ``hc_attn_scale ~= [2.08, 0.019, 0.245]`` and O(1) mixes, where the same
+    diff survives into the fp32 outputs.
+    """
     set_random_seed(0)
     fn = (
         torch.randn(
             (HC_MULT3, HC_MULT, HIDDEN_SIZE), dtype=torch.float32, device=device
         )
-        * 1e-4
-        * (1 + torch.arange(HC_MULT, device=device).mul(0.01).view(1, -1, 1))
+        * (HC_MULT * HIDDEN_SIZE) ** -0.5
     ).flatten(1, 2)
-    hc_scale = torch.randn((3,), dtype=torch.float32, device=device) * 0.1
+    hc_scale = torch.tensor([2.0, 0.02, 0.25], dtype=torch.float32, device=device)
     hc_base = torch.randn((HC_MULT3,), dtype=torch.float32, device=device) * 0.1
     return fn, hc_scale, hc_base
 

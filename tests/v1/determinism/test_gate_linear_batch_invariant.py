@@ -11,13 +11,34 @@ linear_batch_invariant. No global init is needed: that route keys on the env
 flag alone (linear.py), so these tests stay process-clean.
 """
 
+import tempfile
+
 import pytest
 import torch
 
 import vllm.envs as envs
 from tests.v1.determinism.utils import skip_if_not_cuda
+from vllm.distributed import (
+    init_distributed_environment,
+    initialize_model_parallel,
+    model_parallel_is_initialized,
+)
 from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
 from vllm.utils.torch_utils import set_random_seed
+
+
+@pytest.fixture(autouse=True)
+def _tp1(default_vllm_config):
+    if not model_parallel_is_initialized():
+        with tempfile.NamedTemporaryFile() as f:
+            init_distributed_environment(
+                world_size=1,
+                rank=0,
+                local_rank=0,
+                distributed_init_method=f"file://{f.name}",
+            )
+            initialize_model_parallel(1, 1)
+    yield
 
 # DeepSeek V4: hidden_size=4096, n_routed_experts=256. With these dims tiers
 # 2/3 are shape-ineligible and tier 4 is opt-in, so dispatch is a clean
