@@ -225,6 +225,118 @@ def test_mhc_fused_post_pre_negative_control(monkeypatch):
 
 
 @skip_if_not_cuda
+def test_mhc_pre_with_norm_batch_invariance(monkeypatch):
+    """Production always fuses RMSNorm (norm_weight path); cover that
+    big_fuse variant too."""
+    _set_bi(monkeypatch, True)
+    device = "cuda"
+    fn, hc_scale, hc_base = _mhc_weights(device)
+    set_random_seed(3)
+    norm_w = torch.randn((HIDDEN_SIZE,), dtype=torch.bfloat16, device=device)
+    victim = torch.randn((1, HC_MULT, HIDDEN_SIZE), dtype=torch.bfloat16, device=device)
+
+    def row0(n, seed):
+        set_random_seed(seed)
+        filler = torch.randn(
+            (n - 1, HC_MULT, HIDDEN_SIZE), dtype=torch.bfloat16, device=device
+        )
+        batch = torch.cat([victim, filler]) if n > 1 else victim
+        outs = torch.ops.vllm.mhc_pre_tilelang(
+            batch,
+            fn,
+            hc_scale,
+            hc_base,
+            RMS_EPS,
+            HC_PRE_EPS,
+            HC_SINKHORN_EPS,
+            HC_POST_ALPHA,
+            SINKHORN_REPEAT,
+            norm_weight=norm_w,
+        )
+        return [o[0].clone() for o in outs]
+
+    base = row0(BOUNDARIES[0], 1)
+    for i, n in enumerate(BOUNDARIES[1:], start=2):
+        outs = row0(n, i)
+        for name, a, b in zip(("post_mix", "comb_mix", "layer_input"), base, outs):
+            assert torch.equal(a, b), (
+                f"mhc_pre(norm) {name} row 0 changed at batch size {n}"
+            )
+
+
+# The broadcast entry computes its splits from k=hidden_size (cap 16), so the
+# count first drops at cdiv(n, 64) = 10, i.e. n = 577.
+BROADCAST_BOUNDARIES = [1, 7, 8, 15, 16, 17, 64, 65, 512, 576, 577, 640]
+
+
+def _broadcast_row0(n, victim, seed, fn, fn_b, hc_scale, hc_base, norm_w):
+    from vllm.model_executor.kernels.mhc.tilelang import mhc_pre_broadcast_tilelang
+
+    set_random_seed(seed)
+    filler = torch.randn(
+        (n - 1, HIDDEN_SIZE), dtype=torch.bfloat16, device=victim.device
+    )
+    batch = torch.cat([victim, filler]) if n > 1 else victim
+    outs = mhc_pre_broadcast_tilelang(
+        batch,
+        fn,
+        hc_scale,
+        hc_base,
+        RMS_EPS,
+        HC_PRE_EPS,
+        HC_SINKHORN_EPS,
+        HC_POST_ALPHA,
+        SINKHORN_REPEAT,
+        norm_weight=norm_w,
+        fn_broadcast=fn_b,
+    )
+    return [o[0].clone() for o in outs]
+
+
+def _broadcast_setup(device):
+    fn, hc_scale, hc_base = _mhc_weights(device)
+    set_random_seed(4)
+    fn_b = (
+        torch.randn((HC_MULT3, HIDDEN_SIZE), dtype=torch.float32, device=device)
+        * HIDDEN_SIZE**-0.5
+    )
+    norm_w = torch.randn((HIDDEN_SIZE,), dtype=torch.bfloat16, device=device)
+    victim = torch.randn((1, HIDDEN_SIZE), dtype=torch.bfloat16, device=device)
+    return fn, fn_b, hc_scale, hc_base, norm_w, victim
+
+
+@skip_if_not_cuda
+def test_mhc_pre_broadcast_batch_invariance(monkeypatch):
+    """Layer 0's production entry (residual broadcast from (T, H))."""
+    _set_bi(monkeypatch, True)
+    fn, fn_b, hc_scale, hc_base, norm_w, victim = _broadcast_setup("cuda")
+    names = ("residual", "post_mix", "comb_mix", "layer_input")
+    base = _broadcast_row0(1, victim, 1, fn, fn_b, hc_scale, hc_base, norm_w)
+    for i, n in enumerate(BROADCAST_BOUNDARIES[1:], start=2):
+        outs = _broadcast_row0(n, victim, i, fn, fn_b, hc_scale, hc_base, norm_w)
+        for name, a, b in zip(names, base, outs):
+            assert torch.equal(a, b), (
+                f"mhc_pre_broadcast {name} row 0 changed at batch size {n}"
+            )
+
+
+@skip_if_not_cuda
+def test_mhc_pre_broadcast_negative_control(monkeypatch):
+    _set_bi(monkeypatch, False)
+    fn, fn_b, hc_scale, hc_base, norm_w, victim = _broadcast_setup("cuda")
+    base = _broadcast_row0(1, victim, 1, fn, fn_b, hc_scale, hc_base, norm_w)
+    diffs = []
+    for i, n in enumerate(BROADCAST_BOUNDARIES[1:], start=2):
+        outs = _broadcast_row0(n, victim, i, fn, fn_b, hc_scale, hc_base, norm_w)
+        if any(not torch.equal(a, b) for a, b in zip(base, outs)):
+            diffs.append(n)
+    assert diffs, (
+        "default mhc_pre_broadcast was bitwise invariant across all "
+        "boundaries; the BI test cannot distinguish fixed from broken"
+    )
+
+
+@skip_if_not_cuda
 def test_hc_head_batch_invariance(monkeypatch):
     """hc_head has no K-split and each token maps to its own block, so it
     should be invariant even without the flag; assert that holds under BI."""

@@ -40,6 +40,7 @@ def _tp1(default_vllm_config):
             initialize_model_parallel(1, 1)
     yield
 
+
 # DeepSeek V4: hidden_size=4096, n_routed_experts=256. With these dims tiers
 # 2/3 are shape-ineligible and tier 4 is opt-in, so dispatch is a clean
 # binary: x.shape[0] <= 16 -> cuteDSL ll_bf16_gemm, else cuBLAS.
@@ -93,7 +94,12 @@ def test_gate_linear_batch_invariance(monkeypatch):
 
 @skip_if_not_cuda
 def test_gate_linear_correctness(monkeypatch):
-    """The invariant path must match fp32 F.linear within bf16 input noise."""
+    """The invariant path computes in fp32 end to end.
+
+    Guards against the persistent matmul's input-dtype output rounding the
+    fp32 logits through bf16 (~4e-3 relative) before the cast: the bound here
+    is fp32 reassociation only, which a bf16 round trip exceeds by ~1000x.
+    """
     monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
     device = "cuda"
     gate = _make_gate(device)
@@ -102,32 +108,50 @@ def test_gate_linear_correctness(monkeypatch):
         x = torch.randn((n, HIDDEN_SIZE), dtype=torch.bfloat16, device=device)
         out = gate(x)
         scores = out[0] if isinstance(out, tuple) else out
+        assert scores.dtype == torch.float32
         ref = torch.nn.functional.linear(x.float(), gate.weight.float())
-        # Output is fp32 but inputs are bf16, so the bound is set by the bf16
-        # products, not fp32 ULPs: |err| <~ K * eps_bf16 * |x||w| per element.
-        torch.testing.assert_close(scores, ref, atol=5e-2, rtol=1e-2)
+        # Measured: <=1 element per 16k at rel ~8e-5 (tf32/reassociation).
+        # A bf16 round trip is ~4e-3 relative on nearly every element, so
+        # this bound still fails loudly on the input-dtype-output bug.
+        torch.testing.assert_close(scores, ref, atol=2e-3, rtol=1e-4)
 
 
 @skip_if_not_cuda
 def test_gate_linear_negative_control(monkeypatch):
-    """The two default-path implementations that BI mode bypasses must be
-    shown to actually disagree; otherwise the BI test proves nothing."""
+    """The default path must be shown to actually vary; otherwise the BI
+    test proves nothing. Sweep the public forward across batch sizes; if the
+    stack happens to be invariant (e.g. cuBLAS never re-picks its algorithm
+    for these shapes), also try the tier-1-vs-tier-5 comparison, and only
+    then record a skip."""
     monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", False)
     device = "cuda"
     gate = _make_gate(device)
-    if not gate.allow_ll_bf16_gemm:
-        pytest.skip(
-            "cuteDSL ll_bf16_gemm unavailable; on this build the default "
-            "path never leaves cuBLAS for (4096, 256)"
-        )
-    from vllm.model_executor.kernels.linear.cute_dsl.ll_bf16 import ll_bf16_gemm
+    victim = torch.randn((1, HIDDEN_SIZE), dtype=torch.bfloat16, device=device)
 
-    set_random_seed(1)
-    x = torch.randn((16, HIDDEN_SIZE), dtype=torch.bfloat16, device=device)
-    tier1 = ll_bf16_gemm(x, gate.weight)
-    tier5 = torch.mm(x, gate.weight.T, out_dtype=torch.float32)
-    assert not torch.equal(tier1, tier5), (
-        "cuteDSL and cuBLAS agree bitwise on (16, 4096) x (4096, 256); "
-        "the 16->17 dispatch flip would then be harmless and this suite "
-        "should be re-examined"
+    base = _row0(gate, victim, BOUNDARIES[0], 1)
+    diffs = [
+        n
+        for i, n in enumerate(BOUNDARIES[1:], start=2)
+        if not torch.equal(base, _row0(gate, victim, n, i))
+    ]
+    if diffs:
+        return
+
+    if gate.allow_ll_bf16_gemm:
+        from vllm.model_executor.kernels.linear.cute_dsl.ll_bf16 import ll_bf16_gemm
+
+        set_random_seed(1)
+        x = torch.randn((16, HIDDEN_SIZE), dtype=torch.bfloat16, device=device)
+        tier1 = ll_bf16_gemm(x, gate.weight)
+        tier5 = torch.mm(x, gate.weight.T, out_dtype=torch.float32)
+        assert not torch.equal(tier1, tier5), (
+            "cuteDSL and cuBLAS agree bitwise and the batch sweep was "
+            "invariant; the BI test cannot distinguish fixed from broken"
+        )
+        return
+
+    pytest.skip(
+        "default-path variance not reproduced on this stack: cuteDSL is "
+        "unavailable and cuBLAS stayed bitwise stable across the sweep "
+        "(it does use split-k here, so the risk remains cross-version)"
     )
