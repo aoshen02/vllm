@@ -262,6 +262,7 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                 extra_topk_cap=(
                     topk_indices.shape[-1] if topk_indices is not None else None
                 ),
+                split_budget_cfg=self.swa_cache_layer.split_budget_cfg,
             )
             if pinned is not None:
                 tile_metadata.tile_scheduler_metadata = pinned.tile_scheduler_metadata

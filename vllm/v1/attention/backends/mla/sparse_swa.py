@@ -74,12 +74,10 @@ def record_num_sm_parts(h_q: int, s_q: int, sched: FlashMLASchedMeta) -> None:
         _num_sm_parts_cache.setdefault((h_q, s_q), int(tsm.shape[0]))
 
 
-# (max_num_seqs, cudagraph_mode), captured at layer init when the vllm
-# config context is active; forward-time reads would assert during warmup.
-_split_budget_cfg: tuple[int, "CUDAGraphMode"] | None = None
-
-
-def _split_budget(num_sm_parts: int) -> tuple[int, int]:
+def _split_budget(
+    num_sm_parts: int,
+    cfg: tuple[int, "CUDAGraphMode"] | None = None,
+) -> tuple[int, int]:
     """``(max_splits_per_request, max_num_seqs)``, fixed for the server's life.
 
     Giving each request one whole partition is invariant but leaves most SMs
@@ -91,11 +89,12 @@ def _split_budget(num_sm_parts: int) -> tuple[int, int]:
     split simply *is* a partition boundary landing inside a request, so the
     bound is ``num_sm_parts // max_num_seqs``.
     """
-    if _split_budget_cfg is not None:
-        max_num_seqs, cudagraph_mode = _split_budget_cfg
+    if cfg is not None:
+        max_num_seqs, cudagraph_mode = cfg
     else:
-        # Only reachable when the layer __init__ never ran (direct kernel
-        # tests); engine forward passes have no config context.
+        # Direct kernel tests, which run inside a config context; engine
+        # forward passes pass cfg captured at layer init instead, since
+        # warmup has no active context.
         config = get_current_vllm_config()
         max_num_seqs = config.scheduler_config.max_num_seqs
         cudagraph_mode = config.compilation_config.cudagraph_mode
@@ -236,6 +235,7 @@ def build_pinned_sched_meta(
     device: torch.device,
     topk_cap: int | None = None,
     extra_topk_cap: int | None = None,
+    split_budget_cfg: tuple[int, "CUDAGraphMode"] | None = None,
 ) -> FlashMLASchedMeta | None:
     """A tile-scheduler plan whose reduction order does not depend on the batch.
 
@@ -275,7 +275,7 @@ def build_pinned_sched_meta(
     num_blocks = ((lens - 1) // _BLOCK_SIZE_TOPK + 1).to(torch.int32)
 
     max_splits, max_num_seqs = (1, 0) if topk_cap is None else _split_budget(
-        num_sm_parts
+        num_sm_parts, split_budget_cfg
     )
     if max_splits > 1 and b <= max_num_seqs:
         f = _blocks_per_split(topk_cap, extra_topk_cap, has_extra, max_splits)
@@ -340,8 +340,9 @@ class DeepseekV4SWACache(torch.nn.Module, AttentionLayerBase):
         if prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self
-        global _split_budget_cfg
-        _split_budget_cfg = (
+        # Captured here because forward runs (cudagraph warmup included)
+        # have no active config context.
+        self.split_budget_cfg = (
             vllm_config.scheduler_config.max_num_seqs,
             compilation_config.cudagraph_mode,
         )
