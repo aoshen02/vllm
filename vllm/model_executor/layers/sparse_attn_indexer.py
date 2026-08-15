@@ -292,6 +292,199 @@ def kv_cache_as_quant_view(
     return kv_cache.unsqueeze(-2)
 
 
+_TOPK_BI_NUM_WARPS = 8
+# tl.constexpr instantiation: @jit bodies may only read globals wrapped this way.
+_INT32_MIN = tl.constexpr(-(2**31))
+
+
+@triton.jit
+def _topk_bi_key(x):
+    # Monotone int32 key: bitcast, canonicalize -0.0 to +0.0 (torch.sort
+    # compares them equal; their raw bit patterns would not be), then flip
+    # negatives so signed comparison matches fp32 ordering with -inf minimal.
+    u = x.to(tl.int32, bitcast=True)
+    u = tl.where(u == _INT32_MIN, 0, u)
+    return u ^ ((u >> 31) & 0x7FFFFFFF)
+
+
+@triton.jit
+def _topk_bi_kernel(
+    logits_ptr,
+    stride_l0,
+    stride_l1,
+    row_start_ptr,
+    row_end_ptr,
+    out_ptr,
+    stride_o0,
+    num_cols,
+    TOPK: tl.constexpr,
+    NCOLS: tl.constexpr,
+    HAS_START: tl.constexpr,
+):
+    # One program per row, whole row register-resident, exact integer
+    # arithmetic throughout: the result depends only on the row's own
+    # contents, so it is deterministic and batch-invariant by construction.
+    # Assumes NaN-free scores (relu outputs); invalid columns are masked to
+    # -inf before keying; out-of-bounds lanes get INT32_MIN, below every
+    # real key.
+    row = tl.program_id(0).to(tl.int64)
+    l_base = logits_ptr + row * stride_l0
+    o_base = out_ptr + row * stride_o0
+    end = tl.load(row_end_ptr + row)
+    start = tl.load(row_start_ptr + row) if HAS_START else 0
+
+    offs = tl.arange(0, NCOLS)
+    inb = offs < num_cols
+    x = tl.load(l_base + offs * stride_l1, mask=inb, other=float("-inf"))
+    vmask = inb & (offs < end)
+    if HAS_START:
+        vmask = vmask & (offs >= start)
+    masked = tl.where(vmask, x, float("-inf"))
+    key = tl.where(inb, _topk_bi_key(masked), _INT32_MIN)
+
+    # Exact k-th key by 32-step binary search on the int32 key space: each
+    # step is one vectorized compare + tree reduction on the register-resident
+    # row. Interval arithmetic in int64 to avoid overflow at the full range.
+    k_eff = tl.minimum(TOPK, num_cols)
+    lo = tl.full((), _INT32_MIN, dtype=tl.int64)
+    hi = tl.full((), 2**31 - 1, dtype=tl.int64)
+    for _ in range(32):
+        mid = (lo + hi + 1) >> 1
+        cnt = tl.sum((key >= mid.to(tl.int32)).to(tl.int32))
+        take = cnt >= k_eff
+        lo = tl.where(take, mid, lo)
+        hi = tl.where(take, hi, mid - 1)
+    t_key = lo.to(tl.int32)
+    budget = k_eff - tl.sum((key > t_key).to(tl.int32))
+
+    # Ascending emission: `key > T` plus the first `budget` ties by column
+    # index; positions from an exclusive cumsum, so output is ascending with
+    # a -1 tail and no sort anywhere.
+    tl.store(o_base + tl.arange(0, TOPK), tl.full((TOPK,), -1, dtype=tl.int32))
+    eq = inb & (key == t_key)
+    eq_i = eq.to(tl.int32)
+    eq_before = tl.cumsum(eq_i, axis=0) - eq_i
+    sel = (inb & (key > t_key)) | (eq & (eq_before < budget))
+    emit = sel & vmask
+    e_i = emit.to(tl.int32)
+    pos = tl.cumsum(e_i, axis=0) - e_i
+    tl.store(o_base + pos, offs - start, mask=emit & (pos < TOPK))
+
+
+def _topk_indices_batch_invariant(
+    logits: torch.Tensor,
+    row_start: torch.Tensor | None,
+    row_end: torch.Tensor,
+    topk_indices: torch.Tensor,
+    topk_tokens: int,
+) -> None:
+    """Deterministic per-row top-k: score descending, exact ties by ascending
+    column index.
+
+    All three CUDA top-k kernels (cooperative/persistent/per-row) resolve
+    exact-score ties through shared-memory atomics, so on tie plateaus both
+    the selected set and its order change run to run; ``relu``-based DSA
+    scores make exact-0.0 plateaus routine. This path depends only on each
+    row's own contents, which makes the result reproducible and
+    batch-invariant.
+
+    Emits row-local indices (relative to ``row_start``, matching the CUDA
+    prefill kernel's write contract — its packed-workspace column minus
+    ``rowStart``), ascending with a ``-1`` tail like
+    ``_fill_short_context_topk_indices``. Dispatches to a fused Triton
+    kernel on CUDA (bitwise-equal to the torch reference); the torch
+    stable-sort reference serves other platforms.
+    """
+    num_cols = logits.shape[1]
+    if (
+        logits.is_cuda
+        and logits.dtype == torch.float32
+        and topk_indices.stride(1) == 1
+        and topk_indices.shape[1] == topk_tokens
+        # Same envelope as the CUDA kernels; power-of-two for tl.arange.
+        and topk_tokens in (512, 1024, 2048)
+        and num_cols <= 8192  # register-resident row; larger falls back
+    ):
+        num_rows = logits.shape[0]
+        if num_rows == 0:
+            return
+        # Clamp to [0, num_cols] before narrowing: identical validity
+        # semantics (cols are compared against these bounds anyway) and
+        # immune to negative decode row_end or int64 values that would
+        # wrap in int32.
+        row_end_i32 = row_end.clamp(min=0, max=num_cols).to(torch.int32).contiguous()
+        if row_start is not None:
+            row_start_i32 = (
+                row_start.clamp(min=0, max=num_cols).to(torch.int32).contiguous()
+            )
+        else:
+            row_start_i32 = row_end_i32
+        _topk_bi_kernel[(num_rows,)](
+            logits,
+            logits.stride(0),
+            logits.stride(1),
+            row_start_i32,
+            row_end_i32,
+            topk_indices,
+            topk_indices.stride(0),
+            num_cols,
+            TOPK=topk_tokens,
+            NCOLS=max(triton.next_power_of_2(num_cols), topk_tokens),
+            HAS_START=row_start is not None,
+            num_warps=_TOPK_BI_NUM_WARPS,
+        )
+        return
+    if logits.is_cuda and num_cols > 8192:
+        logger.warning_once(
+            "Batch-invariant indexer top-k: %d columns exceeds the fused "
+            "kernel's 8192-column limit; using the slower torch path.",
+            num_cols,
+        )
+    _topk_indices_batch_invariant_ref(
+        logits, row_start, row_end, topk_indices, topk_tokens
+    )
+
+
+def _topk_indices_batch_invariant_ref(
+    logits: torch.Tensor,
+    row_start: torch.Tensor | None,
+    row_end: torch.Tensor,
+    topk_indices: torch.Tensor,
+    topk_tokens: int,
+) -> None:
+    """Torch stable-sort reference for ``_topk_indices_batch_invariant``.
+
+    Rows are processed in chunks so the transient mask/sort allocations stay
+    bounded by the chunk, not the full prefill workspace.
+    """
+    num_cols = logits.shape[1]
+    cols = torch.arange(num_cols, device=logits.device)
+    chunk = 1024
+    # Chunks can carry fewer candidate columns than top-k; the CUDA kernels
+    # fill the remainder with -1.
+    k = min(topk_tokens, num_cols)
+    for i in range(0, logits.shape[0], chunk):
+        end = row_end[i : i + chunk].unsqueeze(1)
+        valid = cols < end
+        start = None
+        if row_start is not None:
+            start = row_start[i : i + chunk].unsqueeze(1)
+            valid &= cols >= start
+        masked = torch.where(valid, logits[i : i + chunk].float(), float("-inf"))
+        # Stable sort: equal scores keep ascending column order.
+        order = torch.sort(masked, dim=-1, descending=True, stable=True).indices
+        sel = order[:, :k]
+        sel_valid = torch.gather(valid, 1, sel)
+        if start is not None:
+            sel = sel - start
+        sel = torch.where(sel_valid, sel, num_cols).to(torch.int32)
+        sel = torch.sort(sel, dim=-1).values
+        dst = topk_indices[i : i + chunk]
+        dst[:, :k].copy_(torch.where(sel == num_cols, -1, sel))
+        if k < topk_tokens:
+            dst[:, k:].fill_(-1)
+
+
 @eager_break_during_capture
 def sparse_attn_indexer(
     hidden_states: torch.Tensor,
@@ -506,16 +699,25 @@ def sparse_attn_indexer(
                         clean_logits=False,
                     )
                 num_rows = logits.shape[0]
-                ops.top_k_per_row_prefill(
-                    logits,
-                    cu_seqlen_ks,
-                    cu_seqlen_ke,
-                    topk_indices,
-                    num_rows,
-                    logits.stride(0),
-                    logits.stride(1),
-                    topk_tokens,
-                )
+                if envs.VLLM_BATCH_INVARIANT:
+                    _topk_indices_batch_invariant(
+                        logits,
+                        cu_seqlen_ks,
+                        cu_seqlen_ke,
+                        topk_indices,
+                        topk_tokens,
+                    )
+                else:
+                    ops.top_k_per_row_prefill(
+                        logits,
+                        cu_seqlen_ks,
+                        cu_seqlen_ke,
+                        topk_indices,
+                        num_rows,
+                        logits.stride(0),
+                        logits.stride(1),
+                        topk_tokens,
+                    )
 
             _merge_dcp_topk_global(
                 logits,
@@ -626,7 +828,16 @@ def sparse_attn_indexer(
             1024,
             2048,
         )
-        if use_cooperative_topk:
+        if envs.VLLM_BATCH_INVARIANT:
+            if seq_lens.dim() == 2:
+                row_end = seq_lens.reshape(-1)[:num_rows]
+            else:
+                rows = torch.arange(num_rows, device=seq_lens.device)
+                row_end = seq_lens[rows // next_n] - next_n + rows % next_n + 1
+            _topk_indices_batch_invariant(
+                logits, None, row_end, topk_indices, topk_tokens
+            )
+        elif use_cooperative_topk:
             workspace_manager = current_workspace_manager()
             (topk_workspace,) = workspace_manager.get_simultaneous(
                 ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),
