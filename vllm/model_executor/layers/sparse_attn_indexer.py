@@ -331,13 +331,19 @@ def _topk_indices_batch_invariant(
         # composite-key torch.topk variant measured ~25% slower: 64-bit radix
         # needs twice the digit passes of this fp32 sort.)
         order = torch.sort(masked, dim=-1, descending=True, stable=True).indices
-        sel = order[:, :topk_tokens]
+        # Chunks can carry fewer candidate columns than top-k; the CUDA
+        # kernels fill the remainder with -1.
+        k = min(topk_tokens, num_cols)
+        sel = order[:, :k]
         sel_valid = torch.gather(valid, 1, sel)
         if start is not None:
             sel = sel - start
         sel = torch.where(sel_valid, sel, num_cols).to(torch.int32)
         sel = torch.sort(sel, dim=-1).values
-        topk_indices[i : i + chunk].copy_(torch.where(sel == num_cols, -1, sel))
+        dst = topk_indices[i : i + chunk]
+        dst[:, :k].copy_(torch.where(sel == num_cols, -1, sel))
+        if k < topk_tokens:
+            dst[:, k:].fill_(-1)
 
 
 @eager_break_during_capture

@@ -115,6 +115,18 @@ def test_topk_batch_invariant_prefill_row_start():
     assert valid.numel() == 512
 
 
+def test_topk_batch_invariant_narrow_logits():
+    """Prefill chunks can carry fewer candidate columns than top-k; the CUDA
+    kernels fill the remainder with -1 (TP4 hit this live with 30 columns)."""
+    cols = 30
+    logits = torch.randn((2, cols), device="cuda", dtype=torch.float32)
+    ke = torch.tensor([cols, 20], device="cuda", dtype=torch.int32)
+    out = torch.empty((2, TOPK), device="cuda", dtype=torch.int32)
+    _topk_indices_batch_invariant(logits, None, ke, out, TOPK)
+    assert (out[0, :cols] >= 0).all() and (out[0, cols:] == -1).all()
+    assert (out[1, :20] >= 0).all() and (out[1, 20:] == -1).all()
+
+
 def test_topk_batch_invariant_prefill_shifted_ks():
     """The same row content packed at different cu_seqlen_ks offsets (i.e.
     different preceding requests in the workspace) must give identical
