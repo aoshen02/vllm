@@ -81,6 +81,9 @@ KV compressor, and fp8/mxfp4 MoE expert stacks.
 4. `bi/gate-linear` — fp32 router + small-N persistent matmul config + tests
 5. `bi/deepgemm-fp8` — DeepGEMM BI wiring (fail-closed probe, alignment pin,
    `FallbackExperts` forwarding fix) + mocked tests
+6. `bi/cudagraph-mode` — keep piecewise cudagraphs out of batch-invariant runs
+   (`vllm/config/vllm.py`, `vllm/config/compilation.py`) + config tests; this
+   is the fix for the mixed-step leak described under the roadmap
 
 Serving recipe under BI: `--kv-cache-dtype fp8 --block-size 256
 --no-enable-prefix-caching --no-enable-flashinfer-autotune`,
