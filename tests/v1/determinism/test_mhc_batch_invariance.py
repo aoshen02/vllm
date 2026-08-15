@@ -343,13 +343,13 @@ def test_hc_head_batch_invariance(monkeypatch):
     _set_bi(monkeypatch, True)
     device = "cuda"
     set_random_seed(0)
-    fn = (
-        torch.randn(
-            (HC_MULT, HC_MULT * HIDDEN_SIZE), dtype=torch.float32, device=device
-        )
-        * 1e-4
-    )
-    hc_scale = torch.randn((1,), dtype=torch.float32, device=device) * 0.1
+    # Checkpoint-realistic magnitudes (see _mhc_weights): the old ``* 1e-4``
+    # weights compress reassociation diffs below one output ULP, making the
+    # assertion vacuously easy.
+    fn = torch.randn(
+        (HC_MULT, HC_MULT * HIDDEN_SIZE), dtype=torch.float32, device=device
+    ) * (HC_MULT * HIDDEN_SIZE) ** -0.5
+    hc_scale = torch.tensor([2.0], dtype=torch.float32, device=device)
     hc_base = torch.randn((HC_MULT,), dtype=torch.float32, device=device) * 0.1
     victim = torch.randn((1, HC_MULT, HIDDEN_SIZE), dtype=torch.bfloat16, device=device)
 
@@ -368,3 +368,47 @@ def test_hc_head_batch_invariance(monkeypatch):
     for i, n in enumerate(BOUNDARIES[1:], start=2):
         out = row0(n, i)
         assert torch.equal(base, out), f"hc_head row 0 changed at batch size {n}"
+
+
+def test_mhc_post_batch_invariance(monkeypatch):
+    """mhc_post (the end-of-loop post-mix catch-up) never goes through
+    compute_num_split — per-token CTA, reductions only over hc_mult with a
+    vectorized fixed order — so it must be invariant even without the flag;
+    pin that fact under BI so a future K-split refactor trips this test."""
+    _set_bi(monkeypatch, True)
+    device = "cuda"
+    set_random_seed(0)
+    victim_x = torch.randn((1, HIDDEN_SIZE), dtype=torch.bfloat16, device=device)
+    victim_res = torch.randn(
+        (1, HC_MULT, HIDDEN_SIZE), dtype=torch.bfloat16, device=device
+    )
+    victim_post = torch.randn((1, HC_MULT, 1), dtype=torch.float32, device=device)
+    victim_comb = torch.randn(
+        (1, HC_MULT, HC_MULT), dtype=torch.float32, device=device
+    )
+
+    def row0(n, seed):
+        set_random_seed(seed)
+        x = torch.cat(
+            [victim_x]
+            + [torch.randn_like(victim_x) for _ in range(n - 1)]
+        )
+        res = torch.cat(
+            [victim_res]
+            + [torch.randn_like(victim_res) for _ in range(n - 1)]
+        )
+        post = torch.cat(
+            [victim_post]
+            + [torch.randn_like(victim_post) for _ in range(n - 1)]
+        )
+        comb = torch.cat(
+            [victim_comb]
+            + [torch.randn_like(victim_comb) for _ in range(n - 1)]
+        )
+        out = torch.ops.vllm.mhc_post_tilelang(x, res, post, comb)
+        return out[0].clone()
+
+    base = row0(BOUNDARIES[0], 1)
+    for i, n in enumerate(BOUNDARIES[1:], start=2):
+        out = row0(n, i)
+        assert torch.equal(base, out), f"mhc_post row 0 changed at batch size {n}"
