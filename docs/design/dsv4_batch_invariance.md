@@ -87,16 +87,23 @@ Keep `use_fp4_indexer_cache=False` (the upstream default) — see roadmap.
 
 ## Not covered yet (roadmap)
 
-- **`use_fp4_indexer_cache=True` leak (found 2026-08-15)**: the official
-  V4-Flash Blackwell recipe enables the fp4 indexer KV cache; under it the
-  full 43-layer model shows one deterministic composition-dependent flip
-  (long victim, batch 17, second decode token; bit-identical across server
-  instances). Controls: fp8 default path clean on the same sequence, 6L
-  dummy clean, BI=0 negative control fails loudly, no history dependence
-  (solo requests bit-stable under any preceding traffic). Mechanism
-  screening so far: indexer Q quant is per-(token, head); the DeepGEMM MQA
-  logits kernel is elementwise over KV. Next: offline full-scale repro +
-  per-op bisect. Until fixed, BI deployments keep the cache off.
+- **Full-scale mixed-step leak (found 2026-08-15, the top open item)**:
+  a 75-round soak on the full 43-layer model (fp8 default cache, BI=1)
+  shows an intermittent composition-dependent flip in 29/75 rounds with a
+  razor-sharp signature: always the long victim at position 0, always the
+  second decode token, always the same bimodal value pair — i.e. the
+  victim's decode step diverges when it shares an engine step with
+  neighbors' chunked prefill. Cache-independent (first seen under
+  `use_fp4_indexer_cache=True`, initially misattributed to it). The 6L
+  dummy never reproduces it — its prefill is too fast for the mixed step
+  to exist, which is why all dummy-scale evidence (including offline
+  mixed-step enumeration) stayed green. Excluded: request history
+  effects, indexer Q quant, MQA logits kernel. Prime suspect: the MoE
+  grouped path shared by decode tokens and large-M prefill chunks
+  (large-M DeepGEMM config selection never reached at dummy scale).
+  Next: offline full-scale mixed-step repro + per-op bisect.
+  Lesson recorded: single-round 0-diff is underpowered against a
+  ~0.4/round intermittent leak; sweeps must be repeated.
 - NCCL pin ablation result (2026-08-15): the minimal sufficient set is
   **all five pins** — relaxing any one breaks 0-diff (dropping
   `NCCL_ALGO=allreduce:tree` fails 46/46; multi-channel, NTHREADS,
