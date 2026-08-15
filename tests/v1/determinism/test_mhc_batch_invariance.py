@@ -370,6 +370,7 @@ def test_hc_head_batch_invariance(monkeypatch):
         assert torch.equal(base, out), f"hc_head row 0 changed at batch size {n}"
 
 
+@skip_if_not_cuda
 def test_mhc_post_batch_invariance(monkeypatch):
     """mhc_post (the end-of-loop post-mix catch-up) never goes through
     compute_num_split — per-token CTA, reductions only over hc_mult with a
