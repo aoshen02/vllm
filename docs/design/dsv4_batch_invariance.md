@@ -68,6 +68,10 @@ KV compressor, and fp8/mxfp4 MoE expert stacks.
   together +23%. Relaxing the comm pins (a deterministic multi-channel
   config) is the highest-value upstream perf item; every relaxation must
   re-verify invariance.
+  Caveat: these medians were taken before piecewise graphs were pinned off
+  for invariance (see roadmap), so mixed prefill/decode steps were graphed
+  and now run eager. Decode-side graphs are unaffected. The number is being
+  re-measured under the new configuration.
 
 ## PR map (all against this fork, path-disjoint, independently mergeable)
 
@@ -81,29 +85,39 @@ KV compressor, and fp8/mxfp4 MoE expert stacks.
 Serving recipe under BI: `--kv-cache-dtype fp8 --block-size 256
 --no-enable-prefix-caching --no-enable-flashinfer-autotune`,
 `max_num_batched_tokens <= 8192`, TP4/EP4 adds `NCCL_MNNVL_ENABLE=0`;
-cudagraphs stay ON (PIECEWISE+FULL capture verified under BI, including
-the fused top-k); speculative decoding stays off (upstream #27433).
+cudagraphs stay ON but **piecewise is pinned off** — batch invariance
+forces `cudagraph_mode=FULL`, which the DSA indexer backend
+(`AttentionCGSupport.UNIFORM_BATCH`) resolves to `FULL_DECODE_ONLY`:
+uniform-decode steps replay a full graph, everything else runs eager, and
+those two agree bit-for-bit. Speculative decoding stays off (upstream
+#27433).
 Keep `use_fp4_indexer_cache=False` (the upstream default) — see roadmap.
 
 ## Not covered yet (roadmap)
 
-- **Full-scale mixed-step leak (found 2026-08-15, the top open item)**:
-  a 75-round soak on the full 43-layer model (fp8 default cache, BI=1)
-  shows an intermittent composition-dependent flip in 29/75 rounds with a
-  razor-sharp signature: always the long victim at position 0, always the
-  second decode token, always the same bimodal value pair — i.e. the
-  victim's decode step diverges when it shares an engine step with
-  neighbors' chunked prefill. Cache-independent (first seen under
-  `use_fp4_indexer_cache=True`, initially misattributed to it). The 6L
-  dummy never reproduces it — its prefill is too fast for the mixed step
-  to exist, which is why all dummy-scale evidence (including offline
-  mixed-step enumeration) stayed green. Excluded: request history
-  effects, indexer Q quant, MQA logits kernel. Prime suspect: the MoE
-  grouped path shared by decode tokens and large-M prefill chunks
-  (large-M DeepGEMM config selection never reached at dummy scale).
-  Next: offline full-scale mixed-step repro + per-op bisect.
-  Lesson recorded: single-round 0-diff is underpowered against a
-  ~0.4/round intermittent leak; sweeps must be repeated.
+- ~~Full-scale mixed-step leak~~ **root-caused and fixed on 2026-08-15**:
+  a 75-round soak on the full 43-layer model showed a composition-dependent
+  logprob flip in 29/75 rounds. It was **piecewise cudagraph replay**, not
+  any operator. With the batch composition pinned by a hand-driven
+  `LLMEngine` (no HTTP races), the same step sequence gives: eager 19/19
+  identical; `FULL` 17/17 identical *and bit-equal to eager*; `PIECEWISE`
+  neither equal to those nor shape-invariant; `FULL_AND_PIECEWISE` flipping
+  between the two values step by step. Since the per-step mode is chosen
+  from batch properties (uniform decode? within `max_cudagraph_capture_size`?),
+  a request's output depended on its neighbours. Fix: pin
+  `cudagraph_mode=FULL` under `VLLM_BATCH_INVARIANT` and keep the mixed-mode
+  downgrade from handing piecewise back. Ruled out by single-variable
+  experiments before landing there: cudagraph batch padding (dense capture
+  sizes `[1..128]` still reproduce), the tile-scheduler plan family (graphs +
+  forced skeleton still leaks at the same rate), `use_fp4_indexer_cache`,
+  request history, indexer Q quant, and the MQA logits kernel. The
+  piecewise/full divergence itself is upstream-reportable.
+  Three lessons worth carrying: single-round 0-diff is underpowered against
+  a ~0.4/round intermittent leak; a switch that changes *speed* (eager)
+  also changes *scheduling*, so composition must be pinned before comparing;
+  and a repro scenario has to make the target path actually execute — long
+  fillers pushed the step past `max_cudagraph_capture_size`, so no graph ran
+  and every configuration agreed for the wrong reason.
 - NCCL pin ablation result (2026-08-15): the minimal sufficient set is
   **all five pins** — relaxing any one breaks 0-diff (dropping
   `NCCL_ALGO=allreduce:tree` fails 46/46; multi-channel, NTHREADS,
