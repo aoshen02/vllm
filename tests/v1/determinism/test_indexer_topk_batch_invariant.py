@@ -13,7 +13,6 @@ import pytest
 import torch
 
 from vllm.model_executor.layers.sparse_attn_indexer import (
-    RADIX_TOPK_WORKSPACE_SIZE,
     _topk_indices_batch_invariant,
 )
 
@@ -102,7 +101,9 @@ def test_topk_batch_invariant_short_row_padding():
 
 
 def test_topk_batch_invariant_prefill_row_start():
-    """Prefill semantics: columns below cu_seqlen_ks are excluded."""
+    """Prefill contract: columns below cu_seqlen_ks are excluded and emitted
+    indices are row-local (relative to ks), matching the CUDA prefill kernel
+    (sampler.cu writes ``rowIt``, not ``rowIt + rowStart``)."""
     logits = torch.zeros((1, NUM_COLS), device="cuda", dtype=torch.float32)
     logits[0, :50] = 10.0  # would win top-k if the start bound leaked
     ks = torch.tensor([50], device="cuda", dtype=torch.int32)
@@ -110,29 +111,34 @@ def test_topk_batch_invariant_prefill_row_start():
     out = torch.empty((1, TOPK), device="cuda", dtype=torch.int32)
     _topk_indices_batch_invariant(logits, ks, ke, out, TOPK)
     valid = out[out >= 0]
-    assert valid.min() >= 50 and valid.max() < 600
+    assert valid.min() >= 0 and valid.max() < 550
     assert valid.numel() == 512
 
 
-def test_cuda_persistent_topk_negative_control():
-    """The disease this module guards against: persistent_topk on a tie
-    plateau returns a different selected set run to run. If this ever starts
-    passing deterministically, the BI branch may be removable — re-evaluate."""
-    victim = _victim_row()
-    logits, seq_lens = _batch_with_victim(victim, 33, 16, 33)
-    sets = set()
-    for _ in range(20):
-        out = torch.full((33, TOPK), -1, device="cuda", dtype=torch.int32)
-        workspace = torch.zeros(
-            (RADIX_TOPK_WORKSPACE_SIZE,), device="cuda", dtype=torch.uint8
+def test_topk_batch_invariant_prefill_shifted_ks():
+    """The same row content packed at different cu_seqlen_ks offsets (i.e.
+    different preceding requests in the workspace) must give identical
+    row-local output — absolute-column emit would break exactly here."""
+    seg = 550
+    content = _victim_row()[:seg]
+    outs = []
+    for ks_val in (0, 50, 300):
+        logits = torch.full(
+            (1, NUM_COLS), -100.0, device="cuda", dtype=torch.float32
         )
-        torch.ops._C.persistent_topk(
-            logits, seq_lens, out, workspace, TOPK, NUM_COLS
-        )
-        torch.cuda.synchronize()
-        kept = out[16][out[16] >= 0]
-        sets.add(tuple(kept.sort().values.tolist()))
-    assert len(sets) > 1, (
-        "persistent_topk resolved ties deterministically 20/20 times; "
-        "negative control lost its teeth"
-    )
+        logits[0, ks_val : ks_val + seg] = content
+        ks = torch.tensor([ks_val], device="cuda", dtype=torch.int32)
+        ke = torch.tensor([ks_val + seg], device="cuda", dtype=torch.int32)
+        out = torch.empty((1, TOPK), device="cuda", dtype=torch.int32)
+        _topk_indices_batch_invariant(logits, ks, ke, out, TOPK)
+        outs.append(out[0])
+    assert torch.equal(outs[0], outs[1]) and torch.equal(outs[0], outs[2])
+
+
+# NOTE: the negative control for the CUDA kernels (persistent_topk /
+# top_k_per_row_{decode,prefill} returning different tie SETS run to run) is
+# deliberately NOT an asserted test: nondeterminism is permitted, not
+# guaranteed, so asserting it would be flaky by construction. The manual
+# probe and its archived evidence live at
+# agent_run/scripts/probe_indexer_topk_determinism.py and
+# agent_run/results/batch_invariance/shared/indexer-topk/accuracy/.

@@ -307,24 +307,37 @@ def _topk_indices_batch_invariant(
     the selected set and its order change run to run; ``relu``-based DSA
     scores make exact-0.0 plateaus routine. A stable sort depends only on the
     row's own contents, which makes the result reproducible and
-    batch-invariant. Emits ascending indices with a ``-1`` tail, matching
-    ``_fill_short_context_topk_indices``.
+    batch-invariant.
+
+    Emits row-local indices (relative to ``row_start``, matching the CUDA
+    prefill kernel's write contract — its packed-workspace column minus
+    ``rowStart``), ascending with a ``-1`` tail like
+    ``_fill_short_context_topk_indices``. Rows are processed in chunks so the
+    transient mask/sort allocations stay bounded by the chunk, not the full
+    prefill workspace.
     """
     num_cols = logits.shape[1]
     cols = torch.arange(num_cols, device=logits.device)
-    valid = cols < row_end.unsqueeze(1)
-    if row_start is not None:
-        valid &= cols >= row_start.unsqueeze(1)
-    masked = torch.where(valid, logits.float(), float("-inf"))
-    # Stable sort: equal scores keep ascending column order, so the selected
-    # set and its order depend only on the row's own contents. (An int64
-    # composite-key torch.topk variant measured ~25% slower: 64-bit radix
-    # needs twice the digit passes of this fp32 sort.)
-    order = torch.sort(masked, dim=-1, descending=True, stable=True).indices
-    sel = order[:, :topk_tokens]
-    sel = torch.where(torch.gather(valid, 1, sel), sel, num_cols).to(torch.int32)
-    sel = torch.sort(sel, dim=-1).values
-    topk_indices.copy_(torch.where(sel == num_cols, -1, sel))
+    chunk = 1024
+    for i in range(0, logits.shape[0], chunk):
+        end = row_end[i : i + chunk].unsqueeze(1)
+        valid = cols < end
+        start = None
+        if row_start is not None:
+            start = row_start[i : i + chunk].unsqueeze(1)
+            valid &= cols >= start
+        masked = torch.where(valid, logits[i : i + chunk].float(), float("-inf"))
+        # Stable sort: equal scores keep ascending column order. (An int64
+        # composite-key torch.topk variant measured ~25% slower: 64-bit radix
+        # needs twice the digit passes of this fp32 sort.)
+        order = torch.sort(masked, dim=-1, descending=True, stable=True).indices
+        sel = order[:, :topk_tokens]
+        sel_valid = torch.gather(valid, 1, sel)
+        if start is not None:
+            sel = sel - start
+        sel = torch.where(sel_valid, sel, num_cols).to(torch.int32)
+        sel = torch.sort(sel, dim=-1).values
+        topk_indices[i : i + chunk].copy_(torch.where(sel == num_cols, -1, sel))
 
 
 @eager_break_during_capture
