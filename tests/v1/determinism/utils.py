@@ -13,6 +13,7 @@ from vllm.transformers_utils.model_arch_config_convertor import (
     ModelArchConfigConvertorBase,
 )
 from vllm.triton_utils import HAS_TRITON
+from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.attention.backends.fa_utils import flash_attn_supports_mla
 
 
@@ -67,6 +68,23 @@ skip_if_not_cuda = pytest.mark.skipif(
     not DEVICE_BACKENDS["cuda"].available,
     reason="Requires CUDA >= Ampere (SM80)",
 )
+
+
+def batch_with_victim(
+    victims: tuple[torch.Tensor, ...], n: int, seed: int
+) -> tuple[torch.Tensor, ...]:
+    """Batch of ``n`` rows led by each victim row, padded with seeded random
+    filler rows behind it: batch invariance means the victim's output bits
+    must not depend on the filler."""
+    set_random_seed(seed)
+    return tuple(
+        torch.cat(
+            [v, torch.randn((n - 1, *v.shape[1:]), dtype=v.dtype, device=v.device)]
+        )
+        if n > 1
+        else v
+        for v in victims
+    )
 
 
 def _random_prompt(min_words: int = 1024, max_words: int = 1024 * 2) -> str:
