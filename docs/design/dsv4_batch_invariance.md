@@ -97,8 +97,13 @@ Keep `use_fp4_indexer_cache=False` (the upstream default) — see roadmap.
   screening so far: indexer Q quant is per-(token, head); the DeepGEMM MQA
   logits kernel is elementwise over KV. Next: offline full-scale repro +
   per-op bisect. Until fixed, BI deployments keep the cache off.
-- NCCL pin ablation (minimal sufficient set for the +31% comm cost):
-  in progress; per-step checker x2 + throughput, defaults unchanged.
+- NCCL pin ablation result (2026-08-15): the minimal sufficient set is
+  **all five pins** — relaxing any one breaks 0-diff (dropping
+  `NCCL_ALGO=allreduce:tree` fails 46/46; multi-channel, NTHREADS,
+  symm-mem, custom-AR each leak intermittently, caught only on x2
+  checker rounds). The +31% comm cost is not reducible by configuration;
+  the upstream path is deterministic multi-channel collectives (new
+  kernel work). Defaults unchanged.
 - mxfp4/MegaMoE production path: DeepGEMM patch preserved on
   `codex/bugfix-deepgemm-fp4-bi-v261` (references/DeepGEMM); e2e first-pass
   pending — deferred by owner decision 2026-08-15.
