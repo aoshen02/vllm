@@ -5,7 +5,10 @@ from typing import ClassVar, cast
 
 import torch
 
+import vllm.envs as envs
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
+from vllm.config.compilation import CUDAGraphMode
+from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.warmup.jit_warmup import (
     VllmJitKernel,
@@ -34,6 +37,8 @@ from vllm.v1.kv_cache_interface import (
     get_kv_quant_mode,
 )
 
+logger = init_logger(__name__)
+
 # DeepseekV4 decode layer types, keyed by compress_ratio. Each type has a distinct
 # (topk, extra_topk, extra_page_block_size) config, so they cannot share a
 # FlashMLA tile-scheduler plan. Within a type, all ~60 DeepseekV4 layers share one
@@ -41,6 +46,268 @@ from vllm.v1.kv_cache_interface import (
 _LAYER_TYPE_SWAONLY = "swaonly"
 _LAYER_TYPE_C4A = "c4a"
 _LAYER_TYPE_C128A = "c128a"
+
+# FlashMLA's decode planner works in units of block_size_topk over the top-k
+# list (get_decoding_sched_meta.cu). Measured: topk_length=256 yields 4 blocks.
+_BLOCK_SIZE_TOPK = 64
+# csrc/params.h DecodingSchedMeta: begin_req_idx, end_req_idx (both inclusive),
+# begin_block_idx, end_block_idx (inclusive, exclusive), begin_split_idx,
+# is_first_req_splitted, is_last_req_splitted, _pad.
+_SCHED_META_INTS = 8
+
+# num_sm_parts depends only on the arch and (h_q, s_q) — never on the batch —
+# so learning it once from the kernel's own planner is safe. Doing that beats
+# duplicating the four get_meta() formulas in sparse_decode.h.
+_num_sm_parts_cache: dict[tuple[int, int], int] = {}
+
+
+# Which partition owns which request depends only on (b, num_sm_parts) — never
+# on any request's length — so it is identical for every layer in a step and for
+# every step with the same batch size. Cache it: this is a per-layer hot path,
+# and building it from a boolean mask costs a device sync (measured 610 us,
+# ~37 ms per step over 61 layers).
+_plan_cache: dict[
+    tuple[int, int, torch.device], tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+] = {}
+
+
+def record_num_sm_parts(h_q: int, s_q: int, sched: FlashMLASchedMeta) -> None:
+    """Remember the partition count the kernel chose, so later steps can pin."""
+    tsm = sched.tile_scheduler_metadata
+    if tsm is not None:
+        _num_sm_parts_cache.setdefault((h_q, s_q), int(tsm.shape[0]))
+
+
+def _split_budget(
+    num_sm_parts: int,
+    cfg: tuple[int, "CUDAGraphMode"] | None = None,
+) -> tuple[int, int]:
+    """``(max_splits_per_request, max_num_seqs)``, fixed for the server's life.
+
+    Giving each request one whole partition is invariant but leaves most SMs
+    idle: measured 1.19-1.28x the shipped planner's GPU time for b=4..17. A
+    request can instead be cut at multiples of its *own* block count, which is
+    still invariant, but only if the per-request split count is a static bound —
+    derive it from the current batch and a row's reduction order would move
+    again. The plan has exactly ``num_sm_parts`` rows (sparse_decode.h:457) and a
+    split simply *is* a partition boundary landing inside a request, so the
+    bound is ``num_sm_parts // max_num_seqs``.
+    """
+    if cfg is not None:
+        max_num_seqs, cudagraph_mode = cfg
+    else:
+        # Direct kernel tests, which run inside a config context; engine
+        # forward passes pass cfg captured at layer init instead, since
+        # warmup has no active context.
+        config = get_current_vllm_config()
+        max_num_seqs = config.scheduler_config.max_num_seqs
+        cudagraph_mode = config.compilation_config.cudagraph_mode
+    if max_num_seqs <= 0 or max_num_seqs > num_sm_parts:
+        # More requests than partitions: not even one partition each.
+        return 1, max_num_seqs
+    if cudagraph_mode == CUDAGraphMode.NONE:
+        # The split plan cannot be cached — its layout follows this step's
+        # lengths — so building it costs ~670 us of kernel launches against
+        # ~86 us for the whole-request plan. Under cudagraphs those launches are
+        # captured and replayed for free, and the GPU saving (0.2 ms/step at
+        # b=8) is real; in eager the build dominates and it is a net loss.
+        return 1, max_num_seqs
+    return max(num_sm_parts // max_num_seqs, 1), max_num_seqs
+
+
+def _blocks_per_split(
+    topk_cap: int, extra_topk_cap: int | None, has_extra: bool, max_splits: int
+) -> int:
+    """Static block count per split, sized so the worst case still fits.
+
+    ``topk_cap`` / ``extra_topk_cap`` are the layer's configured top-k widths,
+    not this step's lengths — the divisor has to be a constant.
+    """
+    cap = topk_cap
+    if has_extra and extra_topk_cap:
+        cap = cdiv(cap, _BLOCK_SIZE_TOPK) * _BLOCK_SIZE_TOPK + extra_topk_cap
+    max_blocks = max(cdiv(cap, _BLOCK_SIZE_TOPK), 1)
+    return max(cdiv(max_blocks, min(max_splits, max_blocks)), 1)
+
+
+def _split_plan(
+    num_blocks: torch.Tensor,
+    b: int,
+    num_sm_parts: int,
+    blocks_per_split: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Plan that cuts each request every ``blocks_per_split`` of its own blocks.
+
+    Request j claims ``ceil(num_blocks[j] / blocks_per_split)`` consecutive
+    partitions; partition p resolves to its request by a searchsorted over the
+    running total. All device work, no host sync — the shapes are static, only
+    the values depend on this step's lengths.
+    """
+    ks = cdiv(num_blocks.to(torch.int64), blocks_per_split)
+    bounds = ks.cumsum(0)
+    part = torch.arange(num_sm_parts, device=device, dtype=torch.int64)
+    # right=True so a partition landing exactly on a boundary belongs to the
+    # next request; idle partitions resolve to j == b.
+    j = torch.searchsorted(bounds, part, right=True)
+    busy = j < b
+    jc = j.clamp(max=b - 1)
+    k = part - (bounds[jc] - ks[jc])
+    lo = k * blocks_per_split
+    hi = torch.minimum(lo + blocks_per_split, num_blocks[jc].to(torch.int64))
+
+    meta = torch.zeros(
+        (num_sm_parts, _SCHED_META_INTS), dtype=torch.int32, device=device
+    )
+    zero = torch.zeros((), dtype=torch.int64, device=device)
+    # Idle partitions are encoded begin_req_idx > end_req_idx, which is what the
+    # planner itself leaves behind once it runs out of requests.
+    meta[:, 0] = torch.where(busy, jc, b).to(torch.int32)
+    meta[:, 1] = torch.where(busy, jc, b - 1).to(torch.int32)
+    meta[:, 2] = torch.where(busy, lo, zero).to(torch.int32)
+    meta[:, 3] = torch.where(busy, hi, zero).to(torch.int32)
+    meta[:, 4] = torch.where(busy, k, zero).to(torch.int32)
+    # get_decoding_sched_meta.cu collapses both flags to the OR of its two
+    # conditions when a partition covers exactly one request, which here reduces
+    # to "this request spans more than one partition".
+    flag = (busy & (ks[jc] > 1)).to(torch.int32)
+    meta[:, 5] = flag
+    meta[:, 6] = flag
+
+    num_splits = torch.cat(
+        [torch.zeros(1, dtype=torch.int64, device=device), bounds]
+    ).to(torch.int32)
+    return meta, num_splits
+
+
+def _plan_skeleton(
+    b: int, num_sm_parts: int, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """The batch-length-independent part of the plan: who owns what.
+
+    Returns ``(meta, owners, num_splits)`` where ``meta`` needs only its
+    end_block_idx column filled in per call.
+    """
+    key = (b, num_sm_parts, device)
+    cached = _plan_cache.get(key)
+    if cached is not None:
+        return cached
+
+    # Partition p owns requests [floor(p*b/P), floor((p+1)*b/P)). Since b <= P
+    # every span is 0 or 1 wide and lo is continuous in p, so exactly b
+    # partitions are busy and the j-th busy one owns request j. Plain host
+    # integer arithmetic — no device work and no sync.
+    owners = [
+        p
+        for p in range(num_sm_parts)
+        if (p * b) // num_sm_parts < ((p + 1) * b) // num_sm_parts
+    ]
+    meta = torch.zeros((num_sm_parts, _SCHED_META_INTS), dtype=torch.int32)
+    # Idle partitions are encoded begin_req_idx > end_req_idx, which is what the
+    # planner itself leaves behind once it runs out of requests.
+    meta[:, 0] = b
+    meta[:, 1] = b - 1
+    owner_idx = torch.tensor(owners, dtype=torch.int64)
+    req = torch.arange(b, dtype=torch.int32)
+    meta[owner_idx, 0] = req
+    meta[owner_idx, 1] = req
+    # first_block_idx (column 2), begin_split_idx and the two is_splitted flags
+    # (4..6) all stay 0: nothing is ever split.
+
+    logger.info_once(
+        "Batch-invariant sparse MLA decode: pinning the tile-scheduler plan "
+        "(num_sm_parts=%d), one request per partition, no request split.",
+        num_sm_parts,
+        scope="local",
+    )
+    skeleton = (
+        meta.to(device),
+        owner_idx.to(device),
+        # Cumulative split count; exactly one split per request.
+        torch.arange(b + 1, dtype=torch.int32, device=device),
+    )
+    _plan_cache[key] = skeleton
+    return skeleton
+
+
+def build_pinned_sched_meta(
+    h_q: int,
+    s_q: int,
+    topk_length: torch.Tensor,
+    extra_topk_length: torch.Tensor | None,
+    has_extra: bool,
+    device: torch.device,
+    topk_cap: int | None = None,
+    extra_topk_cap: int | None = None,
+    split_budget_cfg: tuple[int, "CUDAGraphMode"] | None = None,
+) -> FlashMLASchedMeta | None:
+    """A tile-scheduler plan whose reduction order does not depend on the batch.
+
+    The shipped planner sizes each partition's payload as
+    ``ceil_div(total_num_blocks, num_sm_parts)``, so a given request's KV gets
+    cut at different block boundaries depending on how much work the *other*
+    requests brought. Measured effect: a pinned row's decode output changes at
+    b>=17 on GB200.
+
+    This plan cuts a request only at multiples of ``blocks_per_split`` of its
+    *own* block count, so one row's reduction order is fixed by its own length
+    and nothing else. ``topk_cap`` / ``extra_topk_cap`` are the layer's
+    configured top-k widths; without them the plan degrades to one whole request
+    per partition, which is equally invariant but leaves most SMs idle.
+
+    Returns None until ``record_num_sm_parts`` has seen a real plan for this
+    (h_q, s_q); the caller then falls back to the kernel planner for that one
+    step (warmup covers this in practice).
+    """
+    num_sm_parts = _num_sm_parts_cache.get((h_q, s_q))
+    if num_sm_parts is None:
+        return None
+
+    b = int(topk_length.shape[0])
+    if b == 0 or b > num_sm_parts:
+        # With more requests than partitions a partition must hold several
+        # requests; that is still invariant, but the >b case is untested here so
+        # stay on the shipped planner rather than guess.
+        return None
+
+    # Mirror get_decoding_sched_meta.cu's per-request block count. The extra
+    # top-k branch rounds the main length up to a whole block *before* adding
+    # the extra length, so the two cannot simply be summed.
+    lens = topk_length.clamp(min=1)
+    if has_extra and extra_topk_length is not None:
+        lens = cdiv(lens, _BLOCK_SIZE_TOPK) * _BLOCK_SIZE_TOPK + extra_topk_length
+    num_blocks = ((lens - 1) // _BLOCK_SIZE_TOPK + 1).to(torch.int32)
+
+    max_splits, max_num_seqs = (
+        (1, 0) if topk_cap is None else _split_budget(num_sm_parts, split_budget_cfg)
+    )
+    if max_splits > 1 and b <= max_num_seqs:
+        f = _blocks_per_split(topk_cap, extra_topk_cap, has_extra, max_splits)
+        logger.info_once(
+            "Batch-invariant sparse MLA decode: pinning the tile-scheduler plan "
+            "(num_sm_parts=%d), each request cut every %d of its own KV blocks, "
+            "at most %d partitions per request.",
+            num_sm_parts,
+            f,
+            max_splits,
+            scope="local",
+        )
+        meta, num_splits = _split_plan(num_blocks, b, num_sm_parts, f, device)
+    else:
+        # b > max_num_seqs should be impossible (the scheduler caps it) but the
+        # split budget is sized from max_num_seqs, so fall back rather than
+        # overrun the partition count.
+        skeleton, owners, num_splits = _plan_skeleton(b, num_sm_parts, device)
+        # Cloned rather than written in place: the kernel reads this buffer
+        # asynchronously, and the next layer would otherwise overwrite it.
+        meta = skeleton.clone()
+        # end_block_idx (exclusive). Integer indices, so no host sync.
+        meta[owners, 3] = num_blocks
+
+    sched = get_mla_metadata()[0]
+    sched.tile_scheduler_metadata = meta
+    sched.num_splits = num_splits
+    return sched
 
 
 def _layer_type_for(compress_ratio: int) -> str:
@@ -74,10 +341,17 @@ class DeepseekV4SWACache(torch.nn.Module, AttentionLayerBase):
         self.prefix = prefix
         self.cache_config = cache_config
         self.dtype = dtype
-        compilation_config = get_current_vllm_config().compilation_config
+        vllm_config = get_current_vllm_config()
+        compilation_config = vllm_config.compilation_config
         if prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self
+        # Captured here because forward runs (cudagraph warmup included)
+        # have no active config context.
+        self.split_budget_cfg = (
+            vllm_config.scheduler_config.max_num_seqs,
+            compilation_config.cudagraph_mode,
+        )
 
         # Block size is constrained by tensor sharing between SWA and C4A KV blocks.
         # Since both block types share the same physical tensor, they must use the
@@ -256,6 +530,22 @@ class DeepseekSparseSWAMetadata:
                 rounding_mode="floor",
             )
         )
+
+        if envs.VLLM_BATCH_INVARIANT:
+            # One request per chunk. The sparse-prefill kernel takes no
+            # schedule metadata and plans its internal splits from the call
+            # geometry (query rows, gathered-KV width), so packing neighbors
+            # into a chunk changes a row's reduction plan with the batch —
+            # the prefill twin of the decode tile-scheduler pin above. With
+            # per-request calls the geometry is a function of the request
+            # alone; a lone request is a single-request chunk by definition,
+            # so both sides of the comparison run identical calls.
+            compressed = compressed_lens_cpu.tolist()
+            gather = gather_lens_cpu.tolist()
+            return [
+                (i, i + 1, compressed[i], compressed[i] + gather[i])
+                for i in range(self.num_prefills)
+            ]
 
         chunk_plan: list[tuple[int, int, int, int]] = []
         chunk_start = 0
