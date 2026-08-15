@@ -292,6 +292,41 @@ def kv_cache_as_quant_view(
     return kv_cache.unsqueeze(-2)
 
 
+def _topk_indices_batch_invariant(
+    logits: torch.Tensor,
+    row_start: torch.Tensor | None,
+    row_end: torch.Tensor,
+    topk_indices: torch.Tensor,
+    topk_tokens: int,
+) -> None:
+    """Deterministic per-row top-k: score descending, exact ties by ascending
+    column index.
+
+    All three CUDA top-k kernels (cooperative/persistent/per-row) resolve
+    exact-score ties through shared-memory atomics, so on tie plateaus both
+    the selected set and its order change run to run; ``relu``-based DSA
+    scores make exact-0.0 plateaus routine. A stable sort depends only on the
+    row's own contents, which makes the result reproducible and
+    batch-invariant. Emits ascending indices with a ``-1`` tail, matching
+    ``_fill_short_context_topk_indices``.
+    """
+    num_cols = logits.shape[1]
+    cols = torch.arange(num_cols, device=logits.device)
+    valid = cols < row_end.unsqueeze(1)
+    if row_start is not None:
+        valid &= cols >= row_start.unsqueeze(1)
+    masked = torch.where(valid, logits.float(), float("-inf"))
+    # Stable sort: equal scores keep ascending column order, so the selected
+    # set and its order depend only on the row's own contents. (An int64
+    # composite-key torch.topk variant measured ~25% slower: 64-bit radix
+    # needs twice the digit passes of this fp32 sort.)
+    order = torch.sort(masked, dim=-1, descending=True, stable=True).indices
+    sel = order[:, :topk_tokens]
+    sel = torch.where(torch.gather(valid, 1, sel), sel, num_cols).to(torch.int32)
+    sel = torch.sort(sel, dim=-1).values
+    topk_indices.copy_(torch.where(sel == num_cols, -1, sel))
+
+
 @eager_break_during_capture
 def sparse_attn_indexer(
     hidden_states: torch.Tensor,
@@ -506,16 +541,25 @@ def sparse_attn_indexer(
                         clean_logits=False,
                     )
                 num_rows = logits.shape[0]
-                ops.top_k_per_row_prefill(
-                    logits,
-                    cu_seqlen_ks,
-                    cu_seqlen_ke,
-                    topk_indices,
-                    num_rows,
-                    logits.stride(0),
-                    logits.stride(1),
-                    topk_tokens,
-                )
+                if envs.VLLM_BATCH_INVARIANT:
+                    _topk_indices_batch_invariant(
+                        logits,
+                        cu_seqlen_ks,
+                        cu_seqlen_ke,
+                        topk_indices,
+                        topk_tokens,
+                    )
+                else:
+                    ops.top_k_per_row_prefill(
+                        logits,
+                        cu_seqlen_ks,
+                        cu_seqlen_ke,
+                        topk_indices,
+                        num_rows,
+                        logits.stride(0),
+                        logits.stride(1),
+                        topk_tokens,
+                    )
 
             _merge_dcp_topk_global(
                 logits,
@@ -620,19 +664,22 @@ def sparse_attn_indexer(
             and logits.stride(0) % 4 == 0  # TMA 16-byte alignment
             and current_platform.has_device_capability(90)
             and not current_platform.is_device_capability_family(120)
-            # Both `num_rows <= 32` and the stride condition flip with batch
-            # composition, so leaving this enabled means a row's selected KV set
-            # can change because the batch grew — a different set of attended
-            # tokens, not a rounding difference. persistent_topk covers every
-            # num_rows at the same topk sizes, so pin to it instead.
-            and not envs.VLLM_BATCH_INVARIANT
         )
         use_persistent_topk = current_platform.is_cuda() and topk_tokens in (
             512,
             1024,
             2048,
         )
-        if use_cooperative_topk:
+        if envs.VLLM_BATCH_INVARIANT:
+            if seq_lens.dim() == 2:
+                row_end = seq_lens.reshape(-1)[:num_rows]
+            else:
+                rows = torch.arange(num_rows, device=seq_lens.device)
+                row_end = seq_lens[rows // next_n] - next_n + rows % next_n + 1
+            _topk_indices_batch_invariant(
+                logits, None, row_end.clamp_min(0), topk_indices, topk_tokens
+            )
+        elif use_cooperative_topk:
             workspace_manager = current_workspace_manager()
             (topk_workspace,) = workspace_manager.get_simultaneous(
                 ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),
