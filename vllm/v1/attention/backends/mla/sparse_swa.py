@@ -5,6 +5,7 @@ from typing import ClassVar, cast
 
 import torch
 
+import vllm.envs as envs
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.config.compilation import CUDAGraphMode
 from vllm.logger import init_logger
@@ -519,6 +520,26 @@ class DeepseekSparseSWAMetadata:
                 rounding_mode="floor",
             )
         )
+
+        if envs.VLLM_BATCH_INVARIANT:
+            # One request per chunk. The sparse-prefill kernel takes no
+            # schedule metadata and plans its internal splits from the call
+            # geometry (query rows, gathered-KV width), so packing neighbors
+            # into a chunk changes a row's reduction plan with the batch —
+            # the prefill twin of the decode tile-scheduler pin above. With
+            # per-request calls the geometry is a function of the request
+            # alone; a lone request is a single-request chunk by definition,
+            # so both sides of the comparison run identical calls.
+            return [
+                (
+                    i,
+                    i + 1,
+                    int(compressed_lens_cpu[i].item()),
+                    int(compressed_lens_cpu[i].item())
+                    + int(gather_lens_cpu[i].item()),
+                )
+                for i in range(self.num_prefills)
+            ]
 
         chunk_plan: list[tuple[int, int, int, int]] = []
         chunk_start = 0
