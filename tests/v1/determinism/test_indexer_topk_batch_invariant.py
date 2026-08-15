@@ -14,6 +14,7 @@ import torch
 
 from vllm.model_executor.layers.sparse_attn_indexer import (
     _topk_indices_batch_invariant,
+    _topk_indices_batch_invariant_ref,
 )
 
 if not torch.cuda.is_available():
@@ -173,6 +174,78 @@ def test_topk_batch_invariant_prefill_shifted_ks():
         _topk_indices_batch_invariant(logits, ks, ke, out, TOPK)
         outs.append(out[0])
     assert torch.equal(outs[0], outs[1]) and torch.equal(outs[0], outs[2])
+
+
+def _adversarial_content(
+    kind: str, rows: int, cols: int, gen: torch.Generator
+) -> torch.Tensor:
+    x = torch.randn((rows, cols), generator=gen, device="cuda", dtype=torch.float32)
+    if kind == "randn":
+        return x
+    if kind == "plateau":  # relu-style exact-0.0 plateau straddling the cutoff
+        x = torch.relu(x)
+        x[x < 1.2] = 0.0
+        return x
+    if kind == "quantized":  # dense exact ties at many value levels
+        return (x * 4).round() / 4
+    if kind == "signed_zero":  # -0.0 vs +0.0 must compare equal, like torch.sort
+        x = (x * 2).round() / 2
+        x[::2] *= -1.0
+        x[x == 0] = -0.0
+        return x
+    if kind == "denormal":  # keying must not flush denormals
+        return x * 1e-40
+    raise ValueError(kind)
+
+
+def test_topk_triton_matches_torch_reference_bitwise():
+    """The Triton fast path must be bitwise-equal to the torch stable-sort
+    reference on adversarial contents: tie plateaus at the cutoff, dense
+    quantized ties, mixed-sign zeros, denormals, empty / full / start==end
+    rows, and narrow chunks, with and without ``cu_seqlen_ks`` offsets."""
+    seed = 0
+    for rows in (1, 3, 64, 257, 1100):
+        for cols in (30, 512, 2048, 8192):
+            for kind in ("randn", "plateau", "quantized", "signed_zero", "denormal"):
+                for has_start in (False, True):
+                    seed += 1
+                    gen = torch.Generator(device="cuda").manual_seed(seed)
+                    logits = _adversarial_content(kind, rows, cols, gen)
+                    end = torch.randint(
+                        0, cols + 1, (rows,), generator=gen, device="cuda"
+                    ).to(torch.int32)
+                    end[0] = cols
+                    if rows > 1:
+                        end[1] = 0
+                    start = None
+                    if has_start:
+                        start = (
+                            torch.rand((rows,), generator=gen, device="cuda")
+                            * end.clamp(min=1)
+                        ).to(torch.int32)
+                        if rows > 2:
+                            start[2] = end[2]
+                    got = torch.full((rows, TOPK), -7, device="cuda", dtype=torch.int32)
+                    ref = torch.full((rows, TOPK), -7, device="cuda", dtype=torch.int32)
+                    _topk_indices_batch_invariant(logits, start, end, got, TOPK)
+                    _topk_indices_batch_invariant_ref(logits, start, end, ref, TOPK)
+                    assert torch.equal(got, ref), (
+                        f"rows={rows} cols={cols} kind={kind} start={has_start}"
+                    )
+
+
+def test_topk_triton_matches_reference_noncontiguous_rows():
+    """Column-sliced (non-contiguous stride 0) logits must go through the
+    same strided load path and stay bitwise-equal to the reference."""
+    gen = torch.Generator(device="cuda").manual_seed(3)
+    big = torch.randn((8, 4096), generator=gen, device="cuda", dtype=torch.float32)
+    logits = big[:, :1500]
+    end = torch.randint(1, 1501, (8,), generator=gen, device="cuda").to(torch.int32)
+    got = torch.empty((8, TOPK), device="cuda", dtype=torch.int32)
+    ref = torch.empty((8, TOPK), device="cuda", dtype=torch.int32)
+    _topk_indices_batch_invariant(logits, None, end, got, TOPK)
+    _topk_indices_batch_invariant_ref(logits, None, end, ref, TOPK)
+    assert torch.equal(got, ref)
 
 
 # NOTE: the negative control for the CUDA kernels (persistent_topk /
