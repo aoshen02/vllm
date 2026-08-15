@@ -81,10 +81,24 @@ KV compressor, and fp8/mxfp4 MoE expert stacks.
 Serving recipe under BI: `--kv-cache-dtype fp8 --block-size 256
 --no-enable-prefix-caching --no-enable-flashinfer-autotune`,
 `max_num_batched_tokens <= 8192`, TP4/EP4 adds `NCCL_MNNVL_ENABLE=0`;
-cudagraphs and speculative decoding stay off (upstream #27433 limitations).
+cudagraphs stay ON (PIECEWISE+FULL capture verified under BI, including
+the fused top-k); speculative decoding stays off (upstream #27433).
+Keep `use_fp4_indexer_cache=False` (the upstream default) — see roadmap.
 
 ## Not covered yet (roadmap)
 
+- **`use_fp4_indexer_cache=True` leak (found 2026-08-15)**: the official
+  V4-Flash Blackwell recipe enables the fp4 indexer KV cache; under it the
+  full 43-layer model shows one deterministic composition-dependent flip
+  (long victim, batch 17, second decode token; bit-identical across server
+  instances). Controls: fp8 default path clean on the same sequence, 6L
+  dummy clean, BI=0 negative control fails loudly, no history dependence
+  (solo requests bit-stable under any preceding traffic). Mechanism
+  screening so far: indexer Q quant is per-(token, head); the DeepGEMM MQA
+  logits kernel is elementwise over KV. Next: offline full-scale repro +
+  per-op bisect. Until fixed, BI deployments keep the cache off.
+- NCCL pin ablation (minimal sufficient set for the +31% comm cost):
+  in progress; per-step checker x2 + throughput, defaults unchanged.
 - mxfp4/MegaMoE production path: DeepGEMM patch preserved on
   `codex/bugfix-deepgemm-fp4-bi-v261` (references/DeepGEMM); e2e first-pass
   pending — deferred by owner decision 2026-08-15.
