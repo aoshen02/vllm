@@ -181,6 +181,22 @@ def matmul_persistent(
             "num_warps": 8,
         },
     }
+    config = configs[dtype]
+    if dtype == torch.float32 and N <= 256 and K >= 1024 and K % 128 == 0:
+        # Narrow outputs leave most of a 128x128 tile empty: a (64, 4096) x
+        # (4096, 256) router gate launches only 2 blocks with the default
+        # config. The key is (dtype, N, K) and never M, so a row's reduction
+        # order is unchanged by batch size and invariance is preserved.
+        # Scoped to deep 128-aligned K, the measured regime (GB200, K=4096:
+        # 43us -> 27us for M <= 1024, +9% at M = 4096); shallow or ragged K
+        # was not measured and keeps the default tiles.
+        config = {
+            **config,
+            "BLOCK_SIZE_M": 64,
+            "BLOCK_SIZE_N": 64,
+            "BLOCK_SIZE_K": 128,
+            "num_warps": 4,
+        }
     matmul_kernel_persistent[grid](
         a,
         b,
@@ -200,7 +216,7 @@ def matmul_persistent(
         B_LARGE=b.numel() > 2**31,
         C_LARGE=c.numel() > 2**31,
         HAS_BIAS=bias is not None,
-        **configs[dtype],
+        **config,
     )
     return c
 
