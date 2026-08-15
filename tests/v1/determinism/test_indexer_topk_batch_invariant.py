@@ -189,9 +189,13 @@ def _adversarial_content(
     if kind == "quantized":  # dense exact ties at many value levels
         return (x * 4).round() / 4
     if kind == "signed_zero":  # -0.0 vs +0.0 must compare equal, like torch.sort
-        x = (x * 2).round() / 2
-        x[::2] *= -1.0
-        x[x == 0] = -0.0
+        # Guarantee a mixed +-0.0 plateau inside every row that straddles
+        # the top-k cutoff: few positives, the rest alternating zero signs.
+        x = torch.relu(x)
+        x[x < 2.0] = 0.0
+        x[:, 1::2] = torch.where(
+            x[:, 1::2] == 0, torch.tensor(-0.0, device="cuda"), x[:, 1::2]
+        )
         return x
     if kind == "denormal":  # keying must not flush denormals
         return x * 1e-40
@@ -234,18 +238,64 @@ def test_topk_triton_matches_torch_reference_bitwise():
                     )
 
 
-def test_topk_triton_matches_reference_noncontiguous_rows():
-    """Column-sliced (non-contiguous stride 0) logits must go through the
-    same strided load path and stay bitwise-equal to the reference."""
+def test_topk_triton_matches_reference_noncontiguous():
+    """Sliced-column (padded row stride), strided-element (stride 1 != 1),
+    and padded-output layouts must all go through the strided load/store
+    paths and stay bitwise-equal to the reference."""
     gen = torch.Generator(device="cuda").manual_seed(3)
     big = torch.randn((8, 4096), generator=gen, device="cuda", dtype=torch.float32)
-    logits = big[:, :1500]
-    end = torch.randint(1, 1501, (8,), generator=gen, device="cuda").to(torch.int32)
-    got = torch.empty((8, TOPK), device="cuda", dtype=torch.int32)
-    ref = torch.empty((8, TOPK), device="cuda", dtype=torch.int32)
+    out_buf = torch.empty((8, TOPK + 88), device="cuda", dtype=torch.int32)
+    for logits in (big[:, :1500], big[:, ::2]):
+        cols = logits.shape[1]
+        end = torch.randint(1, cols + 1, (8,), generator=gen, device="cuda").to(
+            torch.int32
+        )
+        got = out_buf[:, :TOPK]
+        ref = torch.empty((8, TOPK), device="cuda", dtype=torch.int32)
+        _topk_indices_batch_invariant(logits, None, end, got, TOPK)
+        _topk_indices_batch_invariant_ref(logits, None, end, ref, TOPK)
+        assert torch.equal(got, ref), f"cols={cols} stride={logits.stride()}"
+
+
+def test_topk_triton_bucket_boundaries_and_degenerate_rows():
+    """NCOLS power-of-two bucket edges, all-equal rows, all--inf valid
+    windows, and single/zero-column shapes must match the reference."""
+    for cols in (1, 511, 512, 513, 1023, 1024, 1025, 2047, 2048, 2049, 4095, 4097):
+        gen = torch.Generator(device="cuda").manual_seed(cols)
+        logits = torch.randn(
+            (4, cols), generator=gen, device="cuda", dtype=torch.float32
+        )
+        logits[1] = 0.25  # fully tied row
+        logits[2] = float("-inf")  # valid window entirely -inf
+        end = torch.randint(0, cols + 1, (4,), generator=gen, device="cuda").to(
+            torch.int32
+        )
+        end[0] = cols
+        got = torch.empty((4, TOPK), device="cuda", dtype=torch.int32)
+        ref = torch.empty((4, TOPK), device="cuda", dtype=torch.int32)
+        _topk_indices_batch_invariant(logits, None, end, got, TOPK)
+        _topk_indices_batch_invariant_ref(logits, None, end, ref, TOPK)
+        assert torch.equal(got, ref), f"cols={cols}"
+
+
+def test_topk_dispatcher_fallback_paths_match_reference():
+    """Out-of-envelope inputs (columns beyond the fused kernel's 8192 limit;
+    int64 bounds at and beyond int32 range) must route through the fallback
+    or the clamped narrowing and still match the reference exactly."""
+    gen = torch.Generator(device="cuda").manual_seed(11)
+    logits = torch.randn((3, 8193), generator=gen, device="cuda", dtype=torch.float32)
+    end = torch.randint(1, 8194, (3,), generator=gen, device="cuda").to(torch.int32)
+    got = torch.empty((3, TOPK), device="cuda", dtype=torch.int32)
+    ref = torch.empty((3, TOPK), device="cuda", dtype=torch.int32)
     _topk_indices_batch_invariant(logits, None, end, got, TOPK)
     _topk_indices_batch_invariant_ref(logits, None, end, ref, TOPK)
     assert torch.equal(got, ref)
+
+    logits = torch.randn((2, 640), generator=gen, device="cuda", dtype=torch.float32)
+    end64 = torch.tensor([2**31, 2**40], device="cuda", dtype=torch.int64)
+    _topk_indices_batch_invariant(logits, None, end64, got[:2], TOPK)
+    _topk_indices_batch_invariant_ref(logits, None, end64, ref[:2], TOPK)
+    assert torch.equal(got[:2], ref[:2]), "int64 row_end must not wrap in int32"
 
 
 # NOTE: the negative control for the CUDA kernels (persistent_topk /

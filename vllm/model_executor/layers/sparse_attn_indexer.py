@@ -401,14 +401,22 @@ def _topk_indices_batch_invariant(
         and logits.dtype == torch.float32
         and topk_indices.stride(1) == 1
         and topk_indices.shape[1] == topk_tokens
+        # Same envelope as the CUDA kernels; power-of-two for tl.arange.
+        and topk_tokens in (512, 1024, 2048)
         and num_cols <= 8192  # register-resident row; larger falls back
     ):
         num_rows = logits.shape[0]
         if num_rows == 0:
             return
-        row_end_i32 = row_end.to(torch.int32).contiguous()
+        # Clamp to [0, num_cols] before narrowing: identical validity
+        # semantics (cols are compared against num_cols anyway) and immune
+        # to int64 values that would wrap in int32. Bounds are nonnegative
+        # by construction (cu_seqlen_ks/ke; decode row_end is clamped).
+        row_end_i32 = row_end.clamp(min=0, max=num_cols).to(torch.int32).contiguous()
         if row_start is not None:
-            row_start_i32 = row_start.to(torch.int32).contiguous()
+            row_start_i32 = (
+                row_start.clamp(min=0, max=num_cols).to(torch.int32).contiguous()
+            )
         else:
             row_start_i32 = row_end_i32
         _topk_bi_kernel[(num_rows,)](
@@ -426,6 +434,12 @@ def _topk_indices_batch_invariant(
             num_warps=_TOPK_BI_NUM_WARPS,
         )
         return
+    if logits.is_cuda and num_cols > 8192:
+        logger.warning_once(
+            "Batch-invariant indexer top-k: %d columns exceeds the fused "
+            "kernel's 8192-column limit; using the slower torch path.",
+            num_cols,
+        )
     _topk_indices_batch_invariant_ref(
         logits, row_start, row_end, topk_indices, topk_tokens
     )
