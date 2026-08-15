@@ -9,6 +9,7 @@ import math
 
 import torch
 
+import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.model_executor.layers.fused_moe.utils import count_expert_num_tokens
 from vllm.triton_utils import tl, triton
@@ -60,22 +61,26 @@ def compute_aligned_M_and_alignment(
     # Also shrink `alignment` to DeepGEMM's per-call theoretical BLOCK_M on
     # SM100/SM120 when smaller.
     expected_m = M * num_topk
-    try:
-        from vllm.utils.deep_gemm import (
-            get_theoretical_mk_alignment_for_contiguous_layout,
-        )
+    # The theoretical shrink makes BLOCK_M a function of the batch (224 down
+    # to 32); with swap_ab that is the grouped GEMM's UMMA-N. Keep the fixed
+    # caller alignment under batch invariance.
+    if not envs.VLLM_BATCH_INVARIANT:
+        try:
+            from vllm.utils.deep_gemm import (
+                get_theoretical_mk_alignment_for_contiguous_layout,
+            )
 
-        # num_groups=local_num_experts so the helper recovers per-expert em;
-        # omitting it over-picks BLOCK_M on SM120 (heuristic assumes em is
-        # already per-expert).
-        per_call_align = get_theoretical_mk_alignment_for_contiguous_layout(
-            expected_m=expected_m,
-            num_groups=local_num_experts,
-        )
-        if per_call_align and per_call_align <= alignment:
-            alignment = per_call_align
-    except Exception:
-        pass
+            # num_groups=local_num_experts so the helper recovers per-expert
+            # em; omitting it over-picks BLOCK_M on SM120 (heuristic assumes
+            # em is already per-expert).
+            per_call_align = get_theoretical_mk_alignment_for_contiguous_layout(
+                expected_m=expected_m,
+                num_groups=local_num_experts,
+            )
+            if per_call_align and per_call_align <= alignment:
+                alignment = per_call_align
+        except Exception:
+            pass
 
     max_active_experts = min(M * num_topk, local_num_experts)
     M_sum = (M * num_topk) + max_active_experts * (alignment - 1)
