@@ -127,6 +127,34 @@ def test_topk_batch_invariant_narrow_logits():
     assert (out[1, :20] >= 0).all() and (out[1, 20:] == -1).all()
 
 
+def test_topk_batch_invariant_row_chunk_boundary():
+    """The implementation processes rows in chunks of 1024; identical rows on
+    both sides of that boundary must produce identical outputs."""
+    victim = _victim_row()
+    n = 1100
+    logits = torch.randn((n, NUM_COLS), device="cuda", dtype=torch.float32)
+    seq_lens = torch.full((n,), VICTIM_SEQ, device="cuda", dtype=torch.int32)
+    logits[1023] = victim
+    logits[1024] = victim
+    out = _run_bi_topk(logits, seq_lens)
+    assert torch.equal(out[1023], out[1024])
+
+
+def test_topk_batch_invariant_narrow_with_row_start():
+    """Narrow candidate width combined with a nonzero cu_seqlen_ks: row-local
+    coords plus the -1 tail must both survive."""
+    cols = 40
+    logits = torch.zeros((1, cols), device="cuda", dtype=torch.float32)
+    logits[0, :10] = 5.0  # below ks; must be excluded
+    ks = torch.tensor([10], device="cuda", dtype=torch.int32)
+    ke = torch.tensor([cols], device="cuda", dtype=torch.int32)
+    out = torch.empty((1, TOPK), device="cuda", dtype=torch.int32)
+    _topk_indices_batch_invariant(logits, ks, ke, out, TOPK)
+    valid = out[0][out[0] >= 0]
+    assert valid.numel() == 30 and valid.min() >= 0 and valid.max() < 30
+    assert (out[0, 30:] == -1).all()
+
+
 def test_topk_batch_invariant_prefill_shifted_ks():
     """The same row content packed at different cu_seqlen_ks offsets (i.e.
     different preceding requests in the workspace) must give identical

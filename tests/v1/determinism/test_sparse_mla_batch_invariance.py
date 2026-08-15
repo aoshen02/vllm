@@ -285,3 +285,40 @@ def test_pinned_plan_does_not_drop_work(
             f"batch={b}: pinned plan deviates by {deviation:.3e}, beyond 8 bf16 "
             f"ULP ({tolerance:.3e}) — it is likely skipping KV blocks"
         )
+
+
+def test_prefill_chunk_plan_batch_invariant(monkeypatch):
+    """Under BI the prefill chunk plan must emit one request per chunk with
+    the same per-request (chunk_N, chunk_M) the greedy planner would compute:
+    the sparse-prefill kernel plans its splits from the call geometry, so a
+    request's chunk must not depend on which neighbors share the batch."""
+    import vllm.envs as envs
+    from vllm.v1.attention.backends.mla.sparse_swa import (
+        DeepseekSparseSWAMetadata,
+    )
+
+    def make_meta(seq_lens, query_lens):
+        meta = object.__new__(DeepseekSparseSWAMetadata)
+        meta.num_prefills = len(seq_lens)
+        meta.prefill_seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int32)
+        meta.prefill_query_lens_cpu = torch.tensor(query_lens, dtype=torch.int32)
+        meta.prefill_window_size = 128
+        meta.prefill_max_model_len = 8192
+        meta.prefill_max_num_batched_tokens = 8192
+        return meta
+
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
+    seq_lens = [40, 2400, 6, 512]
+    query_lens = [40, 2400, 6, 512]
+    plan = make_meta(seq_lens, query_lens).get_prefill_chunk_plan(
+        compress_ratio=4, prefill_chunk_size=64
+    )
+    assert [(c[0], c[1]) for c in plan] == [(i, i + 1) for i in range(4)]
+    for i, (start, end, chunk_n, chunk_m) in enumerate(plan):
+        solo = make_meta(seq_lens[i : i + 1], query_lens[i : i + 1])
+        solo_plan = solo.get_prefill_chunk_plan(
+            compress_ratio=4, prefill_chunk_size=64
+        )
+        assert solo_plan == [(0, 1, chunk_n, chunk_m)], (
+            f"request {i} chunk geometry depends on neighbors"
+        )
