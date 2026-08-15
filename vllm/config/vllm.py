@@ -1661,6 +1661,39 @@ class VllmConfig:
                 "Disabling cascade attention when VLLM_BATCH_INVARIANT is enabled.",
             )
 
+        if (
+            envs.VLLM_BATCH_INVARIANT
+            and self.compilation_config.cudagraph_mode is not None
+            and self.compilation_config.cudagraph_mode.has_piecewise_cudagraphs()
+        ):
+            # Piecewise cudagraphs are not numerically equivalent to full
+            # cudagraphs or to eager, and which mode a step runs under is a
+            # function of the batch (uniform decode? within the largest capture
+            # size?), so leaving piecewise on makes a request's output depend on
+            # its neighbours. Full cudagraphs and the eager fallback agree
+            # bit-for-bit, so keeping only FULL preserves invariance and the
+            # decode-side graph win.
+            if (
+                self.speculative_config is not None
+                and self.speculative_config.uses_dynamic_speculative_decoding()
+                and not self.use_v2_model_runner
+            ):
+                # _maybe_override_dynamic_sd_cudagraph_mode just forced piecewise
+                # here because the verification length varies at runtime. Silently
+                # forcing it back to FULL would trade a correctness problem for a
+                # different one, so say so instead.
+                raise ValueError(
+                    "VLLM_BATCH_INVARIANT cannot use piecewise cudagraphs, but "
+                    "dynamic speculative decoding requires them on this model "
+                    "runner. Disable speculative decoding, or set "
+                    "VLLM_USE_V2_MODEL_RUNNER=1."
+                )
+            self.compilation_config.cudagraph_mode = CUDAGraphMode.FULL
+            logger.warning_once(
+                "Piecewise cudagraphs break batch invariance; setting "
+                "cudagraph_mode to FULL because VLLM_BATCH_INVARIANT is enabled."
+            )
+
         if self.parallel_config.use_ubatching:
             a2a_backend = self.parallel_config.all2all_backend
             assert a2a_backend in [

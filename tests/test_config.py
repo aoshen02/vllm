@@ -1648,6 +1648,46 @@ def test_vllm_config_explicit_overrides():
     assert config.compilation_config.cudagraph_mode == CUDAGraphMode.FULL_AND_PIECEWISE
 
 
+@pytest.mark.parametrize(
+    "requested",
+    [CUDAGraphMode.PIECEWISE, CUDAGraphMode.FULL_AND_PIECEWISE],
+)
+def test_batch_invariant_drops_piecewise_cudagraphs(monkeypatch, requested):
+    """Piecewise graph replay is not bit-equal to full-graph replay or eager,
+    and the per-step mode is chosen from batch properties, so leaving it on
+    makes a request's output depend on its neighbours."""
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
+    config = VllmConfig(
+        compilation_config=CompilationConfig(cudagraph_mode=requested)
+    )
+    assert not config.compilation_config.cudagraph_mode.has_piecewise_cudagraphs()
+
+
+def test_batch_invariant_resolve_prefers_full_decode_only(monkeypatch):
+    """The mixed-mode downgrade must not hand piecewise back to a
+    batch-invariant run, even when attention is in splitting_ops."""
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
+    compilation_config = CompilationConfig(
+        cudagraph_mode=CUDAGraphMode.FULL,
+        cudagraph_capture_sizes=list(range(1, 17)),
+    )
+    # Without batch invariance this combination downgrades to FULL_AND_PIECEWISE.
+    compilation_config.splitting_ops = list(CompilationConfig._attention_ops)
+    assert compilation_config.splitting_ops_contain_attention()
+    compilation_config.max_cudagraph_capture_size = 16
+    compilation_config.post_init_cudagraph_sizes()
+
+    resolved = compilation_config.resolve_cudagraph_mode_and_sizes(
+        AttentionCGSupport.UNIFORM_BATCH,
+        "FakeAttentionBackend",
+        uniform_decode_query_len=1,
+        use_v2_model_runner=True,
+        tensor_parallel_size=1,
+    )
+
+    assert resolved == CUDAGraphMode.FULL_DECODE_ONLY
+
+
 def test_fusion_pass_op_priority():
     """This test checks that custom op enablement & IR op priority
     correctly control default fusions"""
