@@ -186,3 +186,35 @@ def test_gate_linear_bias_survives_the_fp32_path(monkeypatch, default_vllm_confi
     unbiased = linear_batch_invariant(x.float(), layer.weight.float())
     assert returned_bias is None
     torch.testing.assert_close(out, unbiased + layer.bias.float(), rtol=0, atol=0)
+
+
+@skip_if_not_cuda
+@pytest.mark.parametrize("x_dtype", [torch.bfloat16, torch.float32])
+def test_gate_linear_fp32_output_never_rounds_through_the_weight_dtype(
+    monkeypatch, x_dtype
+):
+    """fp32 logits must survive whatever dtypes the operands happen to be in.
+
+    The fallback casts the input to the weight dtype and the persistent matmul
+    stores in the input dtype, so with a bf16 weight the fp32 output would be a
+    promoted bf16 result. x already being fp32 does not save it -- that is the
+    case the original guard missed, since it only checked the input.
+    """
+    from vllm.model_executor.layers.batch_invariant import linear_batch_invariant
+
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
+    torch.manual_seed(0)
+    layer = GateLinear(
+        input_size=128,
+        output_size=8,
+        bias=False,
+        out_dtype=torch.float32,
+        params_dtype=torch.bfloat16,
+    ).cuda()
+    assert layer.weight.dtype == torch.bfloat16
+
+    x = torch.randn(4, 128, device="cuda", dtype=x_dtype)
+    out, _ = layer(x)
+
+    exact = linear_batch_invariant(x.float(), layer.weight.float())
+    torch.testing.assert_close(out, exact, rtol=0, atol=0)

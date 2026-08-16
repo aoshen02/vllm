@@ -182,14 +182,24 @@ def matmul_persistent(
         },
     }
     config = configs[dtype]
-    if dtype == torch.float32 and N <= 256 and K >= 1024 and K % 128 == 0:
-        # Narrow outputs leave most of a 128x128 tile empty: a (64, 4096) x
-        # (4096, 256) router gate launches only 2 blocks with the default
-        # config. The key is (dtype, N, K) and never M, so a row's reduction
-        # order is unchanged by batch size and invariance is preserved.
-        # Scoped to deep 128-aligned K, the measured regime (GB200, K=4096:
-        # 43us -> 27us for M <= 1024, +9% at M = 4096); shallow or ragged K
-        # was not measured and keeps the default tiles.
+    # Narrow outputs leave most of a 128x128 tile empty: a (64, 4096) x
+    # (4096, 256) router gate launches only 2 blocks with the default config.
+    #
+    # Scoped to exactly the shape and platform this was measured on -- the DSv4
+    # router gate on SM100. Measured there: 43us -> 27us for M <= 1024, and a 9%
+    # regression at M = 4096, which is accepted because the gate runs at decode
+    # batch sizes. Nothing else was measured, and the 64/64/128 three-stage tile
+    # wants ~192 KiB of shared memory, which is not a given elsewhere.
+    #
+    # The key is (dtype, N, K) and never M. Splitting on M instead would make
+    # BLOCK_K a function of the batch, which is precisely the reduction-order
+    # dependence this module exists to remove.
+    if (
+        dtype == torch.float32
+        and N == 256
+        and K == 4096
+        and current_platform.is_device_capability_family(100)
+    ):
         config = {
             **config,
             "BLOCK_SIZE_M": 64,
