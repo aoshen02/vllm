@@ -1041,6 +1041,14 @@ class VllmConfig:
         if self.performance_mode != "balanced":
             logger.info_once("Performance mode set to '%s'.", self.performance_mode)
 
+        # Snapshot before any hook can fill these in: try_verify_and_update_config
+        # lets a model write its own capture defaults (GPT-OSS does), which the
+        # batch-invariance check below must not mistake for a deployment choice.
+        self._cudagraph_sizes_user_specified = (
+            self.compilation_config.max_cudagraph_capture_size is not None
+            or self.compilation_config.cudagraph_capture_sizes is not None
+        )
+
         self.try_verify_and_update_config()
 
         if self.model_config is not None:
@@ -2057,13 +2065,6 @@ class VllmConfig:
             # determine the initial max_cudagraph_capture_size
             max_cudagraph_capture_size = (
                 self.compilation_config.max_cudagraph_capture_size
-            )
-            # Recorded before the defaults overwrite it: the batch-invariance
-            # check below needs to know whether the capture envelope was chosen
-            # by the deployment or handed to it.
-            self._cudagraph_sizes_user_specified = (
-                max_cudagraph_capture_size is not None
-                or self.compilation_config.cudagraph_capture_sizes is not None
             )
             if max_cudagraph_capture_size is None:
                 from vllm.platforms import current_platform

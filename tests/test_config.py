@@ -1732,16 +1732,11 @@ def test_batch_invariant_never_falls_back_to_piecewise(
 def test_batch_invariant_refuses_full_when_full_is_unsupported(monkeypatch):
     """A configuration that cannot use full cudagraphs is refused, not pinned.
 
-    Pooling models downgrade to PIECEWISE because full graphs do not work for
-    them; pinning FULL afterwards would put the run back on the unsupported
-    mode. This covers that.
-
-    The check is deliberately not gated on the mode still reading as piecewise:
-    set_splitting_ops_for_v1() runs before the pin and can raise a downgraded
-    mode back to FULL (sequence parallelism, fuse_attn_quant), which would hide
-    the downgrade from a piecewise-gated check. No config-only input was found
-    that reaches the pin in that state, so that ordering is guarded by
-    construction rather than by this test.
+    The refusal must not be gated on the mode still reading as piecewise. Here
+    FULL is downgraded to PIECEWISE because the model is a pooling model, and
+    then raised back to FULL by attention-quant fusion -- both before the batch
+    invariance pin runs. A piecewise-gated check sees a plain FULL at that point
+    and lets the run continue on a mode the model does not support.
     """
     monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
     with pytest.raises(ValueError, match="cannot use full ones either"):
@@ -1756,15 +1751,45 @@ def test_batch_invariant_refuses_full_when_full_is_unsupported(monkeypatch):
                 is_encoder_decoder=False,
                 max_num_seqs=64,
             ),
-            # Sequence parallelism raises the pooling downgrade back to FULL in
-            # set_splitting_ops_for_v1(), which runs before the pin: by then
-            # there is no piecewise left for a piecewise-gated check to see.
+            # FULL -> pooling downgrades to PIECEWISE -> attention-quant fusion
+            # raises it back to FULL, all before the pin.
             compilation_config=CompilationConfig(
                 mode=CompilationMode.VLLM_COMPILE,
-                cudagraph_mode=CUDAGraphMode.PIECEWISE,
-                pass_config={"enable_sp": True},
+                cudagraph_mode=CUDAGraphMode.FULL,
+                use_inductor_graph_partition=False,
+                pass_config={"fuse_attn_quant": True},
             ),
         )
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+def test_batch_invariant_records_only_deployment_chosen_capture_sizes(
+    monkeypatch, explicit
+):
+    """The capture-set check must distinguish a deployment's choice from a default.
+
+    Defaults arrive from several places and not all of them are the platform's:
+    try_verify_and_update_config() lets a model write its own capture sizes
+    (gpt-oss sets 1024). Sampling the fields after that ran would read a model
+    default as an explicit choice and warn about a configuration nobody wrote,
+    so the flag is taken before any hook can touch them.
+    """
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
+    config = VllmConfig(
+        model_config=ModelConfig("Qwen/Qwen3-0.6B", max_model_len=2048),
+        scheduler_config=SchedulerConfig(
+            max_model_len=2048, is_encoder_decoder=False, max_num_seqs=64
+        ),
+        compilation_config=CompilationConfig(
+            cudagraph_mode=CUDAGraphMode.FULL,
+            # Wide enough to cover the decode fan-out, so this does not consume
+            # the warning that the next test asserts on (it is warning_once).
+            **({"cudagraph_capture_sizes": [8, 16, 32, 64]} if explicit else {}),
+        ),
+    )
+    assert config._cudagraph_sizes_user_specified is explicit
+    # The resolved value is always populated, so it cannot be the signal.
+    assert config.compilation_config.max_cudagraph_capture_size
 
 
 def test_batch_invariant_warns_when_decode_step_escapes_capture(monkeypatch, caplog):
