@@ -18,7 +18,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     get_fp8_min_max,
 )
 from vllm.platforms import current_platform
-from vllm.triton_utils import tl, triton
+from vllm.triton_utils import HAS_TRITON, tl, triton
 from vllm.utils.deep_gemm import (
     fp8_fp4_mqa_logits,
     fp8_fp4_paged_mqa_logits,
@@ -295,7 +295,9 @@ def kv_cache_as_quant_view(
 _TOPK_BI_NUM_WARPS = 8
 # tl.constexpr instantiation: @jit bodies may only read globals wrapped this way.
 _INT32_MIN_PY = -(2**31)
-_INT32_MIN = tl.constexpr(_INT32_MIN_PY)
+# tl.constexpr is None without Triton, so guard the instantiation the way the
+# rest of the tree does -- this module is imported on CPU-only paths too.
+_INT32_MIN = tl.constexpr(_INT32_MIN_PY) if HAS_TRITON else _INT32_MIN_PY
 
 
 @triton.jit
