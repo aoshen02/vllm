@@ -6,9 +6,11 @@ The gate's output is the expert scores: if a row's scores move with the batch,
 expert *selection* flips, which is divergence rather than rounding noise. The
 router top-k is already BI-guarded (sorted=...), but that only fixes tie
 ordering. Under VLLM_BATCH_INVARIANT the forward skips the shape-dispatched
-tiers 1-5 and uses F.linear, which UnquantizedLinearMethod.apply routes to
-linear_batch_invariant. No global init is needed: that route keys on the env
-flag alone (linear.py), so these tests stay process-clean.
+tiers 1-5. With an fp32 out_dtype it calls linear_batch_invariant directly so
+the matmul stays in fp32; otherwise it falls through to F.linear, which
+UnquantizedLinearMethod.apply routes to the same helper. No global init is
+needed: that route keys on the env flag alone (linear.py), so these tests stay
+process-clean.
 """
 
 import tempfile
