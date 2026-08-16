@@ -6751,19 +6751,6 @@ class GPUModelRunner(
             self.compilation_config.cudagraph_mm_encoder and self.supports_mm_inputs
         ):
             return None
-        if envs.VLLM_BATCH_INVARIANT:
-            # This manager batches the step's encoder items together and picks a
-            # graph from their combined token count, so an item's numeric path
-            # would be decided by whatever it was batched with. Disabled rather
-            # than refused at config time: reaching it also needs a model
-            # capability that is not known until the model is loaded.
-            logger.warning_once(
-                "Disabling encoder cudagraphs because VLLM_BATCH_INVARIANT is "
-                "enabled: the encoder graph is selected from the combined token "
-                "count of everything batched with it."
-            )
-            return None
-
         # Use get_model() to unwrap CUDAGraphWrapper/UBatchWrapper, because
         # @runtime_checkable Protocol isinstance() checks do not work through
         # __getattr__ forwarding.
@@ -6777,6 +6764,20 @@ class GPUModelRunner(
 
         raw_model = self.get_model()
         if not supports_encoder_cudagraph(raw_model):
+            return None
+
+        if envs.VLLM_BATCH_INVARIANT:
+            # Checked after the capability so only deployments that would really
+            # have got this manager are told anything. It batches the step's
+            # encoder items together and picks a graph from their combined token
+            # count, so an item's numeric path would be decided by whatever it
+            # was batched with. Disabled here rather than refused at config time
+            # because the capability is not knowable until the model is loaded.
+            logger.warning_once(
+                "Disabling encoder cudagraphs because VLLM_BATCH_INVARIANT is "
+                "enabled: the encoder graph is selected from the combined token "
+                "count of everything batched with it."
+            )
             return None
 
         return EncoderCudaGraphManager(

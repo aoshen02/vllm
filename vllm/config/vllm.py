@@ -1681,7 +1681,7 @@ class VllmConfig:
         # switch it off either. Opt-in, and the condition is exact here, so
         # refuse. (The multimodal encoder is the same shape but its dispatcher
         # also needs a model capability that is only known once the model is
-        # loaded, so it is handled at that point instead.)
+        # loaded, so it is disabled there instead.)
         if envs.VLLM_BATCH_INVARIANT and self.parallel_config.use_ubatching:
             raise ValueError(
                 "VLLM_BATCH_INVARIANT is enabled but microbatching chooses "
