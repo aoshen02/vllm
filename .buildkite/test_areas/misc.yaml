@@ -414,6 +414,9 @@ steps:
   source_file_dependencies:
     - vllm/v1/attention
     - vllm/model_executor/layers
+    - vllm/config/
+    - vllm/v1/spec_decode/
+    - vllm/v1/worker/gpu_model_runner.py
     - tests/v1/determinism/
   commands:
     - export VLLM_WORKER_MULTIPROC_METHOD=spawn
