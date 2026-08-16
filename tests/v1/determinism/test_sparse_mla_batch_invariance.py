@@ -240,6 +240,113 @@ def test_pinned_plan_makes_decode_batch_invariant(
                 )
 
 
+def test_cold_shape_cannot_be_pinned_until_a_plan_is_observed():
+    """The precondition the cold-start rerun is built on.
+
+    ``_forward_decode`` runs the shipped planner once for an unseen
+    ``(h_q, s_q)`` precisely because the partition count is not derivable
+    without it, then reruns with the pinned plan so the batch-dependent result
+    is never the one returned. That control flow is not exercised here -- it
+    needs the model -- but the fact it hinges on is: cold gives None, and only
+    observing a real plan makes pinning possible.
+    """
+    from vllm.v1.attention.backends.mla.sparse_swa import _num_sm_parts_cache
+
+    device = torch.device("cuda:0")
+    cold = (H_Q + 7, 3)
+    assert cold not in _num_sm_parts_cache
+    topk_len = torch.tensor([64], dtype=torch.int32, device=device)
+    assert (
+        build_pinned_sched_meta(
+            h_q=cold[0],
+            s_q=cold[1],
+            topk_length=topk_len,
+            extra_topk_length=None,
+            has_extra=False,
+            device=device,
+        )
+        is None
+    ), "an unobserved shape must not produce a plan out of thin air"
+
+    sched = flashmla.get_mla_metadata()[0]
+    gen = torch.Generator(device=device).manual_seed(7)
+    kv = _kv_cache(64, device)
+    q, idx, n = _row(gen, device, 64 * PAGE, TOPK // 2)
+    _decode(q, kv, idx, torch.tensor([n], dtype=torch.int32, device=device), sched)
+    record_num_sm_parts(*cold, sched)
+
+    assert (
+        build_pinned_sched_meta(
+            h_q=cold[0],
+            s_q=cold[1],
+            topk_length=topk_len,
+            extra_topk_length=None,
+            has_extra=False,
+            device=device,
+        )
+        is not None
+    ), "after one observed plan the same shape must be pinnable"
+
+
+def test_pinned_plan_batch_invariant_above_the_partition_count(bootstrapped):
+    """More requests than partitions, on the real kernel.
+
+    ``BATCH_SIZES`` tops out at 65 while a GB200 plans 152 partitions, so every
+    test above stays in the regime where each request gets a partition to
+    itself. Above the count a partition holds several whole requests, which is
+    the branch that replaced the fallback to the shipped planner -- and the only
+    coverage it had was a CPU assertion on the skeleton's shape.
+    """
+    from vllm.v1.attention.backends.mla.sparse_swa import _num_sm_parts_cache
+
+    device, kv, _extra_kv, kv_tokens = bootstrapped
+    num_sm_parts = _num_sm_parts_cache[(H_Q, 1)]
+    gen = torch.Generator(device=device).manual_seed(99)
+    victim = _row(gen, device, kv_tokens, TOPK // 2)
+
+    reference = None
+    for b in (num_sm_parts - 1, num_sm_parts, num_sm_parts + 1, 2 * num_sm_parts + 1):
+        for victim_at in {0, b - 1}:
+            packed, _ = _batch(device, kv_tokens, b, victim, victim_at, False, None)
+            q, idx, topk_len = packed
+            out = _decode(q, kv, idx, topk_len, _pinned(topk_len, device))
+            row = out[victim_at]
+            if reference is None:
+                reference = row.clone()
+            else:
+                assert torch.equal(reference, row), (
+                    f"pinned row moved at batch={b} (partitions={num_sm_parts}) "
+                    f"position={victim_at}"
+                )
+
+
+def test_pinned_plan_above_the_partition_count_covers_every_request(bootstrapped):
+    """Grouping whole requests must not drop any of them.
+
+    Invariance alone would be satisfied by a plan that quietly stopped at the
+    partition count and left the tail unattended, so check the spans as the
+    kernel receives them.
+    """
+    from vllm.v1.attention.backends.mla.sparse_swa import _num_sm_parts_cache
+
+    device, _kv, _extra_kv, kv_tokens = bootstrapped
+    num_sm_parts = _num_sm_parts_cache[(H_Q, 1)]
+    gen = torch.Generator(device=device).manual_seed(100)
+    victim = _row(gen, device, kv_tokens, TOPK // 2)
+
+    b = 2 * num_sm_parts + 1
+    packed, _ = _batch(device, kv_tokens, b, victim, 0, False, None)
+    meta = _pinned(packed[2], device).tile_scheduler_metadata.cpu()
+    busy = meta[meta[:, 0] <= meta[:, 1]]
+    covered = torch.cat(
+        [torch.arange(int(lo), int(hi) + 1) for lo, hi in busy[:, :2]]
+    )
+    assert torch.equal(covered, torch.arange(b)), (
+        f"partitions covered {covered.tolist()[:8]}... for {b} requests; spans "
+        "must be contiguous, disjoint and complete"
+    )
+
+
 @pytest.mark.parametrize("split", [False, True], ids=["whole_request", "split"])
 @pytest.mark.parametrize("with_extra", [False, True], ids=["swa_only", "with_extra_kv"])
 def test_pinned_plan_does_not_drop_work(

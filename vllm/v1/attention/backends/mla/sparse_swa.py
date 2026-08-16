@@ -63,9 +63,10 @@ _num_sm_parts_cache: dict[tuple[int, int], int] = {}
 # every step with the same batch size. Cache it: this is a per-layer hot path,
 # and building it from a boolean mask costs a device sync (measured 610 us,
 # ~37 ms per step over 61 layers).
-_plan_cache: dict[
-    tuple[int, int, torch.device], tuple[torch.Tensor, torch.Tensor, torch.Tensor]
-] = {}
+_PlanSkeleton = tuple[
+    torch.Tensor, tuple[torch.Tensor, torch.Tensor], torch.Tensor
+]
+_plan_cache: dict[tuple[int, int, torch.device], _PlanSkeleton] = {}
 
 
 def record_num_sm_parts(h_q: int, s_q: int, sched: FlashMLASchedMeta) -> None:
@@ -179,7 +180,7 @@ def _split_plan(
 
 def _plan_skeleton(
     b: int, num_sm_parts: int, device: torch.device
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> _PlanSkeleton:
     """The batch-length-independent part of the plan: who owns what.
 
     Partition ``p`` owns requests ``[floor(p*b/P), floor((p+1)*b/P))``. Spans are
@@ -188,9 +189,10 @@ def _plan_skeleton(
     No request is ever split across partitions, so a row's reduction order still
     depends only on its own length.
 
-    Returns ``(meta, last_owned, num_splits)``. ``last_owned`` indexes, for each
-    busy partition, the last request it owns; that is the only place the caller
-    has to write a per-call block count.
+    Returns ``(meta, (busy_idx, last_owned), num_splits)``. ``busy_idx`` lists
+    the partitions that own at least one request and ``last_owned`` the last
+    request each of them owns; that pair is the only place the caller has to
+    write a per-call block count.
     """
     key = (b, num_sm_parts, device)
     cached = _plan_cache.get(key)
