@@ -118,6 +118,7 @@ def test_matmul_batch_invariance(dtype):
         (4096, 256, 4096),  # more tiles than SMs: persistent programs loop
     ],
 )
+@skip_unsupported
 def test_matmul_fp32_narrow_output_rows_do_not_move_with_m(M, N, K):
     """A row's result must not depend on how many rows share the launch.
 

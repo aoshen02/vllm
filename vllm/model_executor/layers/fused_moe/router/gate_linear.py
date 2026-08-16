@@ -186,11 +186,15 @@ class GateLinear(ReplicatedLinear):
         # batch_invariant.py entirely; tier 5's cuBLAS may re-pick its
         # algorithm as M changes even with CUBLAS_WORKSPACE_CONFIG pinned).
         # F.linear routes through UnquantizedLinearMethod.apply, which calls
-        # linear_batch_invariant under this flag. The persistent matmul
-        # stores in the input dtype, which would round fp32 logits through
-        # bf16; compute in fp32 when fp32 output is requested.
+        # linear_batch_invariant under this flag -- but that path casts the
+        # input to the weight dtype and the persistent matmul stores in the
+        # input dtype, so fp32 logits would round through bf16 whenever either
+        # operand is not already fp32. Promote both when fp32 output is asked
+        # for, whatever the operands are.
         if envs.VLLM_BATCH_INVARIANT:
-            if self.out_dtype == torch.float32 and x.dtype != torch.float32:
+            if self.out_dtype == torch.float32 and not (
+                x.dtype == torch.float32 and self.weight.dtype == torch.float32
+            ):
                 from vllm.model_executor.layers.batch_invariant import (
                     linear_batch_invariant,
                 )

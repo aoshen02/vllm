@@ -56,11 +56,16 @@ def _make_gate(device) -> GateLinear:
         output_size=NUM_EXPERTS,
         bias=False,
         out_dtype=torch.float32,
+        # Without this the weight is created in the default dtype (fp32 in
+        # tests), copy_ would only convert the values, and the bf16-only tiers
+        # this test is about would never be eligible in the first place.
+        params_dtype=torch.bfloat16,
     ).to(device)
     with torch.no_grad():
         gate.weight.copy_(
             torch.randn(NUM_EXPERTS, HIDDEN_SIZE, dtype=torch.bfloat16, device=device)
         )
+    assert gate.weight.dtype == torch.bfloat16
     return gate
 
 
@@ -151,6 +156,7 @@ def test_gate_linear_negative_control(monkeypatch):
     )
 
 
+@skip_if_not_cuda
 def test_gate_linear_bias_survives_the_fp32_path(monkeypatch, default_vllm_config):
     """The fp32 batch-invariant path must still add ReplicatedLinear's bias.
 
@@ -161,7 +167,11 @@ def test_gate_linear_bias_survives_the_fp32_path(monkeypatch, default_vllm_confi
     monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
     torch.manual_seed(0)
     layer = GateLinear(
-        input_size=128, output_size=8, bias=True, out_dtype=torch.float32
+        input_size=128,
+        output_size=8,
+        bias=True,
+        out_dtype=torch.float32,
+        params_dtype=torch.bfloat16,
     ).cuda()
     with torch.no_grad():
         layer.bias.copy_(torch.arange(8, device="cuda", dtype=layer.bias.dtype) + 1)
