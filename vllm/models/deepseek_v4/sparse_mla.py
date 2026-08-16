@@ -7,6 +7,7 @@ from typing import Any, ClassVar
 
 import torch
 
+import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType
 from vllm.platforms.interface import DeviceCapability
@@ -261,13 +262,24 @@ class DeepseekV4FlashMLAMetadataBuilder(
         assert cm.positions is not None, (
             "positions is required for C128A metadata build"
         )
-        active_topk_width = min(
-            max(
-                triton.next_power_of_2(max(cm.max_seq_len // self.compress_ratio, 1)),
-                _C128A_TOPK_ALIGNMENT,
-            ),
-            self.c128a_max_compressed,
-        )
+        if envs.VLLM_BATCH_INVARIANT:
+            # cm.max_seq_len is the longest sequence *in this step*, so sizing
+            # the width from it lets a long neighbour push a request into a
+            # different power-of-two bucket -- and the width reaches the kernel
+            # as the split granularity. Use the configured maximum, which is
+            # max_model_len // compress_ratio rounded up to the alignment: a
+            # constant, valid for every request the engine can serve.
+            active_topk_width = self.c128a_max_compressed
+        else:
+            active_topk_width = min(
+                max(
+                    triton.next_power_of_2(
+                        max(cm.max_seq_len // self.compress_ratio, 1)
+                    ),
+                    _C128A_TOPK_ALIGNMENT,
+                ),
+                self.c128a_max_compressed,
+            )
         block_size = self.kv_cache_spec.block_size // self.compress_ratio
         global_decode, decode_lens, prefill_local = build_c128a_topk_metadata(
             cm.positions[:num_total],
