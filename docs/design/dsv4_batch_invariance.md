@@ -82,8 +82,16 @@ KV compressor, and fp8/mxfp4 MoE expert stacks.
 5. `bi/deepgemm-fp8` — DeepGEMM BI wiring (fail-closed probe, alignment pin,
    `FallbackExperts` forwarding fix) + mocked tests
 6. `bi/cudagraph-mode` — keep piecewise cudagraphs out of batch-invariant runs
-   (`vllm/config/vllm.py`, `vllm/config/compilation.py`) + config tests; this
-   is the fix for the mixed-step leak described under the roadmap
+   (`vllm/config/vllm.py`, `vllm/config/compilation.py`) + config tests, plus a
+   config-time warning when an explicit capture set is too small to hold the
+   largest decode step; this is the policy-level defence for the mixed-step leak
+7. `bi/indexer-shortcut` — bound the indexer short-context shortcut on
+   `max_model_len` (`vllm/models/deepseek_v4/attention.py`, +10/-1); this is the
+   **root cause** of the mixed-step leak and is a correctness bug independent of
+   batch invariance — the predicate is a host value evaluated inside a captured
+   graph segment, so every replayed step silently ran the "select the earliest
+   candidates" fallback instead of the real top-k. With it applied, `PIECEWISE`
+   itself becomes bit-identical to `FULL` and eager
 
 Serving recipe under BI: `--kv-cache-dtype fp8 --block-size 256
 --no-enable-prefix-caching --no-enable-flashinfer-autotune`,
