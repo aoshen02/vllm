@@ -29,9 +29,15 @@ from vllm.v1.attention.backends.mla.sparse_swa import (  # noqa: E402
     record_num_sm_parts,
 )
 
-pytestmark = pytest.mark.skipif(
+# The backend accepts compute capability 9 and 10
+# (DeepseekV4FlashMLABackend.supports_compute_capability), but the kernel tests
+# below were only ever run on SM100 and the numbers quoted in the docstring are
+# GB200's. Gate the ones that launch FlashMLA rather than the whole module, so
+# the structural and control-flow coverage still runs everywhere -- including on
+# the SM90 half of the supported range, where the kernel side is untested.
+requires_flashmla_gpu = pytest.mark.skipif(
     not current_platform.is_device_capability(100),
-    reason="DeepSeek-V4 sparse MLA decode is SM100-only",
+    reason="sparse MLA decode kernel coverage has only been validated on SM100",
 )
 
 D_QK, D_V = 576, 512
@@ -204,6 +210,7 @@ def bootstrapped():
 
 @pytest.mark.parametrize("split", [False, True], ids=["whole_request", "split"])
 @pytest.mark.parametrize("with_extra", [False, True], ids=["swa_only", "with_extra_kv"])
+@requires_flashmla_gpu
 def test_pinned_plan_makes_decode_batch_invariant(
     bootstrapped, small_batch_config, with_extra, split
 ):
@@ -240,6 +247,7 @@ def test_pinned_plan_makes_decode_batch_invariant(
                 )
 
 
+@requires_flashmla_gpu
 def test_cold_shape_cannot_be_pinned_until_a_plan_is_observed():
     """The precondition the cold-start rerun is built on.
 
@@ -288,6 +296,7 @@ def test_cold_shape_cannot_be_pinned_until_a_plan_is_observed():
     ), "after one observed plan the same shape must be pinnable"
 
 
+@requires_flashmla_gpu
 def test_pinned_plan_batch_invariant_above_the_partition_count(bootstrapped):
     """More requests than partitions, on the real kernel.
 
@@ -320,6 +329,7 @@ def test_pinned_plan_batch_invariant_above_the_partition_count(bootstrapped):
                 )
 
 
+@requires_flashmla_gpu
 def test_pinned_plan_above_the_partition_count_covers_every_request(bootstrapped):
     """Grouping whole requests must not drop any of them.
 
@@ -349,6 +359,7 @@ def test_pinned_plan_above_the_partition_count_covers_every_request(bootstrapped
 
 @pytest.mark.parametrize("split", [False, True], ids=["whole_request", "split"])
 @pytest.mark.parametrize("with_extra", [False, True], ids=["swa_only", "with_extra_kv"])
+@requires_flashmla_gpu
 def test_pinned_plan_does_not_drop_work(
     bootstrapped, small_batch_config, with_extra, split
 ):
@@ -388,6 +399,7 @@ def test_pinned_plan_does_not_drop_work(
         )
 
 
+@requires_flashmla_gpu
 def test_prefill_chunk_plan_batch_invariant():
     """Under BI the prefill chunk plan must emit one request per chunk with
     the same per-request (chunk_N, chunk_M) the greedy planner would compute:
@@ -418,6 +430,127 @@ def test_prefill_chunk_plan_batch_invariant():
         solo_plan = solo.get_prefill_chunk_plan(compress_ratio=4, prefill_chunk_size=64)
         assert solo_plan == [(0, 1, chunk_n, chunk_m)], (
             f"request {i} chunk geometry depends on neighbors"
+        )
+
+
+def _stub_decode_layer(monkeypatch, pinned_after_record):
+    """A DeepseekV4FlashMLAAttention with only what the swa-only decode reads.
+
+    The cold-start control flow lives in _forward_decode: plan missing -> run
+    the shipped planner once -> record the partition count -> rebuild pinned ->
+    rerun. Nothing about it needs weights or a real kernel, so stub the kernel
+    and the planner and watch the sequence.
+    """
+    from types import SimpleNamespace
+
+    import vllm.envs as envs
+    from vllm.models.deepseek_v4.nvidia import flashmla as fm
+
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
+
+    calls = []
+    tile = SimpleNamespace(tile_scheduler_metadata=None, num_splits=None)
+
+    def fake_kernel(**kw):
+        meta = kw["tile_scheduler_metadata"]
+        calls.append(meta.tile_scheduler_metadata)
+        kw["out"].fill_(len(calls))
+        return kw["out"], None
+
+    def fake_record(h_q, s_q, sched):
+        # What the real one does once the shipped planner has left a plan
+        # behind; here the shipped planner is the stub above.
+        sched.tile_scheduler_metadata = sched.tile_scheduler_metadata
+
+    pinned = SimpleNamespace(
+        tile_scheduler_metadata=torch.zeros(1, dtype=torch.int32),
+        num_splits=torch.zeros(1, dtype=torch.int32),
+    )
+    seen = []
+
+    def fake_build(**kw):
+        seen.append(kw)
+        # First call is the cold miss; the second is after record.
+        return pinned if (len(seen) > 1 and pinned_after_record) else None
+
+    monkeypatch.setattr(fm, "flash_mla_with_kvcache", fake_kernel)
+    import vllm.v1.attention.backends.mla.sparse_swa as swa
+
+    monkeypatch.setattr(swa, "build_pinned_sched_meta", fake_build)
+    monkeypatch.setattr(swa, "record_num_sm_parts", fake_record)
+
+    layer = object.__new__(fm.DeepseekV4FlashMLAAttention)
+    layer.compress_ratio = 1
+    layer.scale = 1.0
+    layer.attn_sink = None
+    layer.swa_cache_layer = SimpleNamespace(
+        kv_cache=torch.zeros(1, PAGE, 1), split_budget_cfg=None
+    )
+    swa_meta = SimpleNamespace(
+        num_decodes=1,
+        num_decode_tokens=1,
+        decode_swa_indices=torch.zeros(1, 1, TOPK, dtype=torch.int32),
+        decode_swa_lens=torch.ones(1, dtype=torch.int32),
+        tile_sched_swaonly=tile,
+        is_valid_token=None,
+        token_to_req_indices=None,
+    )
+    return layer, swa_meta, calls, tile
+
+
+def test_cold_start_reruns_with_the_pinned_plan(monkeypatch):
+    """The shipped planner's output must never be the one that comes back.
+
+    A cold (h_q, s_q) has to run the real planner once because the partition
+    count is not observable any other way. The contract is that this first
+    result is discarded: the kernel runs a second time with the pinned plan
+    installed, and that is what the caller sees.
+    """
+    layer, swa_meta, calls, tile = _stub_decode_layer(monkeypatch, True)
+    out = torch.zeros(1, 64, D_V)
+
+    layer._forward_decode(
+        q=torch.zeros(1, 64, D_QK),
+        kv_cache=None,
+        swa_metadata=swa_meta,
+        attn_metadata=None,
+        swa_only=True,
+        output=out,
+    )
+
+    assert len(calls) == 2, (
+        f"cold shape ran the kernel {len(calls)} time(s); it must run once to "
+        "observe the plan and once more with the pinned one"
+    )
+    assert calls[0] is None, "the first call must be the shipped planner's"
+    assert calls[1] is not None, "the second call must carry the pinned plan"
+    assert tile.tile_scheduler_metadata is not None, (
+        "the pinned plan must be installed on the per-type struct so the "
+        "remaining layers of this step reuse it"
+    )
+    assert torch.equal(out, torch.full_like(out, 2.0)), (
+        "the returned output is the first kernel call's, i.e. the "
+        "batch-dependent one this flag exists to avoid"
+    )
+
+
+def test_cold_start_fails_closed_when_the_plan_stays_unbuildable(monkeypatch):
+    """If pinning still fails after the observation, raise rather than return.
+
+    Returning here would hand back the shipped planner's batch-dependent
+    output under a flag that promises the opposite, and it would do it
+    silently.
+    """
+    layer, swa_meta, _calls, _tile = _stub_decode_layer(monkeypatch, False)
+
+    with pytest.raises(RuntimeError, match="could not pin the tile-scheduler"):
+        layer._forward_decode(
+            q=torch.zeros(1, 64, D_QK),
+            kv_cache=None,
+            swa_metadata=swa_meta,
+            attn_metadata=None,
+            swa_only=True,
+            output=torch.zeros(1, 64, D_V),
         )
 
 
