@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 import torch
 import torch.nn as nn
 
+import vllm.envs as envs
 from vllm.config import CUDAGraphMode, VllmConfig, get_layers_from_vllm_config
 from vllm.distributed.eplb.eplb_state import EplbState
 from vllm.forward_context import set_forward_context
@@ -247,11 +248,16 @@ class ExtractHiddenStatesProposer:
         assert self.vllm_config.speculative_config is not None
         if (
             not self.vllm_config.speculative_config.enforce_eager
+            and not envs.VLLM_BATCH_INVARIANT
             and cudagraph_mode.mixed_mode()
             in [CUDAGraphMode.PIECEWISE, CUDAGraphMode.FULL]
         ):
             proposer_cudagraph_mode = CUDAGraphMode.PIECEWISE
         else:
+            # Batch invariance pins the target model off piecewise for a reason:
+            # the dispatcher picks graph or eager per step from the token count,
+            # so the proposer would reintroduce exactly that batch-dependent
+            # choice on the draft path.
             proposer_cudagraph_mode = CUDAGraphMode.NONE
 
         self.cudagraph_dispatcher.initialize_cudagraph_keys(proposer_cudagraph_mode)

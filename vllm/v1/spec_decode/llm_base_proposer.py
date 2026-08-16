@@ -8,6 +8,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+import vllm.envs as envs
 from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphWrapper
 from vllm.config import (
     CUDAGraphMode,
@@ -424,11 +425,16 @@ class SpecDecodeBaseProposer:
         """
         if (
             not self.speculative_config.enforce_eager
+            and not envs.VLLM_BATCH_INVARIANT
             and cudagraph_mode.mixed_mode()
             in [CUDAGraphMode.PIECEWISE, CUDAGraphMode.FULL]
         ):
             eagle_cudagraph_mode = CUDAGraphMode.PIECEWISE
         else:
+            # Batch invariance pins the target model off piecewise for a reason:
+            # the dispatcher picks graph or eager per step from the token count,
+            # so the proposer would reintroduce exactly that batch-dependent
+            # choice on the draft path.
             eagle_cudagraph_mode = CUDAGraphMode.NONE
 
         self.cudagraph_dispatcher.initialize_cudagraph_keys(eagle_cudagraph_mode)

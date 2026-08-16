@@ -2003,12 +2003,23 @@ class VllmConfig:
         ):
             return "pooling models do not support full cudagraphs"
 
-        # Mirrors the ROCm platform hook, which is where these two are enforced.
-        if current_platform.is_rocm():
-            if self.parallel_config.decode_context_parallel_size > 1:
-                return "decode context parallel is incompatible with full cudagraphs"
-            if self.parallel_config.prefill_context_parallel_size > 1:
-                return "prefill context parallel is incompatible with full cudagraphs"
+        # PCP rejects full cudagraphs in the worker on every platform
+        # (gpu/pcp_manager.py), so it is not gated on ROCm.
+        if self.parallel_config.prefill_context_parallel_size > 1:
+            return "prefill context parallel supports piecewise cudagraphs only"
+
+        # DCP is only downgraded by the ROCm platform hook, so match that.
+        if (
+            current_platform.is_rocm()
+            and self.parallel_config.decode_context_parallel_size > 1
+        ):
+            return "decode context parallel is incompatible with full cudagraphs"
+
+        if self.model_config is not None and any(
+            arch == "VoxtralRealtimeGeneration"
+            for arch in (self.model_config.architectures or [])
+        ):
+            return "Voxtral Realtime does not support full cudagraphs"
 
         return None
 

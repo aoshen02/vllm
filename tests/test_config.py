@@ -1828,6 +1828,27 @@ def test_batch_invariant_model_capture_default_is_not_a_deployment_choice(monkey
     assert config.compilation_config._capture_sizes_user_specified is False
 
 
+def test_batch_invariant_refuses_prefill_context_parallel(monkeypatch):
+    """PCP takes piecewise only, on every platform.
+
+    The worker raises for any full mode (gpu/pcp_manager.py), so the refusal
+    must not be gated on ROCm the way the DCP downgrade is.
+    """
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
+    config = VllmConfig(
+        model_config=ModelConfig("Qwen/Qwen3-0.6B", max_model_len=2048),
+        scheduler_config=SchedulerConfig(
+            max_model_len=2048, is_encoder_decoder=False, max_num_seqs=64
+        ),
+        compilation_config=CompilationConfig(cudagraph_mode=CUDAGraphMode.FULL),
+    )
+    assert config._full_cudagraph_unsupported_reason() is None
+
+    object.__setattr__(config.parallel_config, "prefill_context_parallel_size", 2)
+    reason = config._full_cudagraph_unsupported_reason()
+    assert reason is not None and "prefill context parallel" in reason
+
+
 def test_batch_invariant_refuses_dynamic_spec_decode_on_the_old_runner(monkeypatch):
     """Dynamic speculative decoding needs piecewise on the v1 runner.
 
