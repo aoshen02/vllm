@@ -108,14 +108,18 @@ Keep `use_fp4_indexer_cache=False` (the upstream default) — see roadmap.
 
 - ~~Full-scale mixed-step leak~~ **root-caused and fixed on 2026-08-15**:
   a 75-round soak on the full 43-layer model showed a composition-dependent
-  logprob flip in 29/75 rounds. It was **piecewise cudagraph replay**, not
-  any operator. With the batch composition pinned by a hand-driven
-  `LLMEngine` (no HTTP races), the same step sequence gives: eager 19/19
-  identical; `FULL` 17/17 identical *and bit-equal to eager*; `PIECEWISE`
-  neither equal to those nor shape-invariant; `FULL_AND_PIECEWISE` flipping
-  between the two values step by step. Since the per-step mode is chosen
-  from batch properties (uniform decode? within `max_cudagraph_capture_size`?),
-  a request's output depended on its neighbours. Fix: pin
+  logprob flip in 29/75 rounds. It was first attributed to **piecewise
+  cudagraph replay**; the actual cause is a host-side predicate in
+  `DeepseekV4Indexer` frozen at capture time, fixed on `bi/indexer-shortcut`.
+  With the batch composition pinned by a hand-driven `LLMEngine` (no HTTP
+  races), the same step sequence gave: eager 19/19 identical; `FULL` 17/17
+  identical *and bit-equal to eager*; `PIECEWISE` equal to neither;
+  `FULL_AND_PIECEWISE` flipping between the two values step by step. With the
+  predicate fixed, `PIECEWISE` is bit-identical to both. What stands
+  independently of that model bug: the per-step mode is chosen from batch
+  properties (uniform decode? within `max_cudagraph_capture_size`?), so a
+  request's path is picked by its neighbours and nothing checks that the
+  selectable paths agree. Fix: pin
   `cudagraph_mode=FULL` under `VLLM_BATCH_INVARIANT` and keep the mixed-mode
   downgrade from handing piecewise back. Ruled out by single-variable
   experiments before landing there: cudagraph batch padding (dense capture
