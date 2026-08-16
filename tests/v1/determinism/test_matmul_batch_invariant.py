@@ -136,3 +136,56 @@ def test_matmul_fp32_narrow_output_rows_do_not_move_with_m(M, N, K):
     for row in (0, M // 2, M - 1):
         alone = matmul_batch_invariant(a[row : row + 1], b)
         torch.testing.assert_close(full[row : row + 1], alone, rtol=0, atol=0)
+
+
+@skip_unsupported
+def test_matmul_fp32_narrow_output_config_is_actually_selected():
+    """The sweep above cannot tell which config it exercised.
+
+    Every assertion there holds for the default 128x128x32 tile too, so a tree
+    where the narrow config was never wired in -- or never reached because the
+    module was not the one under test -- would pass it unchanged. Assert the
+    selection itself.
+    """
+    from vllm.model_executor.layers.batch_invariant import (
+        _persistent_matmul_config,
+    )
+
+    narrow = _persistent_matmul_config(torch.float32, 256, 4096)
+    if not current_platform.is_device_capability_family(100):
+        pytest.skip("the narrow-output config is scoped to SM100")
+
+    assert (
+        narrow["BLOCK_SIZE_M"],
+        narrow["BLOCK_SIZE_N"],
+        narrow["BLOCK_SIZE_K"],
+        narrow["num_warps"],
+    ) == (64, 64, 128, 4)
+
+    default = _persistent_matmul_config(torch.float32, 512, 4096)
+    assert default["BLOCK_SIZE_M"] == 128 and default["BLOCK_SIZE_K"] == 32, (
+        "only (fp32, N=256, K=4096) is in scope; a wider N must keep the default"
+    )
+    assert _persistent_matmul_config(torch.bfloat16, 256, 4096) == (
+        _persistent_matmul_config(torch.bfloat16, 512, 4096)
+    ), "the narrow config must not leak into other dtypes"
+
+
+@skip_unsupported
+def test_matmul_config_key_cannot_include_m():
+    """M is not a parameter, so no future edit can make the tile track the batch.
+
+    Keying the tile on M would make BLOCK_K a function of how many rows share
+    the launch -- the reduction-order dependence this module exists to remove.
+    Enforced by signature rather than by comment.
+    """
+    import inspect
+
+    from vllm.model_executor.layers.batch_invariant import (
+        _persistent_matmul_config,
+    )
+
+    params = list(inspect.signature(_persistent_matmul_config).parameters)
+    assert params == ["dtype", "N", "K"], (
+        f"the tile config takes {params}; it must not be able to see M"
+    )
