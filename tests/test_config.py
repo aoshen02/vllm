@@ -1849,6 +1849,26 @@ def test_batch_invariant_refuses_prefill_context_parallel(monkeypatch):
     assert reason is not None and "prefill context parallel" in reason
 
 
+def test_batch_invariant_refuses_multimodal_encoder_cudagraphs(monkeypatch):
+    """The encoder dispatcher is a second, independent numeric path.
+
+    It batches this step's encoder items together and picks a graph from their
+    combined token count, so pinning cudagraph_mode never reaches it. Opt-in, so
+    refuse rather than disable behind the user's back.
+    """
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
+    with pytest.raises(ValueError, match="cudagraph_mm_encoder"):
+        VllmConfig(
+            model_config=ModelConfig("Qwen/Qwen3-0.6B", max_model_len=2048),
+            scheduler_config=SchedulerConfig(
+                max_model_len=2048, is_encoder_decoder=False, max_num_seqs=64
+            ),
+            compilation_config=CompilationConfig(
+                cudagraph_mode=CUDAGraphMode.FULL, cudagraph_mm_encoder=True
+            ),
+        )
+
+
 def test_batch_invariant_refuses_dynamic_spec_decode_on_the_old_runner(monkeypatch):
     """Dynamic speculative decoding needs piecewise on the v1 runner.
 

@@ -2021,6 +2021,19 @@ class VllmConfig:
         ):
             return "Voxtral Realtime does not support full cudagraphs"
 
+        # The multimodal encoder runs its own dispatcher: it batches this step's
+        # encoder items together, picks a graph by their combined token count and
+        # falls back to eager over budget. Pinning cudagraph_mode does not reach
+        # it, so an item's numeric path would still be chosen by whatever else
+        # was scheduled alongside it. It is opt-in, so refuse rather than
+        # silently disable.
+        if self.compilation_config.cudagraph_mm_encoder:
+            return (
+                "cudagraph_mm_encoder batches encoder items across requests and "
+                "picks a graph by their combined token count, which is a "
+                "batch-dependent numeric path of its own"
+            )
+
         return None
 
     def _set_cudagraph_sizes(self):
