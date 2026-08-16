@@ -132,9 +132,20 @@ def matmul_kernel_persistent(
 def _persistent_matmul_config(dtype: torch.dtype, N: int, K: int) -> dict:
     """Tile config for the persistent matmul.
 
-    Deliberately not a function of M. Keying on the batch would make BLOCK_K
-    depend on how many rows share the launch, which is the reduction-order
-    dependence this module exists to remove.
+    Deliberately not a function of M.
+
+    Not because an M-keyed tile would move a row's bits today -- on the fp32
+    path it would not. ``acc = tl.dot(a, b, acc)`` accumulates over k tiles in
+    increasing k, and that sum is the same whatever the chunking, so tile
+    choice does not reach the output: measured across three configs with two
+    distinct BLOCK_K values, and again with the tile deliberately switched at
+    M=1024, bitwise equal every time.
+
+    That equality is a property of the current lowering, not of the contract.
+    bf16 and fp16 go through tensor cores, where it has no reason to hold, and
+    this helper serves every dtype. Keeping the batch out of the key makes the
+    guarantee structural instead of resting on how Triton happens to lower an
+    fp32 dot -- and a regression there would be silent.
     """
     configs = {
         torch.bfloat16: {

@@ -175,9 +175,12 @@ def test_matmul_fp32_narrow_output_config_is_actually_selected():
 def test_matmul_config_key_cannot_include_m():
     """M is not a parameter, so no future edit can make the tile track the batch.
 
-    Keying the tile on M would make BLOCK_K a function of how many rows share
-    the launch -- the reduction-order dependence this module exists to remove.
-    Enforced by signature rather than by comment.
+    Worth being precise about why, because the obvious reason is not the real
+    one: on the fp32 path an M-keyed tile would still be bitwise invariant,
+    since the k loop accumulates in increasing k whatever BLOCK_K is. The rule
+    holds because that is a property of the current Triton lowering rather than
+    of the contract -- it has no reason to survive tensor cores, and this
+    helper serves every dtype. Enforced by signature rather than by comment.
     """
     import inspect
 
