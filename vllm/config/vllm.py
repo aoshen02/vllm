@@ -1675,6 +1675,29 @@ class VllmConfig:
                 "Disabling cascade attention when VLLM_BATCH_INVARIANT is enabled.",
             )
 
+        if envs.VLLM_BATCH_INVARIANT:
+            # These two schedule graphs of their own, keyed on what else this
+            # step happens to carry, and neither consults cudagraph_mode -- so
+            # unlike everything below they are not gated on it, and
+            # --enforce-eager does not switch them off either. Both are opt-in.
+            if self.compilation_config.cudagraph_mm_encoder and (
+                self.model_config is not None and self.model_config.is_multimodal_model
+            ):
+                raise ValueError(
+                    "VLLM_BATCH_INVARIANT is enabled but cudagraph_mm_encoder "
+                    "batches encoder items across requests and picks a graph by "
+                    "their combined token count, so an item's numeric path would "
+                    "depend on what it was batched with. Set "
+                    "cudagraph_mm_encoder=False."
+                )
+            if self.parallel_config.use_ubatching:
+                raise ValueError(
+                    "VLLM_BATCH_INVARIANT is enabled but microbatching chooses "
+                    "per step whether to split and which graph to replay, so a "
+                    "request's numeric path would depend on its neighbours. "
+                    "Disable it (enable_dbo / ubatch_size)."
+                )
+
         if (
             envs.VLLM_BATCH_INVARIANT
             and self.compilation_config.cudagraph_mode is not None
@@ -2027,22 +2050,6 @@ class VllmConfig:
         # it, so an item's numeric path would still be chosen by whatever else
         # was scheduled alongside it. It is opt-in, so refuse rather than
         # silently disable.
-        if self.compilation_config.cudagraph_mm_encoder and (
-            self.model_config is not None and self.model_config.is_multimodal_model
-        ):
-            return (
-                "cudagraph_mm_encoder batches encoder items across requests and "
-                "picks a graph by their combined token count, which is a "
-                "batch-dependent numeric path of its own"
-            )
-
-        # Same shape again: the wrapper decides per step whether to microbatch
-        # and picks a graph from the resulting shapes. Opt-in, so refuse.
-        if self.parallel_config.use_ubatching:
-            return (
-                "microbatching chooses per step whether to split and which graph "
-                "to replay, which is a batch-dependent numeric path of its own"
-            )
 
         return None
 

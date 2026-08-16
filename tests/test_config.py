@@ -1854,32 +1854,31 @@ def test_batch_invariant_refuses_the_other_batch_dependent_dispatchers(monkeypat
 
     The multimodal encoder batches this step's encoder items together and picks
     a graph from their combined token count; microbatching decides per step
-    whether to split and which graph to replay. Neither is reachable from
-    cudagraph_mode, and both are opt-in, so refuse rather than disable behind
-    the user's back. The encoder check is scoped to multimodal models -- the
-    flag is inert on a text-only one.
+    whether to split and which graph to replay. Neither consults cudagraph_mode,
+    so unlike every other refusal these are not gated on it -- setting
+    cudagraph_mode=NONE or --enforce-eager does not switch them off. Both are
+    opt-in, so refuse rather than disable behind the user's back.
     """
     monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
-    config = VllmConfig(
-        model_config=ModelConfig("Qwen/Qwen3-0.6B", max_model_len=2048),
-        scheduler_config=SchedulerConfig(
-            max_model_len=2048, is_encoder_decoder=False, max_num_seqs=64
-        ),
-        compilation_config=CompilationConfig(
-            cudagraph_mode=CUDAGraphMode.FULL, cudagraph_mm_encoder=True
-        ),
-    )
+
+    def build(**compilation):
+        return VllmConfig(
+            model_config=ModelConfig("Qwen/Qwen3-0.6B", max_model_len=2048),
+            scheduler_config=SchedulerConfig(
+                max_model_len=2048, is_encoder_decoder=False, max_num_seqs=64
+            ),
+            compilation_config=CompilationConfig(**compilation),
+        )
+
     # Text-only model: the encoder flag has nothing to act on.
-    assert config._full_cudagraph_unsupported_reason() is None
+    build(cudagraph_mode=CUDAGraphMode.FULL, cudagraph_mm_encoder=True)
 
     monkeypatch.setattr(ModelConfig, "is_multimodal_model", property(lambda _: True))
-    reason = config._full_cudagraph_unsupported_reason()
-    assert reason is not None and "cudagraph_mm_encoder" in reason
-
-    monkeypatch.setattr(ModelConfig, "is_multimodal_model", property(lambda _: False))
-    object.__setattr__(config.parallel_config, "enable_dbo", True)
-    reason = config._full_cudagraph_unsupported_reason()
-    assert reason is not None and "microbatching" in reason
+    with pytest.raises(ValueError, match="cudagraph_mm_encoder"):
+        build(cudagraph_mode=CUDAGraphMode.FULL, cudagraph_mm_encoder=True)
+    # Still refused with graphs off entirely: this dispatcher is separate.
+    with pytest.raises(ValueError, match="cudagraph_mm_encoder"):
+        build(cudagraph_mode=CUDAGraphMode.NONE, cudagraph_mm_encoder=True)
 
 
 def test_batch_invariant_refuses_dynamic_spec_decode_on_the_old_runner(monkeypatch):
