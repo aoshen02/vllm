@@ -441,7 +441,7 @@ def _row_from_bits(bits: list[int], cols: int) -> torch.Tensor:
 
 
 @pytest.mark.parametrize("name,bits", _BIT_PATTERNS, ids=[n for n, _ in _BIT_PATTERNS])
-@pytest.mark.parametrize("topk", [512, 1024])
+@pytest.mark.parametrize("topk", [512, 1024, 2048])
 def test_topk_every_float_class_matches_reference(name, bits, topk):
     """Kernel and reference must agree on every fp32 class, not just on scores.
 
@@ -450,7 +450,9 @@ def test_topk_every_float_class_matches_reference(name, bits, topk):
     zeros the key canonicalizes, the infinities that bound it, and denormals.
     Signaling NaNs are included because nothing in the pipeline quiets them.
     """
-    for start, width in ((0, 600), (1, 600), (600, 30)):
+    # The last shape keeps the in-window count above every topk under test, so
+    # the selection actually truncates instead of emitting the whole window.
+    for start, width in ((0, 600), (1, 600), (600, 30), (1, 2600)):
         cols = start + width
         row = _row_from_bits(bits, cols)
         row_start = torch.tensor([start], device="cuda", dtype=torch.int32)
