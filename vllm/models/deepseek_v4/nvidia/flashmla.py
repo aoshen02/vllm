@@ -354,6 +354,19 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                         extra_topk_length=topk_lens,
                         out=output.unsqueeze(1),
                     )
+                else:
+                    # The shipped planner ran and its output is what `out`
+                    # currently holds -- a layout that depends on the batch.
+                    # Under this flag that result must never be returned, so
+                    # fail closed rather than hand back the one value the flag
+                    # promises not to produce.
+                    raise RuntimeError(
+                        "batch-invariant sparse MLA decode could not pin the "
+                        f"tile-scheduler plan for (h_q={q.shape[2]}, "
+                        f"s_q={q.shape[1]}) even after observing the shipped "
+                        "planner; returning its batch-dependent output would "
+                        "silently break VLLM_BATCH_INVARIANT"
+                    )
 
     def _forward_prefill(
         self,
