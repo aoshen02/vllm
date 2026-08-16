@@ -330,6 +330,47 @@ def test_pinned_plan_batch_invariant_above_the_partition_count(bootstrapped):
 
 
 @requires_flashmla_gpu
+def test_grouped_plan_agrees_with_the_shipped_planner(bootstrapped):
+    """Above the partition count the grouped plan must still be *right*.
+
+    ``test_pinned_plan_does_not_drop_work`` makes this comparison, but only
+    over batch sizes below the partition count, where each request still owns a
+    partition to itself. The grouped layout is a shape FlashMLA's own planner
+    never emits and whose metadata columns we write by hand, so agreement there
+    is what says both that no KV is being skipped and that each column means
+    what we think the kernel reads it as -- getting a column wrong would move
+    the output.
+
+    Same bar as the sibling test: 8 bf16 ULP separates reduction-order noise
+    (1-2) from a dropped KV block (~160).
+    """
+    from vllm.v1.attention.backends.mla.sparse_swa import _num_sm_parts_cache
+
+    device, kv, _extra_kv, kv_tokens = bootstrapped
+    num_sm_parts = _num_sm_parts_cache[(H_Q, 1)]
+    tolerance_ulp = 8 * 2.0**-8
+
+    for b in (num_sm_parts + 1, 2 * num_sm_parts + 1):
+        gen = torch.Generator(device=device).manual_seed(555 + b)
+        victim = _row(gen, device, kv_tokens, TOPK // 2)
+        packed, _ = _batch(device, kv_tokens, b, victim, 0, False, None)
+        q, idx, topk_len = packed
+
+        shipped = _decode(q, kv, idx, topk_len, flashmla.get_mla_metadata()[0])
+        pinned = _decode(q, kv, idx, topk_len, _pinned(topk_len, device))
+
+        expected = shipped.float()
+        deviation = (expected - pinned.float()).abs().max().item()
+        tolerance = tolerance_ulp * expected.abs().max().item()
+        assert deviation <= tolerance, (
+            f"grouped plan at batch={b} (partitions={num_sm_parts}) deviates by "
+            f"{deviation:.3e}, beyond 8 bf16 ULP ({tolerance:.3e}) -- it is "
+            "either skipping KV or writing a metadata column the kernel reads "
+            "differently"
+        )
+
+
+@requires_flashmla_gpu
 def test_pinned_plan_above_the_partition_count_covers_every_request(bootstrapped):
     """Grouping whole requests must not drop any of them.
 
