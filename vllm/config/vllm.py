@@ -1696,29 +1696,13 @@ class VllmConfig:
             and self.compilation_config.cudagraph_mode is not None
             and self.compilation_config.cudagraph_mode.has_piecewise_cudagraphs()
         ):
-            # Piecewise cudagraphs are not numerically equivalent to full
-            # cudagraphs or to eager, and which mode a step runs under is a
-            # function of the batch (uniform decode? within the largest capture
-            # size?), so leaving piecewise on makes a request's output depend on
-            # its neighbours. Dropping to FULL removes that per-step choice and
-            # keeps the decode-side graph win. It does not by itself make graph
-            # and eager agree; the residual FULL/eager boundary is covered by
-            # the capture-set check below.
-            if (
-                self.speculative_config is not None
-                and self.speculative_config.uses_dynamic_speculative_decoding()
-                and not self.use_v2_model_runner
-            ):
-                # _maybe_override_dynamic_sd_cudagraph_mode just forced piecewise
-                # here because the verification length varies at runtime. Silently
-                # forcing it back to FULL would trade a correctness problem for a
-                # different one, so say so instead.
-                raise ValueError(
-                    "VLLM_BATCH_INVARIANT cannot use piecewise cudagraphs, but "
-                    "dynamic speculative decoding requires them on this model "
-                    "runner. Disable speculative decoding, or set "
-                    "VLLM_USE_V2_MODEL_RUNNER=1."
-                )
+            # FULL_AND_PIECEWISE picks the per-step mode from batch properties
+            # (uniform decode? within the largest capture size?), so a request's
+            # decode step runs under a mode its neighbours chose. That is only
+            # harmless while every selectable path is bit-identical -- a
+            # per-model property nothing checks here. Dropping to FULL removes
+            # the choice and keeps the decode-side graph win; it does not by
+            # itself make graph and eager agree.
             self.compilation_config.cudagraph_mode = CUDAGraphMode.FULL
             logger.warning_once(
                 "Piecewise cudagraphs break batch invariance; setting "
@@ -2000,6 +1984,17 @@ class VllmConfig:
                     f"the {connector_cls.__name__} KV connector performs layerwise "
                     "async operations that cannot be captured"
                 )
+
+        if (
+            self.speculative_config is not None
+            and self.speculative_config.uses_dynamic_speculative_decoding()
+            and not self.use_v2_model_runner
+        ):
+            return (
+                "dynamic speculative decoding on this model runner needs piecewise "
+                "cudagraphs because the verification length varies at runtime "
+                "(disable speculative decoding, or set VLLM_USE_V2_MODEL_RUNNER=1)"
+            )
 
         if (
             current_platform.support_static_graph_mode()

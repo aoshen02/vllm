@@ -1828,6 +1828,33 @@ def test_batch_invariant_model_capture_default_is_not_a_deployment_choice(monkey
     assert config.compilation_config._capture_sizes_user_specified is False
 
 
+def test_batch_invariant_refuses_dynamic_spec_decode_on_the_old_runner(monkeypatch):
+    """Dynamic speculative decoding needs piecewise on the v1 runner.
+
+    It is refused for the same reason as the others and through the same helper:
+    the downgrade it triggers can be raised back to FULL before the pin, so a
+    check gated on the mode still reading as piecewise would miss it.
+    """
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
+    config = VllmConfig(
+        model_config=ModelConfig("Qwen/Qwen3-0.6B", max_model_len=2048),
+        scheduler_config=SchedulerConfig(
+            max_model_len=2048, is_encoder_decoder=False, max_num_seqs=64
+        ),
+        compilation_config=CompilationConfig(cudagraph_mode=CUDAGraphMode.FULL),
+    )
+    assert config._full_cudagraph_unsupported_reason() is None
+
+    class _DynamicSpec:
+        def uses_dynamic_speculative_decoding(self):
+            return True
+
+    object.__setattr__(config, "speculative_config", _DynamicSpec())
+    monkeypatch.setattr(VllmConfig, "use_v2_model_runner", property(lambda _: False))
+    reason = config._full_cudagraph_unsupported_reason()
+    assert reason is not None and "dynamic speculative decoding" in reason
+
+
 def test_batch_invariant_warns_when_decode_step_escapes_capture(monkeypatch, caplog):
     """An explicitly chosen capture set too small for the deployment's own decode
     fan-out pushes decode steps to eager, and which side of that boundary a
