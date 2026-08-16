@@ -1694,6 +1694,38 @@ class VllmConfig:
                 "cudagraph_mode to FULL because VLLM_BATCH_INVARIANT is enabled."
             )
 
+        if (
+            envs.VLLM_BATCH_INVARIANT
+            and self.compilation_config.cudagraph_mode is not None
+            and self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
+            and self.compilation_config.max_cudagraph_capture_size
+        ):
+            # A step larger than the capture set falls back to eager, and the
+            # captured and eager paths are not required to agree bit-for-bit.
+            # That only stays harmless while the boundary cannot be crossed as a
+            # function of the batch. Decode steps are the ones that get
+            # captured, so the largest decode step the scheduler can build has
+            # to stay inside the capture set; otherwise a request sharing a step
+            # with enough neighbours takes a different numeric path than the
+            # same request alone. The default capture sizes leave 2x headroom,
+            # so this only fires on an explicit override.
+            largest_decode_step = min(
+                self.scheduler_config.max_num_seqs * (1 + self.num_speculative_tokens),
+                self.scheduler_config.max_num_batched_tokens,
+            )
+            if self.compilation_config.max_cudagraph_capture_size < largest_decode_step:
+                logger.warning_once(
+                    "VLLM_BATCH_INVARIANT is enabled but the largest decode step "
+                    "(%d tokens) does not fit in max_cudagraph_capture_size (%d). "
+                    "Decode batches above that size fall back to eager, which is "
+                    "not bit-identical to graph replay, so outputs will depend on "
+                    "how many requests share a step. Extend cudagraph_capture_sizes "
+                    "to cover %d tokens, or lower max_num_seqs.",
+                    largest_decode_step,
+                    self.compilation_config.max_cudagraph_capture_size,
+                    largest_decode_step,
+                )
+
         if self.parallel_config.use_ubatching:
             a2a_backend = self.parallel_config.all2all_backend
             assert a2a_backend in [

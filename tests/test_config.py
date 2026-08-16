@@ -1657,9 +1657,7 @@ def test_batch_invariant_drops_piecewise_cudagraphs(monkeypatch, requested):
     and the per-step mode is chosen from batch properties, so leaving it on
     makes a request's output depend on its neighbours."""
     monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
-    config = VllmConfig(
-        compilation_config=CompilationConfig(cudagraph_mode=requested)
-    )
+    config = VllmConfig(compilation_config=CompilationConfig(cudagraph_mode=requested))
     assert not config.compilation_config.cudagraph_mode.has_piecewise_cudagraphs()
 
 
@@ -1686,6 +1684,46 @@ def test_batch_invariant_resolve_prefers_full_decode_only(monkeypatch):
     )
 
     assert resolved == CUDAGraphMode.FULL_DECODE_ONLY
+
+
+def test_batch_invariant_warns_when_decode_step_escapes_capture(monkeypatch, caplog):
+    """Pinning FULL only preserves invariance while every decode step stays
+    inside the capture set; above it a step falls back to eager, and which side
+    of that boundary a request lands on is decided by its neighbours."""
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
+    with caplog.at_level(logging.WARNING):
+        VllmConfig(
+            # Without a model_config the capture size resolves to 0 (cudagraphs
+            # off) and the check correctly does not apply.
+            model_config=ModelConfig("Qwen/Qwen3-0.6B", max_model_len=2048),
+            scheduler_config=SchedulerConfig(
+                max_model_len=2048,
+                is_encoder_decoder=False,
+                max_num_seqs=64,
+            ),
+            compilation_config=CompilationConfig(
+                cudagraph_mode=CUDAGraphMode.FULL,
+                cudagraph_capture_sizes=[1, 2, 4, 8],
+            ),
+        )
+    assert "does not fit in max_cudagraph_capture_size" in caplog.text
+
+
+def test_batch_invariant_quiet_when_capture_covers_decode(monkeypatch, caplog):
+    """The default capture sizes leave 2x headroom, so the warning above must
+    not fire on an ordinary batch-invariant run."""
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
+    with caplog.at_level(logging.WARNING):
+        VllmConfig(
+            model_config=ModelConfig("Qwen/Qwen3-0.6B", max_model_len=2048),
+            scheduler_config=SchedulerConfig(
+                max_model_len=2048,
+                is_encoder_decoder=False,
+                max_num_seqs=64,
+            ),
+            compilation_config=CompilationConfig(cudagraph_mode=CUDAGraphMode.FULL),
+        )
+    assert "does not fit in max_cudagraph_capture_size" not in caplog.text
 
 
 def test_fusion_pass_op_priority():
