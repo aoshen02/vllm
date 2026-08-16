@@ -1787,9 +1787,45 @@ def test_batch_invariant_records_only_deployment_chosen_capture_sizes(
             **({"cudagraph_capture_sizes": [8, 16, 32, 64]} if explicit else {}),
         ),
     )
-    assert config._cudagraph_sizes_user_specified is explicit
+    assert config.compilation_config._capture_sizes_user_specified is explicit
     # The resolved value is always populated, so it cannot be the signal.
     assert config.compilation_config.max_cudagraph_capture_size
+
+    # with_hf_config() rebuilds the config through replace(), which re-runs
+    # __post_init__ against the already-resolved fields. Without carrying the
+    # answer over, the rebuild reads its own defaults as a deployment choice.
+    rebuilt = config.with_hf_config(config.model_config.hf_config)
+    assert rebuilt.compilation_config._capture_sizes_user_specified is explicit
+
+
+def test_batch_invariant_model_capture_default_is_not_a_deployment_choice(monkeypatch):
+    """A model writing its own capture sizes must not read as an explicit choice.
+
+    try_verify_and_update_config() lets a model set capture defaults when the
+    user set none -- gpt-oss writes 1024. Sampling after that ran would warn
+    about a configuration nobody chose, so this pins the ordering rather than
+    the specific model.
+    """
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
+    original = VllmConfig.try_verify_and_update_config
+
+    def writes_capture_default(self):
+        original(self)
+        if self.compilation_config.max_cudagraph_capture_size is None:
+            self.compilation_config.max_cudagraph_capture_size = 1024
+
+    monkeypatch.setattr(
+        VllmConfig, "try_verify_and_update_config", writes_capture_default
+    )
+    config = VllmConfig(
+        model_config=ModelConfig("Qwen/Qwen3-0.6B", max_model_len=2048),
+        scheduler_config=SchedulerConfig(
+            max_model_len=2048, is_encoder_decoder=False, max_num_seqs=64
+        ),
+        compilation_config=CompilationConfig(cudagraph_mode=CUDAGraphMode.FULL),
+    )
+    assert config.compilation_config.max_cudagraph_capture_size == 1024
+    assert config.compilation_config._capture_sizes_user_specified is False
 
 
 def test_batch_invariant_warns_when_decode_step_escapes_capture(monkeypatch, caplog):

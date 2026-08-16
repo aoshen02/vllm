@@ -1044,10 +1044,16 @@ class VllmConfig:
         # Snapshot before any hook can fill these in: try_verify_and_update_config
         # lets a model write its own capture defaults (GPT-OSS does), which the
         # batch-invariance check below must not mistake for a deployment choice.
-        self._cudagraph_sizes_user_specified = (
-            self.compilation_config.max_cudagraph_capture_size is not None
-            or self.compilation_config.cudagraph_capture_sizes is not None
-        )
+        # Stored on the compilation config, which survives replace(): rebuilding
+        # a VllmConfig (with_hf_config does) re-runs this against already
+        # resolved fields, and a second look would read them as a choice.
+        if not hasattr(self.compilation_config, "_capture_sizes_user_specified"):
+            object.__setattr__(
+                self.compilation_config,
+                "_capture_sizes_user_specified",
+                self.compilation_config.max_cudagraph_capture_size is not None
+                or self.compilation_config.cudagraph_capture_sizes is not None,
+            )
 
         self.try_verify_and_update_config()
 
@@ -1724,7 +1730,7 @@ class VllmConfig:
             and self.compilation_config.cudagraph_mode is not None
             and self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
             and self.compilation_config.max_cudagraph_capture_size
-            and getattr(self, "_cudagraph_sizes_user_specified", False)
+            and getattr(self.compilation_config, "_capture_sizes_user_specified", False)
         ):
             # Keeping cudagraphs on at all means a run straddles the graph and
             # eager paths: with FULL resolved to FULL_DECODE_ONLY every mixed
