@@ -831,7 +831,16 @@ class DeepseekV4Indexer(nn.Module):
         attn_metadata = get_forward_context().attn_metadata
         if isinstance(attn_metadata, dict):
             indexer_metadata = cast(Any, attn_metadata[self.k_cache.prefix])
-            if indexer_metadata.max_seq_len // self.compress_ratio <= self.topk_tokens:
+            # Bound this on the configured maximum, not on this step's
+            # max_seq_len. The indexer runs inside a captured cudagraph segment
+            # under breakable PIECEWISE, so a per-step host value is evaluated
+            # once against the capture-time dummy batch (max_seq_len 1-2) and
+            # baked in; every replay then takes the short-context path even for
+            # a long context, silently selecting indices 0..topk-1 instead of
+            # the score-based top-k. self.max_model_len is already divided by
+            # compress_ratio, so this takes the shortcut only when it is valid
+            # for every request the engine can serve.
+            if self.max_model_len <= self.topk_tokens:
                 # candidates num smaller than topk, every candidate is selected
                 # but we still need to build k cache
                 compressor(compressed_kv_score, positions, rotary_emb)
