@@ -106,7 +106,7 @@ Keep `use_fp4_indexer_cache=False` (the upstream default) — see roadmap.
 
 ## Not covered yet (roadmap)
 
-- ~~Full-scale mixed-step leak~~ **root-caused and fixed on 2026-08-15**:
+- ~~Full-scale mixed-step leak~~ **root-caused and fixed on 2026-08-16**:
   a 75-round soak on the full 43-layer model showed a composition-dependent
   logprob flip in 29/75 rounds. It was first attributed to **piecewise
   cudagraph replay**; the actual cause is a host-side predicate in
