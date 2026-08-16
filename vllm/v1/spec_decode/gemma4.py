@@ -13,6 +13,7 @@ from copy import copy
 import torch
 import torch.nn as nn
 
+import vllm.envs as envs
 from vllm.config import VllmConfig, get_layers_from_vllm_config, replace
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.logger import init_logger
@@ -213,7 +214,13 @@ class Gemma4Proposer(SpecDecodeBaseProposer):
 
         self._setup_gemma4_kv_sharing(target_attn_layer_names)
 
-        if getattr(self.model, "masked_embedding", None) is not None:
+        # The centroid graphs are captured at fixed sizes and replayed when the
+        # step's token count fits, eager otherwise -- a batch-dependent numeric
+        # path of its own, outside cudagraph_mode's reach.
+        if (
+            getattr(self.model, "masked_embedding", None) is not None
+            and not envs.VLLM_BATCH_INVARIANT
+        ):
             self._setup_centroids_cuda_graphs()
 
     def validate_same_kv_cache_group(self, kv_cache_config: KVCacheConfig) -> None:

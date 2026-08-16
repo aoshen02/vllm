@@ -2027,11 +2027,21 @@ class VllmConfig:
         # it, so an item's numeric path would still be chosen by whatever else
         # was scheduled alongside it. It is opt-in, so refuse rather than
         # silently disable.
-        if self.compilation_config.cudagraph_mm_encoder:
+        if self.compilation_config.cudagraph_mm_encoder and (
+            self.model_config is not None and self.model_config.is_multimodal_model
+        ):
             return (
                 "cudagraph_mm_encoder batches encoder items across requests and "
                 "picks a graph by their combined token count, which is a "
                 "batch-dependent numeric path of its own"
+            )
+
+        # Same shape again: the wrapper decides per step whether to microbatch
+        # and picks a graph from the resulting shapes. Opt-in, so refuse.
+        if self.parallel_config.use_ubatching:
+            return (
+                "microbatching chooses per step whether to split and which graph "
+                "to replay, which is a batch-dependent numeric path of its own"
             )
 
         return None
