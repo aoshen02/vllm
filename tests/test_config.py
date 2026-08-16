@@ -1730,9 +1730,13 @@ def test_batch_invariant_never_falls_back_to_piecewise(
 
 
 def test_batch_invariant_warns_when_decode_step_escapes_capture(monkeypatch, caplog):
-    """Pinning FULL only preserves invariance while every decode step stays
-    inside the capture set; above it a step falls back to eager, and which side
-    of that boundary a request lands on is decided by its neighbours."""
+    """A capture set shrunk below the default pushes decode steps to eager, and
+    which side of that boundary a request lands on is decided by its neighbours.
+
+    The criterion is "below what this deployment would capture by default", not
+    "below the whole decode fan-out": the defaults cap at 512/1024 and so do not
+    cover the fan-out either, so warning on a stock configuration would be noise
+    rather than a signal."""
     monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
     with caplog.at_level(logging.WARNING):
         VllmConfig(
@@ -1749,24 +1753,38 @@ def test_batch_invariant_warns_when_decode_step_escapes_capture(monkeypatch, cap
                 cudagraph_capture_sizes=[1, 2, 4, 8],
             ),
         )
-    assert "does not fit in max_cudagraph_capture_size" in caplog.text
+    assert "is below the" in caplog.text
 
 
-def test_batch_invariant_quiet_when_capture_covers_decode(monkeypatch, caplog):
-    """The default capture sizes leave 2x headroom, so the warning above must
-    not fire on an ordinary batch-invariant run."""
+@pytest.mark.parametrize("max_num_seqs", [64, 1024])
+def test_batch_invariant_quiet_when_capture_covers_decode(
+    monkeypatch, caplog, max_num_seqs
+):
+    """Stock configurations must stay quiet, including ones whose decode fan-out
+    exceeds the default capture cap -- that is the default, not a misconfig.
+
+    max_num_seqs=1024 with the non-Blackwell cap is the case that matters: the
+    default capture size stops at 512 while the fan-out is 1024, so a check
+    written against the fan-out alone warns on every stock deployment. The
+    capability family is pinned so the assertion does not depend on the host.
+    """
     monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
+    from vllm.platforms import current_platform
+
+    monkeypatch.setattr(
+        current_platform, "is_device_capability_family", lambda _family: False
+    )
     with caplog.at_level(logging.WARNING):
         VllmConfig(
             model_config=ModelConfig("Qwen/Qwen3-0.6B", max_model_len=2048),
             scheduler_config=SchedulerConfig(
                 max_model_len=2048,
                 is_encoder_decoder=False,
-                max_num_seqs=64,
+                max_num_seqs=max_num_seqs,
             ),
             compilation_config=CompilationConfig(cudagraph_mode=CUDAGraphMode.FULL),
         )
-    assert "does not fit in max_cudagraph_capture_size" not in caplog.text
+    assert "is below the" not in caplog.text
 
 
 def test_fusion_pass_op_priority():

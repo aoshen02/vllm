@@ -1404,10 +1404,11 @@ class CompilationConfig:
 
             # attempt to resolve the full cudagraph related mode
             if self.splitting_ops_contain_attention() and not envs.VLLM_BATCH_INVARIANT:
-                # Batch invariance cannot take the piecewise fallback: piecewise
-                # graphs are not numerically equal to full/eager, so a step's
-                # mode leaking into its result makes the output depend on the
-                # batch. FULL_DECODE_ONLY agrees with eager bit-for-bit.
+                # Batch invariance cannot take the piecewise fallback: it adds a
+                # third numeric path selected per step from batch properties, so
+                # the mode leaks into the result. FULL_DECODE_ONLY still
+                # straddles graph and eager; whether those two agree bit-for-bit
+                # is a per-model property to verify, not one this can assert.
                 msg += "; setting cudagraph_mode=FULL_AND_PIECEWISE"
                 cudagraph_mode = CUDAGraphMode.FULL_AND_PIECEWISE
             else:

@@ -1674,13 +1674,11 @@ class VllmConfig:
             # keeps the decode-side graph win. It does not by itself make graph
             # and eager agree; the residual FULL/eager boundary is covered by
             # the capture-set check below.
-            if self._batch_invariant_requires_piecewise():
+            if (reason := self._full_cudagraph_unsupported_reason()) is not None:
                 raise ValueError(
                     "VLLM_BATCH_INVARIANT cannot use piecewise cudagraphs, but "
-                    "this configuration requires them: the KV connector "
-                    "performs layerwise async operations that cannot be "
-                    "captured. Disable the KV connector, or run with "
-                    "--enforce-eager."
+                    f"this configuration cannot use full ones either: {reason}. "
+                    "Change the configuration, or run with --enforce-eager."
                 )
             if (
                 self.speculative_config is not None
@@ -1717,31 +1715,40 @@ class VllmConfig:
             # model's kernels -- a property to verify per model, not something
             # config validation can establish.
             #
-            # What config validation *can* flag is the one knob that makes the
-            # split gratuitously worse: a capture set too small to hold the
-            # decode fan-out, which pushes even uniform-decode steps to eager
-            # once enough requests share one. The default sizes leave 2x
-            # headroom, so this only fires on an explicit override.
+            # What config validation *can* flag is a capture set the deployment
+            # shrank below what it would have got by default, which pushes even
+            # uniform-decode steps to eager once enough requests share one. The
+            # default sizes do not cover the whole decode fan-out either (they
+            # cap at 512/1024), so comparing against the fan-out alone would
+            # warn on stock configurations; compare against the default too.
+            from vllm.platforms import current_platform
+
             token_budget = self.scheduler_config.max_num_batched_tokens
             if self.scheduler_config.max_num_scheduled_tokens is not None:
                 token_budget = min(
                     token_budget, self.scheduler_config.max_num_scheduled_tokens
                 )
+            decode_query_len = 1 + self.num_speculative_tokens
             largest_decode_step = min(
-                self.scheduler_config.max_num_seqs * (1 + self.num_speculative_tokens),
+                self.scheduler_config.max_num_seqs * decode_query_len, token_budget
+            )
+            default_capture_size = min(
+                self.scheduler_config.max_num_seqs * decode_query_len * 2,
+                1024 if current_platform.is_device_capability_family(100) else 512,
                 token_budget,
             )
-            if self.compilation_config.max_cudagraph_capture_size < largest_decode_step:
+            expected = min(largest_decode_step, default_capture_size)
+            if self.compilation_config.max_cudagraph_capture_size < expected:
                 logger.warning_once(
-                    "VLLM_BATCH_INVARIANT is enabled but the largest decode step "
-                    "(%d tokens) does not fit in max_cudagraph_capture_size (%d). "
-                    "Decode batches above that size fall back to eager, so which "
+                    "VLLM_BATCH_INVARIANT is enabled but max_cudagraph_capture_size "
+                    "(%d) is below the %d tokens this deployment would capture by "
+                    "default. Decode batches above it fall back to eager, so which "
                     "numeric path a request takes depends on how many requests "
                     "share its step. Extend cudagraph_capture_sizes to cover %d "
                     "tokens, or lower max_num_seqs.",
-                    largest_decode_step,
                     self.compilation_config.max_cudagraph_capture_size,
-                    largest_decode_step,
+                    expected,
+                    expected,
                 )
 
         if self.parallel_config.use_ubatching:
@@ -1941,26 +1948,51 @@ class VllmConfig:
                     f" Got {max_num_batched_tokens=} and {scheduled_token_delta=}."
                 )
 
-    def _batch_invariant_requires_piecewise(self) -> bool:
-        """Whether something in this config hard-requires piecewise cudagraphs.
+    def _full_cudagraph_unsupported_reason(self) -> str | None:
+        """Why full cudagraphs are unusable here, if they are.
 
-        Batch invariance pins ``cudagraph_mode`` to ``FULL``, which would
-        silently undo such a requirement. Trading one correctness problem for
-        another is worse than refusing the configuration.
+        Several places downgrade ``cudagraph_mode`` to ``PIECEWISE`` because
+        full graphs genuinely do not work for the configuration. Batch
+        invariance pins the mode to ``FULL``, which runs later and would
+        silently undo those downgrades -- trading one correctness problem for
+        another. Refuse instead.
         """
-        if (
-            self.kv_transfer_config is None
-            or not self.kv_transfer_config.is_kv_transfer_instance
-        ):
-            return False
-        from vllm.distributed.kv_transfer.kv_connector.factory import (
-            KVConnectorFactory,
-        )
+        from vllm.platforms import current_platform
 
-        connector_cls = KVConnectorFactory.get_connector_class(self.kv_transfer_config)
-        return connector_cls.requires_piecewise_for_cudagraph(
-            self.kv_transfer_config.kv_connector_extra_config
-        )
+        if (
+            self.kv_transfer_config is not None
+            and self.kv_transfer_config.is_kv_transfer_instance
+        ):
+            from vllm.distributed.kv_transfer.kv_connector.factory import (
+                KVConnectorFactory,
+            )
+
+            connector_cls = KVConnectorFactory.get_connector_class(
+                self.kv_transfer_config
+            )
+            if connector_cls.requires_piecewise_for_cudagraph(
+                self.kv_transfer_config.kv_connector_extra_config
+            ):
+                return (
+                    f"the {connector_cls.__name__} KV connector performs layerwise "
+                    "async operations that cannot be captured"
+                )
+
+        if (
+            current_platform.support_static_graph_mode()
+            and self.model_config is not None
+            and self.model_config.pooler_config is not None
+        ):
+            return "pooling models do not support full cudagraphs"
+
+        # Mirrors the ROCm platform hook, which is where these two are enforced.
+        if current_platform.is_rocm():
+            if self.parallel_config.decode_context_parallel_size > 1:
+                return "decode context parallel is incompatible with full cudagraphs"
+            if self.parallel_config.prefill_context_parallel_size > 1:
+                return "prefill context parallel is incompatible with full cudagraphs"
+
+        return None
 
     def _set_cudagraph_sizes(self):
         """
