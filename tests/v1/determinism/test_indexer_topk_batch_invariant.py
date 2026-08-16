@@ -363,3 +363,29 @@ def test_masked_lanes_do_not_spend_the_tie_budget(all_neg_inf):
             f"row_start={start} selected different indices than "
             f"row_start={base_start}: masked lanes are consuming the tie budget"
         )
+
+
+def test_topk_sentinel_collision_and_narrow_windows_match_reference():
+    """Bit patterns and shapes where the out-of-window sentinel could leak.
+
+    A negative NaN maps to exactly the INT32_MIN sentinel, so an in-window lane
+    can collide with the out-of-window ones; the kernel keeps them apart by
+    restricting its tie scan to in-window lanes, the reference by lifting
+    in-window keys off the sentinel. Also covers a window narrower than top-k
+    inside a wider row, where the cutoff lands on the sentinel.
+    """
+    # -1 as int32 is the bit pattern 0xffffffff, i.e. a negative NaN.
+    neg_nan = torch.tensor([-1], dtype=torch.int32).view(torch.float32).item()
+
+    cols = 601
+    row = torch.full((1, cols), neg_nan, device="cuda", dtype=torch.float32)
+    start = torch.tensor([1], device="cuda", dtype=torch.int32)
+    end = torch.tensor([cols], device="cuda", dtype=torch.int32)
+    _assert_matches_ref(row, start, end, "negative-NaN plateau vs sentinel")
+
+    # valid_count (30) < k_eff (512) while num_cols (630) > TOPK.
+    gen = torch.Generator(device="cuda").manual_seed(31)
+    row = torch.randn((1, 630), generator=gen, device="cuda", dtype=torch.float32)
+    start = torch.tensor([600], device="cuda", dtype=torch.int32)
+    end = torch.tensor([630], device="cuda", dtype=torch.int32)
+    _assert_matches_ref(row, start, end, "narrow window inside a wide row")
