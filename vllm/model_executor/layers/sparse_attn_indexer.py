@@ -475,27 +475,27 @@ def _topk_indices_batch_invariant_ref(
         if row_start is not None:
             start = row_start[i : i + chunk].unsqueeze(1)
             valid &= cols >= start
-        # Same monotone int32 key as the Triton kernel, for the same reason:
-        # out-of-window lanes must key strictly below every in-window lane, so
-        # they cannot tie with an in-window score of -inf and spend the tie
-        # budget ahead of it. Masking to -inf instead would make the emitted
-        # count depend on `start`, i.e. on how the batch was packed.
+        # Same monotone int32 key as the Triton kernel. Ranking on the raw
+        # scores instead would let an out-of-window lane tie with an in-window
+        # score of -inf and take its slot, making the emitted count depend on
+        # `start` -- i.e. on how the batch was packed.
         u = logits[i : i + chunk].float().contiguous().view(torch.int32)
         u = torch.where(u == _INT32_MIN_PY, torch.zeros_like(u), u)
         key = u ^ ((u >> 31) & 0x7FFFFFFF)
-        # A negative NaN (0xffffffff) maps to exactly _INT32_MIN, colliding with
-        # the out-of-window sentinel. The kernel keeps them apart because its tie
-        # scan is already restricted to in-window lanes; the reference sorts
-        # first and drops after, so lift in-window keys off the sentinel to get
-        # the same order. Scores are not expected to be NaN -- this only keeps
-        # the two implementations equal on every bit pattern.
-        key = torch.where(
-            valid,
-            key.clamp_min(_INT32_MIN_PY + 1),
-            torch.full_like(key, _INT32_MIN_PY),
-        )
-        # Stable sort: equal keys keep ascending column order.
+        # No sentinel value can be reserved: a negative NaN (0xffffffff) already
+        # maps to _INT32_MIN and 0xfffffffe to _INT32_MIN + 1, so lifting
+        # in-window keys off a sentinel would merge two distinct keys instead.
+        # Rank on validity first and key second -- the kernel selects only from
+        # in-window lanes, so validity is its implicit primary key too. Two
+        # stable sorts compose lexicographically, last one primary.
         order = torch.sort(key, dim=-1, descending=True, stable=True).indices
+        by_valid = torch.sort(
+            torch.gather(valid, 1, order).to(torch.uint8),
+            dim=-1,
+            descending=True,
+            stable=True,
+        ).indices
+        order = torch.gather(order, 1, by_valid)
         sel = order[:, :k]
         sel_valid = torch.gather(valid, 1, sel)
         if start is not None:
