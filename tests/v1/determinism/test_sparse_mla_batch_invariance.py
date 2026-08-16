@@ -351,3 +351,33 @@ def test_plan_skeleton_groups_whole_requests_for_any_batch(b):
     # Nothing is ever marked as split.
     assert int(meta[:, 2].abs().sum()) == 0
     assert int(meta[:, 4:7].abs().sum()) == 0
+
+
+def test_c128a_topk_width_is_not_sized_from_the_batch():
+    """The C128A top-k width must not follow this step's longest sequence.
+
+    It reaches the kernel as the split granularity, so deriving it from
+    cm.max_seq_len lets a long neighbour push a request into a different
+    power-of-two bucket and change how its own work is cut.
+
+    Structural: building real C128A metadata needs a populated metadata builder
+    and a KV cache spec. What is asserted is that the batch-invariant branch
+    binds the width to the configured maximum and never reads the batch-wide
+    length -- which is what would regress if someone folded the branches back
+    together.
+    """
+    import inspect
+
+    from vllm.models.deepseek_v4.sparse_mla import DeepseekV4FlashMLAMetadataBuilder
+
+    src = inspect.getsource(DeepseekV4FlashMLAMetadataBuilder._build_c128a_metadata)
+    start = src.index("VLLM_BATCH_INVARIANT")
+    bi_branch = src[start : src.index("else:", start)]
+    # Comments in that branch explain what it is avoiding, so look at code only.
+    code = "\n".join(
+        line for line in bi_branch.splitlines() if not line.strip().startswith("#")
+    )
+    assert "active_topk_width = self.c128a_max_compressed" in code
+    assert "max_seq_len" not in code, (
+        "the batch-invariant width must not read this step's max_seq_len"
+    )
