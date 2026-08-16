@@ -406,6 +406,10 @@ steps:
     - pytest -v -s v1/determinism/test_rms_norm_batch_invariant.py
     - VLLM_TEST_MODEL=deepseek-ai/DeepSeek-V2-Lite-Chat pytest -v -s v1/determinism/test_batch_invariance.py::test_v1_generation_is_deterministic_across_batch_sizes_with_needle -k TRITON_MLA
     - VLLM_TEST_MODEL=Qwen/Qwen3-30B-A3B-Thinking-2507-FP8 pytest -v -s v1/determinism/test_batch_invariance.py::test_v1_generation_is_deterministic_across_batch_sizes_with_needle -k FLASH_ATTN
+    # The sparse-MLA backend accepts compute capability 9 as well as 10. The
+    # kernel tests skip here (only validated on SM100); the structural and
+    # control-flow ones do not, and this is the only lane that collects them.
+    - pytest -v -s v1/determinism/test_sparse_mla_batch_invariance.py
 
 - label: Batch Invariance (B200)
   key: batch-invariance-b200

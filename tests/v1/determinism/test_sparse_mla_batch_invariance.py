@@ -399,7 +399,6 @@ def test_pinned_plan_does_not_drop_work(
         )
 
 
-@requires_flashmla_gpu
 def test_prefill_chunk_plan_batch_invariant():
     """Under BI the prefill chunk plan must emit one request per chunk with
     the same per-request (chunk_N, chunk_M) the greedy planner would compute:
@@ -433,13 +432,23 @@ def test_prefill_chunk_plan_batch_invariant():
         )
 
 
-def _stub_decode_layer(monkeypatch, pinned_after_record):
+def _stub_decode_layer(monkeypatch, record_works=True):
     """A DeepseekV4FlashMLAAttention with only what the swa-only decode reads.
 
     The cold-start control flow lives in _forward_decode: plan missing -> run
-    the shipped planner once -> record the partition count -> rebuild pinned ->
-    rerun. Nothing about it needs weights or a real kernel, so stub the kernel
-    and the planner and watch the sequence.
+    the shipped planner once -> record the partition count from what it left
+    behind -> rebuild pinned -> rerun. Nothing about it needs weights or a real
+    kernel, so model each participant closely enough that dropping any one of
+    them shows up:
+
+    - the fake kernel leaves a shipped plan on the struct, as the real planner
+      does on its first call;
+    - the fake record only counts as an observation if it was handed that plan;
+    - the fake build returns a pinned plan only once an observation happened.
+
+    So removing ``record_num_sm_parts``, or calling it before the kernel, leaves
+    the build returning None and the decode failing closed -- which is what the
+    real cold start would do.
     """
     from types import SimpleNamespace
 
@@ -449,29 +458,30 @@ def _stub_decode_layer(monkeypatch, pinned_after_record):
     monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
 
     calls = []
+    observed = []
+    shipped = torch.zeros(1, dtype=torch.int32)
     tile = SimpleNamespace(tile_scheduler_metadata=None, num_splits=None)
 
     def fake_kernel(**kw):
         meta = kw["tile_scheduler_metadata"]
         calls.append(meta.tile_scheduler_metadata)
+        if meta.tile_scheduler_metadata is None:
+            # The in-kernel planner allocates the plan on its first call.
+            meta.tile_scheduler_metadata = shipped
         kw["out"].fill_(len(calls))
         return kw["out"], None
 
     def fake_record(h_q, s_q, sched):
-        # What the real one does once the shipped planner has left a plan
-        # behind; here the shipped planner is the stub above.
-        sched.tile_scheduler_metadata = sched.tile_scheduler_metadata
+        if record_works and sched.tile_scheduler_metadata is not None:
+            observed.append((h_q, s_q))
 
     pinned = SimpleNamespace(
-        tile_scheduler_metadata=torch.zeros(1, dtype=torch.int32),
-        num_splits=torch.zeros(1, dtype=torch.int32),
+        tile_scheduler_metadata=torch.ones(1, dtype=torch.int32),
+        num_splits=torch.ones(2, dtype=torch.int32),
     )
-    seen = []
 
     def fake_build(**kw):
-        seen.append(kw)
-        # First call is the cold miss; the second is after record.
-        return pinned if (len(seen) > 1 and pinned_after_record) else None
+        return pinned if observed else None
 
     monkeypatch.setattr(fm, "flash_mla_with_kvcache", fake_kernel)
     import vllm.v1.attention.backends.mla.sparse_swa as swa
@@ -495,7 +505,7 @@ def _stub_decode_layer(monkeypatch, pinned_after_record):
         is_valid_token=None,
         token_to_req_indices=None,
     )
-    return layer, swa_meta, calls, tile
+    return layer, swa_meta, calls, tile, shipped, pinned
 
 
 def test_cold_start_reruns_with_the_pinned_plan(monkeypatch):
@@ -506,7 +516,7 @@ def test_cold_start_reruns_with_the_pinned_plan(monkeypatch):
     result is discarded: the kernel runs a second time with the pinned plan
     installed, and that is what the caller sees.
     """
-    layer, swa_meta, calls, tile = _stub_decode_layer(monkeypatch, True)
+    layer, swa_meta, calls, tile, shipped, pinned = _stub_decode_layer(monkeypatch)
     out = torch.zeros(1, 64, D_V)
 
     layer._forward_decode(
@@ -523,10 +533,15 @@ def test_cold_start_reruns_with_the_pinned_plan(monkeypatch):
         "observe the plan and once more with the pinned one"
     )
     assert calls[0] is None, "the first call must be the shipped planner's"
-    assert calls[1] is not None, "the second call must carry the pinned plan"
-    assert tile.tile_scheduler_metadata is not None, (
-        "the pinned plan must be installed on the per-type struct so the "
-        "remaining layers of this step reuse it"
+    assert calls[1] is pinned.tile_scheduler_metadata, (
+        "the second call must carry the pinned plan, not the shipped one"
+    )
+    # Both fields, by identity: installing only the metadata leaves the split
+    # counts describing the shipped layout.
+    assert tile.tile_scheduler_metadata is pinned.tile_scheduler_metadata
+    assert tile.num_splits is pinned.num_splits, (
+        "num_splits must be installed too, or the rerun reads the pinned plan "
+        "with the shipped plan's split counts"
     )
     assert torch.equal(out, torch.full_like(out, 2.0)), (
         "the returned output is the first kernel call's, i.e. the "
@@ -539,9 +554,10 @@ def test_cold_start_fails_closed_when_the_plan_stays_unbuildable(monkeypatch):
 
     Returning here would hand back the shipped planner's batch-dependent
     output under a flag that promises the opposite, and it would do it
-    silently.
+    silently. Driven by making the observation itself fail, which is also what
+    dropping record_num_sm_parts from the production path would look like.
     """
-    layer, swa_meta, _calls, _tile = _stub_decode_layer(monkeypatch, False)
+    layer, swa_meta, *_ = _stub_decode_layer(monkeypatch, record_works=False)
 
     with pytest.raises(RuntimeError, match="could not pin the tile-scheduler"):
         layer._forward_decode(
