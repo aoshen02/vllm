@@ -108,10 +108,10 @@ def test_matmul_batch_invariance(dtype):
 @pytest.mark.parametrize(
     "M,N,K",
     [
-        # The fp32 narrow-output config (BLOCK_M/N=64, BLOCK_K=128) applies when
-        # N <= 256 and K is a multiple of 128 >= 1024. Its key is (dtype, N, K)
-        # and never M, so a row's reduction order must not move with M. These
-        # shapes straddle the points where that could go wrong:
+        # The fp32 narrow-output config (BLOCK_M/N=64, BLOCK_K=128) is scoped to
+        # (N, K) = (256, 4096) on SM100, the shape it was measured on. Its key
+        # never includes M, so a row's reduction order must not move with M.
+        # These shapes straddle the points where that could go wrong:
         (64, 256, 4096),  # exactly one M tile
         (65, 256, 4096),  # second M tile, partially filled
         (128, 256, 4096),  # second M tile, full
