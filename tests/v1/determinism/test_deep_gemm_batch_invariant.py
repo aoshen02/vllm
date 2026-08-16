@@ -8,9 +8,15 @@ capability declaration, M-independent implementation selection, and the
 alignment ladder staying pinned under VLLM_BATCH_INVARIANT.
 """
 
+import inspect
+import threading
+import types
+
 import pytest
 
+import vllm.envs as envs
 import vllm.utils.deep_gemm as dg_wrapper
+from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.deep_gemm_utils import (
     compute_aligned_M_and_alignment,
 )
@@ -65,3 +71,84 @@ def test_alignment_ladder_pinned_under_bi(monkeypatch, m_tokens):
     assert align == 128, "alignment must not shrink with the batch under BI"
     assert not shrink_called
     assert m_sum % 128 == 0
+
+
+def test_probe_fails_closed_on_every_way_the_api_can_be_missing():
+    """The probe decides whether DeepGEMM is offered under batch invariance, so
+    every way it can fail has to leave it False.
+
+    Structural, not behavioural: the enabling block cannot be driven without a
+    vendored deep_gemm build. What is asserted is that the flag is only ever set
+    on the success path -- looked up with getattr, set inside a try, and never
+    assigned in the except or the missing-API branch.
+    """
+    import vllm.utils.deep_gemm as dg
+
+    body = inspect.getsource(dg._lazy_init_locked)
+    block = body[body.index("if envs.VLLM_BATCH_INVARIANT") :]
+    assert 'getattr(_dg, "set_batch_invariant", None)' in block
+    assignments = [
+        line for line in block.splitlines() if "_batch_invariant_enabled = " in line
+    ]
+    assert assignments == ["                _batch_invariant_enabled = True"], (
+        f"the flag must be set only on the success path, found: {assignments}"
+    )
+    assert dg.deep_gemm_batch_invariant_enabled() is dg._batch_invariant_enabled
+
+
+def test_lazy_init_is_serialized():
+    """Two threads must not be able to observe "initialized" before the
+    batch-invariance flag is set.
+
+    The fast path keys on the impl globals, which are assigned before the flag;
+    a second thread slipping in between would read False and, since that
+    decides whether DeepGEMM is offered, two ranks could pick different MoE
+    backends for the same configuration.
+    """
+    import vllm.utils.deep_gemm as dg
+
+    assert isinstance(dg._lazy_init_lock, threading.Lock().__class__)
+    # The public entry takes the lock and delegates; the body must not be
+    # reachable without it.
+    source = inspect.getsource(dg._lazy_init)
+    assert "_lazy_init_lock" in source and "_lazy_init_locked()" in source
+
+
+def test_bi_workspace_matches_the_implementation_it_will_use(monkeypatch):
+    """Workspace sizing must ask the same question the dispatch does.
+
+    Under BI the implementation is picked from N and K alone, so a deployment
+    whose weight shapes always route to Triton should not be charged for
+    DeepGemm's strictly larger workspace.
+    """
+    import vllm.model_executor.layers.fused_moe.experts.triton_deep_gemm_moe as m
+
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
+    monkeypatch.setattr(m, "get_mk_alignment_for_contiguous_layout", lambda: [128, 128])
+    monkeypatch.setattr(m, "has_deep_gemm", lambda: True)
+
+    picked = []
+    experts = types.SimpleNamespace(
+        workspace_shapes=lambda *a, **k: picked.append("deep_gemm") or ((), (), ())
+    )
+    fallback = types.SimpleNamespace(
+        workspace_shapes=lambda *a, **k: picked.append("triton") or ((), (), ())
+    )
+    obj = types.SimpleNamespace(experts=experts, fallback_experts=fallback)
+
+    def ws(N):
+        return m.TritonOrDeepGemmExperts.workspace_shapes(
+            obj,
+            M=128,
+            N=N,
+            K=4096,
+            topk=6,
+            global_num_experts=8,
+            local_num_experts=8,
+            expert_tokens_meta=None,
+            activation=MoEActivation.SILU,
+        )
+
+    ws(512)  # small-N carve-out: dispatch takes Triton, so must the sizing
+    ws(1024)  # aligned: dispatch takes DeepGemm
+    assert picked == ["triton", "deep_gemm"]

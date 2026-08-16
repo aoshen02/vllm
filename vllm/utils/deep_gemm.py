@@ -9,6 +9,7 @@ import contextlib
 import functools
 import importlib
 import os
+import threading
 from collections.abc import Callable
 from enum import Enum
 from typing import Any, NoReturn
@@ -220,6 +221,7 @@ def _apply_pdl(mod, enable: bool = True) -> None:
 
 
 _batch_invariant_enabled: bool = False
+_lazy_init_lock = threading.Lock()
 
 
 def deep_gemm_batch_invariant_enabled() -> bool:
@@ -232,7 +234,19 @@ def deep_gemm_batch_invariant_enabled() -> bool:
 
 
 def _lazy_init() -> None:
-    """Import deep_gemm and resolve symbols on first use."""
+    """Import deep_gemm and resolve symbols on first use.
+
+    Serialized: the fast path below keys on the impl globals, which are assigned
+    before ``_batch_invariant_enabled``. A second thread arriving in between
+    would take the fast path and then read the flag as False, and since that
+    flag decides whether DeepGEMM is offered under batch invariance, two ranks
+    could pick different MoE backends for the same configuration.
+    """
+    with _lazy_init_lock:
+        _lazy_init_locked()
+
+
+def _lazy_init_locked() -> None:
     global _batch_invariant_enabled
     global _cublaslt_gemm_nt_impl
     global _fp8_gemm_nt_impl, _fp8_einsum_impl

@@ -66,11 +66,16 @@ class TritonOrDeepGemmExperts(FallbackExperts):
         # Note: the deep gemm workspaces are strictly larger than the triton
         # workspaces so we can be pessimistic here and allocate for DeepGemm
         # even if we fall back to triton later, e.g. if expert maps are set.
-        if (
-            envs.VLLM_BATCH_INVARIANT
-            or is_deep_gemm_e8m0_used()
-            or _valid_deep_gemm_shape(M, N, K)
-        ):
+        #
+        # Under batch invariance the implementation is picked from N and K
+        # alone, so ask the same question here instead of always assuming
+        # DeepGemm: a deployment whose weight shapes always route to Triton
+        # would otherwise pay for the larger workspace it never uses.
+        if envs.VLLM_BATCH_INVARIANT:
+            use_deep_gemm = _bi_use_deep_gemm(N, K)
+        else:
+            use_deep_gemm = is_deep_gemm_e8m0_used() or _valid_deep_gemm_shape(M, N, K)
+        if use_deep_gemm:
             return self.experts.workspace_shapes(
                 M,
                 N,
