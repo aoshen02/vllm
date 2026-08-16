@@ -369,15 +369,15 @@ def test_topk_sentinel_collision_and_narrow_windows_match_reference():
     """Bit patterns and shapes where the out-of-window sentinel could leak.
 
     A negative NaN maps to exactly the INT32_MIN sentinel, so an in-window lane
-    can collide with the out-of-window ones; the kernel keeps them apart by
-    restricting its tie scan to in-window lanes, the reference by lifting
-    in-window keys off the sentinel. Also covers a window narrower than top-k
-    inside a wider row, where the cutoff lands on the sentinel.
+    can collide with the out-of-window ones. The kernel keeps them apart by
+    restricting its tie scan to in-window lanes; the reference by ranking on
+    validity before key. Also covers a window narrower than top-k inside a
+    wider row, where the cutoff lands on the sentinel.
     """
     # -1 and -2 as int32 are 0xffffffff and 0xfffffffe: two distinct negative
-    # NaNs whose keys are exactly INT32_MIN and INT32_MIN + 1. They are the only
-    # two patterns that can collide with a reserved sentinel, and lifting keys
-    # off one would merge them, so the reference ranks on validity instead.
+    # NaNs whose keys are exactly INT32_MIN and INT32_MIN + 1 -- the only two
+    # patterns adjacent to the sentinel, and the reason no value can be reserved
+    # as one (lifting keys off it would merge these two).
     neg_nan = torch.tensor([-1], dtype=torch.int32).view(torch.float32).item()
     neg_nan2 = torch.tensor([-2], dtype=torch.int32).view(torch.float32).item()
 
@@ -399,3 +399,66 @@ def test_topk_sentinel_collision_and_narrow_windows_match_reference():
     start = torch.tensor([600], device="cuda", dtype=torch.int32)
     end = torch.tensor([630], device="cuda", dtype=torch.int32)
     _assert_matches_ref(row, start, end, "narrow window inside a wide row")
+
+
+# Written as raw int32 so the patterns survive: float32 -> Python float quiets
+# signaling NaNs, so `.item()` round-trips cannot construct them.
+_BIT_PATTERNS = [
+    ("pos_zero_neg_zero", [0x00000000, 0x80000000]),
+    ("infinities", [0x7F800000, 0xFF800000]),
+    ("quiet_nans", [0x7FC00000, 0xFFC00000]),
+    ("signaling_nans", [0x7F800001, 0xFF800001]),
+    ("min_denormals", [0x00000001, 0x80000001]),
+    ("max_denormals", [0x007FFFFF, 0x807FFFFF]),
+    ("sentinel_adjacent", [0xFFFFFFFF, 0xFFFFFFFE]),
+    (
+        "everything",
+        [
+            0x00000000,
+            0x80000000,
+            0x7F800000,
+            0xFF800000,
+            0x7FC00000,
+            0xFFC00000,
+            0x7F800001,
+            0xFF800001,
+            0x00000001,
+            0x80000001,
+            0x007FFFFF,
+            0x807FFFFF,
+            0xFFFFFFFF,
+            0xFFFFFFFE,
+        ],
+    ),
+]
+
+
+def _row_from_bits(bits: list[int], cols: int) -> torch.Tensor:
+    as_signed = [b - 2**32 if b >= 2**31 else b for b in bits]
+    raw = torch.tensor(as_signed, dtype=torch.int32, device="cuda")
+    row = raw.repeat((cols + len(bits) - 1) // len(bits))[:cols]
+    return row.view(torch.float32).unsqueeze(0)
+
+
+@pytest.mark.parametrize("name,bits", _BIT_PATTERNS, ids=[n for n, _ in _BIT_PATTERNS])
+@pytest.mark.parametrize("topk", [512, 1024])
+def test_topk_every_float_class_matches_reference(name, bits, topk):
+    """Kernel and reference must agree on every fp32 class, not just on scores.
+
+    Ranking is done on a monotone integer key, so the classes that matter are
+    the bit patterns near its edges: the sentinel-adjacent NaNs, the signed
+    zeros the key canonicalizes, the infinities that bound it, and denormals.
+    Signaling NaNs are included because nothing in the pipeline quiets them.
+    """
+    for start, width in ((0, 600), (1, 600), (600, 30)):
+        cols = start + width
+        row = _row_from_bits(bits, cols)
+        row_start = torch.tensor([start], device="cuda", dtype=torch.int32)
+        row_end = torch.tensor([cols], device="cuda", dtype=torch.int32)
+        out = torch.empty((1, topk), device="cuda", dtype=torch.int32)
+        ref = torch.empty((1, topk), device="cuda", dtype=torch.int32)
+        _topk_indices_batch_invariant(row, row_start, row_end, out, topk)
+        _topk_indices_batch_invariant_ref(row, row_start, row_end, ref, topk)
+        assert torch.equal(out, ref), (
+            f"{name}: kernel != reference at start={start} width={width} topk={topk}"
+        )
