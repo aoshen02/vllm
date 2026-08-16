@@ -149,3 +149,26 @@ def test_gate_linear_negative_control(monkeypatch):
         "unavailable and cuBLAS stayed bitwise stable across the sweep "
         "(it does use split-k here, so the risk remains cross-version)"
     )
+
+
+def test_gate_linear_bias_survives_the_fp32_path(monkeypatch, default_vllm_config):
+    """The fp32 batch-invariant path must still add ReplicatedLinear's bias.
+
+    That path bypasses super().forward() to keep the matmul in fp32, so the bias
+    has to be folded in by hand. Dropping it silently shifts every router score,
+    and router scores decide which experts run.
+    """
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
+    torch.manual_seed(0)
+    layer = GateLinear(
+        input_size=128, output_size=8, bias=True, out_dtype=torch.float32
+    ).cuda()
+    with torch.no_grad():
+        layer.bias.copy_(torch.arange(8, device="cuda", dtype=layer.bias.dtype) + 1)
+
+    x = torch.randn(4, 128, device="cuda", dtype=torch.bfloat16)
+    out, returned_bias = layer(x)
+
+    unbiased = torch.nn.functional.linear(x.float(), layer.weight.float())
+    assert returned_bias is None
+    torch.testing.assert_close(out, unbiased + layer.bias.float(), rtol=0, atol=0)

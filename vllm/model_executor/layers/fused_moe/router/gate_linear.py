@@ -195,7 +195,16 @@ class GateLinear(ReplicatedLinear):
                     linear_batch_invariant,
                 )
 
-                return linear_batch_invariant(x.float(), self.weight.float()), None
+                # This bypasses ReplicatedLinear.forward, so the bias it would
+                # have folded in has to be folded in here. skip_bias_add is
+                # mirrored for completeness; GateLinear never sets it.
+                fold_bias = self.bias if not self.skip_bias_add else None
+                output = linear_batch_invariant(
+                    x.float(),
+                    self.weight.float(),
+                    fold_bias.float() if fold_bias is not None else None,
+                )
+                return output, self.bias if self.skip_bias_add else None
             return self._forward_linear(x)
 
         # Tier 1: cuteDSL ll_bf16_gemm (SM90+, any dims)
