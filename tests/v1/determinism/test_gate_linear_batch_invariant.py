@@ -169,6 +169,10 @@ def test_gate_linear_bias_survives_the_fp32_path(monkeypatch, default_vllm_confi
     x = torch.randn(4, 128, device="cuda", dtype=torch.bfloat16)
     out, returned_bias = layer(x)
 
-    unbiased = torch.nn.functional.linear(x.float(), layer.weight.float())
+    # Compare against the same persistent matmul rather than F.linear: those two
+    # are not required to agree bit-for-bit, and only the bias is under test.
+    from vllm.model_executor.layers.batch_invariant import linear_batch_invariant
+
+    unbiased = linear_batch_invariant(x.float(), layer.weight.float())
     assert returned_bias is None
     torch.testing.assert_close(out, unbiased + layer.bias.float(), rtol=0, atol=0)
