@@ -374,14 +374,24 @@ def test_topk_sentinel_collision_and_narrow_windows_match_reference():
     in-window keys off the sentinel. Also covers a window narrower than top-k
     inside a wider row, where the cutoff lands on the sentinel.
     """
-    # -1 as int32 is the bit pattern 0xffffffff, i.e. a negative NaN.
+    # -1 and -2 as int32 are 0xffffffff and 0xfffffffe: two distinct negative
+    # NaNs whose keys are exactly INT32_MIN and INT32_MIN + 1. They are the only
+    # two patterns that can collide with a reserved sentinel, and lifting keys
+    # off one would merge them, so the reference ranks on validity instead.
     neg_nan = torch.tensor([-1], dtype=torch.int32).view(torch.float32).item()
+    neg_nan2 = torch.tensor([-2], dtype=torch.int32).view(torch.float32).item()
 
     cols = 601
     row = torch.full((1, cols), neg_nan, device="cuda", dtype=torch.float32)
     start = torch.tensor([1], device="cuda", dtype=torch.int32)
     end = torch.tensor([cols], device="cuda", dtype=torch.int32)
     _assert_matches_ref(row, start, end, "negative-NaN plateau vs sentinel")
+
+    # Both sentinel-adjacent patterns in one window: their keys differ by one,
+    # so any scheme that clamps in-window keys off the sentinel would tie them.
+    row = torch.full((1, cols), neg_nan, device="cuda", dtype=torch.float32)
+    row[0, 1::2] = neg_nan2
+    _assert_matches_ref(row, start, end, "two distinct negative NaNs in-window")
 
     # valid_count (30) < k_eff (512) while num_cols (630) > TOPK.
     gen = torch.Generator(device="cuda").manual_seed(31)
