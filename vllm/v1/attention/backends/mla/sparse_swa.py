@@ -182,44 +182,52 @@ def _plan_skeleton(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """The batch-length-independent part of the plan: who owns what.
 
-    Returns ``(meta, owners, num_splits)`` where ``meta`` needs only its
-    end_block_idx column filled in per call.
+    Partition ``p`` owns requests ``[floor(p*b/P), floor((p+1)*b/P))``. Spans are
+    contiguous, disjoint and cover every request exactly once, for any ``b`` --
+    including ``b > P``, where a partition simply holds several whole requests.
+    No request is ever split across partitions, so a row's reduction order still
+    depends only on its own length.
+
+    Returns ``(meta, last_owned, num_splits)``. ``last_owned`` indexes, for each
+    busy partition, the last request it owns; that is the only place the caller
+    has to write a per-call block count.
     """
     key = (b, num_sm_parts, device)
     cached = _plan_cache.get(key)
     if cached is not None:
         return cached
 
-    # Partition p owns requests [floor(p*b/P), floor((p+1)*b/P)). Since b <= P
-    # every span is 0 or 1 wide and lo is continuous in p, so exactly b
-    # partitions are busy and the j-th busy one owns request j. Plain host
-    # integer arithmetic — no device work and no sync.
-    owners = [
-        p
+    # Plain host integer arithmetic -- no device work and no sync.
+    spans = [
+        ((p * b) // num_sm_parts, ((p + 1) * b) // num_sm_parts)
         for p in range(num_sm_parts)
-        if (p * b) // num_sm_parts < ((p + 1) * b) // num_sm_parts
     ]
+    busy = [p for p, (lo, hi) in enumerate(spans) if lo < hi]
     meta = torch.zeros((num_sm_parts, _SCHED_META_INTS), dtype=torch.int32)
     # Idle partitions are encoded begin_req_idx > end_req_idx, which is what the
     # planner itself leaves behind once it runs out of requests.
     meta[:, 0] = b
     meta[:, 1] = b - 1
-    owner_idx = torch.tensor(owners, dtype=torch.int64)
-    req = torch.arange(b, dtype=torch.int32)
-    meta[owner_idx, 0] = req
-    meta[owner_idx, 1] = req
+    busy_idx = torch.tensor(busy, dtype=torch.int64)
+    meta[busy_idx, 0] = torch.tensor([spans[p][0] for p in busy], dtype=torch.int32)
+    meta[busy_idx, 1] = torch.tensor([spans[p][1] - 1 for p in busy], dtype=torch.int32)
     # first_block_idx (column 2), begin_split_idx and the two is_splitted flags
     # (4..6) all stay 0: nothing is ever split.
+    #
+    # end_block_idx belongs to the partition's *last* request, so that is the
+    # row the caller fills in.
+    last_owned = torch.tensor([spans[p][1] - 1 for p in busy], dtype=torch.int64)
 
     logger.info_once(
         "Batch-invariant sparse MLA decode: pinning the tile-scheduler plan "
-        "(num_sm_parts=%d), one request per partition, no request split.",
+        "(num_sm_parts=%d), whole requests grouped per partition, no request "
+        "split.",
         num_sm_parts,
         scope="local",
     )
     skeleton = (
         meta.to(device),
-        owner_idx.to(device),
+        (busy_idx.to(device), last_owned.to(device)),
         # Cumulative split count; exactly one split per request.
         torch.arange(b + 1, dtype=torch.int32, device=device),
     )
@@ -261,10 +269,7 @@ def build_pinned_sched_meta(
         return None
 
     b = int(topk_length.shape[0])
-    if b == 0 or b > num_sm_parts:
-        # With more requests than partitions a partition must hold several
-        # requests; that is still invariant, but the >b case is untested here so
-        # stay on the shipped planner rather than guess.
+    if b == 0:
         return None
 
     # Mirror get_decoding_sched_meta.cu's per-request block count. The extra
@@ -291,15 +296,19 @@ def build_pinned_sched_meta(
         )
         meta, num_splits = _split_plan(num_blocks, b, num_sm_parts, f, device)
     else:
-        # b > max_num_seqs should be impossible (the scheduler caps it) but the
-        # split budget is sized from max_num_seqs, so fall back rather than
-        # overrun the partition count.
-        skeleton, owners, num_splits = _plan_skeleton(b, num_sm_parts, device)
+        # Either splitting is off, or the batch is larger than the split budget
+        # was sized for. Group whole requests per partition instead: still one
+        # split per request, no request across partitions, and no fall back to
+        # the shipped planner's batch-dependent layout.
+        skeleton, (busy, last_owned), num_splits = _plan_skeleton(
+            b, num_sm_parts, device
+        )
         # Cloned rather than written in place: the kernel reads this buffer
         # asynchronously, and the next layer would otherwise overwrite it.
         meta = skeleton.clone()
-        # end_block_idx (exclusive). Integer indices, so no host sync.
-        meta[owners, 3] = num_blocks
+        # end_block_idx (exclusive) is the block count of the partition's last
+        # request. Integer indices, so no host sync.
+        meta[busy, 3] = num_blocks[last_owned]
 
     sched = get_mla_metadata()[0]
     sched.tile_scheduler_metadata = meta
