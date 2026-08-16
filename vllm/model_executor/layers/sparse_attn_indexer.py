@@ -325,9 +325,10 @@ def _topk_bi_kernel(
     # One program per row, whole row register-resident, exact integer
     # arithmetic throughout: the result depends only on the row's own
     # contents, so it is deterministic and batch-invariant by construction.
-    # Assumes NaN-free scores (relu outputs); invalid columns are masked to
-    # -inf before keying; out-of-bounds lanes get INT32_MIN, below every
-    # real key.
+    # Every lane outside [row_start, row_end) keys at INT32_MIN and the tie scan
+    # is restricted to in-window lanes, so out-of-window lanes can neither
+    # outrank an in-window one nor spend its tie budget -- true for any bit
+    # pattern, including a negative NaN whose key is INT32_MIN itself.
     row = tl.program_id(0).to(tl.int64)
     l_base = logits_ptr + row * stride_l0
     o_base = out_ptr + row * stride_o0
