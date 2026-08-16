@@ -1675,28 +1675,20 @@ class VllmConfig:
                 "Disabling cascade attention when VLLM_BATCH_INVARIANT is enabled.",
             )
 
-        if envs.VLLM_BATCH_INVARIANT:
-            # These two schedule graphs of their own, keyed on what else this
-            # step happens to carry, and neither consults cudagraph_mode -- so
-            # unlike everything below they are not gated on it, and
-            # --enforce-eager does not switch them off either. Both are opt-in.
-            if self.compilation_config.cudagraph_mm_encoder and (
-                self.model_config is not None and self.model_config.is_multimodal_model
-            ):
-                raise ValueError(
-                    "VLLM_BATCH_INVARIANT is enabled but cudagraph_mm_encoder "
-                    "batches encoder items across requests and picks a graph by "
-                    "their combined token count, so an item's numeric path would "
-                    "depend on what it was batched with. Set "
-                    "cudagraph_mm_encoder=False."
-                )
-            if self.parallel_config.use_ubatching:
-                raise ValueError(
-                    "VLLM_BATCH_INVARIANT is enabled but microbatching chooses "
-                    "per step whether to split and which graph to replay, so a "
-                    "request's numeric path would depend on its neighbours. "
-                    "Disable it (enable_dbo / ubatch_size)."
-                )
+        # Microbatching schedules graphs of its own, keyed on what else this step
+        # happens to carry, and never consults cudagraph_mode -- so unlike
+        # everything below it is not gated on it, and --enforce-eager does not
+        # switch it off either. Opt-in, and the condition is exact here, so
+        # refuse. (The multimodal encoder is the same shape but its dispatcher
+        # also needs a model capability that is only known once the model is
+        # loaded, so it is handled at that point instead.)
+        if envs.VLLM_BATCH_INVARIANT and self.parallel_config.use_ubatching:
+            raise ValueError(
+                "VLLM_BATCH_INVARIANT is enabled but microbatching chooses "
+                "per step whether to split and which graph to replay, so a "
+                "request's numeric path would depend on its neighbours. "
+                "Disable it (enable_dbo / ubatch_size)."
+            )
 
         if (
             envs.VLLM_BATCH_INVARIANT
