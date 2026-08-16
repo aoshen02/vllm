@@ -103,3 +103,35 @@ def test_matmul_batch_invariance(dtype):
     batch_output_a = batch_output[3]
 
     assert torch.equal(standard_output[0], batch_output_a)
+
+
+@pytest.mark.parametrize(
+    "M,N,K",
+    [
+        # The fp32 narrow-output config (BLOCK_M/N=64, BLOCK_K=128) applies when
+        # N <= 256 and K is a multiple of 128 >= 1024. Its key is (dtype, N, K)
+        # and never M, so a row's reduction order must not move with M. These
+        # shapes straddle the points where that could go wrong:
+        (64, 256, 4096),  # exactly one M tile
+        (65, 256, 4096),  # second M tile, partially filled
+        (128, 256, 4096),  # second M tile, full
+        (4096, 256, 4096),  # more tiles than SMs: persistent programs loop
+    ],
+)
+def test_matmul_fp32_narrow_output_rows_do_not_move_with_m(M, N, K):
+    """A row's result must not depend on how many rows share the launch.
+
+    The narrow-output tile config exists for the fp32 router gate; it changes
+    BLOCK_M, so the M tiling and the persistent loop are where a row's reduction
+    order could start tracking the batch. Compare the same row computed alone
+    against the same row inside progressively larger launches.
+    """
+    device = torch.device(DEVICE_TYPE)
+    gen = torch.Generator(device=device).manual_seed(M)
+    b = torch.randn((K, N), generator=gen, device=device, dtype=torch.float32)
+    a = torch.randn((M, K), generator=gen, device=device, dtype=torch.float32)
+
+    full = matmul_batch_invariant(a, b)
+    for row in (0, M // 2, M - 1):
+        alone = matmul_batch_invariant(a[row : row + 1], b)
+        torch.testing.assert_close(full[row : row + 1], alone, rtol=0, atol=0)
