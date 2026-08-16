@@ -483,7 +483,17 @@ def _topk_indices_batch_invariant_ref(
         u = logits[i : i + chunk].float().contiguous().view(torch.int32)
         u = torch.where(u == _INT32_MIN_PY, torch.zeros_like(u), u)
         key = u ^ ((u >> 31) & 0x7FFFFFFF)
-        key = torch.where(valid, key, torch.full_like(key, _INT32_MIN_PY))
+        # A negative NaN (0xffffffff) maps to exactly _INT32_MIN, colliding with
+        # the out-of-window sentinel. The kernel keeps them apart because its tie
+        # scan is already restricted to in-window lanes; the reference sorts
+        # first and drops after, so lift in-window keys off the sentinel to get
+        # the same order. Scores are not expected to be NaN -- this only keeps
+        # the two implementations equal on every bit pattern.
+        key = torch.where(
+            valid,
+            key.clamp_min(_INT32_MIN_PY + 1),
+            torch.full_like(key, _INT32_MIN_PY),
+        )
         # Stable sort: equal keys keep ascending column order.
         order = torch.sort(key, dim=-1, descending=True, stable=True).indices
         sel = order[:, :k]
