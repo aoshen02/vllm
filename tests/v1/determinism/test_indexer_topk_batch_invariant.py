@@ -313,3 +313,53 @@ def test_topk_dispatcher_fallback_paths_match_reference():
 # probe and its archived evidence live at
 # agent_run/scripts/probe_indexer_topk_determinism.py and
 # agent_run/results/batch_invariance/shared/indexer-topk/accuracy/.
+
+
+@pytest.mark.parametrize("all_neg_inf", [True, False])
+def test_masked_lanes_do_not_spend_the_tie_budget(all_neg_inf):
+    """The same logical row must select the same local indices wherever the
+    packer puts its window.
+
+    Out-of-window lanes are excluded from the output, but they still have a
+    key. Keying them on ``-inf`` ties them with in-window lanes whose score
+    really is ``-inf``; because the tie budget is spent in column order, the
+    lanes sitting before ``row_start`` would eat it and the number of emitted
+    indices would drop by exactly ``row_start``. That is a direct batch
+    dependence: ``row_start`` is where this request landed in the packed
+    prefill, i.e. a function of its neighbours.
+
+    Comparing against the torch reference cannot catch this on its own -- the
+    reference has to make the same choice, so both would be wrong together.
+    Assert the invariant itself instead.
+    """
+    width = 600
+    outs = []
+    for start in (0, 1, 100, 511, 512, 977):
+        cols = start + width
+        row = torch.full((1, cols), float("-inf"), device="cuda", dtype=torch.float32)
+        if not all_neg_inf:
+            # Mixed: a handful of finite scores, the rest of the window -inf,
+            # so the cutoff still lands on the -inf plateau.
+            row[0, start : start + 5] = torch.arange(
+                5, device="cuda", dtype=torch.float32
+            )
+        row_start = torch.tensor([start], device="cuda", dtype=torch.int32)
+        row_end = torch.tensor([cols], device="cuda", dtype=torch.int32)
+        out = torch.empty((1, TOPK), device="cuda", dtype=torch.int32)
+        _topk_indices_batch_invariant(row, row_start, row_end, out, TOPK)
+        outs.append((start, out.clone()))
+
+        ref = torch.empty((1, TOPK), device="cuda", dtype=torch.int32)
+        _topk_indices_batch_invariant_ref(row, row_start, row_end, ref, TOPK)
+        assert torch.equal(out, ref), f"kernel != reference at start={start}"
+
+    base_start, base = outs[0]
+    n_emitted = int((base >= 0).sum())
+    assert n_emitted == min(TOPK, width), (
+        f"expected {min(TOPK, width)} emitted indices, got {n_emitted}"
+    )
+    for start, got in outs[1:]:
+        assert torch.equal(got, base), (
+            f"row_start={start} selected different indices than "
+            f"row_start={base_start}: masked lanes are consuming the tie budget"
+        )
