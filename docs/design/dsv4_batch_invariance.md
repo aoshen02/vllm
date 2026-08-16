@@ -73,10 +73,15 @@ KV compressor, and fp8/mxfp4 MoE expert stacks.
   and now run eager. Decode-side graphs are unaffected. The number is being
   re-measured under the new configuration.
 
-## PR map (all against this fork, path-disjoint, independently mergeable)
+## PR map (all against this fork; path-disjoint except where noted)
 
 1. `bi/indexer-topk` — deterministic top-k + fused Triton kernel + tests
-2. `bi/sparse-mla` — decode plan pin + per-request prefill chunks + tests
+2. `bi/sparse-mla` — decode plan pin + per-request prefill chunks + tests.
+   **Based on `bi/indexer-topk`, not on `bi/base`**: the indices this plan
+   operates on come from the indexer's top-k, whose dispatch switches
+   implementation on `num_rows <= 32`. Pinned alone, this branch would fix the
+   schedule and leave the indices batch-dependent, so the dependency is a git
+   base rather than a line in the description.
 3. `bi/mhc` — tilelang split pins + tests
 4. `bi/gate-linear` — fp32 router + small-N persistent matmul config + tests
 5. `bi/deepgemm-fp8` — DeepGEMM BI wiring (fail-closed probe, alignment pin,
