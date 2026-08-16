@@ -1664,6 +1664,22 @@ class VllmConfig:
         if (
             envs.VLLM_BATCH_INVARIANT
             and self.compilation_config.cudagraph_mode is not None
+            and self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
+            and (reason := self._full_cudagraph_unsupported_reason()) is not None
+        ):
+            # Checked before the pin below and independently of whether the mode
+            # still reads as piecewise: something between the downgrade and here
+            # (set_splitting_ops_for_v1, for one) may already have raised it back
+            # to FULL, and pinning would only compound that.
+            raise ValueError(
+                "VLLM_BATCH_INVARIANT cannot use piecewise cudagraphs, but this "
+                f"configuration cannot use full ones either: {reason}. Change the "
+                "configuration, or run with --enforce-eager."
+            )
+
+        if (
+            envs.VLLM_BATCH_INVARIANT
+            and self.compilation_config.cudagraph_mode is not None
             and self.compilation_config.cudagraph_mode.has_piecewise_cudagraphs()
         ):
             # Piecewise cudagraphs are not numerically equivalent to full
@@ -1674,12 +1690,6 @@ class VllmConfig:
             # keeps the decode-side graph win. It does not by itself make graph
             # and eager agree; the residual FULL/eager boundary is covered by
             # the capture-set check below.
-            if (reason := self._full_cudagraph_unsupported_reason()) is not None:
-                raise ValueError(
-                    "VLLM_BATCH_INVARIANT cannot use piecewise cudagraphs, but "
-                    f"this configuration cannot use full ones either: {reason}. "
-                    "Change the configuration, or run with --enforce-eager."
-                )
             if (
                 self.speculative_config is not None
                 and self.speculative_config.uses_dynamic_speculative_decoding()
@@ -1706,6 +1716,7 @@ class VllmConfig:
             and self.compilation_config.cudagraph_mode is not None
             and self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
             and self.compilation_config.max_cudagraph_capture_size
+            and getattr(self, "_cudagraph_sizes_user_specified", False)
         ):
             # Keeping cudagraphs on at all means a run straddles the graph and
             # eager paths: with FULL resolved to FULL_DECODE_ONLY every mixed
@@ -1715,40 +1726,38 @@ class VllmConfig:
             # model's kernels -- a property to verify per model, not something
             # config validation can establish.
             #
-            # What config validation *can* flag is a capture set the deployment
-            # shrank below what it would have got by default, which pushes even
-            # uniform-decode steps to eager once enough requests share one. The
-            # default sizes do not cover the whole decode fan-out either (they
-            # cap at 512/1024), so comparing against the fan-out alone would
-            # warn on stock configurations; compare against the default too.
-            from vllm.platforms import current_platform
-
+            # What config validation *can* flag is a deployment that explicitly
+            # picked a capture envelope too small for its own decode fan-out.
+            # Only an explicit choice is checked: the defaults are set from the
+            # platform, the model (some models override the cap) and, under
+            # speculative decoding, from query-length alignment, so re-deriving
+            # "what the default would have been" here only produces false alarms
+            # on stock configurations.
             token_budget = self.scheduler_config.max_num_batched_tokens
             if self.scheduler_config.max_num_scheduled_tokens is not None:
                 token_budget = min(
                     token_budget, self.scheduler_config.max_num_scheduled_tokens
                 )
-            decode_query_len = 1 + self.num_speculative_tokens
             largest_decode_step = min(
-                self.scheduler_config.max_num_seqs * decode_query_len, token_budget
-            )
-            default_capture_size = min(
-                self.scheduler_config.max_num_seqs * decode_query_len * 2,
-                1024 if current_platform.is_device_capability_family(100) else 512,
+                self.scheduler_config.max_num_seqs * (1 + self.num_speculative_tokens),
                 token_budget,
             )
-            expected = min(largest_decode_step, default_capture_size)
-            if self.compilation_config.max_cudagraph_capture_size < expected:
+            capture_size = self.compilation_config.max_cudagraph_capture_size
+            if capture_size < largest_decode_step:
                 logger.warning_once(
-                    "VLLM_BATCH_INVARIANT is enabled but max_cudagraph_capture_size "
-                    "(%d) is below the %d tokens this deployment would capture by "
-                    "default. Decode batches above it fall back to eager, so which "
-                    "numeric path a request takes depends on how many requests "
-                    "share its step. Extend cudagraph_capture_sizes to cover %d "
-                    "tokens, or lower max_num_seqs.",
-                    self.compilation_config.max_cudagraph_capture_size,
-                    expected,
-                    expected,
+                    "VLLM_BATCH_INVARIANT is enabled and this configuration "
+                    "sets max_cudagraph_capture_size to %d, below its largest "
+                    "decode step (%d tokens). Decode batches above it fall "
+                    "back to eager, so which numeric path a request takes "
+                    "depends on how many requests share its step. Extend "
+                    "cudagraph_capture_sizes to cover %d tokens, or lower "
+                    "max_num_seqs. (Under speculative decoding the effective "
+                    "envelope is also aligned to the decode query length, so "
+                    "treat %d as a lower bound.)",
+                    capture_size,
+                    largest_decode_step,
+                    largest_decode_step,
+                    largest_decode_step,
                 )
 
         if self.parallel_config.use_ubatching:
@@ -2048,6 +2057,13 @@ class VllmConfig:
             # determine the initial max_cudagraph_capture_size
             max_cudagraph_capture_size = (
                 self.compilation_config.max_cudagraph_capture_size
+            )
+            # Recorded before the defaults overwrite it: the batch-invariance
+            # check below needs to know whether the capture envelope was chosen
+            # by the deployment or handed to it.
+            self._cudagraph_sizes_user_specified = (
+                max_cudagraph_capture_size is not None
+                or self.compilation_config.cudagraph_capture_sizes is not None
             )
             if max_cudagraph_capture_size is None:
                 from vllm.platforms import current_platform

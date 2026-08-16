@@ -1729,6 +1729,44 @@ def test_batch_invariant_never_falls_back_to_piecewise(
     assert resolved == CUDAGraphMode.NONE
 
 
+def test_batch_invariant_refuses_full_when_full_is_unsupported(monkeypatch):
+    """A configuration that cannot use full cudagraphs is refused, not pinned.
+
+    Pooling models downgrade to PIECEWISE because full graphs do not work for
+    them; pinning FULL afterwards would put the run back on the unsupported
+    mode. This covers that.
+
+    The check is deliberately not gated on the mode still reading as piecewise:
+    set_splitting_ops_for_v1() runs before the pin and can raise a downgraded
+    mode back to FULL (sequence parallelism, fuse_attn_quant), which would hide
+    the downgrade from a piecewise-gated check. No config-only input was found
+    that reaches the pin in that state, so that ordering is guarded by
+    construction rather than by this test.
+    """
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
+    with pytest.raises(ValueError, match="cannot use full ones either"):
+        VllmConfig(
+            model_config=ModelConfig(
+                "Qwen/Qwen3-Embedding-0.6B",
+                max_model_len=2048,
+                runner="pooling",
+            ),
+            scheduler_config=SchedulerConfig(
+                max_model_len=2048,
+                is_encoder_decoder=False,
+                max_num_seqs=64,
+            ),
+            # Sequence parallelism raises the pooling downgrade back to FULL in
+            # set_splitting_ops_for_v1(), which runs before the pin: by then
+            # there is no piecewise left for a piecewise-gated check to see.
+            compilation_config=CompilationConfig(
+                mode=CompilationMode.VLLM_COMPILE,
+                cudagraph_mode=CUDAGraphMode.PIECEWISE,
+                pass_config={"enable_sp": True},
+            ),
+        )
+
+
 def test_batch_invariant_warns_when_decode_step_escapes_capture(monkeypatch, caplog):
     """A capture set shrunk below the default pushes decode steps to eager, and
     which side of that boundary a request lands on is decided by its neighbours.
@@ -1753,27 +1791,22 @@ def test_batch_invariant_warns_when_decode_step_escapes_capture(monkeypatch, cap
                 cudagraph_capture_sizes=[1, 2, 4, 8],
             ),
         )
-    assert "is below the" in caplog.text
+    assert "below its largest decode step" in caplog.text
 
 
 @pytest.mark.parametrize("max_num_seqs", [64, 1024])
-def test_batch_invariant_quiet_when_capture_covers_decode(
+def test_batch_invariant_quiet_when_capture_is_left_default(
     monkeypatch, caplog, max_num_seqs
 ):
-    """Stock configurations must stay quiet, including ones whose decode fan-out
-    exceeds the default capture cap -- that is the default, not a misconfig.
+    """Stock configurations must stay quiet, whatever their decode fan-out.
 
-    max_num_seqs=1024 with the non-Blackwell cap is the case that matters: the
-    default capture size stops at 512 while the fan-out is 1024, so a check
-    written against the fan-out alone warns on every stock deployment. The
-    capability family is pinned so the assertion does not depend on the host.
+    The default cap comes from the platform, sometimes from the model, and under
+    speculative decoding from query-length alignment; a deployment that never
+    chose a capture envelope has nothing to fix, so the check only looks at
+    explicit ones. max_num_seqs=1024 is the case that matters: its fan-out
+    exceeds every default cap, so a fan-out-only check warns on stock setups.
     """
     monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
-    from vllm.platforms import current_platform
-
-    monkeypatch.setattr(
-        current_platform, "is_device_capability_family", lambda _family: False
-    )
     with caplog.at_level(logging.WARNING):
         VllmConfig(
             model_config=ModelConfig("Qwen/Qwen3-0.6B", max_model_len=2048),
@@ -1784,7 +1817,7 @@ def test_batch_invariant_quiet_when_capture_covers_decode(
             ),
             compilation_config=CompilationConfig(cudagraph_mode=CUDAGraphMode.FULL),
         )
-    assert "is below the" not in caplog.text
+    assert "below its largest decode step" not in caplog.text
 
 
 def test_fusion_pass_op_priority():
