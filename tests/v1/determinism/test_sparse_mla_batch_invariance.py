@@ -312,3 +312,42 @@ def test_prefill_chunk_plan_batch_invariant():
         assert solo_plan == [(0, 1, chunk_n, chunk_m)], (
             f"request {i} chunk geometry depends on neighbors"
         )
+
+
+@pytest.mark.parametrize("b", [1, 3, 4, 5, 11])
+def test_plan_skeleton_groups_whole_requests_for_any_batch(b):
+    """Every request is owned by exactly one partition, whatever the batch size.
+
+    With more requests than partitions a partition holds several whole
+    requests. What must never happen is a request spanning partitions -- that
+    is what would make a row's reduction order depend on the batch. The old
+    code refused to plan at all above the partition count and fell back to the
+    shipped planner, which is batch-dependent by construction.
+    """
+    from vllm.v1.attention.backends.mla.sparse_swa import _plan_skeleton
+
+    P = 4
+    device = torch.device("cpu")
+    meta, (busy, last_owned), num_splits = _plan_skeleton(b, P, device)
+
+    assert meta.shape[0] == P
+    # One split per request, cumulative.
+    assert torch.equal(num_splits, torch.arange(b + 1, dtype=torch.int32))
+
+    covered = []
+    for row, last in zip(busy.tolist(), last_owned.tolist()):
+        begin, end = int(meta[row, 0]), int(meta[row, 1])
+        assert begin <= end, "a busy partition must own at least one request"
+        assert last == end, "the caller writes the block count of the last request"
+        covered.extend(range(begin, end + 1))
+    assert covered == list(range(b)), (
+        f"requests must be covered once, contiguously and in order: {covered}"
+    )
+
+    idle = sorted(set(range(P)) - set(busy.tolist()))
+    for row in idle:
+        assert int(meta[row, 0]) > int(meta[row, 1]), "idle rows stay begin > end"
+
+    # Nothing is ever marked as split.
+    assert int(meta[:, 2].abs().sum()) == 0
+    assert int(meta[:, 4:7].abs().sum()) == 0

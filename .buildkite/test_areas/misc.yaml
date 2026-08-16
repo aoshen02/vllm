@@ -425,6 +425,7 @@ steps:
     - pytest -v -s v1/determinism/test_nvfp4_batch_invariant.py
     - pytest -v -s v1/determinism/test_matmul_batch_invariant.py
     - pytest -v -s v1/determinism/test_indexer_topk_batch_invariant.py
+    - pytest -v -s v1/determinism/test_sparse_mla_batch_invariance.py
     - pytest -v -s v1/determinism/test_cutlass_batch_invariance.py
     - pytest -v -s v1/determinism/test_online_batch_invariance.py
 
