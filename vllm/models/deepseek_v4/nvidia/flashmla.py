@@ -258,6 +258,7 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
         # plan is installed onto the per-type struct so the remaining same-type
         # layers reuse it, the same way they reuse the shipped plan; rebuilding
         # it per layer costs ~80 us x 61 layers per step.
+        needs_pinned_rerun = False
         if envs.VLLM_BATCH_INVARIANT and tile_metadata.tile_scheduler_metadata is None:
             # Imported here: sparse_swa imports this module's siblings, so a
             # top-level import would be circular (hence the TYPE_CHECKING guard
@@ -285,6 +286,13 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
             if pinned is not None:
                 tile_metadata.tile_scheduler_metadata = pinned.tile_scheduler_metadata
                 tile_metadata.num_splits = pinned.num_splits
+            else:
+                # Cold (h_q, s_q): num_sm_parts is only observable from a real
+                # plan, so the shipped planner has to run once. Its layout is
+                # batch-dependent, so that result must not be the one anyone
+                # sees -- record the partition count, then redo the call below
+                # with the pinned plan.
+                needs_pinned_rerun = True
 
         out, _ = flash_mla_with_kvcache(
             q=q,
@@ -304,9 +312,48 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
             out=output.unsqueeze(1),
         )
         if envs.VLLM_BATCH_INVARIANT:
-            from vllm.v1.attention.backends.mla.sparse_swa import record_num_sm_parts
+            from vllm.v1.attention.backends.mla.sparse_swa import (
+                build_pinned_sched_meta,
+                record_num_sm_parts,
+            )
 
             record_num_sm_parts(q.shape[2], q.shape[1], tile_metadata)
+            if needs_pinned_rerun:
+                pinned = build_pinned_sched_meta(
+                    h_q=q.shape[2],
+                    s_q=q.shape[1],
+                    topk_length=swa_lens,
+                    has_extra=topk_indices is not None,
+                    extra_topk_length=topk_lens,
+                    device=q.device,
+                    topk_cap=swa_indices.shape[-1],
+                    extra_topk_cap=(
+                        topk_indices.shape[-1] if topk_indices is not None else None
+                    ),
+                    split_budget_cfg=self.swa_cache_layer.split_budget_cfg,
+                )
+                if pinned is not None:
+                    tile_metadata.tile_scheduler_metadata = (
+                        pinned.tile_scheduler_metadata
+                    )
+                    tile_metadata.num_splits = pinned.num_splits
+                    out, _ = flash_mla_with_kvcache(
+                        q=q,
+                        k_cache=swa_cache,
+                        block_table=None,
+                        head_dim_v=512,
+                        tile_scheduler_metadata=tile_metadata,
+                        cache_seqlens=None,
+                        is_fp8_kvcache=True,
+                        indices=swa_indices,
+                        topk_length=swa_lens,
+                        softmax_scale=self.scale,
+                        attn_sink=self.attn_sink,
+                        extra_k_cache=kv_cache if not swa_only else None,
+                        extra_indices_in_kvcache=topk_indices,
+                        extra_topk_length=topk_lens,
+                        out=output.unsqueeze(1),
+                    )
 
     def _forward_prefill(
         self,
