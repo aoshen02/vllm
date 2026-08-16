@@ -1793,13 +1793,14 @@ def test_batch_invariant_records_only_deployment_chosen_capture_sizes(
 
 
 def test_batch_invariant_warns_when_decode_step_escapes_capture(monkeypatch, caplog):
-    """A capture set shrunk below the default pushes decode steps to eager, and
-    which side of that boundary a request lands on is decided by its neighbours.
+    """An explicitly chosen capture set too small for the deployment's own decode
+    fan-out pushes decode steps to eager, and which side of that boundary a
+    request lands on is decided by its neighbours.
 
-    The criterion is "below what this deployment would capture by default", not
-    "below the whole decode fan-out": the defaults cap at 512/1024 and so do not
-    cover the fan-out either, so warning on a stock configuration would be noise
-    rather than a signal."""
+    Only explicit choices are checked. Defaults come from the platform, from the
+    model, and under speculative decoding from query-length alignment, so a
+    configuration nobody wrote has nothing to fix and warning on it would be
+    noise rather than a signal."""
     monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
     with caplog.at_level(logging.WARNING):
         VllmConfig(
