@@ -1670,9 +1670,18 @@ class VllmConfig:
             # cudagraphs or to eager, and which mode a step runs under is a
             # function of the batch (uniform decode? within the largest capture
             # size?), so leaving piecewise on makes a request's output depend on
-            # its neighbours. Full cudagraphs and the eager fallback agree
-            # bit-for-bit, so keeping only FULL preserves invariance and the
-            # decode-side graph win.
+            # its neighbours. Dropping to FULL removes that per-step choice and
+            # keeps the decode-side graph win. It does not by itself make graph
+            # and eager agree; the residual FULL/eager boundary is covered by
+            # the capture-set check below.
+            if self._batch_invariant_requires_piecewise():
+                raise ValueError(
+                    "VLLM_BATCH_INVARIANT cannot use piecewise cudagraphs, but "
+                    "this configuration requires them: the KV connector "
+                    "performs layerwise async operations that cannot be "
+                    "captured. Disable the KV connector, or run with "
+                    "--enforce-eager."
+                )
             if (
                 self.speculative_config is not None
                 and self.speculative_config.uses_dynamic_speculative_decoding()
@@ -1700,27 +1709,36 @@ class VllmConfig:
             and self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
             and self.compilation_config.max_cudagraph_capture_size
         ):
-            # A step larger than the capture set falls back to eager, and the
-            # captured and eager paths are not required to agree bit-for-bit.
-            # That only stays harmless while the boundary cannot be crossed as a
-            # function of the batch. Decode steps are the ones that get
-            # captured, so the largest decode step the scheduler can build has
-            # to stay inside the capture set; otherwise a request sharing a step
-            # with enough neighbours takes a different numeric path than the
-            # same request alone. The default capture sizes leave 2x headroom,
-            # so this only fires on an explicit override.
+            # Keeping cudagraphs on at all means a run straddles the graph and
+            # eager paths: with FULL resolved to FULL_DECODE_ONLY every mixed
+            # prefill+decode step is eager while uniform-decode steps replay a
+            # graph, and that split is decided by the batch. Invariance
+            # therefore rests on those two paths agreeing bit-for-bit for this
+            # model's kernels -- a property to verify per model, not something
+            # config validation can establish.
+            #
+            # What config validation *can* flag is the one knob that makes the
+            # split gratuitously worse: a capture set too small to hold the
+            # decode fan-out, which pushes even uniform-decode steps to eager
+            # once enough requests share one. The default sizes leave 2x
+            # headroom, so this only fires on an explicit override.
+            token_budget = self.scheduler_config.max_num_batched_tokens
+            if self.scheduler_config.max_num_scheduled_tokens is not None:
+                token_budget = min(
+                    token_budget, self.scheduler_config.max_num_scheduled_tokens
+                )
             largest_decode_step = min(
                 self.scheduler_config.max_num_seqs * (1 + self.num_speculative_tokens),
-                self.scheduler_config.max_num_batched_tokens,
+                token_budget,
             )
             if self.compilation_config.max_cudagraph_capture_size < largest_decode_step:
                 logger.warning_once(
                     "VLLM_BATCH_INVARIANT is enabled but the largest decode step "
                     "(%d tokens) does not fit in max_cudagraph_capture_size (%d). "
-                    "Decode batches above that size fall back to eager, which is "
-                    "not bit-identical to graph replay, so outputs will depend on "
-                    "how many requests share a step. Extend cudagraph_capture_sizes "
-                    "to cover %d tokens, or lower max_num_seqs.",
+                    "Decode batches above that size fall back to eager, so which "
+                    "numeric path a request takes depends on how many requests "
+                    "share its step. Extend cudagraph_capture_sizes to cover %d "
+                    "tokens, or lower max_num_seqs.",
                     largest_decode_step,
                     self.compilation_config.max_cudagraph_capture_size,
                     largest_decode_step,
@@ -1922,6 +1940,27 @@ class VllmConfig:
                     " support the speculative decoding settings."
                     f" Got {max_num_batched_tokens=} and {scheduled_token_delta=}."
                 )
+
+    def _batch_invariant_requires_piecewise(self) -> bool:
+        """Whether something in this config hard-requires piecewise cudagraphs.
+
+        Batch invariance pins ``cudagraph_mode`` to ``FULL``, which would
+        silently undo such a requirement. Trading one correctness problem for
+        another is worse than refusing the configuration.
+        """
+        if (
+            self.kv_transfer_config is None
+            or not self.kv_transfer_config.is_kv_transfer_instance
+        ):
+            return False
+        from vllm.distributed.kv_transfer.kv_connector.factory import (
+            KVConnectorFactory,
+        )
+
+        connector_cls = KVConnectorFactory.get_connector_class(self.kv_transfer_config)
+        return connector_cls.requires_piecewise_for_cudagraph(
+            self.kv_transfer_config.kv_connector_extra_config
+        )
 
     def _set_cudagraph_sizes(self):
         """

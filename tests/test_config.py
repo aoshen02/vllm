@@ -1686,6 +1686,49 @@ def test_batch_invariant_resolve_prefers_full_decode_only(monkeypatch):
     assert resolved == CUDAGraphMode.FULL_DECODE_ONLY
 
 
+@pytest.mark.parametrize(
+    "requested,cg_support,uniform_decode_query_len",
+    [
+        # Backend cannot do full decode graphs at all. Requesting plain FULL
+        # raises earlier (mixed-mode FULL + NEVER is always rejected), so the
+        # reachable path into this downgrade starts from FULL_DECODE_ONLY.
+        (CUDAGraphMode.FULL_DECODE_ONLY, AttentionCGSupport.NEVER, 1),
+        # Backend can do full graphs, but not with spec-decode query lengths.
+        (CUDAGraphMode.FULL, AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE, 2),
+    ],
+)
+def test_batch_invariant_never_falls_back_to_piecewise(
+    monkeypatch, requested, cg_support, uniform_decode_query_len
+):
+    """The unsupported-backend downgrades hand piecewise back by default.
+
+    Pinning cudagraph_mode=FULL earlier is not enough on its own: these two
+    later branches re-resolve to PIECEWISE, which would silently reinstate the
+    per-step mode choice that breaks invariance. Under batch invariance they
+    have to drop to NONE (correct but eager) instead.
+    """
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
+    compilation_config = CompilationConfig(
+        mode=CompilationMode.VLLM_COMPILE,
+        cudagraph_mode=requested,
+        cudagraph_capture_sizes=list(range(1, 17)),
+    )
+    compilation_config.splitting_ops = list(CompilationConfig._attention_ops)
+    compilation_config.max_cudagraph_capture_size = 16
+    compilation_config.post_init_cudagraph_sizes()
+
+    resolved = compilation_config.resolve_cudagraph_mode_and_sizes(
+        cg_support,
+        "FakeAttentionBackend",
+        uniform_decode_query_len=uniform_decode_query_len,
+        use_v2_model_runner=True,
+        tensor_parallel_size=1,
+    )
+
+    assert not resolved.has_piecewise_cudagraphs()
+    assert resolved == CUDAGraphMode.NONE
+
+
 def test_batch_invariant_warns_when_decode_step_escapes_capture(monkeypatch, caplog):
     """Pinning FULL only preserves invariance while every decode step stays
     inside the capture set; above it a step falls back to eager, and which side

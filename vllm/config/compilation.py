@@ -1425,9 +1425,13 @@ class CompilationConfig:
                 f"with {min_cg_attn_backend} backend (support: "
                 f"{min_cg_support})"
             )
-            if self.mode == CompilationMode.VLLM_COMPILE and (
-                self.splitting_ops_contain_attention()
-                or self.use_inductor_graph_partition
+            if (
+                self.mode == CompilationMode.VLLM_COMPILE
+                and (
+                    self.splitting_ops_contain_attention()
+                    or self.use_inductor_graph_partition
+                )
+                and not envs.VLLM_BATCH_INVARIANT
             ):
                 msg += (
                     "; setting cudagraph_mode=PIECEWISE because "
@@ -1435,10 +1439,16 @@ class CompilationConfig:
                 )
                 cudagraph_mode = CUDAGraphMode.PIECEWISE
             else:
-                msg += (
-                    "; setting cudagraph_mode=NONE because "
-                    "attention is not compiled piecewise"
-                )
+                if envs.VLLM_BATCH_INVARIANT:
+                    msg += (
+                        "; setting cudagraph_mode=NONE because "
+                        "VLLM_BATCH_INVARIANT cannot take the piecewise fallback"
+                    )
+                else:
+                    msg += (
+                        "; setting cudagraph_mode=NONE because "
+                        "attention is not compiled piecewise"
+                    )
                 cudagraph_mode = CUDAGraphMode.NONE
             logger.warning(msg)
 
@@ -1454,11 +1464,17 @@ class CompilationConfig:
                 f" with spec-decode for attention backend "
                 f"{min_cg_attn_backend} (support: {min_cg_support})"
             )
-            if self.splitting_ops_contain_attention():
+            if self.splitting_ops_contain_attention() and not envs.VLLM_BATCH_INVARIANT:
                 msg += "; setting cudagraph_mode=PIECEWISE"
                 cudagraph_mode = CUDAGraphMode.PIECEWISE
             else:
-                msg += "; setting cudagraph_mode=NONE"
+                if envs.VLLM_BATCH_INVARIANT:
+                    msg += (
+                        "; setting cudagraph_mode=NONE because "
+                        "VLLM_BATCH_INVARIANT cannot take the piecewise fallback"
+                    )
+                else:
+                    msg += "; setting cudagraph_mode=NONE"
                 cudagraph_mode = CUDAGraphMode.NONE
             logger.warning(msg)
 
