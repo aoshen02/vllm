@@ -294,7 +294,8 @@ def kv_cache_as_quant_view(
 
 _TOPK_BI_NUM_WARPS = 8
 # tl.constexpr instantiation: @jit bodies may only read globals wrapped this way.
-_INT32_MIN = tl.constexpr(-(2**31))
+_INT32_MIN_PY = -(2**31)
+_INT32_MIN = tl.constexpr(_INT32_MIN_PY)
 
 
 @triton.jit
@@ -339,8 +340,13 @@ def _topk_bi_kernel(
     vmask = inb & (offs < end)
     if HAS_START:
         vmask = vmask & (offs >= start)
-    masked = tl.where(vmask, x, float("-inf"))
-    key = tl.where(inb, _topk_bi_key(masked), _INT32_MIN)
+    # Every lane outside the row's window keys strictly below every lane inside
+    # it -- _INT32_MIN sits below _topk_bi_key(-inf). Keying them on -inf
+    # instead would tie them with in-window lanes whose score really is -inf,
+    # and since the tie budget is spent in column order, the number of masked
+    # lanes ahead of a valid one (i.e. `start`, i.e. how the batch was packed)
+    # would decide whether it is emitted.
+    key = tl.where(vmask, _topk_bi_key(x), _INT32_MIN)
 
     # Exact k-th key by 32-step binary search on the int32 key space: each
     # step is one vectorized compare + tree reduction on the register-resident
@@ -361,11 +367,10 @@ def _topk_bi_kernel(
     # index; positions from an exclusive cumsum, so output is ascending with
     # a -1 tail and no sort anywhere.
     tl.store(o_base + tl.arange(0, TOPK), tl.full((TOPK,), -1, dtype=tl.int32))
-    eq = inb & (key == t_key)
+    eq = vmask & (key == t_key)
     eq_i = eq.to(tl.int32)
     eq_before = tl.cumsum(eq_i, axis=0) - eq_i
-    sel = (inb & (key > t_key)) | (eq & (eq_before < budget))
-    emit = sel & vmask
+    emit = (vmask & (key > t_key)) | (eq & (eq_before < budget))
     e_i = emit.to(tl.int32)
     pos = tl.cumsum(e_i, axis=0) - e_i
     tl.store(o_base + pos, offs - start, mask=emit & (pos < TOPK))
@@ -470,9 +475,17 @@ def _topk_indices_batch_invariant_ref(
         if row_start is not None:
             start = row_start[i : i + chunk].unsqueeze(1)
             valid &= cols >= start
-        masked = torch.where(valid, logits[i : i + chunk].float(), float("-inf"))
-        # Stable sort: equal scores keep ascending column order.
-        order = torch.sort(masked, dim=-1, descending=True, stable=True).indices
+        # Same monotone int32 key as the Triton kernel, for the same reason:
+        # out-of-window lanes must key strictly below every in-window lane, so
+        # they cannot tie with an in-window score of -inf and spend the tie
+        # budget ahead of it. Masking to -inf instead would make the emitted
+        # count depend on `start`, i.e. on how the batch was packed.
+        u = logits[i : i + chunk].float().contiguous().view(torch.int32)
+        u = torch.where(u == _INT32_MIN_PY, torch.zeros_like(u), u)
+        key = u ^ ((u >> 31) & 0x7FFFFFFF)
+        key = torch.where(valid, key, torch.full_like(key, _INT32_MIN_PY))
+        # Stable sort: equal keys keep ascending column order.
+        order = torch.sort(key, dim=-1, descending=True, stable=True).indices
         sel = order[:, :k]
         sel_valid = torch.gather(valid, 1, sel)
         if start is not None:
