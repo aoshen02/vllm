@@ -72,7 +72,12 @@ class TritonOrDeepGemmExperts(FallbackExperts):
         # DeepGemm: a deployment whose weight shapes always route to Triton
         # would otherwise pay for the larger workspace it never uses.
         if envs.VLLM_BATCH_INVARIANT:
-            use_deep_gemm = _bi_use_deep_gemm(N, K)
+            # N here is w1's output dim; the dispatch below keys on w2's, which
+            # for a gated activation is half of it. Convert, or the two disagree
+            # for exactly the shapes this is meant to size correctly.
+            use_deep_gemm = _bi_use_deep_gemm(
+                self.adjust_N_for_activation(N, activation), K
+            )
         else:
             use_deep_gemm = is_deep_gemm_e8m0_used() or _valid_deep_gemm_shape(M, N, K)
         if use_deep_gemm:

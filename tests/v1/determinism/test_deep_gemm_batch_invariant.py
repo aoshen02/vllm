@@ -117,38 +117,50 @@ def test_lazy_init_is_serialized():
 def test_bi_workspace_matches_the_implementation_it_will_use(monkeypatch):
     """Workspace sizing must ask the same question the dispatch does.
 
-    Under BI the implementation is picked from N and K alone, so a deployment
-    whose weight shapes always route to Triton should not be charged for
-    DeepGemm's strictly larger workspace.
+    The two entry points do not speak the same dimension: workspace_shapes gets
+    w1's output dim, _select_experts_impl reads w2's, which for a gated
+    activation is half of it. Comparing them for consistent w1/w2 is the point
+    -- checking either alone is what let them disagree.
     """
+    import torch
+
     import vllm.model_executor.layers.fused_moe.experts.triton_deep_gemm_moe as m
 
     monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
     monkeypatch.setattr(m, "get_mk_alignment_for_contiguous_layout", lambda: [128, 128])
     monkeypatch.setattr(m, "has_deep_gemm", lambda: True)
 
-    picked = []
-    experts = types.SimpleNamespace(
-        workspace_shapes=lambda *a, **k: picked.append("deep_gemm") or ((), (), ())
-    )
-    fallback = types.SimpleNamespace(
-        workspace_shapes=lambda *a, **k: picked.append("triton") or ((), (), ())
-    )
-    obj = types.SimpleNamespace(experts=experts, fallback_experts=fallback)
+    cls = m.TritonOrDeepGemmExperts
+    K, E = 4096, 8
+    for w2_n in (512, 1024):
+        sized: list[str] = []
 
-    def ws(N):
-        return m.TritonOrDeepGemmExperts.workspace_shapes(
+        def _record(tag, _sized=sized):
+            return lambda *a, **k: (_sized.append(tag), ((), (), ()))[1]
+
+        experts = types.SimpleNamespace(workspace_shapes=_record("deep_gemm"))
+        fallback = types.SimpleNamespace(workspace_shapes=_record("triton"))
+        obj = types.SimpleNamespace(
+            experts=experts,
+            fallback_experts=fallback,
+            adjust_N_for_activation=cls.adjust_N_for_activation,
+        )
+        # Gated activation: w1's output dim is twice w2's.
+        w1 = torch.empty((E, 2 * w2_n, K))
+        w2 = torch.empty((E, K, w2_n))
+        cls.workspace_shapes(
             obj,
             M=128,
-            N=N,
-            K=4096,
+            N=w1.shape[1],
+            K=K,
             topk=6,
-            global_num_experts=8,
-            local_num_experts=8,
+            global_num_experts=E,
+            local_num_experts=E,
             expert_tokens_meta=None,
             activation=MoEActivation.SILU,
         )
-
-    ws(512)  # small-N carve-out: dispatch takes Triton, so must the sizing
-    ws(1024)  # aligned: dispatch takes DeepGemm
-    assert picked == ["triton", "deep_gemm"]
+        chosen = cls._select_experts_impl(obj, torch.empty((128, K)), w1, w2)
+        dispatched = "deep_gemm" if chosen is experts else "triton"
+        assert sized == [dispatched], (
+            f"w2_n={w2_n}: sized for {sized}, dispatch takes {dispatched}"
+        )
