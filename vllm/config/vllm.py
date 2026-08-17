@@ -1693,45 +1693,28 @@ class VllmConfig:
         if (
             envs.VLLM_BATCH_INVARIANT
             and self.compilation_config.cudagraph_mode is not None
-            and self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
-            and (reason := self._full_cudagraph_unsupported_reason()) is not None
-        ):
-            # Checked before the pin below and independently of whether the mode
-            # still reads as piecewise: something between the downgrade and here
-            # (set_splitting_ops_for_v1, for one) may already have raised it back
-            # to FULL, and pinning would only compound that.
-            raise ValueError(
-                "VLLM_BATCH_INVARIANT cannot use piecewise cudagraphs, but this "
-                f"configuration cannot use full ones either: {reason}. Change the "
-                "configuration, or run with --enforce-eager."
-            )
-
-        if (
-            envs.VLLM_BATCH_INVARIANT
-            and self.compilation_config.cudagraph_mode is not None
             and self.compilation_config.cudagraph_mode.has_piecewise_cudagraphs()
         ):
-            # FULL_AND_PIECEWISE picks the per-step mode from batch properties
+            # A piecewise mode picks the per-step path from batch properties
             # (uniform decode? within the largest capture size?), so a request's
-            # decode step runs under a mode its neighbours chose. That is only
-            # harmless while every selectable path is bit-identical -- a
-            # per-model property nothing checks here. Dropping to FULL removes
-            # the choice and keeps the decode-side graph win; it does not by
-            # itself make graph and eager agree.
+            # decode step runs under a path its neighbours chose. That is
+            # harmless exactly while every selectable path is bit-identical --
+            # a per-model property, and this used to be pinned to FULL on the
+            # assumption that it does not hold.
             #
-            # On DSv4 the paths do now agree: with the indexer's short-context
-            # predicate bounded on a static length, a 50-round soak under
-            # FULL_AND_PIECEWISE is bitwise clean where the same soak leaked at
-            # a 38.7% per-round rate before. So this is a policy, not a
-            # measured necessity -- kept because what makes the choice safe is
-            # that no host-side value read inside a captured region was frozen
-            # against the capture-time dummy batch, and nothing here can check
-            # that for the next model or the next patch.
-            self.compilation_config.cudagraph_mode = CUDAGraphMode.FULL
+            # On DSv4 it does: with the indexer's short-context predicate no
+            # longer frozen against the capture-time dummy batch, a 50-round
+            # soak of the full model under FULL_AND_PIECEWISE is bitwise clean,
+            # where the same soak leaked in 38.7% of rounds before. Pinning
+            # would now cost the mixed-step graph for nothing, so the mode is
+            # left alone and the burden moves to the warning: a deployment that
+            # has not checked its own model should not read silence as safety.
             logger.warning_once(
                 "Piecewise cudagraphs let a request's numeric path depend on "
-                "the token count of the batch it lands in; setting "
-                "cudagraph_mode to FULL because VLLM_BATCH_INVARIANT is enabled."
+                "the token count of the batch it lands in, so batch invariance "
+                "holds only if every path this mode can select is bitwise "
+                "equal for this model. Verified for DeepSeek-V4; unverified "
+                "elsewhere. Use cudagraph_mode=FULL to remove the choice."
             )
 
         if (
@@ -1979,81 +1962,6 @@ class VllmConfig:
                     " support the speculative decoding settings."
                     f" Got {max_num_batched_tokens=} and {scheduled_token_delta=}."
                 )
-
-    def _full_cudagraph_unsupported_reason(self) -> str | None:
-        """Why full cudagraphs are unusable here, if they are.
-
-        Several places downgrade ``cudagraph_mode`` to ``PIECEWISE`` because
-        full graphs genuinely do not work for the configuration. Batch
-        invariance pins the mode to ``FULL``, which runs later and would
-        silently undo those downgrades -- trading one correctness problem for
-        another. Refuse instead.
-        """
-        from vllm.platforms import current_platform
-
-        if (
-            self.kv_transfer_config is not None
-            and self.kv_transfer_config.is_kv_transfer_instance
-        ):
-            from vllm.distributed.kv_transfer.kv_connector.factory import (
-                KVConnectorFactory,
-            )
-
-            connector_cls = KVConnectorFactory.get_connector_class(
-                self.kv_transfer_config
-            )
-            if connector_cls.requires_piecewise_for_cudagraph(
-                self.kv_transfer_config.kv_connector_extra_config
-            ):
-                return (
-                    f"the {connector_cls.__name__} KV connector performs layerwise "
-                    "async operations that cannot be captured"
-                )
-
-        if (
-            self.speculative_config is not None
-            and self.speculative_config.uses_dynamic_speculative_decoding()
-            and not self.use_v2_model_runner
-        ):
-            return (
-                "dynamic speculative decoding on this model runner needs piecewise "
-                "cudagraphs because the verification length varies at runtime "
-                "(disable speculative decoding, or set VLLM_USE_V2_MODEL_RUNNER=1)"
-            )
-
-        if (
-            current_platform.support_static_graph_mode()
-            and self.model_config is not None
-            and self.model_config.pooler_config is not None
-        ):
-            return "pooling models do not support full cudagraphs"
-
-        # PCP rejects full cudagraphs in the worker on every platform
-        # (gpu/pcp_manager.py), so it is not gated on ROCm.
-        if self.parallel_config.prefill_context_parallel_size > 1:
-            return "prefill context parallel supports piecewise cudagraphs only"
-
-        # DCP is only downgraded by the ROCm platform hook, so match that.
-        if (
-            current_platform.is_rocm()
-            and self.parallel_config.decode_context_parallel_size > 1
-        ):
-            return "decode context parallel is incompatible with full cudagraphs"
-
-        if self.model_config is not None and any(
-            arch == "VoxtralRealtimeGeneration"
-            for arch in (self.model_config.architectures or [])
-        ):
-            return "Voxtral Realtime does not support full cudagraphs"
-
-        # The multimodal encoder runs its own dispatcher: it batches this step's
-        # encoder items together, picks a graph by their combined token count and
-        # falls back to eager over budget. Pinning cudagraph_mode does not reach
-        # it, so an item's numeric path would still be chosen by whatever else
-        # was scheduled alongside it. It is opt-in, so refuse rather than
-        # silently disable.
-
-        return None
 
     def _set_cudagraph_sizes(self):
         """

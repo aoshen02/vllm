@@ -14,6 +14,7 @@ from pydantic import ValidationError
 
 import vllm.config.vllm as vllm_config_module
 import vllm.envs as envs
+from vllm.logger import _print_warning_once
 from vllm.compilation.backends import VllmBackend
 from vllm.config import (
     CompilationConfig,
@@ -1652,114 +1653,98 @@ def test_vllm_config_explicit_overrides():
     "requested",
     [CUDAGraphMode.PIECEWISE, CUDAGraphMode.FULL_AND_PIECEWISE],
 )
-def test_batch_invariant_drops_piecewise_cudagraphs(monkeypatch, requested):
-    """Piecewise graph replay is not bit-equal to full-graph replay or eager,
-    and the per-step mode is chosen from batch properties, so leaving it on
-    makes a request's output depend on its neighbours."""
+def test_batch_invariant_keeps_the_requested_piecewise_mode(monkeypatch, requested):
+    """A piecewise mode picks the per-step path from batch properties, so it is
+    invariant only while every selectable path is bitwise equal -- measured for
+    DeepSeek-V4, unknown elsewhere. That is the deployment's call now, so the
+    mode has to survive; pinning it to FULL again would cost the mixed-step
+    graph for a guarantee this cannot make either way."""
     monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
     config = VllmConfig(compilation_config=CompilationConfig(cudagraph_mode=requested))
-    assert not config.compilation_config.cudagraph_mode.has_piecewise_cudagraphs()
+    assert config.compilation_config.cudagraph_mode == requested
 
 
-def test_batch_invariant_resolve_prefers_full_decode_only(monkeypatch):
-    """The mixed-mode downgrade must not hand piecewise back to a
-    batch-invariant run, even when attention is in splitting_ops."""
+def test_batch_invariant_warns_about_the_piecewise_mode_it_now_allows(
+    monkeypatch, caplog
+):
+    """With the pin gone the warning is the only thing left standing in for it,
+    so silence here would read as a safety guarantee nothing checked."""
     monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
-    compilation_config = CompilationConfig(
-        cudagraph_mode=CUDAGraphMode.FULL,
-        cudagraph_capture_sizes=list(range(1, 17)),
-    )
-    # Without batch invariance this combination downgrades to FULL_AND_PIECEWISE.
-    compilation_config.splitting_ops = list(CompilationConfig._attention_ops)
-    assert compilation_config.splitting_ops_contain_attention()
-    compilation_config.max_cudagraph_capture_size = 16
-    compilation_config.post_init_cudagraph_sizes()
+    # warning_once dedupes process-wide and the test above emits this same
+    # message, so without clearing the cache this asserts on test order.
+    _print_warning_once.cache_clear()
+    with caplog.at_level(logging.WARNING):
+        VllmConfig(
+            compilation_config=CompilationConfig(
+                cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE
+            )
+        )
+    assert "bitwise equal for this model" in caplog.text
 
-    resolved = compilation_config.resolve_cudagraph_mode_and_sizes(
-        AttentionCGSupport.UNIFORM_BATCH,
-        "FakeAttentionBackend",
-        uniform_decode_query_len=1,
-        use_v2_model_runner=True,
-        tensor_parallel_size=1,
-    )
 
-    assert resolved == CUDAGraphMode.FULL_DECODE_ONLY
+def test_batch_invariant_resolve_is_no_longer_special_cased(monkeypatch):
+    """The mixed-mode downgrade used to be denied piecewise under batch
+    invariance, landing on FULL_DECODE_ONLY. It now resolves the same way for
+    both, so a batch-invariant run keeps the mixed-step graph."""
+
+    def resolve(batch_invariant):
+        monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", batch_invariant)
+        compilation_config = CompilationConfig(
+            cudagraph_mode=CUDAGraphMode.FULL,
+            cudagraph_capture_sizes=list(range(1, 17)),
+        )
+        compilation_config.splitting_ops = list(CompilationConfig._attention_ops)
+        assert compilation_config.splitting_ops_contain_attention()
+        compilation_config.max_cudagraph_capture_size = 16
+        compilation_config.post_init_cudagraph_sizes()
+        return compilation_config.resolve_cudagraph_mode_and_sizes(
+            AttentionCGSupport.UNIFORM_BATCH,
+            "FakeAttentionBackend",
+            uniform_decode_query_len=1,
+            use_v2_model_runner=True,
+            tensor_parallel_size=1,
+        )
+
+    assert resolve(True) == resolve(False) == CUDAGraphMode.FULL_AND_PIECEWISE
 
 
 @pytest.mark.parametrize(
     "requested,cg_support,uniform_decode_query_len",
     [
-        # Backend cannot do full decode graphs at all. Requesting plain FULL
-        # raises earlier (mixed-mode FULL + NEVER is always rejected), so the
-        # reachable path into this downgrade starts from FULL_DECODE_ONLY.
         (CUDAGraphMode.FULL_DECODE_ONLY, AttentionCGSupport.NEVER, 1),
-        # Backend can do full graphs, but not with spec-decode query lengths.
         (CUDAGraphMode.FULL, AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE, 2),
     ],
 )
-def test_batch_invariant_never_falls_back_to_piecewise(
+def test_batch_invariant_takes_the_same_piecewise_fallback_as_any_run(
     monkeypatch, requested, cg_support, uniform_decode_query_len
 ):
-    """The unsupported-backend downgrades hand piecewise back by default.
+    """These downgrades used to be forced to NONE under batch invariance.
 
-    Pinning cudagraph_mode=FULL earlier is not enough on its own: these two
-    later branches re-resolve to PIECEWISE, which would silently reinstate the
-    per-step mode choice that breaks invariance. Under batch invariance they
-    have to drop to NONE (correct but eager) instead.
+    That existed to stop them reinstating a per-step mode choice after the
+    FULL pin. With the pin gone the choice is allowed and warned about, so
+    these branches must resolve exactly as they do for any other run --
+    otherwise batch invariance is still paying for eager execution it no
+    longer needs.
     """
-    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
-    compilation_config = CompilationConfig(
-        mode=CompilationMode.VLLM_COMPILE,
-        cudagraph_mode=requested,
-        cudagraph_capture_sizes=list(range(1, 17)),
-    )
-    compilation_config.splitting_ops = list(CompilationConfig._attention_ops)
-    compilation_config.max_cudagraph_capture_size = 16
-    compilation_config.post_init_cudagraph_sizes()
-
-    resolved = compilation_config.resolve_cudagraph_mode_and_sizes(
-        cg_support,
-        "FakeAttentionBackend",
-        uniform_decode_query_len=uniform_decode_query_len,
-        use_v2_model_runner=True,
-        tensor_parallel_size=1,
-    )
-
-    assert not resolved.has_piecewise_cudagraphs()
-    assert resolved == CUDAGraphMode.NONE
-
-
-def test_batch_invariant_refuses_full_when_full_is_unsupported(monkeypatch):
-    """A configuration that cannot use full cudagraphs is refused, not pinned.
-
-    The refusal must not be gated on the mode still reading as piecewise. Here
-    FULL is downgraded to PIECEWISE because the model is a pooling model, and
-    then raised back to FULL by attention-quant fusion -- both before the batch
-    invariance pin runs. A piecewise-gated check sees a plain FULL at that point
-    and lets the run continue on a mode the model does not support.
-    """
-    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
-    with pytest.raises(ValueError, match="cannot use full ones either"):
-        VllmConfig(
-            model_config=ModelConfig(
-                "Qwen/Qwen3-Embedding-0.6B",
-                max_model_len=2048,
-                runner="pooling",
-            ),
-            scheduler_config=SchedulerConfig(
-                max_model_len=2048,
-                is_encoder_decoder=False,
-                max_num_seqs=64,
-            ),
-            # FULL -> pooling downgrades to PIECEWISE -> attention-quant fusion
-            # raises it back to FULL, all before the pin.
-            compilation_config=CompilationConfig(
-                mode=CompilationMode.VLLM_COMPILE,
-                cudagraph_mode=CUDAGraphMode.FULL,
-                use_inductor_graph_partition=False,
-                pass_config={"fuse_attn_quant": True},
-            ),
+    def resolve(batch_invariant):
+        monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", batch_invariant)
+        compilation_config = CompilationConfig(
+            mode=CompilationMode.VLLM_COMPILE,
+            cudagraph_mode=requested,
+            cudagraph_capture_sizes=list(range(1, 17)),
         )
+        compilation_config.splitting_ops = list(CompilationConfig._attention_ops)
+        compilation_config.max_cudagraph_capture_size = 16
+        compilation_config.post_init_cudagraph_sizes()
+        return compilation_config.resolve_cudagraph_mode_and_sizes(
+            cg_support,
+            "FakeAttentionBackend",
+            uniform_decode_query_len=uniform_decode_query_len,
+            use_v2_model_runner=True,
+            tensor_parallel_size=1,
+        )
+
+    assert resolve(True) == resolve(False) == CUDAGraphMode.PIECEWISE
 
 
 @pytest.mark.parametrize("explicit", [False, True])
@@ -1828,27 +1813,6 @@ def test_batch_invariant_model_capture_default_is_not_a_deployment_choice(monkey
     assert config.compilation_config._capture_sizes_user_specified is False
 
 
-def test_batch_invariant_refuses_prefill_context_parallel(monkeypatch):
-    """PCP takes piecewise only, on every platform.
-
-    The worker raises for any full mode (gpu/pcp_manager.py), so the refusal
-    must not be gated on ROCm the way the DCP downgrade is.
-    """
-    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
-    config = VllmConfig(
-        model_config=ModelConfig("Qwen/Qwen3-0.6B", max_model_len=2048),
-        scheduler_config=SchedulerConfig(
-            max_model_len=2048, is_encoder_decoder=False, max_num_seqs=64
-        ),
-        compilation_config=CompilationConfig(cudagraph_mode=CUDAGraphMode.FULL),
-    )
-    assert config._full_cudagraph_unsupported_reason() is None
-
-    object.__setattr__(config.parallel_config, "prefill_context_parallel_size", 2)
-    reason = config._full_cudagraph_unsupported_reason()
-    assert reason is not None and "prefill context parallel" in reason
-
-
 def test_batch_invariant_refuses_microbatching(monkeypatch):
     """cudagraph_mode is not the only thing that picks a graph per step.
 
@@ -1890,33 +1854,6 @@ def test_batch_invariant_refuses_microbatching(monkeypatch):
             cudagraph_mode=CUDAGraphMode.FULL, cudagraph_mm_encoder=True
         ),
     )
-
-
-def test_batch_invariant_refuses_dynamic_spec_decode_on_the_old_runner(monkeypatch):
-    """Dynamic speculative decoding needs piecewise on the v1 runner.
-
-    It is refused for the same reason as the others and through the same helper:
-    the downgrade it triggers can be raised back to FULL before the pin, so a
-    check gated on the mode still reading as piecewise would miss it.
-    """
-    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
-    config = VllmConfig(
-        model_config=ModelConfig("Qwen/Qwen3-0.6B", max_model_len=2048),
-        scheduler_config=SchedulerConfig(
-            max_model_len=2048, is_encoder_decoder=False, max_num_seqs=64
-        ),
-        compilation_config=CompilationConfig(cudagraph_mode=CUDAGraphMode.FULL),
-    )
-    assert config._full_cudagraph_unsupported_reason() is None
-
-    class _DynamicSpec:
-        def uses_dynamic_speculative_decoding(self):
-            return True
-
-    object.__setattr__(config, "speculative_config", _DynamicSpec())
-    monkeypatch.setattr(VllmConfig, "use_v2_model_runner", property(lambda _: False))
-    reason = config._full_cudagraph_unsupported_reason()
-    assert reason is not None and "dynamic speculative decoding" in reason
 
 
 def test_batch_invariant_warns_when_decode_step_escapes_capture(monkeypatch, caplog):
