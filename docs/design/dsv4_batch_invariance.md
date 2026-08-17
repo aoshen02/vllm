@@ -48,10 +48,12 @@ KV compressor, and fp8/mxfp4 MoE expert stacks.
 ## e2e evidence (fp8 Flash-Base)
 
 - Checker: fixed victim across batch sizes 1-64, three positions, mixed
-  long/short compositions crossing the indexer shortcut boundary (2048),
-  prefix caching OFF (with it on, the victim's prefill is computed once and
-  prefill invariance is never tested — this exact blind spot hid the sparse
-  MLA prefill bug).
+  long/short compositions crossing the indexer shortcut boundary (2048).
+  It runs with prefix caching off, because with caching on the victim's
+  prefill is computed once and prefill invariance is never tested — this
+  exact blind spot hid the sparse MLA prefill bug. Prefix caching is
+  covered separately by a probe that varies the hit length instead (see
+  "Configuration assumptions").
 - 6L dummy 1-GPU and TP4/EP4: 0 diff x3 rounds; full 43-layer Flash-Base
   TP4/EP4: 0 diff.
 - GSM8K (full 43-layer model, 1319 questions, 5-shot, greedy, 64-way
@@ -68,10 +70,42 @@ KV compressor, and fp8/mxfp4 MoE expert stacks.
   together +23%. Relaxing the comm pins (a deterministic multi-channel
   config) is the highest-value upstream perf item; every relaxation must
   re-verify invariance.
-  Caveat: these medians were taken before piecewise graphs were pinned off
-  for invariance (see roadmap), so mixed prefill/decode steps were graphed
-  and now run eager. Decode-side graphs are unaffected. The number is being
-  re-measured under the new configuration.
+  Re-measured after piecewise graphs were pinned off for invariance: BI=1
+  warm median 0.980s against 0.99s before the pin, i.e. the pin's
+  throughput cost is not measurable on this workload — mixed prefill/decode
+  steps lose their graph, decode-side graphs are unaffected. Compare BI=1
+  against BI=1 only; the BI/non-BI ratio moved between rounds because the
+  BI=0 side got faster.
+
+## Configuration assumptions (2026-08-17)
+
+The e2e claim above was originally hedged with a long list of "…with these
+options off". Each item was re-tested against the merged tree of every PR in
+the map below. Judgement is >=38 checker rounds with 0 diff — the pre-fix
+leak had a 38.7% per-round hit rate, so 38 clean rounds land near 1e-8 by
+chance — or a purpose-built probe for the cases the checker cannot reach.
+
+| Assumption | Verdict | Evidence |
+|---|---|---|
+| code = the tree the evidence was taken on | re-verified | merged tree of all 7 branches: 47/47 rounds, GSM8K 0.9113/0.9113 with 1319/1319 agreement |
+| prefix caching off | **not needed** | probe varying the victim's own cached prefix (0/256/512/1280/2304/3328 hit tokens, two independent readings): 18/18 bitwise equal; checker soak with caching on 64/64 |
+| `cudagraph_mode` pinned to FULL | **policy, not necessity** | pin stepped over, production-default FULL_AND_PIECEWISE: 50/50 rounds, with piecewise and full captures both confirmed non-zero |
+| flashinfer autotune off | **not needed** | autotune on (autotuner confirmed running on all four workers): 42/42. Upstream never coupled the two; autotune resolves once during warmup, and a fixed choice cannot depend on the batch |
+| async scheduling off | **was never true** | the serve config never set it and the field auto-enables; every result above and before was taken with `AsyncScheduler` |
+| `use_fp4_indexer_cache=False` | **not needed** | the Blackwell recipe's `True`: 42/42 |
+| `--block-size 256` | not a knob | `FLASHMLA_SPARSE_DSV4` supports exactly `[256]` |
+| batch <=64, 8K context | holds at 2x | `max_num_seqs` 128, `max_model_len` 16384, checker batches through 128: 38/38 |
+| the NCCL pins | required, and **not ours** | `init_batch_invariance()` sets them itself before the process group exists; the ablation above measures which ones matter |
+| speculative decoding off, SM90 | still open | #27433 upstream; no Hopper part on hand |
+
+Upstream `tests/v1/determinism` as a regression gate on the merged tree,
+since these branches live on a fork and its B200 job has never run them:
+508 passed at the kernel level, and on the e2e file the invariance assertion
+itself (`bs1_vs_bsN`) passes on all three backends. Three failures, none
+attributable to these changes and each checked rather than assumed: one
+negative control fails on the base tree too, one passes 4/4 when run alone,
+and one is an engine that could not start (13.5 of 184 GiB free, the
+previous test's model still resident).
 
 ## PR map (all against this fork; path-disjoint except where noted)
 
