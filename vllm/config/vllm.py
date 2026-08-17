@@ -1718,9 +1718,19 @@ class VllmConfig:
             # per-model property nothing checks here. Dropping to FULL removes
             # the choice and keeps the decode-side graph win; it does not by
             # itself make graph and eager agree.
+            #
+            # On DSv4 the paths do now agree: with the indexer's short-context
+            # predicate bounded on a static length, a 50-round soak under
+            # FULL_AND_PIECEWISE is bitwise clean where the same soak leaked at
+            # a 38.7% per-round rate before. So this is a policy, not a
+            # measured necessity -- kept because what makes the choice safe is
+            # that no host-side value read inside a captured region was frozen
+            # against the capture-time dummy batch, and nothing here can check
+            # that for the next model or the next patch.
             self.compilation_config.cudagraph_mode = CUDAGraphMode.FULL
             logger.warning_once(
-                "Piecewise cudagraphs break batch invariance; setting "
+                "Piecewise cudagraphs let a request's numeric path depend on "
+                "the token count of the batch it lands in; setting "
                 "cudagraph_mode to FULL because VLLM_BATCH_INVARIANT is enabled."
             )
 
