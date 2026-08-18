@@ -295,6 +295,14 @@ class BatchedDeepGemmExperts(mk.FusedMoEExpertsModular):
         return is_deep_gemm_supported()
 
     @staticmethod
+    def _supports_batch_invariance() -> bool:
+        # Fail closed on the loaded deep_gemm exposing set_batch_invariant;
+        # the masked grouped GEMM's kBatchInvariant disables dynamic UMMA-N.
+        from vllm.utils.deep_gemm import deep_gemm_batch_invariant_enabled
+
+        return deep_gemm_batch_invariant_enabled()
+
+    @staticmethod
     def _supports_no_act_and_mul() -> bool:
         return False
 

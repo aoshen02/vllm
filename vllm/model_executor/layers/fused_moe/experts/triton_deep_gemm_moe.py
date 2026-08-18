@@ -3,6 +3,7 @@
 
 import torch
 
+import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.config import (
@@ -17,8 +18,22 @@ from vllm.model_executor.layers.fused_moe.experts.deep_gemm_moe import (
 from vllm.model_executor.layers.fused_moe.experts.fallback import FallbackExperts
 from vllm.model_executor.layers.fused_moe.experts.triton_moe import TritonExperts
 from vllm.utils.deep_gemm import (
+    get_mk_alignment_for_contiguous_layout,
     is_deep_gemm_e8m0_used,
 )
+from vllm.utils.import_utils import has_deep_gemm
+
+
+def _bi_use_deep_gemm(N: int, K: int) -> bool:
+    """Batch-invariant implementation pick from deployment constants only.
+
+    The default selection gates on ``align <= M``, which switches between
+    Triton and DeepGemm as the batch grows; both are invariant individually
+    but not mutually bitwise identical. Grouped padding covers small M, so
+    under BI only the weight-shape constants may decide.
+    """
+    align = get_mk_alignment_for_contiguous_layout()[0]
+    return has_deep_gemm() and N % align == 0 and K % align == 0 and N > 512
 
 
 class TritonOrDeepGemmExperts(FallbackExperts):
@@ -51,7 +66,21 @@ class TritonOrDeepGemmExperts(FallbackExperts):
         # Note: the deep gemm workspaces are strictly larger than the triton
         # workspaces so we can be pessimistic here and allocate for DeepGemm
         # even if we fall back to triton later, e.g. if expert maps are set.
-        if is_deep_gemm_e8m0_used() or _valid_deep_gemm_shape(M, N, K):
+        #
+        # Under batch invariance the implementation is picked from N and K
+        # alone, so ask the same question here instead of always assuming
+        # DeepGemm: a deployment whose weight shapes always route to Triton
+        # would otherwise pay for the larger workspace it never uses.
+        if envs.VLLM_BATCH_INVARIANT:
+            # N here is w1's output dim; the dispatch below keys on w2's, which
+            # for a gated activation is half of it. Convert, or the two disagree
+            # for exactly the shapes this is meant to size correctly.
+            use_deep_gemm = _bi_use_deep_gemm(
+                self.adjust_N_for_activation(N, activation), K
+            )
+        else:
+            use_deep_gemm = is_deep_gemm_e8m0_used() or _valid_deep_gemm_shape(M, N, K)
+        if use_deep_gemm:
             return self.experts.workspace_shapes(
                 M,
                 N,
@@ -80,6 +109,9 @@ class TritonOrDeepGemmExperts(FallbackExperts):
         w1: torch.Tensor,
         w2: torch.Tensor,
     ) -> mk.FusedMoEExpertsModular:
+        if envs.VLLM_BATCH_INVARIANT:
+            _, K, N = w2.size()
+            return self.experts if _bi_use_deep_gemm(N, K) else self.fallback_experts
         if is_deep_gemm_e8m0_used() or _valid_deep_gemm(hidden_states, w1, w2):
             return self.experts
         else:
