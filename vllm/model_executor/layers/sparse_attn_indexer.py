@@ -343,12 +343,16 @@ def _topk_bi_kernel(
     vmask = inb & (offs < end)
     if HAS_START:
         vmask = vmask & (offs >= start)
-    # Every lane outside the row's window keys strictly below every lane inside
-    # it -- _INT32_MIN sits below _topk_bi_key(-inf). Keying them on -inf
-    # instead would tie them with in-window lanes whose score really is -inf,
-    # and since the tie budget is spent in column order, the number of masked
-    # lanes ahead of a valid one (i.e. `start`, i.e. how the batch was packed)
-    # would decide whether it is emitted.
+    # Out-of-window lanes key at _INT32_MIN, which sits below _topk_bi_key of
+    # every finite score and of -inf. Keying them on -inf instead would tie them
+    # with in-window lanes whose score really is -inf, and since the tie budget
+    # is spent in column order, the number of masked lanes ahead of a valid one
+    # (i.e. `start`, i.e. how the batch was packed) would decide whether it is
+    # emitted.
+    #
+    # It is *not* strictly below every possible key: an all-ones negative NaN
+    # (0xFFFFFFFF) keys at _INT32_MIN too. What keeps that safe is the vmask on
+    # the tie scan below, not the sentinel's value -- do not drop it.
     key = tl.where(vmask, _topk_bi_key(x), _INT32_MIN)
 
     # Exact k-th key by 32-step binary search on the int32 key space: each
