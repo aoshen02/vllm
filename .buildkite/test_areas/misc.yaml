@@ -419,6 +419,7 @@ steps:
     - vllm/v1/attention
     - vllm/model_executor/layers
     - vllm/models/deepseek_v4/
+    - vllm/model_executor/kernels/mhc/
     - tests/v1/determinism/
   commands:
     - export VLLM_WORKER_MULTIPROC_METHOD=spawn
@@ -431,6 +432,7 @@ steps:
     - pytest -v -s v1/determinism/test_matmul_batch_invariant.py
     - pytest -v -s v1/determinism/test_indexer_topk_batch_invariant.py
     - pytest -v -s v1/determinism/test_sparse_mla_batch_invariance.py
+    - pytest -v -s v1/determinism/test_mhc_batch_invariance.py
     - pytest -v -s v1/determinism/test_cutlass_batch_invariance.py
     - pytest -v -s v1/determinism/test_online_batch_invariance.py
 

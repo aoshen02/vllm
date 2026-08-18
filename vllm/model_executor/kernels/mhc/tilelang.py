@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import torch
 
+from vllm import envs
 from vllm.utils.torch_utils import direct_register_custom_op
 
 
@@ -39,7 +40,12 @@ def _tilelang_hc_prenorm_gemm(
     assert x.shape[1] == hc_mult * hidden_size
     assert x.shape[1] % n_splits == 0
     assert (x.shape[1] // n_splits) % n_thr == 0
-    use_default_config = tile_n == 12 and n_thr == 512
+    # Both fast paths below switch kernels on x.shape[0], which changes a
+    # row's result when the batch crosses the threshold. Disabling them is a
+    # correctness change and applies on every platform TileLang runs on; only
+    # the numerics and the cost of doing so were measured, and only on SM100.
+    # No performance claim is made for other hardware.
+    use_default_config = tile_n == 12 and n_thr == 512 and not envs.VLLM_BATCH_INVARIANT
     if n_splits == 1 and use_default_config and x.shape[0] >= 1024:
         hc_prenorm_gemm_block_m_tilelang(
             x,
@@ -515,7 +521,11 @@ def mhc_fused_post_pre_tilelang(
     from vllm.utils.deep_gemm import is_deep_gemm_supported
 
     use_deep_gemm = is_deep_gemm_supported()
-    use_small_fma = num_tokens <= 16
+    # The small-token FMA kernel is a second implementation of the same math
+    # with its own n_splits schedule, so crossing num_tokens == 16 changes a
+    # row's result. Batch invariance requires a single implementation. Same
+    # scope note as above: correctness everywhere, measured only on SM100.
+    use_small_fma = num_tokens <= 16 and not envs.VLLM_BATCH_INVARIANT
     if use_small_fma:
         # TODO(gnovack): investigate autotuning these heuristics
         tile_n = 2 if num_tokens < 8 else 3
