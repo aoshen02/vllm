@@ -103,3 +103,92 @@ def test_matmul_batch_invariance(dtype):
     batch_output_a = batch_output[3]
 
     assert torch.equal(standard_output[0], batch_output_a)
+
+
+@pytest.mark.parametrize(
+    "M,N,K",
+    [
+        # The fp32 narrow-output config (BLOCK_M/N=64, BLOCK_K=128) is scoped to
+        # (N, K) = (256, 4096) on SM100, the shape it was measured on. Its key
+        # never includes M, so a row's reduction order must not move with M.
+        # These shapes straddle the points where that could go wrong:
+        (64, 256, 4096),  # exactly one M tile
+        (65, 256, 4096),  # second M tile, partially filled
+        (128, 256, 4096),  # second M tile, full
+        (4096, 256, 4096),  # more tiles than SMs: persistent programs loop
+    ],
+)
+@skip_unsupported
+def test_matmul_fp32_narrow_output_rows_do_not_move_with_m(M, N, K):
+    """A row's result must not depend on how many rows share the launch.
+
+    The narrow-output tile config exists for the fp32 router gate; it changes
+    BLOCK_M, so the M tiling and the persistent loop are where a row's reduction
+    order could start tracking the batch. Compare the same row computed alone
+    against the same row inside progressively larger launches.
+    """
+    device = torch.device(DEVICE_TYPE)
+    gen = torch.Generator(device=device).manual_seed(M)
+    b = torch.randn((K, N), generator=gen, device=device, dtype=torch.float32)
+    a = torch.randn((M, K), generator=gen, device=device, dtype=torch.float32)
+
+    full = matmul_batch_invariant(a, b)
+    for row in (0, M // 2, M - 1):
+        alone = matmul_batch_invariant(a[row : row + 1], b)
+        torch.testing.assert_close(full[row : row + 1], alone, rtol=0, atol=0)
+
+
+@skip_unsupported
+def test_matmul_fp32_narrow_output_config_is_actually_selected():
+    """The sweep above cannot tell which config it exercised.
+
+    Every assertion there holds for the default 128x128x32 tile too, so a tree
+    where the narrow config was never wired in -- or never reached because the
+    module was not the one under test -- would pass it unchanged. Assert the
+    selection itself.
+    """
+    from vllm.model_executor.layers.batch_invariant import (
+        _persistent_matmul_config,
+    )
+
+    narrow = _persistent_matmul_config(torch.float32, 256, 4096)
+    if not current_platform.is_device_capability_family(100):
+        pytest.skip("the narrow-output config is scoped to SM100")
+
+    assert (
+        narrow["BLOCK_SIZE_M"],
+        narrow["BLOCK_SIZE_N"],
+        narrow["BLOCK_SIZE_K"],
+        narrow["num_warps"],
+    ) == (64, 64, 128, 4)
+
+    default = _persistent_matmul_config(torch.float32, 512, 4096)
+    assert default["BLOCK_SIZE_M"] == 128 and default["BLOCK_SIZE_K"] == 32, (
+        "only (fp32, N=256, K=4096) is in scope; a wider N must keep the default"
+    )
+    assert _persistent_matmul_config(torch.bfloat16, 256, 4096) == (
+        _persistent_matmul_config(torch.bfloat16, 512, 4096)
+    ), "the narrow config must not leak into other dtypes"
+
+
+@skip_unsupported
+def test_matmul_config_key_cannot_include_m():
+    """M is not a parameter, so no future edit can make the tile track the batch.
+
+    Worth being precise about why, because the obvious reason is not the real
+    one: on the fp32 path an M-keyed tile would still be bitwise invariant,
+    since the k loop accumulates in increasing k whatever BLOCK_K is. The rule
+    holds because that is a property of the current Triton lowering rather than
+    of the contract -- it has no reason to survive tensor cores, and this
+    helper serves every dtype. Enforced by signature rather than by comment.
+    """
+    import inspect
+
+    from vllm.model_executor.layers.batch_invariant import (
+        _persistent_matmul_config,
+    )
+
+    params = list(inspect.signature(_persistent_matmul_config).parameters)
+    assert params == ["dtype", "N", "K"], (
+        f"the tile config takes {params}; it must not be able to see M"
+    )

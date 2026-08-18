@@ -129,32 +129,24 @@ def matmul_kernel_persistent(
         tl.store(c_ptrs, c, mask=c_mask)
 
 
-def matmul_persistent(
-    a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor | None = None
-):
-    # Check constraints.
-    assert a.shape[1] == b.shape[0], "Incompatible dimensions"
-    assert a.dtype == b.dtype, "Incompatible dtypes"
-    assert bias is None or bias.dim() == 1, (
-        "Currently assuming bias is 1D, let Horace know if you run into this"
-    )
-    NUM_SMS = num_compute_units(a.device.index)
-    M, K = a.shape
-    K, N = b.shape
-    dtype = a.dtype
-    # Allocates output.
-    c = torch.empty((M, N), device=a.device, dtype=dtype)
+def _persistent_matmul_config(dtype: torch.dtype, N: int, K: int) -> dict:
+    """Tile config for the persistent matmul.
 
-    # 1D launch kernel where each block gets its own program.
-    def grid(META):
-        return (
-            min(
-                NUM_SMS,
-                triton.cdiv(M, META["BLOCK_SIZE_M"])
-                * triton.cdiv(N, META["BLOCK_SIZE_N"]),
-            ),
-        )
+    Deliberately not a function of M.
 
+    Not because an M-keyed tile would move a row's bits today -- on the fp32
+    path it would not. ``acc = tl.dot(a, b, acc)`` accumulates over k tiles in
+    increasing k, and that sum is the same whatever the chunking, so tile
+    choice does not reach the output: measured across three configs with two
+    distinct BLOCK_K values, and again with the tile deliberately switched at
+    M=1024, bitwise equal every time.
+
+    That equality is a property of the current lowering, not of the contract.
+    bf16 and fp16 go through tensor cores, where it has no reason to hold, and
+    this helper serves every dtype. Keeping the batch out of the key makes the
+    guarantee structural instead of resting on how Triton happens to lower an
+    fp32 dot -- and a regression there would be silent.
+    """
     configs = {
         torch.bfloat16: {
             "BLOCK_SIZE_M": 128,
@@ -181,6 +173,58 @@ def matmul_persistent(
             "num_warps": 8,
         },
     }
+    config = configs[dtype]
+    # Narrow outputs leave most of a 128x128 tile empty: a (64, 4096) x
+    # (4096, 256) router gate launches only 2 blocks with the default config.
+    #
+    # Scoped to exactly the shape and platform this was measured on -- the DSv4
+    # router gate on SM100. Measured there: 43us -> 27us for M <= 1024, and a 9%
+    # regression at M = 4096, which is accepted because the gate runs at decode
+    # batch sizes. Nothing else was measured, and the 64/64/128 three-stage tile
+    # wants ~192 KiB of shared memory, which is not a given elsewhere.
+    if (
+        dtype == torch.float32
+        and N == 256
+        and K == 4096
+        and current_platform.is_device_capability_family(100)
+    ):
+        config = {
+            **config,
+            "BLOCK_SIZE_M": 64,
+            "BLOCK_SIZE_N": 64,
+            "BLOCK_SIZE_K": 128,
+            "num_warps": 4,
+        }
+    return config
+
+
+def matmul_persistent(
+    a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor | None = None
+):
+    # Check constraints.
+    assert a.shape[1] == b.shape[0], "Incompatible dimensions"
+    assert a.dtype == b.dtype, "Incompatible dtypes"
+    assert bias is None or bias.dim() == 1, (
+        "Currently assuming bias is 1D, let Horace know if you run into this"
+    )
+    NUM_SMS = num_compute_units(a.device.index)
+    M, K = a.shape
+    K, N = b.shape
+    dtype = a.dtype
+    # Allocates output.
+    c = torch.empty((M, N), device=a.device, dtype=dtype)
+
+    # 1D launch kernel where each block gets its own program.
+    def grid(META):
+        return (
+            min(
+                NUM_SMS,
+                triton.cdiv(M, META["BLOCK_SIZE_M"])
+                * triton.cdiv(N, META["BLOCK_SIZE_N"]),
+            ),
+        )
+
+    config = _persistent_matmul_config(dtype, N, K)
     matmul_kernel_persistent[grid](
         a,
         b,
@@ -200,7 +244,7 @@ def matmul_persistent(
         B_LARGE=b.numel() > 2**31,
         C_LARGE=c.numel() > 2**31,
         HAS_BIAS=bias is not None,
-        **configs[dtype],
+        **config,
     )
     return c
 
