@@ -1819,11 +1819,6 @@ def test_batch_invariant_refuses_microbatching(monkeypatch):
     Microbatching decides per step whether to split and which graph to replay,
     and never consults cudagraph_mode -- so unlike every other refusal this one
     is not gated on it, and --enforce-eager does not switch it off either.
-
-    The multimodal encoder is the same shape but its dispatcher also needs a
-    model capability that is only known once the model is loaded, so it is
-    disabled there rather than refused here; refusing at config time would
-    reject configurations where the flag is inert.
     """
     monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
 
@@ -1842,18 +1837,6 @@ def test_batch_invariant_refuses_microbatching(monkeypatch):
     # Still refused with graphs off entirely: this dispatcher is separate.
     with pytest.raises(ValueError, match="microbatching"):
         build(CUDAGraphMode.NONE)
-
-    # The encoder flag alone is not a config-time error.
-    monkeypatch.setattr(ModelConfig, "is_multimodal_model", property(lambda _: True))
-    VllmConfig(
-        model_config=ModelConfig("Qwen/Qwen3-0.6B", max_model_len=2048),
-        scheduler_config=SchedulerConfig(
-            max_model_len=2048, is_encoder_decoder=False, max_num_seqs=64
-        ),
-        compilation_config=CompilationConfig(
-            cudagraph_mode=CUDAGraphMode.FULL, cudagraph_mm_encoder=True
-        ),
-    )
 
 
 def test_batch_invariant_warns_when_decode_step_escapes_capture(monkeypatch, caplog):

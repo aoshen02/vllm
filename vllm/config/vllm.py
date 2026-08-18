@@ -1679,9 +1679,7 @@ class VllmConfig:
         # happens to carry, and never consults cudagraph_mode -- so unlike
         # everything below it is not gated on it, and --enforce-eager does not
         # switch it off either. Opt-in, and the condition is exact here, so
-        # refuse. (The multimodal encoder is the same shape but its dispatcher
-        # also needs a model capability that is only known once the model is
-        # loaded, so it is disabled there instead.)
+        # refuse.
         if envs.VLLM_BATCH_INVARIANT and self.parallel_config.use_ubatching:
             raise ValueError(
                 "VLLM_BATCH_INVARIANT is enabled but microbatching chooses "

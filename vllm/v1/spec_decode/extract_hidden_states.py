@@ -254,10 +254,11 @@ class ExtractHiddenStatesProposer:
         ):
             proposer_cudagraph_mode = CUDAGraphMode.PIECEWISE
         else:
-            # Batch invariance pins the target model off piecewise for a reason:
-            # the dispatcher picks graph or eager per step from the token count,
-            # so the proposer would reintroduce exactly that batch-dependent
-            # choice on the draft path.
+            # A piecewise dispatcher picks graph or eager per step from the
+            # token count, so under batch invariance the draft path would decide
+            # a request's numeric path from whatever else the step carries. The
+            # target model is left to the warning in VllmConfig; here the choice
+            # is ours to make, so make it.
             proposer_cudagraph_mode = CUDAGraphMode.NONE
 
         self.cudagraph_dispatcher.initialize_cudagraph_keys(proposer_cudagraph_mode)

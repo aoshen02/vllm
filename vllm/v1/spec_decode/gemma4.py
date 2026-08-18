@@ -13,7 +13,6 @@ from copy import copy
 import torch
 import torch.nn as nn
 
-import vllm.envs as envs
 from vllm.config import VllmConfig, get_layers_from_vllm_config, replace
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.logger import init_logger
@@ -56,7 +55,6 @@ class Gemma4Proposer(SpecDecodeBaseProposer):
         # masking is active. _centroids_sizes is pre-sorted for fast
         # lookup in _greedy_sample.
         self._centroids_sizes: list[int] = []
-        self._uses_centroids = False
         self._centroids_graphs: dict[int, torch.cuda.CUDAGraph] = {}
         self._centroids_inputs: dict[int, torch.Tensor] = {}
         self._centroids_outputs: dict[int, torch.Tensor] = {}
@@ -105,18 +103,13 @@ class Gemma4Proposer(SpecDecodeBaseProposer):
         return per_group_attn_metadata, per_layer_attn_metadata
 
     def _greedy_sample(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if self._uses_centroids:
-            if self._centroids_sizes:
-                T = hidden_states.shape[0]
-                for size in self._centroids_sizes:
-                    if size >= T:
-                        self._centroids_inputs[size][:T].copy_(hidden_states)
-                        self._centroids_graphs[size].replay()
-                        return self._centroids_outputs[size][:T].clone()
-            # No graph captured (over the largest size, or capture skipped for
-            # batch invariance): same centroid computation, run eagerly. Falling
-            # through to the base class would silently switch to a full-vocab
-            # argmax instead.
+        if self._centroids_sizes:
+            T = hidden_states.shape[0]
+            for size in self._centroids_sizes:
+                if size >= T:
+                    self._centroids_inputs[size][:T].copy_(hidden_states)
+                    self._centroids_graphs[size].replay()
+                    return self._centroids_outputs[size][:T].clone()
             return self.model.get_top_tokens(hidden_states)
         return super()._greedy_sample(hidden_states)
 
@@ -220,11 +213,7 @@ class Gemma4Proposer(SpecDecodeBaseProposer):
 
         self._setup_gemma4_kv_sharing(target_attn_layer_names)
 
-        # The centroid graphs are captured at fixed sizes and replayed when the
-        # step's token count fits, eager otherwise -- a batch-dependent numeric
-        # path of its own, outside cudagraph_mode's reach.
-        self._uses_centroids = getattr(self.model, "masked_embedding", None) is not None
-        if self._uses_centroids and not envs.VLLM_BATCH_INVARIANT:
+        if getattr(self.model, "masked_embedding", None) is not None:
             self._setup_centroids_cuda_graphs()
 
     def validate_same_kv_cache_group(self, kv_cache_config: KVCacheConfig) -> None:
