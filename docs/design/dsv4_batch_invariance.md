@@ -70,12 +70,14 @@ KV compressor, and fp8/mxfp4 MoE expert stacks.
   together +23%. Relaxing the comm pins (a deterministic multi-channel
   config) is the highest-value upstream perf item; every relaxation must
   re-verify invariance.
-  Re-measured after piecewise graphs were pinned off for invariance: BI=1
-  warm median 0.980s against 0.99s before the pin, i.e. the pin's
-  throughput cost is not measurable on this workload — mixed prefill/decode
-  steps lose their graph, decode-side graphs are unaffected. Compare BI=1
-  against BI=1 only; the BI/non-BI ratio moved between rounds because the
-  BI=0 side got faster.
+  That +23% operator term is now attributed per branch, by shadowing
+  `VLLM_BATCH_INVARIANT` to `False` in one branch's files at a time (n=14 warm
+  medians, 6L model, TP4/EP4, BI=1 baseline 0.955s): sparse-MLA scheduling
+  −7.9%, DeepGEMM selection/alignment −5.2%, the fp32 router −3.7%,
+  deterministic indexer top-k −1.6%, mHC −1.0%; the five sum to 19.4%. The last
+  two are inside the noise floor at this sample size and should be read as
+  direction only. Compare BI=1 against BI=1 only; the BI/non-BI ratio moved
+  between rounds because the BI=0 side got faster.
 
 ## Configuration assumptions (2026-08-17)
 
@@ -87,9 +89,9 @@ chance — or a purpose-built probe for the cases the checker cannot reach.
 
 | Assumption | Verdict | Evidence |
 |---|---|---|
-| code = the tree the evidence was taken on | re-verified | merged tree of all 7 branches: 47/47 rounds, GSM8K 0.9113/0.9113 with 1319/1319 agreement |
+| code = the tree the evidence was taken on | re-verified, then re-based | merged tree: 47/47 rounds and GSM8K 0.9113/0.9113 with 1319/1319 agreement on the 08-12 base; re-established on upstream `aa9903490` (the commit the runtime image is built from) after the rebase |
 | prefix caching off | **not needed** | probe varying the victim's own cached prefix (0/256/512/1280/2304/3328 hit tokens, two independent readings): 18/18 bitwise equal; checker soak with caching on 64/64 |
-| `cudagraph_mode` pinned to FULL | **policy, not necessity** | pin stepped over, production-default FULL_AND_PIECEWISE: 50/50 rounds, with piecewise and full captures both confirmed non-zero |
+| `cudagraph_mode` pinned to FULL | **removed** | the pin was stepped over and the production default `FULL_AND_PIECEWISE` ran 50/50 clean with both capture kinds non-zero, so the pin is gone; the merged tree now captures piecewise graphs and stays invariant |
 | flashinfer autotune off | **not needed** | autotune on (autotuner confirmed running on all four workers): 42/42. Upstream never coupled the two; autotune resolves once during warmup, and a fixed choice cannot depend on the batch |
 | async scheduling off | **was never true** | the serve config never set it and the field auto-enables; every result above and before was taken with `AsyncScheduler` |
 | `use_fp4_indexer_cache=False` | **not needed** | the Blackwell recipe's `True`: 42/42 |
@@ -120,27 +122,30 @@ previous test's model still resident).
 4. `bi/gate-linear` — fp32 router + small-N persistent matmul config + tests
 5. `bi/deepgemm-fp8` — DeepGEMM BI wiring (fail-closed probe, alignment pin,
    `FallbackExperts` forwarding fix) + mocked tests
-6. `bi/cudagraph-mode` — keep piecewise cudagraphs out of batch-invariant runs
-   (`vllm/config/vllm.py`, `vllm/config/compilation.py`) + config tests, plus a
-   config-time warning when an explicit capture set is too small to hold the
-   largest decode step; this is the policy-level defence for the mixed-step leak
-7. `bi/indexer-shortcut` — bound the indexer short-context shortcut on
-   `max_model_len` (`vllm/models/deepseek_v4/attention.py`, +10/-1); this is the
-   **root cause** of the mixed-step leak and is a correctness bug independent of
-   batch invariance — the predicate is a host value evaluated inside a captured
-   graph segment, so every replayed step silently ran the "select the earliest
-   candidates" fallback instead of the real top-k. With it applied, `PIECEWISE`
-   itself becomes bit-identical to `FULL` and eager
+6. `bi/cudagraph-mode` — close the cudagraph dispatchers that pick a graph per
+   step outside `cudagraph_mode`'s reach (microbatching is refused; the
+   speculative-decoding proposer drops to `NONE`), warn when an explicit capture
+   envelope is too small for the largest decode step, and warn that a piecewise
+   mode leaves a per-step numeric choice. Policy, not numerics: on the
+   configuration this stack is validated on, none of it changes a bit.
+
+The root cause of the mixed-step leak — the `DeepseekV4Indexer` short-context
+predicate evaluated once against the capture-time dummy batch and baked into the
+graph — was a correctness bug independent of batch invariance, and **upstream
+fixed it in #52492**. The branch that carried our version is deleted. Upstream
+#51318 likewise removed the adaptive C128A metadata packing, which retired a
+second pin of ours (`active_topk_width` no longer exists).
 
 Serving recipe under BI: `--kv-cache-dtype fp8 --block-size 256
 --no-enable-prefix-caching --no-enable-flashinfer-autotune`,
-`max_num_batched_tokens <= 8192`, TP4/EP4 adds `NCCL_MNNVL_ENABLE=0`;
-cudagraphs stay ON but **piecewise is pinned off** — batch invariance
-forces `cudagraph_mode=FULL`, which the DSA indexer backend
-(`AttentionCGSupport.UNIFORM_BATCH`) resolves to `FULL_DECODE_ONLY`:
-uniform-decode steps replay a full graph, everything else runs eager, and
-those two agree bit-for-bit. Speculative decoding stays off (upstream
-#27433).
+`max_num_batched_tokens <= 8192`, TP4/EP4 on this cluster adds `NCCL_MNNVL_ENABLE=0` (a node-local
+workaround for a broken MNNVL/IMEX path, not a batch-invariance requirement);
+cudagraphs stay ON and the mode is left alone — the default
+`FULL_AND_PIECEWISE` is what the evidence is now taken under, and both capture
+kinds are confirmed present in the server log. That is safe exactly while every
+path the mode can select is bit-identical for this model, which is measured here
+and unknown elsewhere; `cudagraph_mode=FULL` removes the choice for anyone who
+has not measured it. Speculative decoding stays off (upstream #27433).
 Keep `use_fp4_indexer_cache=False` (the upstream default) — see roadmap.
 
 ## Not covered yet (roadmap)
@@ -149,7 +154,7 @@ Keep `use_fp4_indexer_cache=False` (the upstream default) — see roadmap.
   a 75-round soak on the full 43-layer model showed a composition-dependent
   logprob flip in 29/75 rounds. It was first attributed to **piecewise
   cudagraph replay**; the actual cause is a host-side predicate in
-  `DeepseekV4Indexer` frozen at capture time, fixed on `bi/indexer-shortcut`.
+  `DeepseekV4Indexer` frozen at capture time, since fixed upstream in #52492.
   With the batch composition pinned by a hand-driven `LLMEngine` (no HTTP
   races), the same step sequence gave: eager 19/19 identical; `FULL` 17/17
   identical *and bit-equal to eager*; `PIECEWISE` equal to neither;
