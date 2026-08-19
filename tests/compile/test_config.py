@@ -616,10 +616,7 @@ def test_sequence_parallelism_requires_full_graph_compilation(
             ),
             cudagraph_mode=cudagraph_mode,
         )
-        vllm_config.compilation_config.set_splitting_ops_for_v1(
-            all2all_backend=vllm_config.parallel_config.all2all_backend,
-            data_parallel_size=1,
-        )
+        vllm_config.compilation_config.set_splitting_ops_for_v1()
         vllm_config._set_compile_ranges()
         vllm_config._set_cudagraph_sizes()
 

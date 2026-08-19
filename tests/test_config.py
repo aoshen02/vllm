@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import inspect
 import logging
 import os
 from dataclasses import MISSING, Field, asdict, dataclass, field
@@ -29,12 +30,59 @@ from vllm.config import (
 from vllm.config.compilation import CompilationMode, CUDAGraphMode
 from vllm.config.kernel import IrOpPriorityConfig
 from vllm.config.load import LoadConfig
+from vllm.config.mamba import MambaBackendEnum
 from vllm.config.utils import get_field
 from vllm.config.vllm import OPTIMIZATION_LEVEL_TO_CONFIG, OptimizationLevel
 from vllm.platforms import current_platform
 from vllm.v1.attention.backend import AttentionCGSupport
 
 DEVICE_TYPE = current_platform.device_type
+
+
+def test_kda_recoverssm_derivation_is_revalidated():
+    config = SimpleNamespace(
+        cache_config=SimpleNamespace(
+            use_replayssm=True,
+            use_kda_recoverssm=False,
+            mamba_cache_mode="none",
+        ),
+        num_speculative_tokens=3,
+        model_config=SimpleNamespace(
+            supports_replayssm=True,
+            architecture="KimiLinearForCausalLM",
+        ),
+        mamba_config=SimpleNamespace(
+            backend=MambaBackendEnum.TRITON,
+            enable_stochastic_rounding=False,
+        ),
+        parallel_config=SimpleNamespace(pipeline_parallel_size=1),
+        kv_transfer_config=None,
+        use_v2_model_runner=True,
+    )
+
+    VllmConfig.validate_mamba_cached_kernel(config)
+    assert config.cache_config.use_replayssm
+    assert config.cache_config.use_kda_recoverssm
+
+    config.cache_config.mamba_cache_mode = "align"
+    VllmConfig.validate_mamba_cached_kernel(config)
+    config.use_v2_model_runner = False
+    with pytest.raises(ValueError, match="VLLM_USE_V2_MODEL_RUNNER=1"):
+        VllmConfig.validate_mamba_cached_kernel(config)
+    config.use_v2_model_runner = True
+    config.cache_config.mamba_cache_mode = "all"
+    with pytest.raises(ValueError, match="only none and align"):
+        VllmConfig.validate_mamba_cached_kernel(config)
+    config.cache_config.mamba_cache_mode = "none"
+
+    config.model_config.architecture = "NemotronHForCausalLM"
+    with pytest.raises(ValueError, match="only supported for Kimi-K3 KDA"):
+        VllmConfig.validate_mamba_cached_kernel(config)
+
+    config.model_config.architecture = "KimiLinearForCausalLM"
+    config.parallel_config.pipeline_parallel_size = 2
+    with pytest.raises(ValueError, match="pipeline_parallel_size=1"):
+        VllmConfig.validate_mamba_cached_kernel(config)
 
 
 def test_compile_config_repr_succeeds():
@@ -66,41 +114,18 @@ def test_v2_model_runner_env_tri_state(monkeypatch, env_value, expected):
     assert envs.VLLM_USE_V2_MODEL_RUNNER is expected
 
 
-@pytest.mark.parametrize(
-    "cudagraph_mode",
-    [CUDAGraphMode.PIECEWISE, CUDAGraphMode.FULL_AND_PIECEWISE],
-)
-def test_deepseek_v4_rejects_mrv1_piecewise_cudagraph(cudagraph_mode):
-    config = SimpleNamespace(
-        use_v2_model_runner=False,
-        model_config=SimpleNamespace(architectures=["DeepseekV4ForCausalLM"]),
-        compilation_config=SimpleNamespace(cudagraph_mode=cudagraph_mode),
-    )
+def test_rocm_defaults_deepseek_v4_to_mrv1(monkeypatch):
+    """ROCm keeps DeepSeek V4 on MRV1, which is still faster there."""
+    from vllm.config.vllm import default_v2_model_runner_architectures
+    from vllm.platforms import current_platform
 
-    with pytest.raises(ValueError, match="DeepSeek V4 does not support PIECEWISE"):
-        VllmConfig._validate_mrv1_piecewise_cudagraph(config)
-
-
-@pytest.mark.parametrize(
-    ("use_v2_model_runner", "architecture", "cudagraph_mode"),
-    [
-        (True, "DeepseekV4ForCausalLM", CUDAGraphMode.PIECEWISE),
-        (False, "DeepseekV4ForCausalLM", CUDAGraphMode.NONE),
-        (False, "DeepseekV4ForCausalLM", CUDAGraphMode.FULL),
-        (False, "DeepseekV4ForCausalLM", CUDAGraphMode.FULL_DECODE_ONLY),
-        (False, "LlamaForCausalLM", CUDAGraphMode.PIECEWISE),
-    ],
-)
-def test_mrv1_piecewise_cudagraph_allowed(
-    use_v2_model_runner, architecture, cudagraph_mode
-):
-    config = SimpleNamespace(
-        use_v2_model_runner=use_v2_model_runner,
-        model_config=SimpleNamespace(architectures=[architecture]),
-        compilation_config=SimpleNamespace(cudagraph_mode=cudagraph_mode),
-    )
-
-    VllmConfig._validate_mrv1_piecewise_cudagraph(config)
+    monkeypatch.setattr(current_platform, "is_rocm", lambda: True)
+    # The lookup is lru_cached against a fixed platform.
+    default_v2_model_runner_architectures.cache_clear()
+    try:
+        assert "DeepseekV4ForCausalLM" not in default_v2_model_runner_architectures()
+    finally:
+        default_v2_model_runner_architectures.cache_clear()
 
 
 @pytest.mark.parametrize(
@@ -330,10 +355,20 @@ def test_resolve_cudagraph_mode_adjusts_spec_decode_sizes_only_for_v1(
         ),
     ],
 )
-def test_is_default_v2_model_runner_model(model_config, expected):
+def test_is_default_v2_model_runner_model(model_config, expected, monkeypatch):
+    from vllm.config.vllm import default_v2_model_runner_architectures
+    from vllm.platforms import current_platform
+
+    # The expectations below are the platform-independent defaults; ROCm's
+    # DeepSeek V4 carve-out is covered by test_rocm_defaults_deepseek_v4_to_mrv1.
+    monkeypatch.setattr(current_platform, "is_rocm", lambda: False)
+    default_v2_model_runner_architectures.cache_clear()
     config = SimpleNamespace(model_config=model_config)
 
-    assert VllmConfig._is_default_v2_model_runner_model(config) is expected
+    try:
+        assert VllmConfig._is_default_v2_model_runner_model(config) is expected
+    finally:
+        default_v2_model_runner_architectures.cache_clear()
 
 
 @pytest.mark.skip_global_cleanup
@@ -1875,3 +1910,107 @@ def test_revision_resolved_when_weights_match_model(mock_resolve):
     assert isinstance(config.revision, ResolvedRevision)
     assert config.revision.resolved == REVISION
     mock_resolve.assert_any_call(model, None, config.hf_token)
+
+
+@pytest.mark.skipif(
+    not current_platform.support_static_graph_mode(),
+    reason="Cudagraph overrides only run where static graph mode is supported.",
+)
+@pytest.mark.parametrize(
+    "breakable,mode",
+    [
+        # Breakable cudagraph pins the mode to NONE, which is how DeepSeek-V4,
+        # Kimi K3, MiniMax-M3 and Inkling always run. This is the case the old
+        # guard could not reach.
+        (True, CompilationMode.NONE),
+        # A genuine VLLM_COMPILE run, which the old guard did reach. Without
+        # breakable cudagraph this is the only mode that keeps a piecewise
+        # cudagraph_mode alive long enough to reach the guard, so the two
+        # parameters really are two different paths -- parametrizing the mode
+        # alone would collapse both cases to NONE.
+        (False, CompilationMode.VLLM_COMPILE),
+    ],
+)
+def test_deepep_high_throughput_disables_cudagraphs(monkeypatch, breakable, mode):
+    """DeepEP high-throughput cannot be captured; the config has to say so.
+
+    Its dispatch leaves work on a side stream that never joins the capture
+    stream, so a run that reaches capture dies with
+    ``cudaErrorStreamCaptureUnjoined`` rather than degrading.
+
+    The capture sizes are asserted next to the mode: switching the mode off and
+    leaving the sizes behind is the inconsistent state the attention sizing,
+    warmup and workspace paths would go on to read.
+    """
+    monkeypatch.setenv("VLLM_USE_BREAKABLE_CUDAGRAPH", "1" if breakable else "0")
+    config = VllmConfig(
+        model_config=ModelConfig("deepseek-ai/DeepSeek-V2-Lite"),
+        parallel_config=ParallelConfig(
+            data_parallel_size=2,
+            enable_expert_parallel=True,
+            all2all_backend="deepep_high_throughput",
+        ),
+        compilation_config=CompilationConfig(
+            mode=mode, cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE
+        ),
+    )
+    assert config.compilation_config.cudagraph_mode == CUDAGraphMode.NONE
+    assert config.compilation_config.cudagraph_capture_sizes == []
+    assert config.compilation_config.max_cudagraph_capture_size == 0
+
+
+@pytest.mark.skipif(
+    not current_platform.support_static_graph_mode(),
+    reason="Cudagraph overrides only run where static graph mode is supported.",
+)
+@pytest.mark.parametrize(
+    "data_parallel_size,all2all_backend",
+    [
+        (1, "deepep_high_throughput"),
+        (2, "deepep_low_latency"),
+        (2, "allgather_reducescatter"),
+    ],
+)
+def test_cudagraphs_survive_capturable_all2all_configurations(
+    monkeypatch, data_parallel_size, all2all_backend
+):
+    """Only DeepEP high-throughput with dp>1 loses cudagraphs.
+
+    This one catches an overbroad guard, not a missing one -- it passes when the
+    guard never fires at all.
+    """
+    monkeypatch.setenv("VLLM_USE_BREAKABLE_CUDAGRAPH", "1")
+    config = VllmConfig(
+        model_config=ModelConfig("deepseek-ai/DeepSeek-V2-Lite"),
+        parallel_config=ParallelConfig(
+            data_parallel_size=data_parallel_size,
+            enable_expert_parallel=True,
+            all2all_backend=all2all_backend,
+        ),
+        compilation_config=CompilationConfig(
+            mode=CompilationMode.NONE, cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE
+        ),
+    )
+    assert config.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
+    assert config.compilation_config.cudagraph_capture_sizes
+    assert config.compilation_config.max_cudagraph_capture_size > 0
+
+
+def test_breakable_cudagraph_still_auto_enables_for_its_architectures():
+    """The guard above only matters for models that reach capture with mode NONE.
+
+    Which models those are is decided by the auto-enable list, and the tests
+    above monkeypatch the env var rather than going through it -- so nothing
+    there would notice the list losing an entry. Pin the list itself.
+    """
+    src = inspect.getsource(vllm_config_module)
+    for arch in (
+        "DeepseekV4ForCausalLM",
+        "KimiK3ForConditionalGeneration",
+        "MiniMaxM3SparseForCausalLM",
+    ):
+        assert arch in src, (
+            f"{arch} no longer auto-enables VLLM_USE_BREAKABLE_CUDAGRAPH; if that "
+            "is deliberate, the DeepEP high-throughput guard tests above no "
+            "longer cover the path those models actually take."
+        )

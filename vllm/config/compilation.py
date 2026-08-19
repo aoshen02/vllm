@@ -1132,8 +1132,13 @@ class CompilationConfig:
             assert self.cudagraph_capture_sizes[-1] == self.max_cudagraph_capture_size
 
     def set_splitting_ops_for_v1(
-        self, all2all_backend: str, data_parallel_size: int = 1
+        self, all2all_backend: str | None = None, data_parallel_size: int = 1
     ):
+        # `all2all_backend` / `data_parallel_size` are no longer read here --
+        # the all2all/cudagraph compatibility decision moved to
+        # `disable_cudagraphs_for_incompatible_all2all`. They stay in the
+        # signature because out-of-tree platforms call this method and may
+        # override it; dropping them would break those callers for no gain.
         # To compatible with OOT hardware plugin platform (for example vllm-ascend)
         # which currently only supports sequence parallelism in eager mode.
         if self.mode != CompilationMode.VLLM_COMPILE:
@@ -1230,23 +1235,43 @@ class CompilationConfig:
                 )
                 self.cudagraph_mode = CUDAGraphMode.FULL
 
-        # Disable CUDA graphs for DeepEP high-throughput since its not CG compatible
+    def disable_cudagraphs_for_incompatible_all2all(
+        self, all2all_backend: str, data_parallel_size: int = 1
+    ) -> None:
+        """Turn cudagraphs off for all2all backends that cannot be captured.
+
+        This used to live in ``set_splitting_ops_for_v1``, which returns early
+        unless the mode is ``VLLM_COMPILE`` -- so with any other mode the check
+        never ran and DeepEP high-throughput died inside capture with
+        ``cudaErrorStreamCaptureUnjoined`` (its dispatch leaves work on a side
+        stream that never joins the capture stream) instead of degrading here.
+        The compatibility question has nothing to do with splitting ops, so it
+        gets its own method and its own call site.
+
+        Call this *before* the capture sizes are derived: the derived sizes are
+        part of the same decision, and this method clears them so a caller can
+        never be left with ``cudagraph_mode == NONE`` next to a non-empty
+        ``cudagraph_capture_sizes``.
+        """
         if (
-            all2all_backend == "deepep_high_throughput"
-            and data_parallel_size > 1
-            and self.cudagraph_mode != CUDAGraphMode.NONE
+            all2all_backend != "deepep_high_throughput"
+            or data_parallel_size <= 1
+            or self.cudagraph_mode == CUDAGraphMode.NONE
         ):
-            # TODO: Piecewise Cuda graph might be enabled
-            # if torch compile cache key issue fixed
-            # See https://github.com/vllm-project/vllm/pull/25093
-            logger.info(
-                "DeepEP: Disabling CUDA Graphs since DeepEP high-throughput kernels "
-                "are optimized for prefill and are incompatible with CUDA Graphs. "
-                "In order to use CUDA Graphs for decode-optimized workloads, "
-                "use --all2all-backend with another option, such as "
-                "deepep_low_latency, nixl_ep, or allgather_reducescatter."
-            )
-            self.cudagraph_mode = CUDAGraphMode.NONE
+            return
+        # TODO: Piecewise Cuda graph might be enabled
+        # if torch compile cache key issue fixed
+        # See https://github.com/vllm-project/vllm/pull/25093
+        logger.info(
+            "DeepEP: Disabling CUDA Graphs since DeepEP high-throughput kernels "
+            "are optimized for prefill and are incompatible with CUDA Graphs. "
+            "In order to use CUDA Graphs for decode-optimized workloads, "
+            "use --all2all-backend with another option, such as "
+            "deepep_low_latency, nixl_ep, or allgather_reducescatter."
+        )
+        self.cudagraph_mode = CUDAGraphMode.NONE
+        self.max_cudagraph_capture_size = 0
+        self.cudagraph_capture_sizes = []
 
     def set_splitting_ops_for_attn_fusion(self):
         assert self.pass_config.fuse_attn_quant
