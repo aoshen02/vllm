@@ -210,16 +210,31 @@ class DeepEPV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         else:
             expert_x, expert_x_scale = recv_x, None
 
-        expert_tokens_meta = mk.ExpertTokensMetadata.make_from_list(
-            recv_expert_num_tokens,
-            device=expert_x.device,
-        )
+        # In decode/cudagraph mode the dispatch runs with do_cpu_sync=False, so
+        # there is no host-side per-expert count -- that is the point, it is
+        # what makes the path capturable. Building metadata out of the empty
+        # list hands downstream a zero-length expert_num_tokens, and the
+        # contiguous DeepGEMM path then trips
+        # `assert expert_start_loc.shape[0] == num_experts` in ep_scatter.
+        # Leave it as None instead: the consumer already falls back to
+        # count_expert_num_tokens() over the routing indices, which runs on
+        # device and stays capturable.
+        expert_tokens_meta = None
+        if recv_expert_num_tokens:
+            expert_tokens_meta = mk.ExpertTokensMetadata.make_from_list(
+                recv_expert_num_tokens,
+                device=expert_x.device,
+            )
 
         if recv_topk_idx is None:
             # do_expand=True (prefill mode): build topk_ids from
             # per-expert token counts.
             total_tokens = sum(recv_expert_num_tokens)
             if total_tokens > 0:
+                assert expert_tokens_meta is not None, (
+                    "do_expand=True dispatches with do_cpu_sync=True, so the "
+                    "per-expert counts must be present here"
+                )
                 recv_topk_idx = torch.repeat_interleave(
                     self._global_expert_ids(
                         len(recv_expert_num_tokens), expert_x.device
