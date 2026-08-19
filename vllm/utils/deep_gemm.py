@@ -9,7 +9,6 @@ import contextlib
 import functools
 import importlib
 import os
-import threading
 from collections.abc import Callable
 from enum import Enum
 from typing import Any, NoReturn
@@ -221,7 +220,6 @@ def _apply_pdl(mod, enable: bool = True) -> None:
 
 
 _batch_invariant_enabled: bool = False
-_lazy_init_lock = threading.Lock()
 
 
 def deep_gemm_batch_invariant_enabled() -> bool:
@@ -234,19 +232,7 @@ def deep_gemm_batch_invariant_enabled() -> bool:
 
 
 def _lazy_init() -> None:
-    """Import deep_gemm and resolve symbols on first use.
-
-    Serialized: the fast path below keys on the impl globals, which are assigned
-    before ``_batch_invariant_enabled``. A second thread arriving in between
-    would take the fast path and then read the flag as False, and since that
-    flag decides whether DeepGEMM is offered under batch invariance, two ranks
-    could pick different MoE backends for the same configuration.
-    """
-    with _lazy_init_lock:
-        _lazy_init_locked()
-
-
-def _lazy_init_locked() -> None:
+    """Import deep_gemm and resolve symbols on first use."""
     global _batch_invariant_enabled
     global _cublaslt_gemm_nt_impl
     global _fp8_gemm_nt_impl, _fp8_einsum_impl
@@ -308,9 +294,13 @@ def _lazy_init_locked() -> None:
             except Exception as e:  # noqa: BLE001
                 logger.warning_once("Failed to enable DeepGEMM batch invariance: %s", e)
         else:
-            logger.info_once(
-                "Loaded deep_gemm has no set_batch_invariant; "
-                "DeepGEMM MoE stays disabled under VLLM_BATCH_INVARIANT"
+            logger.warning_once(
+                "Loaded deep_gemm has no set_batch_invariant, so its GEMM "
+                "configs are not pinned. DeepGEMM MoE falls back, but every "
+                "other DeepGEMM consumer must check "
+                "deep_gemm_batch_invariant_enabled() and fail closed itself -- "
+                "the ones with no fallback (the DeepSeek-V4 sparse indexer, the "
+                "mHC prenorm GEMM) have to refuse rather than run unpinned."
             )
     _cublaslt_gemm_nt_impl = getattr(_dg, "cublaslt_gemm_nt", None)
     _fp8_gemm_nt_impl = getattr(_dg, "fp8_gemm_nt", None)

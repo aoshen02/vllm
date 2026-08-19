@@ -9,7 +9,6 @@ alignment ladder staying pinned under VLLM_BATCH_INVARIANT.
 """
 
 import inspect
-import threading
 import types
 
 import pytest
@@ -84,7 +83,7 @@ def test_probe_fails_closed_on_every_way_the_api_can_be_missing():
     """
     import vllm.utils.deep_gemm as dg
 
-    body = inspect.getsource(dg._lazy_init_locked)
+    body = inspect.getsource(dg._lazy_init)
     block = body[body.index("if envs.VLLM_BATCH_INVARIANT") :]
     assert 'getattr(_dg, "set_batch_invariant", None)' in block
     assignments = [
@@ -96,22 +95,35 @@ def test_probe_fails_closed_on_every_way_the_api_can_be_missing():
     assert dg.deep_gemm_batch_invariant_enabled() is dg._batch_invariant_enabled
 
 
-def test_lazy_init_is_serialized():
-    """Two threads must not be able to observe "initialized" before the
-    batch-invariance flag is set.
+def test_flag_is_set_before_any_impl_global():
+    """A thread taking the fast path must never read the flag as False.
 
-    The fast path keys on the impl globals, which are assigned before the flag;
-    a second thread slipping in between would read False and, since that
-    decides whether DeepGEMM is offered, two ranks could pick different MoE
-    backends for the same configuration.
+    ``_lazy_init``'s fast path returns as soon as *any* impl global is not None,
+    so a second thread can leave with the batch-invariance flag already read.
+    That is safe only while the flag is assigned before every impl global -- and
+    since the flag decides whether DeepGEMM is offered under batch invariance,
+    two ranks reading it differently would pick different MoE backends for the
+    same configuration.
+
+    Asserted on the source order rather than by racing threads: the enabling
+    block cannot be driven without a vendored deep_gemm build, and a race test
+    that cannot fail is worse than none.
     """
     import vllm.utils.deep_gemm as dg
 
-    assert isinstance(dg._lazy_init_lock, threading.Lock().__class__)
-    # The public entry takes the lock and delegates; the body must not be
-    # reachable without it.
-    source = inspect.getsource(dg._lazy_init)
-    assert "_lazy_init_lock" in source and "_lazy_init_locked()" in source
+    lines = inspect.getsource(dg._lazy_init).splitlines()
+    flag_at = next(
+        i for i, ln in enumerate(lines) if "_batch_invariant_enabled = True" in ln
+    )
+    impl_assignments = [
+        i
+        for i, ln in enumerate(lines)
+        if ln.startswith("    _") and "_impl = getattr(" in ln
+    ]
+    assert impl_assignments, "no impl-global assignments found; test is vacuous"
+    assert flag_at < min(impl_assignments), (
+        "_batch_invariant_enabled must be assigned before the first impl global"
+    )
 
 
 def test_bi_workspace_matches_the_implementation_it_will_use(monkeypatch):
