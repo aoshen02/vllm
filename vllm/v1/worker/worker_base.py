@@ -111,6 +111,10 @@ class WorkerBase:
         """Basic health check (override for device-specific checks)."""
         return
 
+    def synchronize_device(self) -> None:
+        """Block until all in-flight device work has completed."""
+        return
+
     def init_device(self) -> None:
         """Initialize device state, such as loading the model or other on-device
         memory allocations.

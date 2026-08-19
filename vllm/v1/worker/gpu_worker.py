@@ -200,6 +200,9 @@ class Worker(WorkerBase):
             )
         return self._sleep_mode_backend
 
+    def synchronize_device(self) -> None:
+        torch.accelerator.synchronize()
+
     def sleep(self, level: int = 1) -> None:
         torch.accelerator.synchronize()
         free_bytes_before_sleep = torch.accelerator.get_memory_info()[0]
