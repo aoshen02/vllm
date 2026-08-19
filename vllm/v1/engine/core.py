@@ -1997,8 +1997,17 @@ class DPEngineCoreProc(EngineCoreProc):
         self.prefill_schedule_interval = scheduler_config.prefill_schedule_interval
 
         # Counts forward-passes of the model so that we can synchronize
-        # finished with DP peers every N steps.
+        # finished with DP peers every N steps. The sync cadence adapts:
+        # the first all-reduce of a wave happens after one step, then every
+        # 32 steps, dropping to every step while a pause is in flight or
+        # draining. Every cadence transition derives from state all ranks
+        # observe identically (all-reduce results, the wave-end reset), so
+        # ranks always enter the blocking all-reduce with equal launch
+        # counts — a rank deciding from locally-timed state would deadlock
+        # its peers' collectives.
         self.step_counter = 0
+        self.next_dp_sync_step = 1
+        self.fast_dp_sync = False
         self.current_wave = 0
 
         # Two-phase pause protocol state. When pending_pause is True, the
@@ -2226,6 +2235,8 @@ class DPEngineCoreProc(EngineCoreProc):
                 # Increment wave count and reset step counter.
                 self.current_wave += 1
                 self.step_counter = 0
+                self.next_dp_sync_step = 1
+                self.fast_dp_sync = False
             elif (
                 not was_running
                 and self.has_coordinator
@@ -2243,12 +2254,11 @@ class DPEngineCoreProc(EngineCoreProc):
         raise SystemExit
 
     def _has_global_unfinished_reqs(self, local_unfinished: bool) -> bool:
-        # Optimization - only perform finish-sync all-reduce every 32 steps.
         self.step_counter += 1
-        if self.step_counter % 32 != 0:
+        if self.step_counter < self.next_dp_sync_step:
             return True
 
-        has_unfinished, pause_consensus = ParallelConfig.sync_dp_state(
+        has_unfinished, pause_in_flight, pause_consensus = ParallelConfig.sync_dp_state(
             self.dp_group,
             has_unfinished=local_unfinished,
             pending_pause=self.pending_pause,
@@ -2258,6 +2268,13 @@ class DPEngineCoreProc(EngineCoreProc):
             self.ignore_start_dp_wave = True
             self.pending_pause = False
             logger.debug("DP pause consensus reached, ignoring START_DP_WAVE.")
+
+        if pause_in_flight or pause_consensus:
+            # Latched until the wave-end reset so that a wait-mode pause
+            # keeps the every-step cadence while it drains; otherwise up to
+            # 31 dummy steps separate the last request from wave-end.
+            self.fast_dp_sync = True
+        self.next_dp_sync_step = self.step_counter + (1 if self.fast_dp_sync else 32)
 
         return has_unfinished
 

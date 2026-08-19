@@ -216,6 +216,10 @@ class ElasticEPScalingState:
             self.engine_core.engines_running = bool(data[0])
             self.engine_core.current_wave = int(data[1])
             self.engine_core.step_counter = int(data[2])
+            # Same value on every rank, so the new group re-syncs promptly
+            # and re-derives its cadence from a shared all-reduce.
+            self.engine_core.next_dp_sync_step = int(data[2]) + 1
+            self.engine_core.fast_dp_sync = False
             self._collective_rpc("elastic_ep_execute", args=("commit_scale_up", False))
             self.state = ScaleUpNewEngineState.COMPLETE
             return True
@@ -379,6 +383,10 @@ class ElasticEPScalingState:
         self.engine_core.engines_running = bool(data[0])
         self.engine_core.current_wave = int(data[1])
         self.engine_core.step_counter = int(data[2])
+        # Same value on every rank, so the new group re-syncs promptly and
+        # re-derives its cadence from a shared all-reduce.
+        self.engine_core.next_dp_sync_step = int(data[2]) + 1
+        self.engine_core.fast_dp_sync = False
         if new_dp_group.rank() == 0:
             logger.info("[Elastic EP] Switched to new setup")
 

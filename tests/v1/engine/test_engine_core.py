@@ -16,6 +16,7 @@ from vllm.config import (
     ECTransferConfig,
     KVTransferConfig,
     ModelConfig,
+    ParallelConfig,
     SchedulerConfig,
     VllmConfig,
 )
@@ -23,7 +24,7 @@ from vllm.engine.arg_utils import EngineArgs
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import set_default_torch_num_threads
 from vllm.v1.engine import EngineCoreRequest
-from vllm.v1.engine.core import EngineCore, EngineCoreProc
+from vllm.v1.engine.core import DPEngineCoreProc, EngineCore, EngineCoreProc
 from vllm.v1.executor.abstract import Executor
 from vllm.v1.executor.uniproc_executor import UniProcExecutor
 from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -665,3 +666,92 @@ def test_pause_idle_callback_failure_lands_on_the_future():
         callback(core)  # must not raise into the busy loop
     with pytest.raises(RuntimeError, match="sync failed"):
         future.result(timeout=0)
+
+
+def _cadenced_dp_engine_core(monkeypatch, results: list[tuple[bool, bool, bool]]):
+    """A bare DPEngineCoreProc whose all-reduce is scripted by `results`;
+    returns the core and the step numbers at which the all-reduce ran."""
+    core = object.__new__(DPEngineCoreProc)
+    core.dp_group = object()
+    core.step_counter = 0
+    core.next_dp_sync_step = 1
+    core.fast_dp_sync = False
+    core.pending_pause = False
+    core.ignore_start_dp_wave = False
+    synced: list[int] = []
+
+    def scripted_sync(dp_group, has_unfinished, pending_pause):
+        synced.append(core.step_counter)
+        return results.pop(0)
+
+    monkeypatch.setattr(ParallelConfig, "sync_dp_state", staticmethod(scripted_sync))
+    return core, synced
+
+
+def test_dp_sync_cadence_normal_wave(monkeypatch):
+    """First all-reduce of a wave after one step, then every 32."""
+    core, synced = _cadenced_dp_engine_core(monkeypatch, [(True, False, False)] * 3)
+    for _ in range(70):
+        assert DPEngineCoreProc._has_global_unfinished_reqs(core, True)
+    assert synced == [1, 33, 65]
+
+
+def test_dp_sync_cadence_pause_in_flight(monkeypatch):
+    """While a pause is in flight the all-reduce runs every step, so
+    consensus is found without manufacturing a 32-step dummy burst."""
+    core, synced = _cadenced_dp_engine_core(
+        monkeypatch,
+        [(True, True, False), (True, True, False), (False, False, True)],
+    )
+    outcomes = [
+        DPEngineCoreProc._has_global_unfinished_reqs(core, False) for _ in range(3)
+    ]
+    assert synced == [1, 2, 3]
+    assert outcomes[-1] is False
+    assert core.ignore_start_dp_wave
+    assert not core.pending_pause
+
+
+def test_dp_sync_cadence_stays_fast_while_wait_mode_drains(monkeypatch):
+    """After consensus a wait-mode pause still has real work draining and no
+    rank reports pending_pause any more; the latched cadence must keep the
+    every-step sync so wave-end is found immediately after the last request."""
+    core, synced = _cadenced_dp_engine_core(
+        monkeypatch,
+        [(True, False, True)] + [(True, False, False)] * 3,
+    )
+    for _ in range(4):
+        DPEngineCoreProc._has_global_unfinished_reqs(core, True)
+    assert synced == [1, 2, 3, 4]
+
+
+def test_sync_dp_state_booleans_come_from_the_group_size(monkeypatch):
+    """pause_in_flight/pause_consensus must be computed against the group's
+    own size: a caller comparing raw counts with a cached dp_size diverges
+    across ranks after an elastic scale event."""
+    import torch as _torch
+
+    class _Group:
+        def __init__(self, n):
+            self._n = n
+
+        def size(self):
+            return self._n
+
+    sums: dict[str, int] = {}
+
+    def scripted_all_reduce(tensor, op=None, group=None):
+        tensor[0] = sums["unfinished"]
+        tensor[1] = sums["pause"]
+
+    monkeypatch.setattr(_torch.distributed, "all_reduce", scripted_all_reduce)
+
+    sums.update(unfinished=0, pause=1)
+    assert ParallelConfig.sync_dp_state(_Group(3), False, True) == (True, True, False)
+    sums.update(unfinished=0, pause=3)
+    assert ParallelConfig.sync_dp_state(_Group(3), False, True) == (False, False, True)
+    sums.update(unfinished=1, pause=2)
+    assert ParallelConfig.sync_dp_state(_Group(3), True, True) == (True, True, False)
+    # dp_size == 1: a lone rank's pause is immediate consensus, never in flight.
+    sums.update(unfinished=0, pause=1)
+    assert ParallelConfig.sync_dp_state(_Group(1), False, True) == (False, False, True)

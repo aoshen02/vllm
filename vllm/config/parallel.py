@@ -738,7 +738,7 @@ class ParallelConfig:
     @staticmethod
     def sync_dp_state(
         dp_group: ProcessGroup, has_unfinished: bool, pending_pause: bool
-    ) -> tuple[bool, bool]:
+    ) -> tuple[bool, bool, bool]:
         """Combined all-reduce for DP state synchronization.
 
         Uses a single SUM all-reduce on a 2-element tensor:
@@ -750,8 +750,13 @@ class ParallelConfig:
         has_unfinished_global is true if any rank has unfinished work,
         or if some ranks are waiting for a pause consensus.
 
+        The booleans are computed here, against this group's size, so that
+        every rank derives identical values from the same all-reduce — a
+        caller comparing the raw count against a cached size would diverge
+        across ranks after an elastic scale event.
+
         Returns:
-            (has_unfinished_global, pause_consensus)
+            (has_unfinished_global, pause_in_flight, pause_consensus)
         """
         tensor = torch.tensor(
             [int(has_unfinished), int(pending_pause)], dtype=torch.int32, device="cpu"
@@ -760,7 +765,11 @@ class ParallelConfig:
         dp_size = dp_group.size()
         pause_count = tensor[1].item()
         has_unfinished_global = tensor[0].item() > 0 or pause_count % dp_size != 0
-        return has_unfinished_global, pause_count == dp_size
+        return (
+            has_unfinished_global,
+            0 < pause_count < dp_size,
+            pause_count == dp_size,
+        )
 
     @staticmethod
     def sync_kv_cache_memory_size(dp_group: ProcessGroup, kv_cache_memory: int) -> int:
