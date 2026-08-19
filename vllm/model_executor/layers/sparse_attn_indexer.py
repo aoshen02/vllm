@@ -967,7 +967,6 @@ direct_register_custom_op(
 )
 
 
-@CustomOp.register("sparse_attn_indexer")
 def _require_batch_invariant_deep_gemm() -> None:
     """Refuse batch invariance when DeepGEMM cannot deliver it.
 
@@ -987,6 +986,7 @@ def _require_batch_invariant_deep_gemm() -> None:
     )
 
 
+@CustomOp.register("sparse_attn_indexer")
 class SparseAttnIndexer(CustomOp):
     """Sparse Attention Indexer Custom Op Layer. This layer is extracted as a
     separate custom op since it involves heavy custom kernels like `mqa_logits`,
