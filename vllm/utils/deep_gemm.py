@@ -219,8 +219,21 @@ def _apply_pdl(mod, enable: bool = True) -> None:
         logger.warning_once("Failed to set DeepGEMM PDL on %s: %s", mod_name, e)
 
 
+_batch_invariant_enabled: bool = False
+
+
+def deep_gemm_batch_invariant_enabled() -> bool:
+    """Whether the loaded deep_gemm pins its GEMM configs for batch
+    invariance (``set_batch_invariant`` API, enabled at first use under
+    ``VLLM_BATCH_INVARIANT``). False when the API is absent or enabling
+    failed — callers must fail closed."""
+    _lazy_init()
+    return _batch_invariant_enabled
+
+
 def _lazy_init() -> None:
     """Import deep_gemm and resolve symbols on first use."""
+    global _batch_invariant_enabled
     global _cublaslt_gemm_nt_impl
     global _fp8_gemm_nt_impl, _fp8_einsum_impl
     global _grouped_impl, _grouped_masked_impl, _grouped_fp4_impl
@@ -271,6 +284,24 @@ def _lazy_init() -> None:
     # Enable PDL for DeepGEMM on architectures that support it (SM90+).
     if current_platform.is_arch_support_pdl():
         _apply_pdl(_dg, True)
+    if envs.VLLM_BATCH_INVARIANT:
+        set_bi_fn = getattr(_dg, "set_batch_invariant", None)
+        if set_bi_fn is not None:
+            try:
+                set_bi_fn(True)
+                _batch_invariant_enabled = True
+                logger.info_once("DeepGEMM batch-invariant mode enabled")
+            except Exception as e:  # noqa: BLE001
+                logger.warning_once("Failed to enable DeepGEMM batch invariance: %s", e)
+        else:
+            logger.warning_once(
+                "Loaded deep_gemm has no set_batch_invariant, so its GEMM "
+                "configs are not pinned. DeepGEMM MoE falls back, but every "
+                "other DeepGEMM consumer must check "
+                "deep_gemm_batch_invariant_enabled() and fail closed itself -- "
+                "the ones with no fallback (the DeepSeek-V4 sparse indexer, the "
+                "mHC prenorm GEMM) have to refuse rather than run unpinned."
+            )
     _cublaslt_gemm_nt_impl = getattr(_dg, "cublaslt_gemm_nt", None)
     _fp8_gemm_nt_impl = getattr(_dg, "fp8_gemm_nt", None)
     _fp8_einsum_impl = getattr(_dg, "fp8_einsum", None)

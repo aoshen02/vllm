@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import functools
+
 import torch
 import torch.nn as nn
 
@@ -7,7 +9,29 @@ from vllm.models.deepseek_v4.common.ops.fused_inv_rope_fp8_quant import (
     fused_inv_rope_fp8_quant,
 )
 from vllm.platforms import current_platform
-from vllm.utils.deep_gemm import fp8_einsum
+from vllm.utils.deep_gemm import deep_gemm_batch_invariant_enabled, fp8_einsum
+
+
+@functools.cache
+def _require_batch_invariant_deep_gemm() -> None:
+    """Refuse batch invariance when DeepGEMM cannot deliver it.
+
+    ``fp8_einsum`` is DeepGEMM's and this projection has no other
+    implementation, so a deep_gemm without ``set_batch_invariant`` leaves it
+    free to pick its config from the batch. The MoE-side fallback does nothing
+    for it -- attention reaches DeepGEMM directly here, without going through
+    the backend selection at all.
+    """
+    import vllm.envs as envs
+
+    if not envs.VLLM_BATCH_INVARIANT or deep_gemm_batch_invariant_enabled():
+        return
+    raise RuntimeError(
+        "VLLM_BATCH_INVARIANT is enabled but the loaded deep_gemm has no "
+        "set_batch_invariant, so the DeepSeek-V4 output projection's fp8_einsum "
+        "would select its config from the batch. Install a deep_gemm that "
+        "exposes set_batch_invariant, or disable batch invariance."
+    )
 
 
 def compute_fp8_einsum_recipe() -> tuple[tuple[int, int, int], bool]:
@@ -18,6 +42,7 @@ def compute_fp8_einsum_recipe() -> tuple[tuple[int, int, int], bool]:
 
     Returns ``(einsum_recipe, tma_aligned_scales)`` for ``deep_gemm_fp8_o_proj``.
     """
+    _require_batch_invariant_deep_gemm()
     cap = current_platform.get_device_capability()
     assert cap is not None, "DeepseekV4 attention requires a CUDA device"
     einsum_recipe = (1, 128, 128) if cap.major <= 9 else (1, 1, 128)

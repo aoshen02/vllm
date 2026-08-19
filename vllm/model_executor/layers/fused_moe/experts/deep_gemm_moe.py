@@ -157,6 +157,16 @@ class DeepGemmExperts(mk.FusedMoEExpertsModular):
         return is_deep_gemm_supported()
 
     @staticmethod
+    def _supports_batch_invariance() -> bool:
+        # Fail closed: True only when the loaded deep_gemm has the
+        # set_batch_invariant API and it was enabled (pins GEMM configs).
+        # The vLLM-side M-dependent alignment shrink is pinned separately in
+        # compute_aligned_M_and_alignment.
+        from vllm.utils.deep_gemm import deep_gemm_batch_invariant_enabled
+
+        return deep_gemm_batch_invariant_enabled()
+
+    @staticmethod
     def _supports_no_act_and_mul() -> bool:
         return False
 
