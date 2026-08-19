@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 import torch
 import torch.nn as nn
 
+import vllm.envs as envs
 from vllm.config import CUDAGraphMode, VllmConfig, get_layers_from_vllm_config
 from vllm.distributed.eplb.eplb_state import EplbState
 from vllm.forward_context import set_forward_context
@@ -247,11 +248,17 @@ class ExtractHiddenStatesProposer:
         assert self.vllm_config.speculative_config is not None
         if (
             not self.vllm_config.speculative_config.enforce_eager
+            and not envs.VLLM_BATCH_INVARIANT
             and cudagraph_mode.mixed_mode()
             in [CUDAGraphMode.PIECEWISE, CUDAGraphMode.FULL]
         ):
             proposer_cudagraph_mode = CUDAGraphMode.PIECEWISE
         else:
+            # A piecewise dispatcher picks graph or eager per step from the
+            # token count, so under batch invariance the draft path would decide
+            # a request's numeric path from whatever else the step carries. The
+            # target model is left to the warning in VllmConfig; here the choice
+            # is ours to make, so make it.
             proposer_cudagraph_mode = CUDAGraphMode.NONE
 
         self.cudagraph_dispatcher.initialize_cudagraph_keys(proposer_cudagraph_mode)

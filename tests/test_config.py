@@ -14,6 +14,7 @@ from pydantic import ValidationError
 
 import vllm.config.vllm as vllm_config_module
 import vllm.envs as envs
+from vllm.logger import _print_warning_once
 from vllm.compilation.backends import VllmBackend
 from vllm.config import (
     CompilationConfig,
@@ -1646,6 +1647,335 @@ def test_vllm_config_explicit_overrides():
     # Other fields should still use defaults
     assert config.compilation_config.mode == CompilationMode.VLLM_COMPILE
     assert config.compilation_config.cudagraph_mode == CUDAGraphMode.FULL_AND_PIECEWISE
+
+
+@pytest.mark.parametrize(
+    "requested",
+    [CUDAGraphMode.PIECEWISE, CUDAGraphMode.FULL_AND_PIECEWISE],
+)
+def test_batch_invariant_keeps_the_requested_piecewise_mode(monkeypatch, requested):
+    """A piecewise mode picks the per-step path from batch properties, so it is
+    invariant only while every selectable path is bitwise equal -- measured for
+    DeepSeek-V4, unknown elsewhere. That is the deployment's call now, so the
+    mode has to survive; pinning it to FULL again would cost the mixed-step
+    graph for a guarantee this cannot make either way."""
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
+    config = VllmConfig(compilation_config=CompilationConfig(cudagraph_mode=requested))
+    assert config.compilation_config.cudagraph_mode == requested
+
+
+def test_batch_invariant_warns_about_the_piecewise_mode_it_now_allows(
+    monkeypatch, caplog
+):
+    """With the pin gone the warning is the only thing left standing in for it,
+    so silence here would read as a safety guarantee nothing checked."""
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
+    # warning_once dedupes process-wide and the test above emits this same
+    # message, so without clearing the cache this asserts on test order.
+    _print_warning_once.cache_clear()
+    with caplog.at_level(logging.WARNING):
+        VllmConfig(
+            compilation_config=CompilationConfig(
+                cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE
+            )
+        )
+    assert "bitwise equal for this model" in caplog.text
+
+
+def test_batch_invariant_resolve_is_no_longer_special_cased(monkeypatch):
+    """The mixed-mode downgrade used to be denied piecewise under batch
+    invariance, landing on FULL_DECODE_ONLY. It now resolves the same way for
+    both, so a batch-invariant run keeps the mixed-step graph."""
+
+    def resolve(batch_invariant):
+        monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", batch_invariant)
+        compilation_config = CompilationConfig(
+            cudagraph_mode=CUDAGraphMode.FULL,
+            cudagraph_capture_sizes=list(range(1, 17)),
+        )
+        compilation_config.splitting_ops = list(CompilationConfig._attention_ops)
+        assert compilation_config.splitting_ops_contain_attention()
+        compilation_config.max_cudagraph_capture_size = 16
+        compilation_config.post_init_cudagraph_sizes()
+        return compilation_config.resolve_cudagraph_mode_and_sizes(
+            AttentionCGSupport.UNIFORM_BATCH,
+            "FakeAttentionBackend",
+            uniform_decode_query_len=1,
+            use_v2_model_runner=True,
+            tensor_parallel_size=1,
+        )
+
+    assert resolve(True) == resolve(False) == CUDAGraphMode.FULL_AND_PIECEWISE
+
+
+@pytest.mark.parametrize(
+    "requested,cg_support,uniform_decode_query_len",
+    [
+        (CUDAGraphMode.FULL_DECODE_ONLY, AttentionCGSupport.NEVER, 1),
+        (CUDAGraphMode.FULL, AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE, 2),
+    ],
+)
+def test_batch_invariant_takes_the_same_piecewise_fallback_as_any_run(
+    monkeypatch, requested, cg_support, uniform_decode_query_len
+):
+    """These downgrades used to be forced to NONE under batch invariance.
+
+    That existed to stop them reinstating a per-step mode choice after the
+    FULL pin. With the pin gone the choice is allowed and warned about, so
+    these branches must resolve exactly as they do for any other run --
+    otherwise batch invariance is still paying for eager execution it no
+    longer needs.
+    """
+    def resolve(batch_invariant):
+        monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", batch_invariant)
+        compilation_config = CompilationConfig(
+            mode=CompilationMode.VLLM_COMPILE,
+            cudagraph_mode=requested,
+            cudagraph_capture_sizes=list(range(1, 17)),
+        )
+        compilation_config.splitting_ops = list(CompilationConfig._attention_ops)
+        compilation_config.max_cudagraph_capture_size = 16
+        compilation_config.post_init_cudagraph_sizes()
+        return compilation_config.resolve_cudagraph_mode_and_sizes(
+            cg_support,
+            "FakeAttentionBackend",
+            uniform_decode_query_len=uniform_decode_query_len,
+            use_v2_model_runner=True,
+            tensor_parallel_size=1,
+        )
+
+    assert resolve(True) == resolve(False) == CUDAGraphMode.PIECEWISE
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+def test_batch_invariant_records_only_deployment_chosen_capture_sizes(
+    monkeypatch, explicit
+):
+    """The capture-set check must distinguish a deployment's choice from a default.
+
+    Defaults arrive from several places and not all of them are the platform's:
+    try_verify_and_update_config() lets a model write its own capture sizes
+    (gpt-oss sets 1024). Sampling the fields after that ran would read a model
+    default as an explicit choice and warn about a configuration nobody wrote,
+    so the flag is taken before any hook can touch them.
+    """
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
+    config = VllmConfig(
+        model_config=ModelConfig("Qwen/Qwen3-0.6B", max_model_len=2048),
+        scheduler_config=SchedulerConfig(
+            max_model_len=2048, is_encoder_decoder=False, max_num_seqs=64
+        ),
+        compilation_config=CompilationConfig(
+            cudagraph_mode=CUDAGraphMode.FULL,
+            # Wide enough to cover the decode fan-out, so this does not consume
+            # the warning that the next test asserts on (it is warning_once).
+            **({"cudagraph_capture_sizes": [8, 16, 32, 64]} if explicit else {}),
+        ),
+    )
+    assert config.compilation_config._capture_sizes_user_specified is explicit
+    # The resolved value is always populated, so it cannot be the signal.
+    assert config.compilation_config.max_cudagraph_capture_size
+
+    # with_hf_config() rebuilds the config through replace(), which re-runs
+    # __post_init__ against the already-resolved fields. Without carrying the
+    # answer over, the rebuild reads its own defaults as a deployment choice.
+    rebuilt = config.with_hf_config(config.model_config.hf_config)
+    assert rebuilt.compilation_config._capture_sizes_user_specified is explicit
+
+
+def test_batch_invariant_model_capture_default_is_not_a_deployment_choice(monkeypatch):
+    """A model writing its own capture sizes must not read as an explicit choice.
+
+    try_verify_and_update_config() lets a model set capture defaults when the
+    user set none -- gpt-oss writes 1024. Sampling after that ran would warn
+    about a configuration nobody chose, so this pins the ordering rather than
+    the specific model.
+    """
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
+    original = VllmConfig.try_verify_and_update_config
+
+    def writes_capture_default(self):
+        original(self)
+        if self.compilation_config.max_cudagraph_capture_size is None:
+            self.compilation_config.max_cudagraph_capture_size = 1024
+
+    monkeypatch.setattr(
+        VllmConfig, "try_verify_and_update_config", writes_capture_default
+    )
+    config = VllmConfig(
+        model_config=ModelConfig("Qwen/Qwen3-0.6B", max_model_len=2048),
+        scheduler_config=SchedulerConfig(
+            max_model_len=2048, is_encoder_decoder=False, max_num_seqs=64
+        ),
+        compilation_config=CompilationConfig(cudagraph_mode=CUDAGraphMode.FULL),
+    )
+    assert config.compilation_config.max_cudagraph_capture_size == 1024
+    assert config.compilation_config._capture_sizes_user_specified is False
+
+
+def _build_dbo_config(mode, parallel_config, max_num_batched_tokens=None):
+    return VllmConfig(
+        model_config=ModelConfig("Qwen/Qwen3-0.6B", max_model_len=2048),
+        scheduler_config=SchedulerConfig(
+            max_model_len=2048,
+            is_encoder_decoder=False,
+            max_num_seqs=64,
+            **(
+                {"max_num_batched_tokens": max_num_batched_tokens}
+                if max_num_batched_tokens is not None
+                else {}
+            ),
+        ),
+        parallel_config=parallel_config,
+        compilation_config=CompilationConfig(cudagraph_mode=mode),
+    )
+
+
+def test_batch_invariant_refuses_microbatching(monkeypatch):
+    """cudagraph_mode is not the only thing that picks a graph per step.
+
+    Microbatching decides per step whether to split and which graph to replay,
+    and never consults cudagraph_mode -- so unlike every other refusal this one
+    is not gated on it, and --enforce-eager does not switch it off either.
+    """
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
+    parallel = ParallelConfig(
+        enable_dbo=True,
+        data_parallel_size=2,
+        all2all_backend="deepep_high_throughput",
+    )
+
+    with pytest.raises(ValueError, match="microbatching"):
+        _build_dbo_config(CUDAGraphMode.FULL, parallel)
+    # Still refused with graphs off entirely: this dispatcher is separate.
+    with pytest.raises(ValueError, match="microbatching"):
+        _build_dbo_config(CUDAGraphMode.NONE, parallel)
+
+
+def test_batch_invariant_allows_microbatching_that_can_never_run(monkeypatch):
+    """A refusal that fires on configurations which cannot microbatch is a
+    startup failure for nothing.
+
+    `use_ubatching` is the configured flag, not whether a step can be split.
+    `should_ubatch` stays False unless data_parallel_size > 1, and
+    `check_ubatch_thresholds` needs a step at least as large as one of the two
+    thresholds -- unreachable once both exceed the token budget.
+    """
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
+    # A supported all2all backend is required by a separate, pre-existing
+    # assertion; without it VllmConfig refuses microbatching for its own reason
+    # and this test would pass without exercising the BI check at all.
+    backend = "deepep_high_throughput"
+
+    # dp=1: the runner never calls coordinate_batch_across_dp at all.
+    _build_dbo_config(
+        CUDAGraphMode.FULL,
+        ParallelConfig(enable_dbo=True, all2all_backend=backend),
+    )
+
+    # dp=2 but no step can reach either threshold.
+    _build_dbo_config(
+        CUDAGraphMode.FULL,
+        ParallelConfig(
+            enable_dbo=True,
+            data_parallel_size=2,
+            all2all_backend=backend,
+            dbo_decode_token_threshold=4096,
+            dbo_prefill_token_threshold=4096,
+        ),
+        max_num_batched_tokens=2048,
+    )
+
+
+def test_batch_invariant_warns_when_decode_step_escapes_capture(monkeypatch, caplog):
+    """An explicitly chosen capture set too small for the deployment's own decode
+    fan-out pushes decode steps to eager, and which side of that boundary a
+    request lands on is decided by its neighbours.
+
+    Only explicit choices are checked. Defaults come from the platform, from the
+    model, and under speculative decoding from query-length alignment, so a
+    configuration nobody wrote has nothing to fix and warning on it would be
+    noise rather than a signal."""
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
+    with caplog.at_level(logging.WARNING):
+        VllmConfig(
+            # Without a model_config the capture size resolves to 0 (cudagraphs
+            # off) and the check correctly does not apply.
+            model_config=ModelConfig("Qwen/Qwen3-0.6B", max_model_len=2048),
+            scheduler_config=SchedulerConfig(
+                max_model_len=2048,
+                is_encoder_decoder=False,
+                max_num_seqs=64,
+            ),
+            compilation_config=CompilationConfig(
+                cudagraph_mode=CUDAGraphMode.FULL,
+                cudagraph_capture_sizes=[1, 2, 4, 8],
+            ),
+        )
+    assert "below its largest decode step" in caplog.text
+
+
+@pytest.mark.parametrize("max_num_seqs", [64, 1024])
+def test_batch_invariant_quiet_when_capture_is_left_default(
+    monkeypatch, caplog, max_num_seqs
+):
+    """Stock configurations must stay quiet, whatever their decode fan-out.
+
+    The default cap comes from the platform, sometimes from the model, and under
+    speculative decoding from query-length alignment; a deployment that never
+    chose a capture envelope has nothing to fix, so the check only looks at
+    explicit ones. max_num_seqs=1024 is the case that matters: its fan-out
+    exceeds every default cap, so a fan-out-only check warns on stock setups.
+    """
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
+    with caplog.at_level(logging.WARNING):
+        VllmConfig(
+            model_config=ModelConfig("Qwen/Qwen3-0.6B", max_model_len=2048),
+            scheduler_config=SchedulerConfig(
+                max_model_len=2048,
+                is_encoder_decoder=False,
+                max_num_seqs=max_num_seqs,
+            ),
+            compilation_config=CompilationConfig(cudagraph_mode=CUDAGraphMode.FULL),
+        )
+    assert "below its largest decode step" not in caplog.text
+
+
+def test_vllm_config_is_still_a_pydantic_dataclass():
+    """Keep the `@config` decorator attached to VllmConfig.
+
+    A helper added just above the class landed between the decorator and the
+    class, so `@config` wrapped the function and `VllmConfig` was never
+    registered -- importing `vllm.config` then died in pydantic with
+    "'function' object has no attribute '__bases__'". Nothing in this file
+    catches that except collection failing, which is easy to misread as an
+    environment problem.
+    """
+    import dataclasses
+
+    assert dataclasses.is_dataclass(VllmConfig)
+    assert callable(vllm_config_module._largest_uniform_decode_step)
+
+
+def test_largest_uniform_decode_step_follows_a_dynamic_spec_schedule():
+    """The global speculative maximum is not a step any batch can produce.
+
+    Dynamic speculative decoding pairs the large draft counts with small
+    batches. Multiplying max_num_seqs by the global maximum invents a step the
+    schedule forbids, and the capture-envelope warning would then fire on a
+    configuration that already covers every real decode step.
+    """
+    from vllm.config.vllm import _largest_uniform_decode_step
+
+    # No schedule: the global maximum applies to every batch size.
+    assert _largest_uniform_decode_step(64, 5, None) == 384
+
+    # Schedule: 5 extra tokens only at batch size 1, none from 2 to 64.
+    schedule = [(1, 1, 5), (2, 64, 0)]
+    assert _largest_uniform_decode_step(64, 5, schedule) == 64
+
+    # max_num_seqs clamps a range that reaches past it.
+    assert _largest_uniform_decode_step(8, 5, [(1, 64, 1)]) == 16
 
 
 def test_fusion_pass_op_priority():
