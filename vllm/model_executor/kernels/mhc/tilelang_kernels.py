@@ -8,6 +8,7 @@ from functools import cache
 
 import torch
 
+from vllm import envs
 from vllm.platforms import current_platform
 from vllm.tilelang_utils import T, tilelang, tilelang_jit
 from vllm.utils.math_utils import cdiv
@@ -19,6 +20,20 @@ ENABLE_PDL = current_platform.is_arch_support_pdl() and current_platform.is_cuda
 def compute_num_split(block_k: int, k: int | None, grid_size: int) -> int:
     device_props = torch.cuda.get_device_properties(0)
     n_sms = device_props.multi_processor_count
+    if envs.VLLM_BATCH_INVARIANT:
+        # grid_size tracks the number of token tiles, so deriving the K-split
+        # count from it changes the cross-split reduction tree whenever the
+        # batch grows. Pin to a value that depends only on k and the GPU:
+        # the largest power of two <= min(k cap, n_sms // 4). Powers of two
+        # divide the K-blocks evenly, and the n_sms // 4 budget keeps
+        # grid <= n_sms for token tiles up to 4, which covers decode; on
+        # GB200 (148 SMs) this lands on 32, measured flat-optimal for
+        # M <= 256 and within 30% of the best fixed value at prefill sizes.
+        split_k = n_sms // 4
+        if k is not None:
+            split_k = min(split_k, cdiv(k, block_k) // 4)
+        split_k = max(split_k, 1)
+        return 1 << (split_k.bit_length() - 1)
     split_k = n_sms // grid_size
     if k is not None:
         # avoid split_k for small k

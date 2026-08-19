@@ -1,8 +1,35 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import functools
+
 import torch
 
+from vllm import envs
 from vllm.utils.torch_utils import direct_register_custom_op
+
+
+@functools.cache
+def _require_batch_invariant_deep_gemm() -> None:
+    """Refuse batch invariance when DeepGEMM cannot deliver it.
+
+    ``tf32_hc_prenorm_gemm`` is DeepGEMM's and the mHC path has no other
+    implementation of it, so a deep_gemm without ``set_batch_invariant`` leaves
+    it free to pick its config from the batch. Disabling DeepGEMM MoE, which is
+    what the loader does with such a build, does nothing here -- the only
+    fail-closed answer is to refuse. Cached: this sits on the per-layer path and
+    the answer cannot change once deep_gemm is loaded.
+    """
+    from vllm.utils.deep_gemm import deep_gemm_batch_invariant_enabled
+
+    if not envs.VLLM_BATCH_INVARIANT or deep_gemm_batch_invariant_enabled():
+        return
+    raise RuntimeError(
+        "VLLM_BATCH_INVARIANT is enabled but the loaded deep_gemm has no "
+        "set_batch_invariant, so the mHC prenorm GEMM would select its config "
+        "from the batch. Install a deep_gemm that exposes set_batch_invariant, "
+        "or disable batch invariance."
+    )
+
 
 
 def _torch_hc_prenorm_gemm(
@@ -39,7 +66,12 @@ def _tilelang_hc_prenorm_gemm(
     assert x.shape[1] == hc_mult * hidden_size
     assert x.shape[1] % n_splits == 0
     assert (x.shape[1] // n_splits) % n_thr == 0
-    use_default_config = tile_n == 12 and n_thr == 512
+    # Both fast paths below switch kernels on x.shape[0], which changes a
+    # row's result when the batch crosses the threshold. Disabling them is a
+    # correctness change and applies on every platform TileLang runs on; only
+    # the numerics and the cost of doing so were measured, and only on SM100.
+    # No performance claim is made for other hardware.
+    use_default_config = tile_n == 12 and n_thr == 512 and not envs.VLLM_BATCH_INVARIANT
     if n_splits == 1 and use_default_config and x.shape[0] >= 1024:
         hc_prenorm_gemm_block_m_tilelang(
             x,
@@ -133,6 +165,8 @@ def mhc_pre_tilelang(
     )
     from vllm.utils.deep_gemm import tf32_hc_prenorm_gemm
     from vllm.utils.math_utils import cdiv
+
+    _require_batch_invariant_deep_gemm()
 
     assert residual.dtype == torch.bfloat16
     assert fn.dtype == torch.float32
@@ -371,6 +405,8 @@ def mhc_pre_broadcast_tilelang(
 
     from vllm.utils.deep_gemm import tf32_hc_prenorm_gemm
 
+    _require_batch_invariant_deep_gemm()
+
     tf32_hc_prenorm_gemm(
         residual_flat,
         fn_broadcast,
@@ -514,8 +550,14 @@ def mhc_fused_post_pre_tilelang(
 
     from vllm.utils.deep_gemm import is_deep_gemm_supported
 
+    _require_batch_invariant_deep_gemm()
+
     use_deep_gemm = is_deep_gemm_supported()
-    use_small_fma = num_tokens <= 16
+    # The small-token FMA kernel is a second implementation of the same math
+    # with its own n_splits schedule, so crossing num_tokens == 16 changes a
+    # row's result. Batch invariance requires a single implementation. Same
+    # scope note as above: correctness everywhere, measured only on SM100.
+    use_small_fma = num_tokens <= 16 and not envs.VLLM_BATCH_INVARIANT
     if use_small_fma:
         # TODO(gnovack): investigate autotuning these heuristics
         tile_n = 2 if num_tokens < 8 else 3
