@@ -464,3 +464,28 @@ def test_topk_every_float_class_matches_reference(name, bits, topk):
         assert torch.equal(out, ref), (
             f"{name}: kernel != reference at start={start} width={width} topk={topk}"
         )
+
+
+def test_indexer_refuses_a_deep_gemm_that_cannot_be_pinned(monkeypatch):
+    """Fail closed, do not fall back.
+
+    Disabling DeepGEMM MoE is the loader's answer to a ``deep_gemm`` without
+    ``set_batch_invariant``, and it does nothing for this op: the MQA-logits
+    kernels are DeepGEMM's and there is no other path to take. Running anyway
+    would leave a request's logits dependent on the batch it landed in, with no
+    warning the user could act on.
+    """
+    import vllm.model_executor.layers.sparse_attn_indexer as sai
+
+    monkeypatch.setattr(sai.envs, "VLLM_BATCH_INVARIANT", True)
+
+    monkeypatch.setattr(sai, "deep_gemm_batch_invariant_enabled", lambda: True)
+    sai._require_batch_invariant_deep_gemm()  # pinned: no complaint
+
+    monkeypatch.setattr(sai, "deep_gemm_batch_invariant_enabled", lambda: False)
+    with pytest.raises(RuntimeError, match="set_batch_invariant"):
+        sai._require_batch_invariant_deep_gemm()
+
+    # With the flag off the same unpinned build is fine -- nothing was promised.
+    monkeypatch.setattr(sai.envs, "VLLM_BATCH_INVARIANT", False)
+    sai._require_batch_invariant_deep_gemm()

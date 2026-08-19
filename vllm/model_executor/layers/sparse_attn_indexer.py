@@ -20,6 +20,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 from vllm.platforms import current_platform
 from vllm.triton_utils import HAS_TRITON, tl, triton
 from vllm.utils.deep_gemm import (
+    deep_gemm_batch_invariant_enabled,
     fp8_fp4_mqa_logits,
     fp8_fp4_paged_mqa_logits,
     has_deep_gemm,
@@ -967,6 +968,25 @@ direct_register_custom_op(
 
 
 @CustomOp.register("sparse_attn_indexer")
+def _require_batch_invariant_deep_gemm() -> None:
+    """Refuse batch invariance when DeepGEMM cannot deliver it.
+
+    The MQA-logits kernels are DeepGEMM's and this op has no non-DeepGEMM path
+    to fall back to, so a deep_gemm without ``set_batch_invariant`` leaves them
+    free to pick their config from the batch. Disabling DeepGEMM MoE, which is
+    what the loader does in that case, does nothing here -- the only fail-closed
+    answer is to refuse.
+    """
+    if not envs.VLLM_BATCH_INVARIANT or deep_gemm_batch_invariant_enabled():
+        return
+    raise RuntimeError(
+        "VLLM_BATCH_INVARIANT is enabled but the loaded deep_gemm has no "
+        "set_batch_invariant, so the sparse indexer's MQA-logits kernels would "
+        "select their config from the batch. Install a deep_gemm that exposes "
+        "set_batch_invariant, or disable batch invariance."
+    )
+
+
 class SparseAttnIndexer(CustomOp):
     """Sparse Attention Indexer Custom Op Layer. This layer is extracted as a
     separate custom op since it involves heavy custom kernels like `mqa_logits`,
@@ -1017,6 +1037,8 @@ class SparseAttnIndexer(CustomOp):
                 "Sparse Attention Indexer CUDA op requires DeepGEMM support in "
                 "the current vLLM environment."
             )
+        if current_platform.is_cuda():
+            _require_batch_invariant_deep_gemm()
 
     def forward_native(
         self,
