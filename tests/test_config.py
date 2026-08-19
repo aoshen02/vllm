@@ -1839,7 +1839,11 @@ def test_batch_invariant_refuses_microbatching(monkeypatch):
     is not gated on it, and --enforce-eager does not switch it off either.
     """
     monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
-    parallel = ParallelConfig(enable_dbo=True, data_parallel_size=2)
+    parallel = ParallelConfig(
+        enable_dbo=True,
+        data_parallel_size=2,
+        all2all_backend="deepep_high_throughput",
+    )
 
     with pytest.raises(ValueError, match="microbatching"):
         _build_dbo_config(CUDAGraphMode.FULL, parallel)
@@ -1858,9 +1862,16 @@ def test_batch_invariant_allows_microbatching_that_can_never_run(monkeypatch):
     thresholds -- unreachable once both exceed the token budget.
     """
     monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
+    # A supported all2all backend is required by a separate, pre-existing
+    # assertion; without it VllmConfig refuses microbatching for its own reason
+    # and this test would pass without exercising the BI check at all.
+    backend = "deepep_high_throughput"
 
     # dp=1: the runner never calls coordinate_batch_across_dp at all.
-    _build_dbo_config(CUDAGraphMode.FULL, ParallelConfig(enable_dbo=True))
+    _build_dbo_config(
+        CUDAGraphMode.FULL,
+        ParallelConfig(enable_dbo=True, all2all_backend=backend),
+    )
 
     # dp=2 but no step can reach either threshold.
     _build_dbo_config(
@@ -1868,6 +1879,7 @@ def test_batch_invariant_allows_microbatching_that_can_never_run(monkeypatch):
         ParallelConfig(
             enable_dbo=True,
             data_parallel_size=2,
+            all2all_backend=backend,
             dbo_decode_token_threshold=4096,
             dbo_prefill_token_threshold=4096,
         ),
