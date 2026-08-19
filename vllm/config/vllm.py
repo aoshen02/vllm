@@ -319,8 +319,6 @@ OPTIMIZATION_LEVEL_TO_CONFIG = {
 }
 
 
-@config(config=ConfigDict(arbitrary_types_allowed=True))
-
 def _largest_uniform_decode_step(
     max_num_seqs: int,
     num_speculative_tokens: int,
@@ -342,6 +340,7 @@ def _largest_uniform_decode_step(
     )
 
 
+@config(config=ConfigDict(arbitrary_types_allowed=True))
 class VllmConfig:
     """Dataclass which contains all vllm-related configuration. This
     simplifies passing around the distinct configurations in the codebase.

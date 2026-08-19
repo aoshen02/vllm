@@ -1929,6 +1929,22 @@ def test_batch_invariant_quiet_when_capture_is_left_default(
     assert "below its largest decode step" not in caplog.text
 
 
+def test_vllm_config_is_still_a_pydantic_dataclass():
+    """Keep the `@config` decorator attached to VllmConfig.
+
+    A helper added just above the class landed between the decorator and the
+    class, so `@config` wrapped the function and `VllmConfig` was never
+    registered -- importing `vllm.config` then died in pydantic with
+    "'function' object has no attribute '__bases__'". Nothing in this file
+    catches that except collection failing, which is easy to misread as an
+    environment problem.
+    """
+    import dataclasses
+
+    assert dataclasses.is_dataclass(VllmConfig)
+    assert callable(vllm_config_module._largest_uniform_decode_step)
+
+
 def test_largest_uniform_decode_step_follows_a_dynamic_spec_schedule():
     """The global speculative maximum is not a step any batch can produce.
 
