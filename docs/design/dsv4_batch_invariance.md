@@ -74,10 +74,14 @@ KV compressor, and fp8/mxfp4 MoE expert stacks.
   `VLLM_BATCH_INVARIANT` to `False` in one branch's files at a time (n=14 warm
   medians, 6L model, TP4/EP4, BI=1 baseline 0.955s): sparse-MLA scheduling
   −7.9%, DeepGEMM selection/alignment −5.2%, the fp32 router −3.7%,
-  deterministic indexer top-k −1.6%, mHC −1.0%; the five sum to 19.4%. The last
-  two are inside the noise floor at this sample size and should be read as
-  direction only. Compare BI=1 against BI=1 only; the BI/non-BI ratio moved
-  between rounds because the BI=0 side got faster.
+  deterministic indexer top-k −1.6%, mHC −1.0%; the five sum to 19.4%. Two
+  self-checks: disabling all five at once gives 17.3% (2.1pp of the 19.4% is
+  non-additive, as expected when the branches share kernels), and a baseline
+  re-measured at the end of the queue drifted 0.5% — a machine-drift floor
+  below every one of the five effects, including the smallest. Compare BI=1
+  against BI=1 only; the BI/non-BI ratio moved between rounds because the BI=0
+  side got faster. All of the above is `data_parallel_size=1`; see the DP
+  caveat below.
 
 ## Configuration assumptions (2026-08-17)
 
@@ -99,6 +103,8 @@ chance — or a purpose-built probe for the cases the checker cannot reach.
 | batch <=64, 8K context | holds at 2x | `max_num_seqs` 128, `max_model_len` 16384, checker batches through 128: 38/38 |
 | the NCCL pins | required, and **not ours** | `init_batch_invariance()` sets them itself before the process group exists; the ablation above measures which ones matter |
 | speculative decoding off, SM90 | still open | #27433 upstream; no Hopper part on hand |
+| **`data_parallel_size == 1`** | **required, newly written down** | every result above is dp=1. With dp>1 the MoE goes through `AgRsAll2AllManager`, whose combine is a reduce-scatter: `reduce_scatterv` is hand-lowered into a group of `ncclReduce` calls whose per-rank `split_offset` is the sum of the *preceding* ranks' token counts, and the choice between `reduce_scatterv` and plain `reduce_scatter` is itself made from whether the token counts happen to be equal. The ten NCCL pins do not cover `Reduce` (`NCCL_ALGO=allreduce:tree` pins allreduce). Measured on DP2xTP2+EP: every round leaks. Characterised, not fixed |
+| all2all backend | **the default is the broken one** | same DP2xTP2+EP shape, one variable apart: `allgather_reducescatter` leaks in every round with graphs on (103 rounds) *and* under `--enforce-eager` (33 rounds), while `deepep_high_throughput` + `--enforce-eager` is clean for 31 rounds. So the leak is the AgRs path, not the DP scheduling and not DeepEP. DeepEP with graphs on is still unanswered: it dies in capture (`cudaErrorStreamCaptureUnjoined`, its all2all uses a side stream that never joins back) |
 
 Upstream `tests/v1/determinism` as a regression gate on the merged tree,
 since these branches live on a fork and its B200 job has never run them:
