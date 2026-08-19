@@ -1594,12 +1594,19 @@ class VllmConfig:
         self._set_compile_ranges()
 
         # Do this after all the updates to compilation_config.mode
+        self.compilation_config.set_splitting_ops_for_v1()
+
+        # Some all2all backends cannot be captured at all. This has to run
+        # after check_and_update_config() above, since a platform may resolve
+        # or rewrite all2all_backend or the DP size there, and it clears the
+        # capture sizes itself because _set_cudagraph_sizes() has already run
+        # by this point.
         effective_dp_size = (
             self.parallel_config.data_parallel_size
             if self.model_config is None or self.model_config.is_moe
             else 1
         )
-        self.compilation_config.set_splitting_ops_for_v1(
+        self.compilation_config.disable_cudagraphs_for_incompatible_all2all(
             all2all_backend=self.parallel_config.all2all_backend,
             data_parallel_size=effective_dp_size,
         )

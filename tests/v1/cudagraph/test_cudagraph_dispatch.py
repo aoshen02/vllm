@@ -60,10 +60,7 @@ def _create_vllm_config(
         )
     # Mimic the behavior of VllmConfig.__post_init__()
     if compilation_config.mode == CompilationMode.VLLM_COMPILE:
-        compilation_config.set_splitting_ops_for_v1(
-            all2all_backend=mock_config.parallel_config.all2all_backend,
-            data_parallel_size=mock_config.parallel_config.data_parallel_size,
-        )
+        compilation_config.set_splitting_ops_for_v1()
 
     # mimic VllmConfig.__post_init__
     if compilation_config.cudagraph_capture_sizes:

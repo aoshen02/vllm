@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import inspect
 import logging
 import os
 from dataclasses import MISSING, Field, asdict, dataclass, field
@@ -1909,3 +1910,107 @@ def test_revision_resolved_when_weights_match_model(mock_resolve):
     assert isinstance(config.revision, ResolvedRevision)
     assert config.revision.resolved == REVISION
     mock_resolve.assert_any_call(model, None, config.hf_token)
+
+
+@pytest.mark.skipif(
+    not current_platform.support_static_graph_mode(),
+    reason="Cudagraph overrides only run where static graph mode is supported.",
+)
+@pytest.mark.parametrize(
+    "breakable,mode",
+    [
+        # Breakable cudagraph pins the mode to NONE, which is how DeepSeek-V4,
+        # Kimi K3, MiniMax-M3 and Inkling always run. This is the case the old
+        # guard could not reach.
+        (True, CompilationMode.NONE),
+        # A genuine VLLM_COMPILE run, which the old guard did reach. Without
+        # breakable cudagraph this is the only mode that keeps a piecewise
+        # cudagraph_mode alive long enough to reach the guard, so the two
+        # parameters really are two different paths -- parametrizing the mode
+        # alone would collapse both cases to NONE.
+        (False, CompilationMode.VLLM_COMPILE),
+    ],
+)
+def test_deepep_high_throughput_disables_cudagraphs(monkeypatch, breakable, mode):
+    """DeepEP high-throughput cannot be captured; the config has to say so.
+
+    Its dispatch leaves work on a side stream that never joins the capture
+    stream, so a run that reaches capture dies with
+    ``cudaErrorStreamCaptureUnjoined`` rather than degrading.
+
+    The capture sizes are asserted next to the mode: switching the mode off and
+    leaving the sizes behind is the inconsistent state the attention sizing,
+    warmup and workspace paths would go on to read.
+    """
+    monkeypatch.setenv("VLLM_USE_BREAKABLE_CUDAGRAPH", "1" if breakable else "0")
+    config = VllmConfig(
+        model_config=ModelConfig("deepseek-ai/DeepSeek-V2-Lite"),
+        parallel_config=ParallelConfig(
+            data_parallel_size=2,
+            enable_expert_parallel=True,
+            all2all_backend="deepep_high_throughput",
+        ),
+        compilation_config=CompilationConfig(
+            mode=mode, cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE
+        ),
+    )
+    assert config.compilation_config.cudagraph_mode == CUDAGraphMode.NONE
+    assert config.compilation_config.cudagraph_capture_sizes == []
+    assert config.compilation_config.max_cudagraph_capture_size == 0
+
+
+@pytest.mark.skipif(
+    not current_platform.support_static_graph_mode(),
+    reason="Cudagraph overrides only run where static graph mode is supported.",
+)
+@pytest.mark.parametrize(
+    "data_parallel_size,all2all_backend",
+    [
+        (1, "deepep_high_throughput"),
+        (2, "deepep_low_latency"),
+        (2, "allgather_reducescatter"),
+    ],
+)
+def test_cudagraphs_survive_capturable_all2all_configurations(
+    monkeypatch, data_parallel_size, all2all_backend
+):
+    """Only DeepEP high-throughput with dp>1 loses cudagraphs.
+
+    This one catches an overbroad guard, not a missing one -- it passes when the
+    guard never fires at all.
+    """
+    monkeypatch.setenv("VLLM_USE_BREAKABLE_CUDAGRAPH", "1")
+    config = VllmConfig(
+        model_config=ModelConfig("deepseek-ai/DeepSeek-V2-Lite"),
+        parallel_config=ParallelConfig(
+            data_parallel_size=data_parallel_size,
+            enable_expert_parallel=True,
+            all2all_backend=all2all_backend,
+        ),
+        compilation_config=CompilationConfig(
+            mode=CompilationMode.NONE, cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE
+        ),
+    )
+    assert config.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
+    assert config.compilation_config.cudagraph_capture_sizes
+    assert config.compilation_config.max_cudagraph_capture_size > 0
+
+
+def test_breakable_cudagraph_still_auto_enables_for_its_architectures():
+    """The guard above only matters for models that reach capture with mode NONE.
+
+    Which models those are is decided by the auto-enable list, and the tests
+    above monkeypatch the env var rather than going through it -- so nothing
+    there would notice the list losing an entry. Pin the list itself.
+    """
+    src = inspect.getsource(vllm_config_module)
+    for arch in (
+        "DeepseekV4ForCausalLM",
+        "KimiK3ForConditionalGeneration",
+        "MiniMaxM3SparseForCausalLM",
+    ):
+        assert arch in src, (
+            f"{arch} no longer auto-enables VLLM_USE_BREAKABLE_CUDAGRAPH; if that "
+            "is deliberate, the DeepEP high-throughput guard tests above no "
+            "longer cover the path those models actually take."
+        )
