@@ -176,3 +176,32 @@ def test_bi_workspace_matches_the_implementation_it_will_use(monkeypatch):
         assert sized == [dispatched], (
             f"w2_n={w2_n}: sized for {sized}, dispatch takes {dispatched}"
         )
+
+
+def test_o_proj_refuses_a_deep_gemm_that_cannot_be_pinned(monkeypatch):
+    """The DSv4 output projection reaches DeepGEMM without asking the probe.
+
+    `deep_gemm_fp8_o_proj` calls `fp8_einsum` directly -- it never goes through
+    MoE backend selection, so "DeepGEMM MoE disabled" leaves it running with its
+    config chosen from the batch, and it has no other implementation to fall
+    back to.
+    """
+    import vllm.models.deepseek_v4.nvidia.ops.o_proj as op
+
+    guard = op._require_batch_invariant_deep_gemm
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
+
+    # o_proj binds the probe at import, so patch the name it actually reads.
+    monkeypatch.setattr(op, "deep_gemm_batch_invariant_enabled", lambda: True)
+    guard.cache_clear()
+    guard()  # pinned: no complaint
+
+    monkeypatch.setattr(op, "deep_gemm_batch_invariant_enabled", lambda: False)
+    guard.cache_clear()
+    with pytest.raises(RuntimeError, match="set_batch_invariant"):
+        guard()
+
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", False)
+    guard.cache_clear()
+    guard()
+    guard.cache_clear()
