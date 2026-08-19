@@ -489,3 +489,19 @@ def test_indexer_refuses_a_deep_gemm_that_cannot_be_pinned(monkeypatch):
     # With the flag off the same unpinned build is fine -- nothing was promised.
     monkeypatch.setattr(sai.envs, "VLLM_BATCH_INVARIANT", False)
     sai._require_batch_invariant_deep_gemm()
+
+
+def test_custom_op_registration_survives():
+    """The guard above sits next to `@CustomOp.register`; keep them together.
+
+    An earlier revision inserted the helper between the decorator and the class,
+    so the decorator wrapped the helper and `SparseAttnIndexer` lost its
+    registration -- every worker then died at load with `type object
+    'SparseAttnIndexer' has no attribute 'name'`. No kernel test touches the
+    class, so nothing caught it until a server came up.
+    """
+    from vllm.model_executor.custom_op import op_registry
+    from vllm.model_executor.layers.sparse_attn_indexer import SparseAttnIndexer
+
+    assert SparseAttnIndexer.name == "sparse_attn_indexer"
+    assert op_registry["sparse_attn_indexer"] is SparseAttnIndexer
