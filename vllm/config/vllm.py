@@ -320,6 +320,28 @@ OPTIMIZATION_LEVEL_TO_CONFIG = {
 
 
 @config(config=ConfigDict(arbitrary_types_allowed=True))
+
+def _largest_uniform_decode_step(
+    max_num_seqs: int,
+    num_speculative_tokens: int,
+    spec_schedule: list[tuple[int, int, int]] | None,
+) -> int:
+    """Largest uniform-decode step this configuration can actually produce.
+
+    ``num_speculative_tokens`` is the global maximum any batch size may draw.
+    Dynamic speculative decoding pairs the large counts with small batches, so
+    multiplying it by ``max_num_seqs`` invents a step the schedule forbids --
+    and the caller would then warn about a capture envelope that already covers
+    every real step. With a schedule, take the largest step it allows.
+    """
+    if not spec_schedule:
+        return max_num_seqs * (1 + num_speculative_tokens)
+    return max(
+        min(range_end, max_num_seqs) * (1 + tokens)
+        for _range_start, range_end, tokens in spec_schedule
+    )
+
+
 class VllmConfig:
     """Dataclass which contains all vllm-related configuration. This
     simplifies passing around the distinct configurations in the codebase.
@@ -1678,15 +1700,30 @@ class VllmConfig:
         # Microbatching schedules graphs of its own, keyed on what else this step
         # happens to carry, and never consults cudagraph_mode -- so unlike
         # everything below it is not gated on it, and --enforce-eager does not
-        # switch it off either. Opt-in, and the condition is exact here, so
-        # refuse.
+        # switch it off either. Opt-in, so refuse rather than warn.
+        #
+        # `use_ubatching` alone is the configured flag, not whether a step can
+        # actually be split, and refusing on it would break startups that could
+        # never microbatch: `should_ubatch` stays False unless
+        # data_parallel_size > 1 (gpu_model_runner.py, the coordinate call is
+        # inside that branch), and `check_ubatch_thresholds` needs a step at
+        # least as large as one of the two thresholds, which no step can reach
+        # once both exceed the token budget.
         if envs.VLLM_BATCH_INVARIANT and self.parallel_config.use_ubatching:
-            raise ValueError(
-                "VLLM_BATCH_INVARIANT is enabled but microbatching chooses "
-                "per step whether to split and which graph to replay, so a "
-                "request's numeric path would depend on its neighbours. "
-                "Disable it (enable_dbo / ubatch_size)."
+            reachable_threshold = min(
+                self.parallel_config.dbo_decode_token_threshold,
+                self.parallel_config.dbo_prefill_token_threshold,
             )
+            if (
+                self.parallel_config.data_parallel_size > 1
+                and reachable_threshold <= self.scheduler_config.max_num_batched_tokens
+            ):
+                raise ValueError(
+                    "VLLM_BATCH_INVARIANT is enabled but microbatching chooses "
+                    "per step whether to split and which graph to replay, so a "
+                    "request's numeric path would depend on its neighbours. "
+                    "Disable it (enable_dbo / ubatch_size)."
+                )
 
         if (
             envs.VLLM_BATCH_INVARIANT
@@ -1713,6 +1750,36 @@ class VllmConfig:
                 "holds only if every path this mode can select is bitwise "
                 "equal for this model. Verified for DeepSeek-V4; unverified "
                 "elsewhere. Use cudagraph_mode=FULL to remove the choice."
+            )
+
+        # The multimodal encoder runs its own dispatcher: it greedy-packs the
+        # images scheduled this step and picks a captured budget -- or eager --
+        # from their combined token count, without consulting cudagraph_mode.
+        # Neither the warning above nor --enforce-eager reaches it. Warn rather
+        # than refuse: it is opt-in, no model here has an encoder, and a
+        # refusal would be a promise made about a deployment we cannot test.
+        if envs.VLLM_BATCH_INVARIANT and self.compilation_config.cudagraph_mm_encoder:
+            logger.warning_once(
+                "cudagraph_mm_encoder is enabled: the encoder picks a captured "
+                "budget from the combined token count of whatever images share "
+                "the step, so an image's numeric path depends on its "
+                "neighbours. Unverified under batch invariance; disable it to "
+                "remove the choice."
+            )
+
+        # Speculative decoding is out of scope for this policy. The draft-side
+        # dispatchers in llm_base_proposer / extract_hidden_states are switched
+        # off under the flag, but the V2 speculators (AutoRegressiveSpeculator,
+        # DFlashSpeculator) build cudagraph managers of their own that nothing
+        # here reaches, and upstream #27433 records that batch invariance under
+        # speculative decoding is unfinished. Say so rather than let the
+        # half-coverage read as coverage.
+        if envs.VLLM_BATCH_INVARIANT and self.speculative_config is not None:
+            logger.warning_once(
+                "Speculative decoding is enabled and is not verified under "
+                "batch invariance: the V2 speculators dispatch their own draft "
+                "cudagraphs from the step's token count, which this "
+                "configuration check does not cover."
             )
 
         if (
@@ -1743,7 +1810,13 @@ class VllmConfig:
                     token_budget, self.scheduler_config.max_num_scheduled_tokens
                 )
             largest_decode_step = min(
-                self.scheduler_config.max_num_seqs * (1 + self.num_speculative_tokens),
+                _largest_uniform_decode_step(
+                    self.scheduler_config.max_num_seqs,
+                    self.num_speculative_tokens,
+                    None
+                    if self.speculative_config is None
+                    else self.speculative_config.num_speculative_tokens_per_batch_size,
+                ),
                 token_budget,
             )
             capture_size = self.compilation_config.max_cudagraph_capture_size

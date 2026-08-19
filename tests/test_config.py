@@ -1813,6 +1813,24 @@ def test_batch_invariant_model_capture_default_is_not_a_deployment_choice(monkey
     assert config.compilation_config._capture_sizes_user_specified is False
 
 
+def _build_dbo_config(mode, parallel_config, max_num_batched_tokens=None):
+    return VllmConfig(
+        model_config=ModelConfig("Qwen/Qwen3-0.6B", max_model_len=2048),
+        scheduler_config=SchedulerConfig(
+            max_model_len=2048,
+            is_encoder_decoder=False,
+            max_num_seqs=64,
+            **(
+                {"max_num_batched_tokens": max_num_batched_tokens}
+                if max_num_batched_tokens is not None
+                else {}
+            ),
+        ),
+        parallel_config=parallel_config,
+        compilation_config=CompilationConfig(cudagraph_mode=mode),
+    )
+
+
 def test_batch_invariant_refuses_microbatching(monkeypatch):
     """cudagraph_mode is not the only thing that picks a graph per step.
 
@@ -1821,22 +1839,40 @@ def test_batch_invariant_refuses_microbatching(monkeypatch):
     is not gated on it, and --enforce-eager does not switch it off either.
     """
     monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
-
-    def build(mode):
-        return VllmConfig(
-            model_config=ModelConfig("Qwen/Qwen3-0.6B", max_model_len=2048),
-            scheduler_config=SchedulerConfig(
-                max_model_len=2048, is_encoder_decoder=False, max_num_seqs=64
-            ),
-            parallel_config=ParallelConfig(enable_dbo=True),
-            compilation_config=CompilationConfig(cudagraph_mode=mode),
-        )
+    parallel = ParallelConfig(enable_dbo=True, data_parallel_size=2)
 
     with pytest.raises(ValueError, match="microbatching"):
-        build(CUDAGraphMode.FULL)
+        _build_dbo_config(CUDAGraphMode.FULL, parallel)
     # Still refused with graphs off entirely: this dispatcher is separate.
     with pytest.raises(ValueError, match="microbatching"):
-        build(CUDAGraphMode.NONE)
+        _build_dbo_config(CUDAGraphMode.NONE, parallel)
+
+
+def test_batch_invariant_allows_microbatching_that_can_never_run(monkeypatch):
+    """A refusal that fires on configurations which cannot microbatch is a
+    startup failure for nothing.
+
+    `use_ubatching` is the configured flag, not whether a step can be split.
+    `should_ubatch` stays False unless data_parallel_size > 1, and
+    `check_ubatch_thresholds` needs a step at least as large as one of the two
+    thresholds -- unreachable once both exceed the token budget.
+    """
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
+
+    # dp=1: the runner never calls coordinate_batch_across_dp at all.
+    _build_dbo_config(CUDAGraphMode.FULL, ParallelConfig(enable_dbo=True))
+
+    # dp=2 but no step can reach either threshold.
+    _build_dbo_config(
+        CUDAGraphMode.FULL,
+        ParallelConfig(
+            enable_dbo=True,
+            data_parallel_size=2,
+            dbo_decode_token_threshold=4096,
+            dbo_prefill_token_threshold=4096,
+        ),
+        max_num_batched_tokens=2048,
+    )
 
 
 def test_batch_invariant_warns_when_decode_step_escapes_capture(monkeypatch, caplog):
@@ -1891,6 +1927,27 @@ def test_batch_invariant_quiet_when_capture_is_left_default(
             compilation_config=CompilationConfig(cudagraph_mode=CUDAGraphMode.FULL),
         )
     assert "below its largest decode step" not in caplog.text
+
+
+def test_largest_uniform_decode_step_follows_a_dynamic_spec_schedule():
+    """The global speculative maximum is not a step any batch can produce.
+
+    Dynamic speculative decoding pairs the large draft counts with small
+    batches. Multiplying max_num_seqs by the global maximum invents a step the
+    schedule forbids, and the capture-envelope warning would then fire on a
+    configuration that already covers every real decode step.
+    """
+    from vllm.config.vllm import _largest_uniform_decode_step
+
+    # No schedule: the global maximum applies to every batch size.
+    assert _largest_uniform_decode_step(64, 5, None) == 384
+
+    # Schedule: 5 extra tokens only at batch size 1, none from 2 to 64.
+    schedule = [(1, 1, 5), (2, 64, 0)]
+    assert _largest_uniform_decode_step(64, 5, schedule) == 64
+
+    # max_num_seqs clamps a range that reaches past it.
+    assert _largest_uniform_decode_step(8, 5, [(1, 64, 1)]) == 16
 
 
 def test_fusion_pass_op_priority():
