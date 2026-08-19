@@ -575,3 +575,33 @@ def test_prenorm_gemm_no_deep_gemm_negative_control(monkeypatch):
         f"the < 128 wide-tile branch left row 0 bitwise unchanged (diffs at "
         f"{sorted(diffs)}); the BI test above cannot prove it is pinned"
     )
+
+
+def test_mhc_refuses_a_deep_gemm_that_cannot_be_pinned(monkeypatch):
+    """Fail closed, do not fall back.
+
+    ``tf32_hc_prenorm_gemm`` is DeepGEMM's and the mHC path has no other
+    implementation, so a ``deep_gemm`` without ``set_batch_invariant`` would
+    keep running with its config chosen from the batch. Disabling DeepGEMM MoE,
+    the loader's answer to such a build, does nothing here.
+    """
+    import vllm.model_executor.kernels.mhc.tilelang as tl
+    import vllm.utils.deep_gemm as dg
+
+    guard = tl._require_batch_invariant_deep_gemm
+    monkeypatch.setattr(tl.envs, "VLLM_BATCH_INVARIANT", True)
+
+    monkeypatch.setattr(dg, "deep_gemm_batch_invariant_enabled", lambda: True)
+    guard.cache_clear()
+    guard()  # pinned: no complaint
+
+    monkeypatch.setattr(dg, "deep_gemm_batch_invariant_enabled", lambda: False)
+    guard.cache_clear()
+    with pytest.raises(RuntimeError, match="set_batch_invariant"):
+        guard()
+
+    # With the flag off the same unpinned build is fine -- nothing was promised.
+    monkeypatch.setattr(tl.envs, "VLLM_BATCH_INVARIANT", False)
+    guard.cache_clear()
+    guard()
+    guard.cache_clear()
