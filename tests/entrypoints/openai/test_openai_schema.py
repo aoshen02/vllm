@@ -112,6 +112,16 @@ def before_generate_case(context: schemathesis.HookContext, strategy):
                             if "custom" in tool_call:
                                 return False
 
+        if hasattr(case, "body") and isinstance(case.body, dict):
+            sampling_params = case.body.get("sampling_params")
+            if isinstance(sampling_params, dict):
+                trace_ids = sampling_params.get("trace_decode_token_ids")
+                if isinstance(trace_ids, list) and any(
+                    isinstance(token_id, int) and token_id < 0
+                    for token_id in trace_ids
+                ):
+                    return False
+
         return True
 
     return strategy.filter(no_invalid_types)
