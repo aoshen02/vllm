@@ -182,6 +182,7 @@ async def test_content_parts_generates_tokens(client, test_image):
         json={
             "token_ids": token_ids,
             "content_parts": [{"type": "image_url", "url": data_url}],
+            "prompt_token_ids_are_expanded": True,
             "sampling_params": {"max_tokens": 10, "temperature": 0.0},
             "return_token_ids": True,
         },

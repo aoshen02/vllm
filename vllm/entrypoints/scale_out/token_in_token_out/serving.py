@@ -159,6 +159,8 @@ class ServingTokens(GenerateBaseServing):
                     mm_parser.parse_video(url, uuid)
             mm_data, mm_uuids = await tracker.resolve_items()
             prompt = TokensPrompt(prompt_token_ids=request.token_ids)
+            if request.prompt_token_ids_are_expanded:
+                prompt["mm_prompt_updates_applied"] = True
             if mm_data:
                 prompt["multi_modal_data"] = mm_data
             if mm_uuids:

@@ -9,6 +9,9 @@ fail loudly if the validator semantics ever drift.
 
 import json
 
+import pytest
+from pydantic import ValidationError
+
 from vllm.entrypoints.scale_out.token_in_token_out.protocol import GenerateRequest
 from vllm.sampling_params import SamplingParams
 
@@ -68,3 +71,32 @@ def test_internal_instance_construction_treats_all_as_provided():
     assert req.is_sampling_param_provided("temperature")
     # And keys we never touched should also count as provided in this path.
     assert req.is_sampling_param_provided("top_p")
+
+
+def test_prompt_token_ids_are_expanded_defaults_false():
+    req = GenerateRequest.model_validate(_base_payload())
+    assert req.prompt_token_ids_are_expanded is False
+
+
+def test_prompt_token_ids_are_expanded_requires_content_parts():
+    payload = _base_payload()
+    payload["prompt_token_ids_are_expanded"] = True
+    with pytest.raises(ValidationError, match="requires content_parts"):
+        GenerateRequest.model_validate(payload)
+
+
+def test_prompt_token_ids_are_expanded_rejects_empty_content_parts():
+    payload = _base_payload()
+    payload["prompt_token_ids_are_expanded"] = True
+    payload["content_parts"] = []
+    with pytest.raises(ValidationError, match="requires content_parts"):
+        GenerateRequest.model_validate(payload)
+
+
+def test_prompt_token_ids_are_expanded_accepted_with_content_parts():
+    payload = _base_payload()
+    payload["content_parts"] = [{"type": "image_url", "url": "http://x/1.png"}]
+    payload["prompt_token_ids_are_expanded"] = True
+    req = GenerateRequest.model_validate(payload)
+    assert req.prompt_token_ids_are_expanded is True
+    assert req.content_parts == payload["content_parts"]
