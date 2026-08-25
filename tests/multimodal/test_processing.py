@@ -12,6 +12,7 @@ from vllm.exceptions import VLLMValidationError
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.processing.context import InputProcessingContext
 from vllm.multimodal.processing.processor import (
+    BaseMultiModalProcessor,
     PlaceholderFeaturesInfo,
     PromptIndexTargets,
     PromptInsertion,
@@ -1396,3 +1397,93 @@ def test_find_mm_placeholders_resolves_content_lazily(prompt):
     )
 
     assert result == {}
+
+
+class _FakeMMItems:
+    def __init__(self, counts: dict) -> None:
+        self._counts = counts
+
+    def get_all_counts(self) -> dict:
+        return self._counts
+
+
+class _FakeTokenizerlessProcessor:
+    class _Info:
+        def get_tokenizer(self):
+            return None
+
+    info = _Info()
+
+    _validate_mm_kwargs = BaseMultiModalProcessor._validate_mm_kwargs
+    _validate_mm_updates = BaseMultiModalProcessor._validate_mm_updates
+    _validate_mm_placeholders = BaseMultiModalProcessor._validate_mm_placeholders
+    _find_mm_placeholders = BaseMultiModalProcessor._find_mm_placeholders
+    _apply_token_matches_with_placeholders = (
+        BaseMultiModalProcessor._apply_token_matches_with_placeholders
+    )
+    _apply_prompt_updates = BaseMultiModalProcessor._apply_prompt_updates
+    _maybe_apply_prompt_updates = BaseMultiModalProcessor._maybe_apply_prompt_updates
+
+
+def test_maybe_apply_prompt_updates_explicit_true_accepts_pre_expanded_prompt():
+    processor = _FakeTokenizerlessProcessor()
+    mm_prompt_updates = {
+        "image": [[PromptReplacement("image", [], [500, 500, 500]).resolve(0)]]
+    }
+
+    prompt_ids, mm_placeholders = processor._maybe_apply_prompt_updates(
+        mm_items=_FakeMMItems({"image": 1}),
+        prompt_ids=[1, 500, 500, 500, 2],
+        mm_kwargs={"image": [None]},
+        mm_prompt_updates=mm_prompt_updates,
+        is_update_applied=True,
+    )
+
+    assert prompt_ids == [1, 500, 500, 500, 2]
+    assert [(item.start_idx, item.tokens) for item in mm_placeholders["image"]] == [
+        (1, [500, 500, 500])
+    ]
+
+
+def test_maybe_apply_prompt_updates_explicit_true_rejects_count_mismatch():
+    processor = _FakeTokenizerlessProcessor()
+    mm_prompt_updates = {
+        "image": [
+            [PromptReplacement("image", [], [500, 500]).resolve(0)],
+            [PromptReplacement("image", [], [500, 500]).resolve(1)],
+        ]
+    }
+
+    with pytest.raises(RuntimeError, match="Expected there to be 2"):
+        processor._maybe_apply_prompt_updates(
+            mm_items=_FakeMMItems({"image": 2}),
+            prompt_ids=[1, 500, 500, 2],
+            mm_kwargs={"image": [None, None]},
+            mm_prompt_updates=mm_prompt_updates,
+            is_update_applied=True,
+        )
+
+
+def test_maybe_apply_prompt_updates_explicit_true_multiple_items_varying_lengths():
+    processor = _FakeTokenizerlessProcessor()
+    variable_length_replacement = lambda item_idx: [500] * (item_idx + 2)  # noqa: E731
+    mm_prompt_updates = {
+        "image": [
+            [PromptReplacement("image", [], variable_length_replacement).resolve(0)],
+            [PromptReplacement("image", [], variable_length_replacement).resolve(1)],
+        ]
+    }
+
+    prompt_ids, mm_placeholders = processor._maybe_apply_prompt_updates(
+        mm_items=_FakeMMItems({"image": 2}),
+        prompt_ids=[1, 500, 500, 9, 500, 500, 500, 2],
+        mm_kwargs={"image": [None, None]},
+        mm_prompt_updates=mm_prompt_updates,
+        is_update_applied=True,
+    )
+
+    assert prompt_ids == [1, 500, 500, 9, 500, 500, 500, 2]
+    assert [(item.start_idx, item.tokens) for item in mm_placeholders["image"]] == [
+        (1, [500, 500]),
+        (4, [500, 500, 500]),
+    ]

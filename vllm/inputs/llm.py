@@ -81,6 +81,9 @@ class _PromptOptions(TypedDict):
     to pass the mm_processor_kwargs to each of them.
     """
 
+    mm_prompt_updates_applied: NotRequired[bool]
+    """Whether multimodal prompt replacements are already applied."""
+
     multi_modal_uuids: NotRequired[MultiModalUUIDDict]
     """
     Optional user-specified UUIDs for multimodal items, mapped by modality.

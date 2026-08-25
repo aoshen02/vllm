@@ -1945,7 +1945,7 @@ class BaseMultiModalProcessor(ABC, Generic[_I]):
                 prompt_ids=prompt_ids,
                 mm_kwargs=mm_info.kwargs,
                 mm_prompt_updates=mm_info.prompt_updates,
-                is_update_applied=is_update_applied,
+                is_update_applied=(is_update_applied or inputs.prompt_updates_applied),
             )
 
         mm_placeholder_ranges = {

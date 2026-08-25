@@ -22,6 +22,7 @@ class ProcessorInputs:
     mm_uuid_items: MultiModalUUIDItems | None = None
     hf_processor_mm_kwargs: Mapping[str, object] = field(default_factory=dict)
     tokenization_kwargs: Mapping[str, object] = field(default_factory=dict)
+    prompt_updates_applied: bool = False
 
     def get_mm_hashes(
         self,

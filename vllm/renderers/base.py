@@ -733,6 +733,7 @@ class BaseRenderer(ABC, Generic[_T]):
         mm_processor_kwargs: Mapping[str, object] | None,
         *,
         skip_mm_cache: bool = False,
+        prompt_updates_applied: bool = False,
     ) -> "MultiModalInput":
         if skip_mm_cache and self._readonly_mm_processor is not None:
             mm_processor = self._readonly_mm_processor
@@ -753,6 +754,7 @@ class BaseRenderer(ABC, Generic[_T]):
             mm_data_items,
             mm_uuid_items,
             hf_processor_mm_kwargs=mm_processor_kwargs or {},
+            prompt_updates_applied=prompt_updates_applied,
         )
         mm_timing_ctx = self._mm_timing_registry.get(mm_req_id)
 
@@ -782,6 +784,10 @@ class BaseRenderer(ABC, Generic[_T]):
                 mm_processor_kwargs=prompt.get("mm_processor_kwargs"),
                 mm_uuids=prompt.get("multi_modal_uuids"),
                 skip_mm_cache=skip_mm_cache,
+                prompt_updates_applied=prompt.get(
+                    "mm_prompt_updates_applied",
+                    False,
+                ),
             )
         else:
             engine_input = tokens_input(prompt_token_ids)
@@ -844,6 +850,10 @@ class BaseRenderer(ABC, Generic[_T]):
                 mm_processor_kwargs=prompt.get("mm_processor_kwargs"),
                 mm_uuids=prompt.get("multi_modal_uuids"),
                 skip_mm_cache=skip_mm_cache,
+                prompt_updates_applied=prompt.get(
+                    "mm_prompt_updates_applied",
+                    False,
+                ),
             )
         else:
             engine_input = tokens_input(prompt_token_ids)
