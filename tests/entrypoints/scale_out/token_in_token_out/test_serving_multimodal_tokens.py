@@ -176,12 +176,22 @@ async def test_content_parts_generates_tokens(client, test_image):
     render_resp.raise_for_status()
     render_data = render_resp.json()
     token_ids = render_data["token_ids"]
+    image_range = render_data["features"]["mm_placeholders"]["image"][0]
+    expanded_placeholders = {
+        "image": [
+            {
+                **image_range,
+                "canonical_token_ids": [token_ids[image_range["offset"]]],
+            }
+        ]
+    }
 
     gen_resp = await client.post(
         GEN_ENDPOINT,
         json={
             "token_ids": token_ids,
             "content_parts": [{"type": "image_url", "url": data_url}],
+            "expanded_placeholders": expanded_placeholders,
             "sampling_params": {"max_tokens": 10, "temperature": 0.0},
             "return_token_ids": True,
         },
