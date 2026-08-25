@@ -1166,6 +1166,58 @@ For an item `MultiModalPromptUpdates[k][i]`,
 `ResolvedPromptUpdate` instances have been applied.
 """
 
+
+def find_applied_prompt_updates(
+    prompt_ids: list[int],
+    mm_prompt_updates: MultiModalPromptUpdates,
+    mm_item_counts: Mapping[str, int],
+    tokenizer: TokenizerLike | None,
+) -> Mapping[str, list[PlaceholderFeaturesInfo]] | None:
+    """Return placeholders only when the whole prompt update is already applied."""
+    placeholders = find_mm_placeholders(prompt_ids, mm_prompt_updates, tokenizer)
+    counts = {
+        modality: len(placeholders.get(modality, [])) for modality in mm_item_counts
+    }
+
+    if any(
+        0 < counts[modality] < item_count
+        for modality, item_count in mm_item_counts.items()
+    ):
+        raise ValueError("The prompt mixes expanded and unexpanded placeholders")
+
+    for modality, updates_by_item in mm_prompt_updates.items():
+        covered = [
+            (placeholder.start_idx, placeholder.start_idx + placeholder.length)
+            for placeholder in placeholders.get(modality, [])
+        ]
+        uncovered = set[tuple[int, int]]()
+        for updates in updates_by_item:
+            for update in updates:
+                if update.mode != UpdateMode.REPLACE:
+                    continue
+                for match in update.iter_token_matches(prompt_ids, tokenizer):
+                    if not any(
+                        start <= match.start_idx and match.end_idx <= end
+                        for start, end in covered
+                    ):
+                        uncovered.add((match.start_idx, match.end_idx))
+
+        allowed = 0 if counts.get(modality, 0) else mm_item_counts[modality]
+        if len(uncovered) > allowed:
+            raise ValueError(
+                "The prompt contains partially expanded or ambiguous placeholders"
+            )
+
+    return (
+        placeholders
+        if all(
+            counts[modality] == item_count
+            for modality, item_count in mm_item_counts.items()
+        )
+        else None
+    )
+
+
 _I = TypeVar("_I", bound=BaseProcessingInfo)
 
 
@@ -1898,6 +1950,15 @@ class BaseMultiModalProcessor(ABC, Generic[_I]):
         mm_item_counts = mm_items.get_all_counts()
         self._validate_mm_kwargs(mm_kwargs, mm_item_counts)
         self._validate_mm_updates(mm_prompt_updates, mm_item_counts)
+
+        if not is_update_applied:
+            detected_placeholders = find_applied_prompt_updates(
+                prompt_ids,
+                mm_prompt_updates,
+                mm_item_counts,
+                self.info.get_tokenizer(),
+            )
+            is_update_applied = detected_placeholders is not None
 
         if is_update_applied:
             mm_placeholders = self._find_mm_placeholders(
