@@ -48,6 +48,7 @@ from vllm.utils.serial_utils import numpy2base64
 
 from .mm_serde import decode_mm_kwargs_item
 from .protocol import (
+    ExpandedPlaceholderRangeInfo,
     GenerateRequest,
     GenerateResponse,
     GenerateResponseChoice,
@@ -57,6 +58,27 @@ from .protocol import (
 )
 
 logger = init_logger(__name__)
+
+
+def normalize_expanded_placeholders(
+    token_ids: list[int],
+    placeholders: dict[str, list[ExpandedPlaceholderRangeInfo]],
+) -> list[int]:
+    spans = sorted(
+        (span for items in placeholders.values() for span in items),
+        key=lambda span: span.offset,
+    )
+    output: list[int] = []
+    previous_end = 0
+    for span in spans:
+        end = span.offset + span.length
+        if span.offset < previous_end or end > len(token_ids):
+            raise ValueError("expanded placeholder ranges overlap or exceed token_ids")
+        output.extend(token_ids[previous_end : span.offset])
+        output.extend(span.canonical_token_ids)
+        previous_end = end
+    output.extend(token_ids[previous_end:])
+    return output
 
 
 class ServingTokens(GenerateBaseServing):
@@ -158,7 +180,13 @@ class ServingTokens(GenerateBaseServing):
                 elif ptype == "video_url":
                     mm_parser.parse_video(url, uuid)
             mm_data, mm_uuids = await tracker.resolve_items()
-            prompt = TokensPrompt(prompt_token_ids=request.token_ids)
+            prompt_ids = request.token_ids
+            if request.expanded_placeholders:
+                prompt_ids = normalize_expanded_placeholders(
+                    prompt_ids,
+                    request.expanded_placeholders,
+                )
+            prompt = TokensPrompt(prompt_token_ids=prompt_ids)
             if mm_data:
                 prompt["multi_modal_data"] = mm_data
             if mm_uuids:

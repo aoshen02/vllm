@@ -43,6 +43,12 @@ class PlaceholderRangeInfo(BaseModel):
     # placeholder masks that cannot be recomputed from offset+length alone.
 
 
+class ExpandedPlaceholderRangeInfo(PlaceholderRangeInfo):
+    """Expanded span and its canonical pre-processing token sequence."""
+
+    canonical_token_ids: list[int] = Field(min_length=1)
+
+
 class MultiModalFeatures(BaseModel):
     """Lightweight multimodal metadata produced by the render step.
 
@@ -108,10 +114,15 @@ class GenerateRequest(BaseModel):
     """Raw multimodal input; server resolves media. Mutually exclusive
     with ``features``."""
 
+    expanded_placeholders: dict[str, list[ExpandedPlaceholderRangeInfo]] | None = None
+    """Expanded spans to canonicalize before processing raw media."""
+
     @model_validator(mode="after")
     def _check_mm_fields_exclusive(self) -> "GenerateRequest":
         if self.content_parts and self.features:
             raise ValueError("content_parts and features are mutually exclusive")
+        if self.expanded_placeholders and not self.content_parts:
+            raise ValueError("expanded_placeholders requires content_parts")
         return self
 
     sampling_params: SamplingParams
