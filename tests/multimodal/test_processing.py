@@ -20,6 +20,7 @@ from vllm.multimodal.processing.processor import (
     _apply_token_matches_with_placeholders,
     apply_text_matches,
     apply_token_matches,
+    find_applied_prompt_updates,
     find_mm_placeholders,
     iter_token_matches,
     replace_token_matches,
@@ -1396,3 +1397,39 @@ def test_find_mm_placeholders_resolves_content_lazily(prompt):
     )
 
     assert result == {}
+
+
+def test_find_mm_placeholders_recognizes_already_expanded_prompt():
+    update = PromptReplacement("image", [10], [10, 10, 10]).resolve(0)
+
+    result = find_mm_placeholders(
+        [1, 10, 10, 10, 2],
+        {"image": [[update]]},
+        tokenizer=None,
+    )
+
+    assert [item.tokens for item in result["image"]] == [[10, 10, 10]]
+
+
+def test_find_applied_prompt_updates_rejects_extra_expanded_tokens():
+    updates = {"image": [[PromptReplacement("image", [10], [10, 10, 10]).resolve(0)]]}
+
+    with pytest.raises(ValueError, match="partially expanded or ambiguous"):
+        find_applied_prompt_updates(
+            [1, 10, 10, 10, 10, 2],
+            updates,
+            {"image": 1},
+            tokenizer=None,
+        )
+
+
+def test_find_applied_prompt_updates_distinguishes_input_state():
+    updates = {"image": [[PromptReplacement("image", [10], [10, 10, 10]).resolve(0)]]}
+
+    assert (
+        find_applied_prompt_updates([1, 10, 2], updates, {"image": 1}, tokenizer=None)
+        is None
+    )
+    assert find_applied_prompt_updates(
+        [1, 10, 10, 10, 2], updates, {"image": 1}, tokenizer=None
+    )
