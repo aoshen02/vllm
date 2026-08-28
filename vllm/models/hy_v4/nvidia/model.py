@@ -574,9 +574,11 @@ class HYV4Model(nn.Module):
                     if is_pp_missing_parameter(name, self):
                         continue
                     narrow_weight = loaded_weight[head_rank_start:head_rank_end]
-                    n = narrow_weight.shape[0]
-                    with torch.no_grad():
-                        params_dict[name][:n].copy_(narrow_weight)
+                    param = params_dict[name]
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
+                    weight_loader(param, narrow_weight)
                 else:
                     if is_expert_weight:
                         # An expert weight that is not mapped to this rank.

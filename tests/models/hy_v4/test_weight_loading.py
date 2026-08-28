@@ -153,6 +153,26 @@ def _assert_fully_loaded(model, checkpoint) -> None:
     assert not loaded - expected, f"loaded unknown params: {sorted(loaded - expected)}"
 
 
+def _track_sink_weight_loaders(model) -> tuple[set[str], list[str]]:
+    expected = {
+        name
+        for name, _ in model.named_parameters()
+        if name.endswith(".learnable_sink_param")
+    }
+    calls: list[str] = []
+    for name, param in model.named_parameters():
+        if name not in expected:
+            continue
+
+        def loader(param, loaded_weight, *, sink_name=name):
+            calls.append(sink_name)
+            with torch.no_grad():
+                param.copy_(loaded_weight)
+
+        param.weight_loader = loader
+    return expected, calls
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("enable_ihc", [False, True])
 @pytest.mark.parametrize("sparse", [False, True])
@@ -167,6 +187,7 @@ def test_backbone_load_weights_covers_every_parameter(
 
     with set_current_vllm_config(vllm_config), torch.device("cuda"):
         model = HYV4ForCausalLM(vllm_config=vllm_config, prefix="")
+    expected_sink_loads, sink_loads = _track_sink_weight_loaders(model)
 
     checkpoint: list[tuple[str, torch.Tensor]] = []
     for name, param in model.named_parameters():
@@ -174,6 +195,7 @@ def test_backbone_load_weights_covers_every_parameter(
 
     with set_current_vllm_config(vllm_config):
         _assert_fully_loaded(model, checkpoint)
+    assert set(sink_loads) == expected_sink_loads
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -198,6 +220,7 @@ def test_mtp_load_weights_covers_every_parameter(
 
     with set_current_vllm_config(vllm_config), torch.device("cuda"):
         mtp = HYV4MTP(vllm_config=vllm_config, prefix="")
+    expected_sink_loads, sink_loads = _track_sink_weight_loaders(mtp)
 
     mtp_prefix = f"model.layers.{hf_config.num_hidden_layers}."
     checkpoint: list[tuple[str, torch.Tensor]] = []
@@ -215,6 +238,7 @@ def test_mtp_load_weights_covers_every_parameter(
 
     with set_current_vllm_config(vllm_config):
         _assert_fully_loaded(mtp, checkpoint)
+    assert set(sink_loads) == expected_sink_loads
 
 
 def test_fused_expert_scale_keeps_its_own_parameter() -> None:
