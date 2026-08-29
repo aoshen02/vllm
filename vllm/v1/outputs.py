@@ -366,6 +366,8 @@ class ModelRunnerOutput:
 
     # req_id -> caller-selected prompt token scores. Kept separate from
     # prompt_logprobs_dict because it has no implicit target/rank columns.
+    # TODO: Propagate this field through Scheduler/EngineCore when exposing the
+    # scoring API; it is intentionally not folded into prompt_logprobs_dict.
     prompt_token_logprobs_dict: dict[
         str, PromptTokenLogprobsTensors | None
     ] = field(default_factory=dict)
