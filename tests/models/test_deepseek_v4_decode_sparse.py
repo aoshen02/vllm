@@ -8,6 +8,11 @@ import torch
 from torch import nn
 
 import vllm.models.deepseek_v4.nvidia.flashmla as flashmla_module
+import vllm.model_executor.layers.sparse_attn_indexer as indexer_module
+from vllm.models.deepseek_v4.common.ops.cache_utils import (
+    compute_gather_lens,
+    zero_invalid_lens,
+)
 from vllm.models.deepseek_v4.nvidia.flashmla import DeepseekV4FlashMLAAttention
 
 
@@ -108,6 +113,17 @@ def test_decode_sparse_reuses_prefill_kernel(
     monkeypatch.setattr(
         flashmla_module, "dequantize_and_gather_k_cache", fake_gather
     )
+    monkeypatch.setattr(
+        flashmla_module,
+        "fill_c128_topk",
+        lambda out, lengths: out.copy_(
+            torch.where(
+                torch.arange(out.shape[1])[None, :] < lengths[:, None],
+                torch.arange(out.shape[1])[None, :],
+                -1,
+            ).to(torch.int32)
+        ),
+    )
     monkeypatch.setattr(flashmla_module, "combine_topk_swa_indices", fake_combine)
     monkeypatch.setattr(flashmla_module, "flash_mla_sparse_fwd", fake_sparse_fwd)
     monkeypatch.setattr(
@@ -195,3 +211,104 @@ def test_decode_sparse_fails_closed_without_scheduler_metadata(
             swa_only=True,
             output=torch.empty((2, 2, 8), dtype=torch.bfloat16),
         )
+
+
+def test_compute_gather_lens_clamps_prefix_and_handles_empty_query() -> None:
+    seq_lens = torch.tensor([0, 2, 10], dtype=torch.int32)
+    query_start_loc = torch.tensor([0, 0, 1, 3], dtype=torch.int32)
+    output = torch.empty(3, dtype=torch.int32)
+
+    compute_gather_lens(seq_lens, query_start_loc, output, window_size=4)
+
+    # q_lens=[0, 1, 2], and the prefix contribution is capped at 3.
+    torch.testing.assert_close(
+        output, torch.tensor([0, 2, 5], dtype=torch.int32), rtol=0, atol=0
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_compute_gather_lens_handles_noncontiguous_cuda_views() -> None:
+    seq_base = torch.tensor([99, 0, 99, 2, 99, 10, 99], dtype=torch.int32,
+                            device="cuda")
+    seq_lens = seq_base[1::2]
+    start_base = torch.tensor([0, 99, 0, 99, 1, 99, 3], dtype=torch.int32,
+                              device="cuda")
+    query_start_loc = start_base[::2]
+    output_base = torch.empty(6, dtype=torch.int32, device="cuda")
+    output = output_base[::2]
+
+    compute_gather_lens(seq_lens, query_start_loc, output, window_size=4)
+
+    torch.testing.assert_close(
+        output, torch.tensor([0, 2, 5], dtype=torch.int32, device="cuda"),
+        rtol=0, atol=0
+    )
+
+
+def test_zero_invalid_lens_preserves_valid_rows() -> None:
+    lens = torch.tensor([7, 0, 3], dtype=torch.int32)
+    is_valid = torch.tensor([True, False, True])
+
+    zero_invalid_lens(lens, is_valid)
+
+    torch.testing.assert_close(
+        lens, torch.tensor([7, 0, 3], dtype=torch.int32), rtol=0, atol=0
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_zero_invalid_lens_handles_noncontiguous_cuda_views() -> None:
+    lens_base = torch.tensor([99, 7, 99, 3, 99], dtype=torch.int32, device="cuda")
+    valid_base = torch.tensor([False, True, False, False, False], device="cuda")
+    lens = lens_base[1::2]
+    is_valid = valid_base[1::2]
+
+    zero_invalid_lens(lens, is_valid)
+
+    torch.testing.assert_close(
+        lens, torch.tensor([7, 0], dtype=torch.int32, device="cuda"),
+        rtol=0, atol=0
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_fill_c128_topk_handles_zero_and_full_lengths() -> None:
+    from vllm.models.deepseek_v4.common.ops.cache_utils import fill_c128_topk
+
+    output = torch.empty((2, 128), dtype=torch.int32, device="cuda")
+    lengths = torch.tensor([0, 128], dtype=torch.int32, device="cuda")
+
+    fill_c128_topk(output, lengths)
+
+    expected = torch.full_like(output, -1)
+    expected[1] = torch.arange(128, dtype=torch.int32, device="cuda")
+    torch.testing.assert_close(output, expected, rtol=0, atol=0)
+
+
+def test_topk_wrapper_uses_native_op_for_wide_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    called = {}
+
+    def fake_wide_fallback(*args):
+        called["args"] = args
+
+    monkeypatch.setattr(indexer_module.envs, "VLLM_BATCH_INVARIANT", True)
+    monkeypatch.setattr(
+        indexer_module, "_top_k_per_row_prefill_wide_fallback", fake_wide_fallback
+    )
+    logits = torch.empty((1, 4096), dtype=torch.float32)
+    starts = torch.zeros(1, dtype=torch.int32)
+    ends = torch.tensor([4096], dtype=torch.int32)
+    indices = torch.empty((1, 8), dtype=torch.int32)
+
+    indexer_module._top_k_per_row_prefill(
+        logits, starts, ends, indices, 1, 4096, 1, 8
+    )
+
+    args = called["args"]
+    assert args[0] is logits
+    assert args[1] is starts
+    assert args[2] is ends
+    assert args[3] is indices
+    assert args[4:] == (1, 8)
