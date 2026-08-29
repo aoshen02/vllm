@@ -788,7 +788,8 @@ class CombineTopkSwaIndicesKernel(
         WINDOW_SIZE: int,
     ) -> None:
         num_reqs = seq_lens.shape[0]
-        self.kernel[(num_reqs, _COMBINE_TOPK_SWA_NUM_WORKERS)](
+        num_workers = max(1, min(num_reqs, _COMBINE_TOPK_SWA_NUM_WORKERS))
+        self.kernel[(num_reqs, num_workers)](
             combined_indices,
             combined_indices.stride(0),
             combined_lens,
