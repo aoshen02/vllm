@@ -631,9 +631,7 @@ def sparse_attn_indexer(
             # At C128 position 2051 there are 513 candidates for top-512, so
             # score/selection differences that were hidden on shorter rows
             # become observable in the chosen KV set.
-            row_starts = torch.zeros(
-                num_rows, dtype=torch.int32, device=logits.device
-            )
+            row_starts = decode_metadata.row_starts[:num_rows]
             row_ends = seq_lens.reshape(-1)[:num_rows].contiguous()
             ops.top_k_per_row_prefill(
                 logits,
