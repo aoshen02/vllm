@@ -449,6 +449,15 @@ def compute_global_topk_indices_and_lens(
     num_tokens = topk_indices.shape[0]
     global_topk_indices = torch.empty_like(topk_indices)
     topk_lens = torch.empty(num_tokens, dtype=torch.int32, device=topk_indices.device)
+    topk_width = topk_indices.shape[-1]
+    if topk_width <= 128:
+        triton_block_size = 128
+    elif topk_width <= 256:
+        triton_block_size = 256
+    elif topk_width <= 512:
+        triton_block_size = 512
+    else:
+        triton_block_size = 1024
     _compute_global_topk_indices_and_lens_kernel[(num_tokens,)](
         global_topk_indices,
         global_topk_indices.stride(0),
@@ -461,7 +470,7 @@ def compute_global_topk_indices_and_lens(
         block_table.stride(0),
         block_size,
         is_valid_token,
-        TRITON_BLOCK_SIZE=1024,
+        TRITON_BLOCK_SIZE=triton_block_size,
     )
     return global_topk_indices, topk_lens
 
