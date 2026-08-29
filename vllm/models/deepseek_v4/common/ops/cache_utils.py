@@ -599,6 +599,57 @@ def combine_topk_swa_indices(
 _COMBINE_TOPK_SWA_NUM_WORKERS = 128
 
 
+@triton.jit
+def _compute_gather_lens_kernel(
+    seq_lens_ptr,
+    seq_lens_stride,
+    query_start_ptr,
+    query_start_stride,
+    output_ptr,
+    output_stride,
+    n_rows,
+    window_size: tl.constexpr,
+):
+    """Compute decode gather lengths without intermediate elementwise tensors."""
+    row = tl.program_id(0)
+    if row >= n_rows:
+        return
+    query_len = tl.load(
+        query_start_ptr + (row + 1) * query_start_stride
+    ) - tl.load(query_start_ptr + row * query_start_stride)
+    seq_len = tl.load(seq_lens_ptr + row * seq_lens_stride)
+    prefix_len = tl.minimum(tl.maximum(seq_len - query_len, 0), window_size - 1)
+    tl.store(output_ptr + row * output_stride, query_len + prefix_len)
+
+
+def compute_gather_lens(
+    seq_lens: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    output: torch.Tensor,
+    window_size: int,
+) -> None:
+    """Fuse decode query-length, prefix clamp, and sum into one kernel."""
+    assert seq_lens.ndim == query_start_loc.ndim == output.ndim == 1
+    assert seq_lens.dtype == query_start_loc.dtype == output.dtype == torch.int32
+    assert seq_lens.shape[0] == output.shape[0]
+    assert query_start_loc.shape[0] == seq_lens.shape[0] + 1
+    if not seq_lens.is_cuda:
+        query_lens = query_start_loc[1:] - query_start_loc[:-1]
+        output.copy_(query_lens + (seq_lens - query_lens).clamp(0, window_size - 1))
+        return
+    _compute_gather_lens_kernel[(seq_lens.shape[0],)](
+        seq_lens,
+        seq_lens.stride(0),
+        query_start_loc,
+        query_start_loc.stride(0),
+        output,
+        output.stride(0),
+        seq_lens.shape[0],
+        window_size=window_size,
+        num_warps=1,
+    )
+
+
 # Representative pointer alignment variants for Triton pointer specialization.
 _COMBINE_TOPK_SWA_POINTER_INPUTS = zip_inputs(
     dict(

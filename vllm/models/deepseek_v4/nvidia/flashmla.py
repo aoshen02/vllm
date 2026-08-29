@@ -10,6 +10,7 @@ from vllm.forward_context import get_forward_context
 from vllm.models.deepseek_v4.attention import DeepseekV4Attention
 from vllm.models.deepseek_v4.common.ops import (
     combine_topk_swa_indices,
+    compute_gather_lens,
     compute_global_topk_indices_and_lens,
     dequantize_and_gather_k_cache,
 )
@@ -307,10 +308,12 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
         gather_lens_cpu = query_lens_cpu + torch.clamp(
             prefix_lens_cpu, min=0, max=self.window_size - 1
         )
-        query_lens = query_start_loc[1:] - query_start_loc[:-1]
-        prefix_lens = seq_lens - query_lens
-        gather_lens = query_lens + torch.clamp(
-            prefix_lens, min=0, max=self.window_size - 1
+        gather_lens = torch.empty_like(seq_lens)
+        compute_gather_lens(
+            seq_lens,
+            query_start_loc,
+            gather_lens,
+            self.window_size,
         )
 
         if int(query_lens_cpu.sum().item()) != num_decode_tokens:
