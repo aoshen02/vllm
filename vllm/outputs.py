@@ -145,6 +145,7 @@ class RequestOutput:
         num_cached_tokens: int | None = None,
         num_cache_creation_tokens: int | None = None,
         *,
+        prompt_token_logprobs: list[dict[int, float] | None] | None = None,
         kv_transfer_params: dict[str, Any] | None = None,
         ec_transfer_params: dict[str, Any] | None = None,
         # Forward compatibility, code that uses args added in new release can
@@ -159,6 +160,7 @@ class RequestOutput:
         self.prompt = prompt
         self.prompt_token_ids = prompt_token_ids
         self.prompt_logprobs = prompt_logprobs
+        self.prompt_token_logprobs = prompt_token_logprobs
         self.outputs = outputs
         self.finished = finished
         self.metrics = metrics
@@ -176,6 +178,8 @@ class RequestOutput:
         self.finished |= next_output.finished
         self.kv_transfer_params = next_output.kv_transfer_params
         self.ec_transfer_params = next_output.ec_transfer_params
+        if next_output.prompt_token_logprobs is not None:
+            self.prompt_token_logprobs = next_output.prompt_token_logprobs
 
         for next_completion in next_output.outputs:
             for i, completion in enumerate(self.outputs):
@@ -209,6 +213,7 @@ class RequestOutput:
             f"encoder_prompt={self.encoder_prompt!r}, "
             f"encoder_prompt_token_ids={self.encoder_prompt_token_ids}, "
             f"prompt_logprobs={self.prompt_logprobs}, "
+            f"prompt_token_logprobs={self.prompt_token_logprobs}, "
             f"outputs={self.outputs}, "
             f"finished={self.finished}, "
             f"metrics={self.metrics}, "
