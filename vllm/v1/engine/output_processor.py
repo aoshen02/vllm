@@ -693,11 +693,15 @@ class OutputProcessor:
                 if engine_core_output.prompt_token_logprobs is not None:
                     ids = engine_core_output.prompt_token_logprobs.token_ids.tolist()
                     scores = engine_core_output.prompt_token_logprobs.logprobs.tolist()
-                    req_state.prompt_token_logprobs = [
+                    scores_for_chunk = [
                         {int(token_id): float(score)
                          for token_id, score in zip(row_ids, row_scores)}
                         for row_ids, row_scores in zip(ids, scores)
                     ]
+                    if req_state.prompt_token_logprobs is None:
+                        req_state.prompt_token_logprobs = scores_for_chunk
+                    else:
+                        req_state.prompt_token_logprobs.extend(scores_for_chunk)
 
             # 4) Create and handle RequestOutput objects.
             if request_output := req_state.make_request_output(
