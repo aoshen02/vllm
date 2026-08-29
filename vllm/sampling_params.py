@@ -292,11 +292,9 @@ class SamplingParams(
     """Number of log probabilities to return per prompt token.
     When set to -1, return all `vocab_size` log probabilities."""
     prompt_logprob_token_ids: list[int] | None = None
-    """Token IDs to score at every prompt position.
-
-    This is an engine-level scoring primitive and is independent of the
-    sampled-token ``logprob_token_ids`` field.
-    """
+    """Token IDs to score at every prompt position."""
+    scoring_only: bool = False
+    """Finish after prefill without sampling an output token."""
     logprob_token_ids: list[int] | None = None
     """Specific token IDs to return logprobs for. More efficient than
     logprobs=-1 when you only need logprobs for a small set of tokens.
@@ -406,6 +404,7 @@ class SamplingParams(
         logprobs: int | None = None,
         prompt_logprobs: int | None = None,
         prompt_logprob_token_ids: list[int] | None = None,
+        scoring_only: bool = False,
         detokenize: bool = True,
         skip_special_tokens: bool = True,
         spaces_between_special_tokens: bool = True,
@@ -472,6 +471,7 @@ class SamplingParams(
             logprobs=logprobs,
             prompt_logprobs=prompt_logprobs,
             prompt_logprob_token_ids=prompt_logprob_token_ids,
+            scoring_only=scoring_only,
             logprob_token_ids=logprob_token_ids,
             detokenize=detokenize,
             skip_special_tokens=skip_special_tokens,
@@ -548,9 +548,21 @@ class SamplingParams(
             # If prefix caching is enabled,
             # the output of prompt logprobs may less than n_prompt_tokens,
             # we need to skip reading cache at this request.
-            self.skip_reading_prefix_cache = self.prompt_logprobs is not None
+            self.skip_reading_prefix_cache = (
+                self.prompt_logprobs is not None
+                or self.prompt_logprob_token_ids is not None
+            )
 
     def _verify_args(self) -> None:
+        if self.scoring_only and (
+            self.prompt_logprobs is None
+            and self.prompt_logprob_token_ids is None
+        ):
+            raise VLLMValidationError(
+                "scoring_only requires prompt_logprobs to be set.",
+                parameter="scoring_only",
+                value=True,
+            )
         _verify_num_sequences(self.n, "n")
         if not -2.0 <= self.presence_penalty <= 2.0:
             raise VLLMValidationError(
@@ -869,24 +881,26 @@ class SamplingParams(
 
         if self.prompt_logprob_token_ids is not None:
             n = len(self.prompt_logprob_token_ids)
-            if n > MAX_LOGPROB_TOKEN_IDS:
+            if n == 0 or n > MAX_LOGPROB_TOKEN_IDS:
                 raise VLLMValidationError(
-                    f"Requested prompt_logprob_token_ids of length {n}, "
-                    f"which is greater than max allowed: {MAX_LOGPROB_TOKEN_IDS}",
+                    f"Requested prompt_logprob_token_ids length must be in "
+                    f"[1, {MAX_LOGPROB_TOKEN_IDS}], got {n}",
                     parameter="prompt_logprob_token_ids",
                     value=n,
                 )
             vocab_size = model_config.get_vocab_size()
-            invalid = [
-                token_id for token_id in self.prompt_logprob_token_ids
+            invalid_token_ids = [
+                token_id
+                for token_id in self.prompt_logprob_token_ids
                 if token_id < 0 or token_id >= vocab_size
             ]
-            if invalid:
+            if invalid_token_ids:
                 raise VLLMValidationError(
-                    f"token_id(s) {invalid} in prompt_logprob_token_ids contain "
-                    f"out-of-vocab token ids. Vocabulary size: {vocab_size}",
+                    f"token_id(s) {invalid_token_ids} in "
+                    f"prompt_logprob_token_ids contain out-of-vocab token ids. "
+                    f"Vocabulary size: {vocab_size}",
                     parameter="prompt_logprob_token_ids",
-                    value=invalid,
+                    value=invalid_token_ids,
                 )
 
     def _validate_logit_bias(self, model_config: ModelConfig) -> None:

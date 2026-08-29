@@ -1923,8 +1923,23 @@ class Scheduler(SchedulerInterface):
             status_before_stop = request.status
             num_output_tokens_before = len(request._output_token_ids)
 
+            # Scoring-only requests consume the prompt but must not enter the
+            # decode loop. The model runner may return a sampled token for the
+            # final prefill row; discard it and finish after exposing scores.
+            scoring_only_prefill_done = (
+                request.sampling_params is not None
+                and request.sampling_params.scoring_only
+                and request.num_computed_tokens + num_tokens_scheduled
+                >= request.num_prompt_tokens
+                and not request.output_token_ids
+            )
+            if scoring_only_prefill_done:
+                new_token_ids = []
+                request.status = RequestStatus.FINISHED_STOPPED
+                stopped = True
+
             # Check for stop and update request status.
-            if new_token_ids:
+            if new_token_ids and not scoring_only_prefill_done:
                 new_token_ids, stopped = self._update_request_with_output(
                     request, new_token_ids, is_stale=output_is_stale
                 )
