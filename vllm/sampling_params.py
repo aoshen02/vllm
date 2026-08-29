@@ -291,6 +291,12 @@ class SamplingParams(
     prompt_logprobs: int | None = None
     """Number of log probabilities to return per prompt token.
     When set to -1, return all `vocab_size` log probabilities."""
+    prompt_logprob_token_ids: list[int] | None = None
+    """Token IDs to score at every prompt position.
+
+    This is an engine-level scoring primitive and is independent of the
+    sampled-token ``logprob_token_ids`` field.
+    """
     logprob_token_ids: list[int] | None = None
     """Specific token IDs to return logprobs for. More efficient than
     logprobs=-1 when you only need logprobs for a small set of tokens.
@@ -399,6 +405,7 @@ class SamplingParams(
         min_tokens: int = 0,
         logprobs: int | None = None,
         prompt_logprobs: int | None = None,
+        prompt_logprob_token_ids: list[int] | None = None,
         detokenize: bool = True,
         skip_special_tokens: bool = True,
         spaces_between_special_tokens: bool = True,
@@ -464,6 +471,7 @@ class SamplingParams(
             min_tokens=min_tokens,
             logprobs=logprobs,
             prompt_logprobs=prompt_logprobs,
+            prompt_logprob_token_ids=prompt_logprob_token_ids,
             logprob_token_ids=logprob_token_ids,
             detokenize=detokenize,
             skip_special_tokens=skip_special_tokens,
@@ -857,6 +865,28 @@ class SamplingParams(
                     f"which is greater than max allowed: {max_logprobs}",
                     parameter="prompt_logprobs",
                     value=num_prompt_logprobs,
+                )
+
+        if self.prompt_logprob_token_ids is not None:
+            n = len(self.prompt_logprob_token_ids)
+            if n > MAX_LOGPROB_TOKEN_IDS:
+                raise VLLMValidationError(
+                    f"Requested prompt_logprob_token_ids of length {n}, "
+                    f"which is greater than max allowed: {MAX_LOGPROB_TOKEN_IDS}",
+                    parameter="prompt_logprob_token_ids",
+                    value=n,
+                )
+            vocab_size = model_config.get_vocab_size()
+            invalid = [
+                token_id for token_id in self.prompt_logprob_token_ids
+                if token_id < 0 or token_id >= vocab_size
+            ]
+            if invalid:
+                raise VLLMValidationError(
+                    f"token_id(s) {invalid} in prompt_logprob_token_ids contain "
+                    f"out-of-vocab token ids. Vocabulary size: {vocab_size}",
+                    parameter="prompt_logprob_token_ids",
+                    value=invalid,
                 )
 
     def _validate_logit_bias(self, model_config: ModelConfig) -> None:
