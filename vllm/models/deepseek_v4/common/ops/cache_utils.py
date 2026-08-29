@@ -599,6 +599,43 @@ def combine_topk_swa_indices(
 _COMBINE_TOPK_SWA_NUM_WORKERS = 128
 
 
+@triton.jit
+def _fill_c128_topk_kernel(
+    output_ptr,
+    lens_ptr,
+    output_stride_0,
+    output_stride_1,
+    TOP_K: tl.constexpr,
+):
+    """Materialize graph-stable C128 indices and their invalid tail in one pass."""
+    row = tl.program_id(0)
+    offsets = tl.arange(0, TOP_K)
+    length = tl.load(lens_ptr + row)
+    values = tl.where(offsets < length, offsets, -1)
+    tl.store(
+        output_ptr + row * output_stride_0 + offsets * output_stride_1, values
+    )
+
+
+def fill_c128_topk(output: torch.Tensor, lengths: torch.Tensor) -> None:
+    """Fill C128 local Top-K indices, using -1 for padded entries."""
+    assert output.ndim == 2 and output.dtype == torch.int32
+    assert lengths.ndim == 1 and lengths.dtype == torch.int32
+    assert output.shape[0] == lengths.shape[0]
+    top_k = output.shape[1]
+    if top_k == 0 or top_k & (top_k - 1):
+        raise ValueError(
+            f"C128 top-k width must be a positive power of two, got {top_k}"
+        )
+    _fill_c128_topk_kernel[(output.shape[0],)](
+        output,
+        lengths,
+        output.stride(0),
+        output.stride(1),
+        TOP_K=top_k,
+        num_warps=4 if top_k <= 1024 else 8,
+    )
+
 # Representative pointer alignment variants for Triton pointer specialization.
 _COMBINE_TOPK_SWA_POINTER_INPUTS = zip_inputs(
     dict(

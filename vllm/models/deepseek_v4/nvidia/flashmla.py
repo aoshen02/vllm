@@ -12,6 +12,7 @@ from vllm.models.deepseek_v4.common.ops import (
     combine_topk_swa_indices,
     compute_global_topk_indices_and_lens,
     dequantize_and_gather_k_cache,
+    fill_c128_topk,
 )
 from vllm.models.deepseek_v4.nvidia.ops.o_proj import (
     compute_fp8_einsum_recipe,
@@ -103,10 +104,19 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                 assert self.topk_indices_buffer is not None
                 top_k = self.topk_indices_buffer.shape[-1]
             combined_topk = round_up(top_k + self.window_size, 128)
-            current_workspace_manager().get_simultaneous(
+            warmup_specs: list[tuple[tuple[int, ...], torch.dtype]] = [
                 ((self.PREFILL_CHUNK_SIZE, M, q.shape[-1]), torch.bfloat16),
                 ((self.max_num_batched_tokens, combined_topk), torch.int32),
                 ((self.max_num_batched_tokens,), torch.int32),
+            ]
+            if not swa_only and self.compress_ratio == 128:
+                # Reserve the same C128 decode buffer used by the real path so
+                # workspace locking cannot be tripped by the first replay.
+                warmup_specs.append(
+                    ((self.max_num_batched_tokens, top_k), torch.int32)
+                )
+            current_workspace_manager().get_simultaneous(
+                *warmup_specs,
             )
             output.zero_()
             return
@@ -393,25 +403,10 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
 
         if not swa_only and self.compress_ratio == 128:
             local_topk = workspace[3]
-            torch.arange(
-                top_k,
-                dtype=torch.int32,
-                device=q.device,
-                out=local_topk[0],
-            )
-            if num_decode_tokens > 1:
-                local_topk[1:].copy_(local_topk[0])
-            # ``top_k`` is the graph-stable padded C128 width, not the number
-            # of compressed rows currently visible to each token.  Leaving
-            # the padded tail as arange values makes BI canonicalization sort
-            # an invalid high index into the valid prefix at the first C128
-            # boundary (for example 127 instead of 0 when the true length is
-            # one).  Prefill metadata already represents this tail as -1.
             assert attn_metadata.c128a_decode_topk_lens is not None
-            local_topk.masked_fill_(
-                local_topk
-                >= attn_metadata.c128a_decode_topk_lens[:num_decode_tokens, None],
-                -1,
+            fill_c128_topk(
+                local_topk,
+                attn_metadata.c128a_decode_topk_lens[:num_decode_tokens],
             )
         assert local_topk is not None
         combined_indices, combined_lens = combine_topk_swa_indices(
