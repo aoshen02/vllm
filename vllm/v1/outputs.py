@@ -131,8 +131,6 @@ class LogprobsTensors(NamedTuple):
             self.cu_num_generated_tokens,
             cu_tensor,
         )
-
-
     def filter(self, mask: torch.Tensor) -> "LogprobsTensors":
         """Filter the logprobs tensors with the given bool mask."""
         assert self.cu_num_generated_tokens is None, (
@@ -201,6 +199,14 @@ class PromptTokenLogprobsTensors(NamedTuple):
 
     token_ids: torch.Tensor
     logprobs: torch.Tensor
+
+    def to_cpu_nonblocking(self) -> "PromptTokenLogprobsTensors":
+        if self.token_ids.device.type == "cpu":
+            return self
+        return PromptTokenLogprobsTensors(
+            self.token_ids.to("cpu", non_blocking=True),
+            self.logprobs.to("cpu", non_blocking=True),
+        )
 
     @staticmethod
     def cat(tensors: Sequence["PromptTokenLogprobsTensors"]):
@@ -366,8 +372,6 @@ class ModelRunnerOutput:
 
     # req_id -> caller-selected prompt token scores. Kept separate from
     # prompt_logprobs_dict because it has no implicit target/rank columns.
-    # TODO: Propagate this field through Scheduler/EngineCore when exposing the
-    # scoring API; it is intentionally not folded into prompt_logprobs_dict.
     prompt_token_logprobs_dict: dict[
         str, PromptTokenLogprobsTensors | None
     ] = field(default_factory=dict)

@@ -238,7 +238,7 @@ class EngineCoreOutput(
     # Appended last so `array_like` positional serialization stays compatible.
     spec_decode_metrics: RequestSpecDecodeMetrics | None = None
 
-    # Appended last to preserve array-like positional serialization.
+    # Keep optional additions at the end to preserve array-like serialization.
     prompt_token_logprobs: PromptTokenLogprobsTensors | None = None
 
     @property
