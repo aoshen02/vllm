@@ -11,7 +11,6 @@ from vllm.triton_utils import tl, triton
 from vllm.v1.outputs import LogprobsTensors, PromptTokenLogprobsTensors
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.sample.logprob import (
-    compute_token_logprobs,
     compute_topk_scores,
 )
 
@@ -335,11 +334,12 @@ def compute_prompt_token_logprobs_with_chunking(
         end_idx = start_idx + 1024
         logits = logits_fn(prompt_hidden_states[start_idx:end_idx])
         ids = candidate_token_ids[start_idx:end_idx]
-        scores = (
-            logits.gather(-1, ids).to(torch.float32)
-            if logits_mode
-            else compute_token_logprobs(logits, ids)
-        )
+        if logits_mode:
+            scores = logits.gather(-1, ids).to(torch.float32)
+        else:
+            # Avoid materializing a [tokens, vocab] log-softmax tensor.
+            scores = logits.gather(-1, ids) - logits.logsumexp(dim=-1, keepdim=True)
+            scores = scores.to(torch.float32)
         ids_chunks.append(ids)
         score_chunks.append(scores)
     if not ids_chunks:
