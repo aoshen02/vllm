@@ -293,8 +293,6 @@ class SamplingParams(
     When set to -1, return all `vocab_size` log probabilities."""
     prompt_logprob_token_ids: list[int] | None = None
     """Token IDs to score at every prompt position."""
-    scoring_only: bool = False
-    """Finish after prefill without sampling an output token."""
     logprob_token_ids: list[int] | None = None
     """Specific token IDs to return logprobs for. More efficient than
     logprobs=-1 when you only need logprobs for a small set of tokens.
@@ -404,7 +402,6 @@ class SamplingParams(
         logprobs: int | None = None,
         prompt_logprobs: int | None = None,
         prompt_logprob_token_ids: list[int] | None = None,
-        scoring_only: bool = False,
         detokenize: bool = True,
         skip_special_tokens: bool = True,
         spaces_between_special_tokens: bool = True,
@@ -471,7 +468,6 @@ class SamplingParams(
             logprobs=logprobs,
             prompt_logprobs=prompt_logprobs,
             prompt_logprob_token_ids=prompt_logprob_token_ids,
-            scoring_only=scoring_only,
             logprob_token_ids=logprob_token_ids,
             detokenize=detokenize,
             skip_special_tokens=skip_special_tokens,
@@ -554,16 +550,6 @@ class SamplingParams(
             )
 
     def _verify_args(self) -> None:
-        if self.scoring_only and (
-            self.prompt_logprobs is None
-            and self.prompt_logprob_token_ids is None
-        ):
-            raise VLLMValidationError(
-                "scoring_only requires prompt_logprobs or "
-                "prompt_logprob_token_ids to be set.",
-                parameter="scoring_only",
-                value=True,
-            )
         _verify_num_sequences(self.n, "n")
         if not -2.0 <= self.presence_penalty <= 2.0:
             raise VLLMValidationError(
