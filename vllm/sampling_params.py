@@ -559,7 +559,8 @@ class SamplingParams(
             and self.prompt_logprob_token_ids is None
         ):
             raise VLLMValidationError(
-                "scoring_only requires prompt_logprobs to be set.",
+                "scoring_only requires prompt_logprobs or "
+                "prompt_logprob_token_ids to be set.",
                 parameter="scoring_only",
                 value=True,
             )
