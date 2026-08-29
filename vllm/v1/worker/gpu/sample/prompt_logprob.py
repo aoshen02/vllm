@@ -56,25 +56,29 @@ class PromptLogprobsWorker:
         """Compute fixed-ID scores and aggregate them across prompt chunks."""
         if not self.prompt_logprob_token_ids:
             return {}
-        rows: list[list[int]] = []
-        for i, req_id in enumerate(input_batch.req_ids):
-            nrows = int(input_batch.query_start_loc_np[i + 1]) - int(
-                input_batch.query_start_loc_np[i]
-            )
-            rows.extend([self.prompt_logprob_token_ids.get(req_id, [])] * nrows)
-        max_width = max((len(row) for row in rows), default=0)
+        max_width = max(
+            (
+                len(self.prompt_logprob_token_ids.get(req_id, []))
+                for req_id in input_batch.req_ids
+            ),
+            default=0,
+        )
         if max_width == 0:
             return {}
+        num_rows = int(input_batch.query_start_loc_np[-1])
         candidate_ids = torch.zeros(
-            (len(rows), max_width), dtype=torch.int64, device=hidden_states.device
+            (num_rows, max_width), dtype=torch.int64, device=hidden_states.device
         )
-        for row, ids in enumerate(rows):
+        for i, req_id in enumerate(input_batch.req_ids):
+            start = int(input_batch.query_start_loc_np[i])
+            end = int(input_batch.query_start_loc_np[i + 1])
+            ids = self.prompt_logprob_token_ids.get(req_id, [])
             if ids:
-                candidate_ids[row, : len(ids)] = torch.as_tensor(
+                candidate_ids[start:end, : len(ids)] = torch.as_tensor(
                     ids, dtype=torch.int64, device=hidden_states.device
                 )
         scores = compute_prompt_token_logprobs_with_chunking(
-            candidate_ids, hidden_states[: len(rows)], logits_fn, self.logprobs_mode
+            candidate_ids, hidden_states[:num_rows], logits_fn, self.logprobs_mode
         )
         out: dict[str, PromptTokenLogprobsTensors] = {}
         for i, req_id in enumerate(input_batch.req_ids):

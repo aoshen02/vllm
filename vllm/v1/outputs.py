@@ -209,6 +209,12 @@ class PromptTokenLogprobsTensors(NamedTuple):
             self.logprobs.to("cpu", non_blocking=True),
         )
 
+    def to_dicts(self) -> list[dict[int, float] | None]:
+        return [
+            {int(token_id): float(score) for token_id, score in zip(ids, scores)}
+            for ids, scores in zip(self.token_ids.tolist(), self.logprobs.tolist())
+        ]
+
     @staticmethod
     def cat(tensors: Sequence["PromptTokenLogprobsTensors"]):
         return PromptTokenLogprobsTensors(

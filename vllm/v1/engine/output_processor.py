@@ -691,15 +691,9 @@ class OutputProcessor:
                 # if required.
                 req_state.logprobs_processor.update_from_output(engine_core_output)
                 if engine_core_output.prompt_token_logprobs is not None:
-                    ids = engine_core_output.prompt_token_logprobs.token_ids.tolist()
-                    scores = engine_core_output.prompt_token_logprobs.logprobs.tolist()
-                    scores_for_chunk: list[dict[int, float] | None] = [
-                        {
-                            int(token_id): float(score)
-                            for token_id, score in zip(row_ids, row_scores)
-                        }
-                        for row_ids, row_scores in zip(ids, scores)
-                    ]
+                    scores_for_chunk: list[dict[int, float] | None] = (
+                        engine_core_output.prompt_token_logprobs.to_dicts()
+                    )
                     if req_state.prompt_token_logprobs is None:
                         req_state.prompt_token_logprobs = scores_for_chunk
                     else:
