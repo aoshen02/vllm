@@ -29,7 +29,7 @@ def main() -> None:
     p.add_argument("--prompt-tokens", type=int, default=8192)
     p.add_argument("--output-tokens", type=int, default=1000)
     p.add_argument("--top-k", type=int, default=8)
-    p.add_argument("--max-union", type=int, default=128)
+    p.add_argument("--max-union", type=int, default=16384)
     p.add_argument("--teacher-only", action="store_true")
     p.add_argument("--tensor-parallel-size", type=int, default=1)
     p.add_argument("--gpu-memory-utilization", type=float, default=0.9)
