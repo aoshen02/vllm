@@ -28,6 +28,9 @@ _SAMPLING_EPS = 1e-5
 _MAX_TEMP = 1e-2
 
 MAX_LOGPROB_TOKEN_IDS = 128
+# Prompt scoring gathers one row per prompt position, so OPD's global union
+# can be much larger than the decode-only fixed-ID request limit.
+MAX_PROMPT_LOGPROB_TOKEN_IDS = 16384
 """Upper bound on `SamplingParams.logprob_token_ids` list length. Must match
 the per-request row width allocated by the sampler's `LogprobTokenIdsState`."""
 
@@ -868,10 +871,10 @@ class SamplingParams(
 
         if self.prompt_logprob_token_ids is not None:
             n = len(self.prompt_logprob_token_ids)
-            if n == 0 or n > MAX_LOGPROB_TOKEN_IDS:
+            if n == 0 or n > MAX_PROMPT_LOGPROB_TOKEN_IDS:
                 raise VLLMValidationError(
                     f"Requested prompt_logprob_token_ids length must be in "
-                    f"[1, {MAX_LOGPROB_TOKEN_IDS}], got {n}",
+                    f"[1, {MAX_PROMPT_LOGPROB_TOKEN_IDS}], got {n}",
                     parameter="prompt_logprob_token_ids",
                     value=n,
                 )
