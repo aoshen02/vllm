@@ -288,10 +288,9 @@ def compute_prompt_logprobs_with_chunking(
     ranks = []
     logits_mode = logprobs_mode in ("raw_logits", "processed_logits")
     prompt_token_ids = prompt_token_ids.to(torch.int64)
-    for start_idx in range(0, prompt_token_ids.shape[0], CHUNK_SIZE):
-        end_idx = start_idx + CHUNK_SIZE
-        # NOTE(woosuk): logits_fn can be slow because it involves all-gather.
-        prompt_logits = logits_fn(prompt_hidden_states[start_idx:end_idx])
+    for start_idx, end_idx, prompt_logits in _prompt_logits_chunks(
+        prompt_hidden_states, logits_fn, CHUNK_SIZE
+    ):
         requested_num = (
             prompt_logits.shape[-1]
             if num_prompt_logprobs == -1
@@ -331,9 +330,9 @@ def compute_prompt_token_logprobs_with_chunking(
     ids_chunks: list[torch.Tensor] = []
     score_chunks: list[torch.Tensor] = []
     logits_mode = logprobs_mode in ("raw_logits", "processed_logits")
-    for start_idx in range(0, candidate_token_ids.shape[0], 1024):
-        end_idx = start_idx + 1024
-        logits = logits_fn(prompt_hidden_states[start_idx:end_idx])
+    for start_idx, end_idx, logits in _prompt_logits_chunks(
+        prompt_hidden_states, logits_fn, 1024
+    ):
         ids = candidate_token_ids[start_idx:end_idx]
         scores = (
             logits.gather(-1, ids).to(torch.float32)
@@ -353,3 +352,14 @@ def compute_prompt_token_logprobs_with_chunking(
         torch.cat(ids_chunks) if len(ids_chunks) > 1 else ids_chunks[0],
         torch.cat(score_chunks) if len(score_chunks) > 1 else score_chunks[0],
     )
+
+
+def _prompt_logits_chunks(
+    hidden_states: torch.Tensor,
+    logits_fn: Callable[[torch.Tensor], torch.Tensor],
+    chunk_size: int,
+):
+    for start_idx in range(0, hidden_states.shape[0], chunk_size):
+        end_idx = start_idx + chunk_size
+        # NOTE(woosuk): logits_fn can be slow because it involves all-gather.
+        yield start_idx, end_idx, logits_fn(hidden_states[start_idx:end_idx])
