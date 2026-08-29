@@ -25,6 +25,7 @@ def main() -> None:
     p.add_argument("--output-tokens", type=int, default=1000)
     p.add_argument("--top-k", type=int, default=8)
     p.add_argument("--max-union", type=int, default=128)
+    p.add_argument("--teacher-only", action="store_true")
     p.add_argument("--tensor-parallel-size", type=int, default=1)
     p.add_argument("--gpu-memory-utilization", type=float, default=0.9)
     args = p.parse_args()
@@ -62,6 +63,17 @@ def main() -> None:
             f"{args.max_union}; use per-position candidates (M2) or raise "
             "the limit deliberately."
         )
+    if args.teacher_only:
+        print(
+            {
+                "prompt_tokens": args.prompt_tokens,
+                "output_tokens": args.output_tokens,
+                "teacher_top_k": args.top_k,
+                "union_size": len(union),
+                "teacher_ms": teacher_ms,
+            }
+        )
+        return
 
     del teacher
     student = LLM(model=args.student, **common)
