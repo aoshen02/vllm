@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 """Teacher-union/student fixed-ID prefill benchmark.
 
 The teacher run supplies a global union of natural prompt top-k IDs. The
@@ -93,8 +98,8 @@ def main() -> None:
             f"expected {args.prompt_tokens - 1} score rows, got "
             f"{None if scores is None else len(scores)}"
         )
-    fixed_peak_memory = torch.cuda.max_memory_allocated()
-    torch.cuda.reset_peak_memory_stats()
+    fixed_peak_memory = torch.accelerator.max_memory_allocated()
+    torch.accelerator.reset_peak_memory_stats()
     start = time.perf_counter()
     student.generate(
         [{"prompt_token_ids": prompt_ids}],
@@ -111,7 +116,9 @@ def main() -> None:
             "student_fixed_ids_ms": student_ms,
             "student_baseline_ms": baseline_ms,
             "student_fixed_peak_memory_bytes": fixed_peak_memory,
-            "student_baseline_peak_memory_bytes": torch.cuda.max_memory_allocated(),
+            "student_baseline_peak_memory_bytes": (
+                torch.accelerator.max_memory_allocated()
+            ),
         }
     )
 
