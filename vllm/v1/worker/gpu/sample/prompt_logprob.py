@@ -81,15 +81,21 @@ class PromptLogprobsWorker:
                 continue
             start = int(input_batch.query_start_loc_np[i])
             end = int(input_batch.query_start_loc_np[i + 1])
+            state_idx = int(input_batch.idx_mapping_np[i])
+            prefill_end = int(input_batch.num_computed_prefill_tokens_np[i]) + int(
+                input_batch.num_scheduled_tokens[i]
+            )
+            # The final prompt row predicts the first decode token and is not
+            # a prompt-position score, matching the existing prompt-logprobs
+            # output convention.
+            if prefill_end >= int(prompt_lens[state_idx]):
+                end -= 1
             part = PromptTokenLogprobsTensors(
                 scores.token_ids[start:end, :len(ids)],
                 scores.logprobs[start:end, :len(ids)],
             )
             pending = self.in_progress_prompt_token_logprobs[req_id]
-            computed_end = int(input_batch.num_computed_prefill_tokens_np[i]) + int(
-                input_batch.num_scheduled_tokens[i]
-            )
-            if computed_end < int(prompt_lens[input_batch.idx_mapping_np[i]]):
+            if prefill_end < int(prompt_lens[state_idx]):
                 pending.append(part)
                 continue
             if pending:
