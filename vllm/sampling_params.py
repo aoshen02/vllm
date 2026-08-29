@@ -902,6 +902,12 @@ class SamplingParams(
                     parameter="prompt_logprob_token_ids",
                     value=invalid_token_ids,
                 )
+            if len(set(self.prompt_logprob_token_ids)) != n:
+                raise VLLMValidationError(
+                    "prompt_logprob_token_ids must not contain duplicates.",
+                    parameter="prompt_logprob_token_ids",
+                    value=self.prompt_logprob_token_ids,
+                )
 
     def _validate_logit_bias(self, model_config: ModelConfig) -> None:
         """Validate logit_bias token IDs are within vocabulary range."""
