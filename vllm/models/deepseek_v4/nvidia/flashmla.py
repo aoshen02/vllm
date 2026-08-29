@@ -12,6 +12,7 @@ from vllm.models.deepseek_v4.common.ops import (
     combine_topk_swa_indices,
     compute_global_topk_indices_and_lens,
     dequantize_and_gather_k_cache,
+    zero_invalid_lens,
 )
 from vllm.models.deepseek_v4.nvidia.ops.o_proj import (
     compute_fp8_einsum_recipe,
@@ -426,8 +427,9 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
             max_compressed,
             out=(combined_indices_out, combined_lens_out),
         )
-        combined_lens.masked_fill_(
-            ~swa_metadata.is_valid_token[:num_decode_tokens], 0
+        zero_invalid_lens(
+            combined_lens,
+            swa_metadata.is_valid_token[:num_decode_tokens],
         )
         flash_mla_sparse_fwd(
             q=q,

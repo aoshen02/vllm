@@ -599,6 +599,35 @@ def combine_topk_swa_indices(
 _COMBINE_TOPK_SWA_NUM_WORKERS = 128
 
 
+@triton.jit
+def _zero_invalid_lens_kernel(
+    lens_ptr, lens_stride, valid_ptr, valid_stride, n_elements
+):
+    row = tl.program_id(0)
+    if row < n_elements:
+        value = tl.load(lens_ptr + row * lens_stride)
+        is_valid = tl.load(valid_ptr + row * valid_stride)
+        tl.store(lens_ptr + row * lens_stride, tl.where(is_valid, value, 0))
+
+
+def zero_invalid_lens(lens: torch.Tensor, is_valid: torch.Tensor) -> None:
+    """Set lengths for invalid tokens to zero without a generic elementwise op."""
+    assert lens.ndim == 1 and lens.dtype == torch.int32
+    assert is_valid.ndim == 1 and is_valid.dtype == torch.bool
+    assert lens.shape == is_valid.shape
+    if not lens.is_cuda:
+        lens.masked_fill_(~is_valid, 0)
+        return
+    _zero_invalid_lens_kernel[(lens.shape[0],)](
+        lens,
+        lens.stride(0),
+        is_valid,
+        is_valid.stride(0),
+        lens.shape[0],
+        num_warps=1,
+    )
+
+
 # Representative pointer alignment variants for Triton pointer specialization.
 _COMBINE_TOPK_SWA_POINTER_INPUTS = zip_inputs(
     dict(
