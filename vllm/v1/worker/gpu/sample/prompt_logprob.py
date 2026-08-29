@@ -10,8 +10,10 @@ from vllm.sampling_params import SamplingParams
 from vllm.triton_utils import tl, triton
 from vllm.v1.outputs import LogprobsTensors, PromptTokenLogprobsTensors
 from vllm.v1.worker.gpu.input_batch import InputBatch
-from vllm.v1.worker.gpu.sample.logprob import compute_topk_scores
-from vllm.v1.worker.gpu.sample.logprob import compute_token_logprobs
+from vllm.v1.worker.gpu.sample.logprob import (
+    compute_token_logprobs,
+    compute_topk_scores,
+)
 
 
 class PromptLogprobsWorker:
@@ -68,16 +70,16 @@ class PromptLogprobsWorker:
         )
         for row, ids in enumerate(rows):
             if ids:
-                candidate_ids[row, :len(ids)] = torch.as_tensor(
+                candidate_ids[row, : len(ids)] = torch.as_tensor(
                     ids, dtype=torch.int64, device=hidden_states.device
                 )
         scores = compute_prompt_token_logprobs_with_chunking(
-            candidate_ids, hidden_states[:len(rows)], logits_fn, self.logprobs_mode
+            candidate_ids, hidden_states[: len(rows)], logits_fn, self.logprobs_mode
         )
         out: dict[str, PromptTokenLogprobsTensors] = {}
         for i, req_id in enumerate(input_batch.req_ids):
-            ids = self.prompt_logprob_token_ids.get(req_id)
-            if ids is None:
+            candidate_ids_for_req = self.prompt_logprob_token_ids.get(req_id)
+            if candidate_ids_for_req is None:
                 continue
             start = int(input_batch.query_start_loc_np[i])
             end = int(input_batch.query_start_loc_np[i + 1])
@@ -91,8 +93,8 @@ class PromptLogprobsWorker:
             if prefill_end >= int(prompt_lens[state_idx]):
                 end -= 1
             part = PromptTokenLogprobsTensors(
-                scores.token_ids[start:end, :len(ids)],
-                scores.logprobs[start:end, :len(ids)],
+                scores.token_ids[start:end, : len(candidate_ids_for_req)],
+                scores.logprobs[start:end, : len(candidate_ids_for_req)],
             )
             pending = self.in_progress_prompt_token_logprobs[req_id]
             if prefill_end < int(prompt_lens[state_idx]):

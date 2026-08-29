@@ -131,6 +131,7 @@ class LogprobsTensors(NamedTuple):
             self.cu_num_generated_tokens,
             cu_tensor,
         )
+
     def filter(self, mask: torch.Tensor) -> "LogprobsTensors":
         """Filter the logprobs tensors with the given bool mask."""
         assert self.cu_num_generated_tokens is None, (
@@ -372,9 +373,9 @@ class ModelRunnerOutput:
 
     # req_id -> caller-selected prompt token scores. Kept separate from
     # prompt_logprobs_dict because it has no implicit target/rank columns.
-    prompt_token_logprobs_dict: dict[
-        str, PromptTokenLogprobsTensors | None
-    ] = field(default_factory=dict)
+    prompt_token_logprobs_dict: dict[str, PromptTokenLogprobsTensors] = field(
+        default_factory=dict
+    )
 
     # [num_reqs, hidden_size]
     pooler_output: list[torch.Tensor | None] | None = None

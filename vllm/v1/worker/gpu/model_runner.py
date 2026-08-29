@@ -68,6 +68,7 @@ from vllm.v1.outputs import (
     DraftTokenIds,
     ECConnectorOutput,
     ModelRunnerOutput,
+    PromptTokenLogprobsTensors,
     RoutedExpertsTensors,
 )
 from vllm.v1.worker.block_table import get_block_table_width
@@ -1859,7 +1860,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.req_states.num_computed_tokens.gpu,
             self.req_states.prompt_len.np,
         )
-        prompt_token_logprobs_dict = (
+        prompt_token_logprobs_dict: dict[str, PromptTokenLogprobsTensors] = (
             self.prompt_logprobs_worker.compute_prompt_token_logprobs(
                 self.model.compute_logits,
                 hidden_states,
