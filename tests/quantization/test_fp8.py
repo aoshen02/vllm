@@ -487,13 +487,50 @@ def test_fp8_reloading(
 
     method.process_weights_after_loading(layer)
 
+    runtime_state = None
+    if isinstance(method, Fp8MoEMethod):
+        runtime_parameters = {
+            name: getattr(layer, name)
+            for name in (
+                "w13_weight",
+                "w2_weight",
+                f"w13_{method.weight_scale_name}",
+                f"w2_{method.weight_scale_name}",
+            )
+        }
+        runtime_ptrs = {
+            name: parameter.data_ptr() for name, parameter in runtime_parameters.items()
+        }
+        moe_kernel = method.moe_kernel
+        moe_quant_config = method.moe_quant_config
+        runtime_state = (
+            runtime_parameters,
+            runtime_ptrs,
+            moe_kernel,
+            moe_quant_config,
+        )
+
     # test reloading works after loading
     for name, shape, _ in original_metadata:
         param = getattr(layer, name)
         weight_loader = getattr(param, "weight_loader", default_weight_loader)
-        weight_loader(param, torch.zeros(shape))  # cannot use empty
+        weight_loader(param, torch.ones(shape))
 
     method.process_weights_after_loading(layer)
+
+    if runtime_state is not None:
+        (
+            runtime_parameters,
+            runtime_ptrs,
+            moe_kernel,
+            moe_quant_config,
+        ) = runtime_state
+        assert method.moe_kernel is moe_kernel
+        assert method.moe_quant_config is moe_quant_config
+        for name, parameter in runtime_parameters.items():
+            assert getattr(layer, name) is parameter
+            assert parameter.data_ptr() == runtime_ptrs[name]
+        assert torch.count_nonzero(layer.w13_weight) == layer.w13_weight.numel()
 
 
 def test_kv_cache_scale_sync_to_host_copies():

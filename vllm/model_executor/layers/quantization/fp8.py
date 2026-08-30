@@ -28,6 +28,7 @@ from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEQuantConfig,
 )
 from vllm.model_executor.layers.fused_moe.oracle.fp8 import (
+    Fp8MoeBackend,
     convert_to_fp8_moe_kernel_format,
     make_fp8_moe_kernel,
     make_fp8_moe_quant_config,
@@ -706,23 +707,37 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             w2_input_scale=w2_input_scale,
         )
 
-        # Replace parameters with updated versions. Note that this helper
-        # function ensures the replacement is compatible with RL weight reloads.
-        replace_parameter(layer, "w13_weight", w13)
-        replace_parameter(layer, "w2_weight", w2)
-        replace_parameter(layer, f"w13_{self.weight_scale_name}", w13_scale)
-        replace_parameter(layer, f"w2_{self.weight_scale_name}", w2_scale)
-
-        self.moe_quant_config = self.get_fused_moe_quant_config(layer)
-        assert self.moe_quant_config is not None
-        assert self.experts_cls is not None
-        self.moe_kernel = make_fp8_moe_kernel(
-            moe_quant_config=self.moe_quant_config,
-            moe_config=self.moe,
-            fp8_backend=self.fp8_backend,
-            experts_cls=self.experts_cls,
-            routing_tables=layer._expert_routing_tables(),
+        reuse_kernel = (
+            self.moe_kernel is not None
+            and self.block_quant
+            and self.fp8_backend == Fp8MoeBackend.TRITON
         )
+        replace_parameter(layer, "w13_weight", w13, prefer_copy=reuse_kernel)
+        replace_parameter(layer, "w2_weight", w2, prefer_copy=reuse_kernel)
+        replace_parameter(
+            layer,
+            f"w13_{self.weight_scale_name}",
+            w13_scale,
+            prefer_copy=reuse_kernel,
+        )
+        replace_parameter(
+            layer,
+            f"w2_{self.weight_scale_name}",
+            w2_scale,
+            prefer_copy=reuse_kernel,
+        )
+
+        if not reuse_kernel:
+            self.moe_quant_config = self.get_fused_moe_quant_config(layer)
+            assert self.moe_quant_config is not None
+            assert self.experts_cls is not None
+            self.moe_kernel = make_fp8_moe_kernel(
+                moe_quant_config=self.moe_quant_config,
+                moe_config=self.moe,
+                fp8_backend=self.fp8_backend,
+                experts_cls=self.experts_cls,
+                routing_tables=layer._expert_routing_tables(),
+            )
 
     def process_weights_after_loading(self, layer: RoutedExperts) -> None:
         # Allow for accessing weights and scales in standard way.
