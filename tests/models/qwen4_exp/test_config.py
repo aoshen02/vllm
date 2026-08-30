@@ -111,13 +111,14 @@ def test_qwen4_exp_mtp_override_sets_draft_config(
     assert draft_config.n_predict == 1
 
 
-def test_qwen4_exp_model_state_prepares_ngram_context() -> None:
+def test_qwen4_exp_model_state_rebuilds_ngram_context_offsets() -> None:
     model_state = object.__new__(Qwen4ExpModelState)
     model_state.uses_ngram_embedding = True
     model_state.ngram_context_len = 3
     model_state.ngram_eos_token_id = 99
     model_state.ngram_context = torch.empty((4, 3), dtype=torch.int32)
-    model_state.ngram_context_offsets = torch.arange(-3, 0, dtype=torch.int64)
+    model_state.ngram_context_offsets = torch.zeros(3, dtype=torch.int64)
+    ngram_context_offsets_ptr = model_state.ngram_context_offsets.data_ptr()
     model_state.ple_query_start_loc = torch.empty(5, dtype=torch.int32)
 
     input_batch = SimpleNamespace(
@@ -144,6 +145,11 @@ def test_qwen4_exp_model_state_prepares_ngram_context() -> None:
         model_inputs["ngram_context"],
         torch.tensor([[99, 99, 20], [1, 2, 3], [99, 99, 99]], dtype=torch.int32),
     )
+    torch.testing.assert_close(
+        model_state.ngram_context_offsets,
+        torch.tensor([-3, -2, -1], dtype=torch.int64),
+    )
+    assert model_state.ngram_context_offsets.data_ptr() == ngram_context_offsets_ptr
 
 
 def test_qwen4_exp_model_state_prepares_stable_dummy_ngram_inputs() -> None:
