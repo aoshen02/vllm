@@ -118,7 +118,7 @@ def test_qwen4_exp_model_state_prepares_ngram_context() -> None:
     model_state.ngram_eos_token_id = 99
     model_state.ngram_context = torch.empty((4, 3), dtype=torch.int32)
     model_state.ngram_context_offsets = torch.arange(-3, 0, dtype=torch.int64)
-    model_state.ple_query_start_loc = torch.empty(5, dtype=torch.int32)
+    model_state.ple_query_start_loc = torch.arange(5, dtype=torch.int32)
 
     input_batch = SimpleNamespace(
         num_reqs=2,
@@ -139,6 +139,10 @@ def test_qwen4_exp_model_state_prepares_ngram_context() -> None:
     torch.testing.assert_close(
         model_inputs["query_start_loc"],
         torch.tensor([0, 2, 3, 3], dtype=torch.int32),
+    )
+    torch.testing.assert_close(
+        model_state.ple_query_start_loc,
+        torch.tensor([0, 2, 3, 3, 3], dtype=torch.int32),
     )
     torch.testing.assert_close(
         model_inputs["ngram_context"],
