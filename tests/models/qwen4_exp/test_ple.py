@@ -11,6 +11,11 @@ from torch.nn import functional as F
 import vllm.model_executor.layers.vocab_parallel_embedding as embedding_module
 import vllm.model_executor.parameter as parameter_module
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config
+from vllm.model_executor.model_loader.reload.layerwise import (
+    finalize_layerwise_reload,
+    initialize_layerwise_reload,
+    record_metadata_for_reloading,
+)
 from vllm.models.qwen4_exp.common.ple import (
     PLEShardOverlap,
     compute_ple_shard_overlap,
@@ -146,6 +151,92 @@ def test_ngram_embedding_loads_fp8_shards_and_global_scale() -> None:
         torch.cat((shard_0[2:4], shard_1[0:2])).float(),
     )
     assert torch.equal(module.ngram_embedding.weight_scale, weight_scale)
+
+
+def test_ngram_embedding_subtree_reloads_shards_in_place(monkeypatch) -> None:
+    monkeypatch.setattr(embedding_module, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(
+        embedding_module, "get_tensor_model_parallel_world_size", lambda: 1
+    )
+    monkeypatch.setattr(parameter_module, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(
+        parameter_module, "get_tensor_model_parallel_world_size", lambda: 1
+    )
+    config = SimpleNamespace(
+        ngram_size=2,
+        heads_per_ngram=1,
+        eos_token_id=0,
+        vocab_size=8,
+        split_ngram_parts=2,
+        ngram_vocab_size_base=3,
+        make_ngram_vocab_size_divisible_by=1,
+        seed=1234,
+    )
+    module = Qwen4ExpNGramEmbedding(
+        config,
+        embedding_dim=2,
+        ple_dense_layer_id=0,
+        max_total_tokens=4,
+        max_num_reqs=2,
+        prefix="ple_embedding",
+        layer_name="ple_embedding",
+        params_dtype=torch.float32,
+    )
+    model = nn.Module()
+    model.plain_layer = nn.Linear(2, 2)
+    model.ngram_layer = module
+    weight_ptr = module.ngram_embedding.weight.data_ptr()
+    buffer_ptrs = {
+        name: buffer.data_ptr() for name, buffer in module.named_buffers(recurse=False)
+    }
+    plain_weight_ptr = model.plain_layer.weight.data_ptr()
+    plain_bias_ptr = model.plain_layer.bias.data_ptr()
+
+    record_metadata_for_reloading(model)
+    for value in (1.0, 11.0):
+        initialize_layerwise_reload(model)
+
+        assert model.plain_layer.weight.is_meta
+        assert not module.ngram_embedding.weight.is_meta
+        assert all(not buffer.is_meta for buffer in module.buffers(recurse=False))
+        plain_weight = torch.full((2, 2), value)
+        plain_bias = torch.full((2,), value)
+        model.plain_layer.weight.weight_loader(model.plain_layer.weight, plain_weight)
+        model.plain_layer.bias.weight_loader(model.plain_layer.bias, plain_bias)
+        shard_0 = torch.tensor([[value, value + 1], [value + 2, value + 3]])
+        shard_1 = torch.tensor([[value + 4, value + 5]])
+        loaded = module.load_weights(
+            [
+                ("layer_multipliers", torch.tensor([7, 9])),
+                ("ngram_heads_offsets", torch.tensor([1])),
+                ("ngram_heads_vocab_sizes", torch.tensor([3])),
+                ("ngram_embedding.shard_0.weight", shard_0),
+                ("ngram_embedding.shard_1.weight", shard_1),
+            ]
+        )
+        finalize_layerwise_reload(model, SimpleNamespace(dtype=torch.float32))
+
+        assert loaded == {
+            "layer_multipliers",
+            "ngram_heads_offsets",
+            "ngram_heads_vocab_sizes",
+            "ngram_embedding.weight",
+        }
+        assert model.plain_layer.weight.data_ptr() == plain_weight_ptr
+        assert model.plain_layer.bias.data_ptr() == plain_bias_ptr
+        assert module.ngram_embedding.weight.data_ptr() == weight_ptr
+        assert {
+            name: buffer.data_ptr()
+            for name, buffer in module.named_buffers(recurse=False)
+        } == buffer_ptrs
+        torch.testing.assert_close(
+            module.ngram_embedding.weight, torch.cat((shard_0, shard_1))
+        )
+        torch.testing.assert_close(model.plain_layer.weight, plain_weight)
+        torch.testing.assert_close(model.plain_layer.bias, plain_bias)
+        assert torch.equal(module.layer_multipliers, torch.tensor([7, 9]))
+        assert torch.equal(module.ngram_heads_offsets, torch.tensor([1]))
+        assert torch.equal(module.ngram_heads_vocab_sizes, torch.tensor([3]))
 
 
 def _make_fp8_embedding_layer(

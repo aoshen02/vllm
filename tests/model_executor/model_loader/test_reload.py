@@ -218,6 +218,32 @@ def test_reload_lifecycle():
         assert tensor.__dict__ == materialized_tensor.__dict__
 
 
+def test_inplace_reload_marker_skips_module_subtree():
+    model = torch.nn.Module()
+    model.inplace = torch.nn.Module()
+    model.inplace._supports_inplace_weight_reload = True
+    model.inplace.child = torch.nn.Linear(2, 2)
+    model.regular = torch.nn.Linear(2, 2)
+    inplace_ptr = model.inplace.child.weight.data_ptr()
+    regular_ptr = model.regular.weight.data_ptr()
+
+    record_metadata_for_reloading(model)
+    initialize_layerwise_reload(model)
+
+    assert not model.inplace.child.weight.is_meta
+    assert model.regular.weight.is_meta
+    model.inplace.child.weight.data.fill_(3)
+    model.regular.weight.weight_loader(model.regular.weight, torch.full((2, 2), 5.0))
+    model.regular.bias.weight_loader(model.regular.bias, torch.full((2,), 7.0))
+    finalize_layerwise_reload(model, ModelConfig())
+
+    assert model.inplace.child.weight.data_ptr() == inplace_ptr
+    assert model.regular.weight.data_ptr() == regular_ptr
+    assert torch.equal(model.inplace.child.weight, torch.full((2, 2), 3.0))
+    assert torch.equal(model.regular.weight, torch.full((2, 2), 5.0))
+    assert torch.equal(model.regular.bias, torch.full((2,), 7.0))
+
+
 def test_restore_layer_replaces_postprocessed_tensor_attribute():
     layer = torch.nn.Linear(2, 3, bias=False)
     info = LayerReloadingInfo(

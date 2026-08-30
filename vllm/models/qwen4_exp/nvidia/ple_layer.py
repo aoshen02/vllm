@@ -261,6 +261,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         params_dtype: torch.dtype | None = None,
     ) -> None:
         super().__init__()
+        self._supports_inplace_weight_reload = True
         self.layer_name = layer_name
         self.embedding_dim = embedding_dim
         self.ngram_size = int(config.ngram_size)
