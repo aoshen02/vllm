@@ -160,6 +160,24 @@ def test_move_metatensors():
     assert tensor.__dict__ == meta_tensor.__dict__ == materialized_tensor.__dict__
 
 
+def test_layerwise_reload_skips_shared_target_layer_for_draft_transaction():
+    shared = torch.nn.Linear(2, 2, bias=False)
+    target = torch.nn.Sequential(shared)
+
+    record_metadata_for_reloading(target)
+    with load_source("embed.weight"):
+        shared.weight.weight_loader(shared.weight, torch.ones_like(shared.weight))
+    freeze_load_plan(target)
+
+    draft = torch.nn.Sequential(shared)
+    initialize_layerwise_reload(draft, excluded_layers=(shared,))
+    finalize_layerwise_reload(
+        draft, model_config=None, excluded_layers=(shared,)
+    )
+
+    assert not shared.weight.is_meta
+
+
 @pytest.mark.parametrize(
     "layer_cls",
     [_ReloadableMMEncoderAttention, _ReloadableAttentionLayer],

@@ -140,7 +140,9 @@ class NCCLWeightTransferEngine(
             initialize_layerwise_reload,
         )
 
-        initialize_layerwise_reload(self.model)
+        initialize_layerwise_reload(
+            self.model, excluded_layers=self._shared_update_modules
+        )
 
     def finish_weight_update(self) -> None:
         """Finalize layerwise reloading after all weights have been received."""
@@ -148,7 +150,11 @@ class NCCLWeightTransferEngine(
             finalize_layerwise_reload,
         )
 
-        finalize_layerwise_reload(self.model, self.model_config)
+        finalize_layerwise_reload(
+            self.model,
+            self.model_config,
+            excluded_layers=self._shared_update_modules,
+        )
 
     def receive_weights(self, update_info: NCCLWeightTransferUpdateInfo) -> None:
         """

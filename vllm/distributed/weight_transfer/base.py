@@ -199,6 +199,7 @@ class WeightTransferEngine(ABC, Generic[TInitInfo, TUpdateInfo]):
         self.model = model
         self._default_model_config = self.model_config
         self._default_model = model
+        self._shared_update_modules: tuple[torch.nn.Module, ...] = ()
 
     def set_weight_update_target(
         self,
@@ -208,11 +209,16 @@ class WeightTransferEngine(ABC, Generic[TInitInfo, TUpdateInfo]):
         """Set the model that will receive the active weight update."""
         self.model = model
         self.model_config = model_config
+        default_modules = set(self._default_model.modules())
+        self._shared_update_modules = tuple(
+            module for module in model.modules() if module in default_modules
+        )
 
     def reset_weight_update_target(self) -> None:
         """Restore weight updates to the engine's default target model."""
         self.model = self._default_model
         self.model_config = self._default_model_config
+        self._shared_update_modules = ()
 
     def parse_init_info(self, init_dict: dict[str, Any]) -> TInitInfo:
         """
