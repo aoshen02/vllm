@@ -44,6 +44,7 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -64,7 +65,7 @@ from vllm.model_executor.models.utils import (
     make_layers,
     maybe_prefix,
 )
-from vllm.model_executor.utils import set_weight_attrs
+from vllm.model_executor.utils import replace_parameter, set_weight_attrs
 from vllm.models.deepseek_v4.attention import DeepseekV4Attention
 from vllm.models.deepseek_v4.nvidia.flashinfer_sparse import (
     DeepseekV4FlashInferMLAAttention,
@@ -238,8 +239,7 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         set_weight_attrs(self.w2_weight_scale, weight_attrs)
         self.w2_weight_scale.quant_method = "block"
 
-        self._transformed_l1_weights: tuple[torch.Tensor, torch.Tensor] | None = None
-        self._transformed_l2_weights: tuple[torch.Tensor, torch.Tensor] | None = None
+        self.quant_method = DeepseekV4MegaMoEMethod()
 
         # Register in the static forward context so the custom-op wrapper
         # can look up this module by name from within a torch.compile graph.
@@ -314,10 +314,16 @@ class DeepseekV4MegaMoEExperts(nn.Module):
                 "to be multiples of 128."
             )
 
-    def finalize_weights(self) -> None:
-        if self._transformed_l1_weights is not None:
-            return
-
+    def _transform_weights(
+        self,
+    ) -> tuple[tuple[torch.Tensor, torch.Tensor], tuple[torch.Tensor, torch.Tensor]]:
+        if (
+            self.w13_weight is None
+            or self.w13_weight_scale is None
+            or self.w2_weight is None
+            or self.w2_weight_scale is None
+        ):
+            raise RuntimeError("MegaMoE source weights are unavailable for conversion")
         self._check_runtime_supported()
         from vllm.utils.deep_gemm import _import_deep_gemm
 
@@ -337,22 +343,23 @@ class DeepseekV4MegaMoEExperts(nn.Module):
             (1, 32),
             self.num_local_experts,
         )
-        self._transformed_l1_weights, self._transformed_l2_weights = (
-            deep_gemm.transform_weights_for_mega_moe(
-                (self.w13_weight.data.view(torch.int8).contiguous(), w13_scale),
-                (self.w2_weight.data.view(torch.int8).contiguous(), w2_scale),
-            )
+        return deep_gemm.transform_weights_for_mega_moe(
+            (self.w13_weight.data.view(torch.int8).contiguous(), w13_scale),
+            (self.w2_weight.data.view(torch.int8).contiguous(), w2_scale),
         )
-        # Drop the original loader-side parameters: the MegaMoE kernels only
-        # consume the transformed views above. transform_weights_for_mega_moe
-        # allocates a fresh tensor for the L1 weight (see _interleave_l1_weights)
-        # and fresh SF tensors for L1/L2; the L2 weight is the only tensor that
-        # aliases the original storage, and _transformed_l2_weights still holds
-        # it, so the storage stays live after we drop the Parameter.
-        self.w13_weight = None
-        self.w13_weight_scale = None
-        self.w2_weight = None
-        self.w2_weight_scale = None
+
+    def finalize_weights(self) -> None:
+        if (
+            self.w13_weight_scale.dtype != torch.uint8
+            and self.w2_weight_scale.dtype != torch.uint8
+        ):
+            return
+
+        l1_weights, l2_weights = self._transform_weights()
+        replace_parameter(self, "w13_weight", l1_weights[0])
+        replace_parameter(self, "w13_weight_scale", l1_weights[1])
+        replace_parameter(self, "w2_weight", l2_weights[0])
+        replace_parameter(self, "w2_weight_scale", l2_weights[1])
 
     def get_symm_buffer(self):
         from vllm.utils.deep_gemm import _import_deep_gemm
@@ -399,8 +406,6 @@ class DeepseekV4MegaMoEExperts(nn.Module):
 
     def get_expert_weights(self) -> list[torch.Tensor]:
         self.finalize_weights()
-        assert self._transformed_l1_weights is not None
-        assert self._transformed_l2_weights is not None
 
         def _to_eplb_view(name: str, t: torch.Tensor) -> torch.Tensor:
             """Return a (num_local_experts, -1) view with contiguous memory layout."""
@@ -420,10 +425,10 @@ class DeepseekV4MegaMoEExperts(nn.Module):
             )
 
         return [
-            _to_eplb_view("l1_packed", self._transformed_l1_weights[0]),
-            _to_eplb_view("l1_scale", self._transformed_l1_weights[1]),
-            _to_eplb_view("l2_weight", self._transformed_l2_weights[0]),
-            _to_eplb_view("l2_scale", self._transformed_l2_weights[1]),
+            _to_eplb_view("l1_packed", self.w13_weight),
+            _to_eplb_view("l1_scale", self.w13_weight_scale),
+            _to_eplb_view("l2_weight", self.w2_weight),
+            _to_eplb_view("l2_scale", self.w2_weight_scale),
         ]
 
     def update_expert_map(self) -> None:
@@ -493,12 +498,10 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         # We call it again here to cover the dummy weight loading case.
         self.finalize_weights()
 
-        assert self._transformed_l1_weights is not None
-        assert self._transformed_l2_weights is not None
         deep_gemm.fp8_fp4_mega_moe(
             y,
-            self._transformed_l1_weights,
-            self._transformed_l2_weights,
+            (self.w13_weight, self.w13_weight_scale),
+            (self.w2_weight, self.w2_weight_scale),
             symm_buffer,
             activation_clamp=activation_clamp,
             fast_math=fast_math,
@@ -507,6 +510,19 @@ class DeepseekV4MegaMoEExperts(nn.Module):
 
 
 DeepseekV4MegaMoEExperts.weight_loader.supports_moe_loading = True  # type: ignore[attr-defined]
+
+
+class DeepseekV4MegaMoEMethod(QuantizeMethodBase):
+    def create_weights(self, layer: nn.Module, *args, **kwargs) -> None:
+        raise NotImplementedError("MegaMoE weights are created by the model")
+
+    def apply(self, layer: nn.Module, *args, **kwargs) -> torch.Tensor:
+        raise NotImplementedError("MegaMoE is applied by the model")
+
+    def process_weights_after_loading(self, layer: nn.Module) -> None:
+        if not isinstance(layer, DeepseekV4MegaMoEExperts):
+            raise TypeError("DeepseekV4MegaMoEMethod requires MegaMoE experts")
+        layer.finalize_weights()
 
 
 class DeepseekV4MoE(nn.Module):
@@ -1473,7 +1489,6 @@ class DeepseekV4ForCausalLM(
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self, skip_substrs=["mtp."])
         loaded_params = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
-        self.model.finalize_mega_moe_weights()
         self.model.finalize_mhc_broadcast_weights()
         return loaded_params
 
