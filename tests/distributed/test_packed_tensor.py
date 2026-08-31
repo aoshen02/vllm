@@ -292,28 +292,40 @@ class TestPackedBroadcastRoundtrip:
 # --- Unit Tests: unpack_tensor ---
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-class TestUnpackTensor:
-    """Test the shared unpack_tensor function."""
+def test_unpack_tensor_clones_misaligned_dtype_slice():
+    prefix = torch.tensor([1, 2, 3], dtype=torch.uint8)
+    expected = torch.tensor([4, 5], dtype=torch.int64)
+    packed = torch.cat((prefix, expected.view(torch.uint8)))
 
-    def test_unpack_produces_independent_copies(self):
-        """Verify unpacked tensors don't share memory with packed buffer."""
-        original = torch.randn(10, dtype=torch.float32).cuda()
-        packed = original.contiguous().view(torch.uint8).view(-1)
+    result = unpack_tensor(
+        packed,
+        names=["prefix", "values"],
+        shapes=[[3], [2]],
+        dtypes=[torch.uint8, torch.int64],
+        tensor_sizes=[prefix.nbytes, expected.nbytes],
+    )
 
-        result = unpack_tensor(
-            packed,
-            names=["w"],
-            shapes=[[10]],
-            dtypes=[torch.float32],
-            tensor_sizes=[packed.numel()],
-        )
+    assert torch.equal(result[0][1], prefix)
+    assert result[0][1].data_ptr() == packed.data_ptr()
+    assert torch.equal(result[1][1], expected)
+    assert result[1][1].data_ptr() != packed[prefix.nbytes :].data_ptr()
 
-        # Mutate the packed buffer
-        packed.zero_()
 
-        # Unpacked tensor should be unaffected
-        assert torch.allclose(result[0][1], original)
+def test_unpack_tensor_keeps_aligned_nonzero_offset_view():
+    prefix = torch.arange(8, dtype=torch.uint8)
+    expected = torch.tensor([4, 5], dtype=torch.int64)
+    packed = torch.cat((prefix, expected.view(torch.uint8)))
+
+    result = unpack_tensor(
+        packed,
+        names=["prefix", "values"],
+        shapes=[[8], [2]],
+        dtypes=[torch.uint8, torch.int64],
+        tensor_sizes=[prefix.nbytes, expected.nbytes],
+    )
+
+    assert torch.equal(result[1][1], expected)
+    assert result[1][1].data_ptr() == packed[prefix.nbytes :].data_ptr()
 
 
 # --- Unit Tests: pack_tensors ---
