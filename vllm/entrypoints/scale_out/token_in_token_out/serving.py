@@ -11,7 +11,10 @@ import msgspec
 from fastapi import Request
 
 from vllm.engine.protocol import EngineClient
-from vllm.entrypoints.chat_utils import AsyncMultiModalItemTracker
+from vllm.entrypoints.chat_utils import (
+    AsyncMultiModalItemTracker,
+    parse_chat_message_content_part,
+)
 from vllm.entrypoints.generate.base.serving import (
     GenerateBaseServing,
     clamp_prompt_logprobs,
@@ -152,15 +155,7 @@ class ServingTokens(GenerateBaseServing):
             tracker = AsyncMultiModalItemTracker(self.model_config)
             mm_parser = tracker.create_parser()
             for part in request.content_parts:
-                ptype = part.get("type", "")
-                url = part.get("url")
-                uuid = part.get("uuid")
-                if ptype == "image_url":
-                    mm_parser.parse_image(url, uuid)
-                elif ptype == "audio_url":
-                    mm_parser.parse_audio(url, uuid)
-                elif ptype == "video_url":
-                    mm_parser.parse_video(url, uuid)
+                parse_chat_message_content_part(part, mm_parser)
             mm_data, mm_uuids = await tracker.resolve_items()
             prompt = TokensPrompt(prompt_token_ids=request.token_ids)
             if mm_data:

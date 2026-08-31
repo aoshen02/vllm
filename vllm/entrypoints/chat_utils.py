@@ -314,8 +314,17 @@ class CustomChatCompletionContentToolReferenceParam(TypedDict, total=False):
     """The content type."""
 
 
+class MediaContentPartParam(TypedDict, total=False):
+    """Flat media content part used by token-in/token-out APIs."""
+
+    type: Required[Literal["image_url", "audio_url", "video_url"]]
+    url: str | None
+    uuid: str | None
+
+
 ChatCompletionContentPartParam: TypeAlias = (
     OpenAIChatCompletionContentPartParam
+    | MediaContentPartParam
     | ChatCompletionContentPartAudioParam
     | ChatCompletionContentPartInputAudioParam
     | ChatCompletionContentPartVideoParam
@@ -1561,6 +1570,11 @@ def _parse_chat_message_content_mm_part(
     part_type = part.get("type", None)
     uuid = part.get("uuid", None)
 
+    if part_type in ("image_url", "audio_url", "video_url") and (
+        "url" in part or part_type not in part
+    ):
+        return part_type, cast(_ContentPart, part.get("url"))
+
     if isinstance(part_type, str) and part_type in MM_PARSER_MAP and uuid is None:  # noqa: E501
         content = MM_PARSER_MAP[part_type](part)
 
@@ -1670,7 +1684,7 @@ def _parse_chat_message_content_parts(
     mm_parser = mm_tracker.create_parser(mm_processor_kwargs=mm_processor_kwargs)
 
     for part in parts:
-        parse_res = _parse_chat_message_content_part(
+        parse_res = parse_chat_message_content_part(
             part,
             mm_parser,
             wrap_dicts=wrap_dicts,
@@ -1715,12 +1729,12 @@ def _reject_reserved_placeholder_in_text(text: str, model_config: ModelConfig) -
         )
 
 
-def _parse_chat_message_content_part(
+def parse_chat_message_content_part(
     part: ChatCompletionContentPartParam,
     mm_parser: BaseMultiModalContentParser,
     *,
-    wrap_dicts: bool,
-    interleave_strings: bool,
+    wrap_dicts: bool = False,
+    interleave_strings: bool = False,
 ) -> _ContentPart | None:
     """Parses a single part of a conversation. If wrap_dicts is True,
     structured dictionary pieces for texts and images will be

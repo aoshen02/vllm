@@ -18,7 +18,9 @@ from vllm.entrypoints.chat_utils import (
     MEDIA_CONNECTOR_REGISTRY,
     AsyncMultiModalItemTracker,
     ConversationMessage,
+    MediaContentPartParam,
     _postprocess_messages,
+    parse_chat_message_content_part,
     parse_chat_messages,
     parse_chat_messages_async,
 )
@@ -36,6 +38,39 @@ PHI3V_MODEL_ID = "microsoft/Phi-3.5-vision-instruct"
 QWEN2AUDIO_MODEL_ID = "Qwen/Qwen2-Audio-7B-Instruct"
 QWEN25OMNI_MODEL_ID = "Qwen/Qwen2.5-Omni-7B"
 MISTRAL_MODEL_ID = "mistralai/Mistral-Small-3.1-24B-Instruct-2503"
+
+
+@pytest.mark.parametrize(
+    ("part_type", "parser_method"),
+    [
+        ("image_url", "parse_image"),
+        ("audio_url", "parse_audio"),
+        ("video_url", "parse_video"),
+    ],
+)
+def test_parse_flat_media_content_part(
+    part_type: Literal["image_url", "audio_url", "video_url"],
+    parser_method: str,
+):
+    mm_parser = MagicMock()
+    part = MediaContentPartParam(
+        type=part_type,
+        url="data:media",
+        uuid="media-id",
+    )
+
+    parse_chat_message_content_part(part, mm_parser)
+
+    getattr(mm_parser, parser_method).assert_called_once_with("data:media", "media-id")
+
+
+def test_parse_flat_media_content_part_from_cache():
+    mm_parser = MagicMock()
+    part = MediaContentPartParam(type="image_url", uuid="media-id")
+
+    parse_chat_message_content_part(part, mm_parser)
+
+    mm_parser.parse_image.assert_called_once_with(None, "media-id")
 
 
 @pytest.fixture(scope="function")

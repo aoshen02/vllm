@@ -9,12 +9,25 @@ fail loudly if the validator semantics ever drift.
 
 import json
 
+import pytest
+from pydantic import ValidationError
+
 from vllm.entrypoints.scale_out.token_in_token_out.protocol import GenerateRequest
 from vllm.sampling_params import SamplingParams
 
 
 def _base_payload() -> dict:
     return {"token_ids": [1, 2, 3], "sampling_params": {}}
+
+
+def test_content_parts_reject_unknown_media_type():
+    payload = _base_payload()
+    payload["content_parts"] = [
+        {"type": "document_url", "url": "https://example.com/file"}
+    ]
+
+    with pytest.raises(ValidationError):
+        GenerateRequest.model_validate(payload)
 
 
 def test_omitted_max_tokens_is_not_provided():
