@@ -30,6 +30,7 @@ from vllm.model_executor.layers.linear import (
     ReplicatedLinear,
 )
 from vllm.model_executor.models.utils import maybe_prefix
+from vllm.model_executor.parameter import BasevLLMParameter
 
 from ..common.hyperconnection import (
     GroupedGemmaRMSNorm,
@@ -42,6 +43,52 @@ from .ops.hc import (
     hc_gate_mix,
     hc_silu,
 )
+
+
+class _ReplicatedZeroPaddedMergedColumnParallelLinear(MergedColumnParallelLinear):
+    """Keep a runtime-only tail shard initialized across weight reloads."""
+
+    def __init__(
+        self,
+        input_size: int,
+        output_sizes: list[int],
+        *,
+        padding_size: int,
+        **kwargs,
+    ) -> None:
+        assert padding_size >= 0
+        assert not padding_size or output_sizes[-1] == padding_size
+        self.padding_size = padding_size
+        super().__init__(input_size, output_sizes, disable_tp=True, **kwargs)
+
+    def _zero_padding(self, param: nn.Parameter) -> None:
+        if not self.padding_size:
+            return
+        output_dim = getattr(param, "output_dim", None)
+        assert output_dim == 0
+        param.data.narrow(
+            output_dim,
+            param.data.shape[output_dim] - self.padding_size,
+            self.padding_size,
+        ).zero_()
+
+    def weight_loader(
+        self,
+        param: nn.Parameter,
+        loaded_weight: torch.Tensor,
+        loaded_shard_id: tuple[int, ...] | int | None = None,
+    ) -> None:
+        super().weight_loader(param, loaded_weight, loaded_shard_id)
+        self._zero_padding(param)
+
+    def weight_loader_v2(
+        self,
+        param: BasevLLMParameter,
+        loaded_weight: torch.Tensor,
+        loaded_shard_id: tuple[int, ...] | int | None = None,
+    ) -> None:
+        super().weight_loader_v2(param, loaded_weight, loaded_shard_id)
+        self._zero_padding(param)
 
 
 # ---------------------------------------------------------------------------
@@ -93,16 +140,18 @@ class GatedResidual(nn.Module):
         # good alignment and performant implementation chosen by CuBLAS heuristics.
         self.pad_size = (-(self.lora_rank + self.hc_count)) % 16 if use_combine else 0
         if use_combine:
-            self.input_mix_weight_down_block_inject = MergedColumnParallelLinear(
-                self.hyper_hidden_size,
-                [self.lora_rank, self.hc_count]
-                + ([self.pad_size] if self.pad_size else []),
-                bias=False,
-                params_dtype=config.params_dtype,
-                quant_config=None,
-                prefix=maybe_prefix(prefix, "input_mix_weight_down_block_inject"),
-                return_bias=False,
-                disable_tp=True,
+            self.input_mix_weight_down_block_inject = (
+                _ReplicatedZeroPaddedMergedColumnParallelLinear(
+                    self.hyper_hidden_size,
+                    [self.lora_rank, self.hc_count]
+                    + ([self.pad_size] if self.pad_size else []),
+                    padding_size=self.pad_size,
+                    bias=False,
+                    params_dtype=config.params_dtype,
+                    quant_config=None,
+                    prefix=maybe_prefix(prefix, "input_mix_weight_down_block_inject"),
+                    return_bias=False,
+                )
             )
         else:
             self.input_mix_weight_down = ReplicatedLinear(
