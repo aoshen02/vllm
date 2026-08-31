@@ -76,6 +76,11 @@ class Qwen4ExpModelState(MambaHybridModelState):
 
         request_indices = input_batch.idx_mapping[:num_reqs].long()
         context_end = req_states.num_computed_tokens.gpu[request_indices].long()
+        torch.arange(
+            -self.ngram_context_len,
+            0,
+            out=self.ngram_context_offsets,
+        )
         token_indices = context_end.unsqueeze(1) + self.ngram_context_offsets
         valid_tokens = token_indices >= 0
         token_indices.clamp_min_(0)
