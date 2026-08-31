@@ -95,12 +95,25 @@ def initialize_layerwise_reload(model: torch.nn.Module):
     2. Load all cached weights
     3. Run quantization processing if applicable
     4. Copy processed values back to original tensor storage
+
+    Modules marked with ``_supports_inplace_weight_reload`` and their descendants
+    remain resident and unwrapped. Their loaders must update final runtime storage
+    directly without post-load processing.
     """
     # disable torchao reloading to avoid infinite recursion
     model._original_do_torchao_reload = getattr(model, "_do_torchao_reload", False)
     model._do_torchao_reload = False
 
+    inplace_reload_layers = {
+        descendant
+        for layer in model.modules()
+        if getattr(layer, "_supports_inplace_weight_reload", False)
+        for descendant in layer.modules()
+    }
     for layer in model.modules():
+        if layer in inplace_reload_layers:
+            continue
+
         info = get_layerwise_info(layer)
 
         # Skip if the layer has already been initialized

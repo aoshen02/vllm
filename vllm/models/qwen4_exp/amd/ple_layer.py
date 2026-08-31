@@ -177,6 +177,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         layer_name: str,
     ) -> None:
         super().__init__()
+        self._supports_inplace_weight_reload = True
         self.embedding_dim = embedding_dim
         self.layer_name = layer_name
         self.ngram_size = int(config.ngram_size)
