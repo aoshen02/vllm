@@ -11,6 +11,7 @@ from pydantic import (
 )
 
 from vllm.config import ModelConfig
+from vllm.entrypoints.chat_utils import MediaContentPartParam
 from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionLogProbs,
     ChatCompletionRequest,
@@ -104,7 +105,7 @@ class GenerateRequest(BaseModel):
     features: MultiModalFeatures | None = None
     """Multimodal hashes and placeholder positions (populated for MM inputs)."""
 
-    content_parts: list[dict[str, Any]] | None = None
+    content_parts: list[MediaContentPartParam] | None = None
     """Raw multimodal input; server resolves media. Mutually exclusive
     with ``features``."""
 
