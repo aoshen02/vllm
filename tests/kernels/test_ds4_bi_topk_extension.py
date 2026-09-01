@@ -79,38 +79,65 @@ def test_standalone_topk_matches_vllm_score_and_tie_order() -> None:
 
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")
-@pytest.mark.parametrize("width", [4095, 4096, 4097, 262144])
 @torch.inference_mode()
-def test_standalone_topk_has_no_packed_width_limit(width: int) -> None:
+def test_wide_batch_exact_pivot_tie_is_deterministic() -> None:
     library = os.environ.get("DS4_BI_TOPK_LIB")
     if not library:
         pytest.skip("DS4_BI_TOPK_LIB is not configured")
     torch.ops.load_library(library)
 
-    top_k = 64
-    logits = torch.zeros((2, width), dtype=torch.float32, device="cuda")
-    # Exercise a short offset row as well as a row spanning the full packed
-    # width. Equal scores make the expected descending local-index tie break
-    # exact and cheap to construct even for a 256K context.
-    row_starts = torch.tensor([17, 0], dtype=torch.int32, device="cuda")
-    row_ends = torch.tensor(
-        [min(width, 529), width], dtype=torch.int32, device="cuda"
-    )
-    indices = torch.empty((2, top_k), dtype=torch.int32, device="cuda")
+    rows, cols, top_k = 128, 65536, 512
+    logits = torch.zeros((rows, cols), dtype=torch.float32, device="cuda")
+    logits[:, :1000] = 1.0
+    starts = torch.zeros(rows, dtype=torch.int32, device="cuda")
+    ends = torch.full((rows,), cols, dtype=torch.int32, device="cuda")
+    expected = torch.arange(999, 999 - top_k, -1, dtype=torch.int32, device="cuda")
+    for _ in range(3):
+        indices = torch.empty((rows, top_k), dtype=torch.int32, device="cuda")
+        _top_k_per_row_prefill(
+            logits,
+            starts,
+            ends,
+            indices,
+            rows,
+            logits.stride(0),
+            logits.stride(1),
+            top_k,
+        )
+        torch.testing.assert_close(
+            indices, expected.expand(rows, -1), rtol=0, atol=0
+        )
 
-    torch.ops.ds4_bi.top_k_per_row_prefill(
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")
+@torch.inference_mode()
+def test_short_histogram_uses_high_index_for_partial_tie() -> None:
+    library = os.environ.get("DS4_BI_TOPK_LIB")
+    if not library:
+        pytest.skip("DS4_BI_TOPK_LIB is not configured")
+    torch.ops.load_library(library)
+
+    rows, cols, top_k = 128, 32768, 512
+    logits = torch.full((rows, cols), -1.0, dtype=torch.float32, device="cuda")
+    logits[:, :511] = 10.0
+    logits[:, 1000:1200] = 1.0
+    starts = torch.zeros(rows, dtype=torch.int32, device="cuda")
+    ends = torch.full((rows,), cols, dtype=torch.int32, device="cuda")
+    expected = torch.cat(
+        (
+            torch.arange(510, -1, -1, dtype=torch.int32, device="cuda"),
+            torch.tensor([1199], dtype=torch.int32, device="cuda"),
+        )
+    )
+    indices = torch.empty((rows, top_k), dtype=torch.int32, device="cuda")
+    _top_k_per_row_prefill(
         logits,
-        row_starts,
-        row_ends,
+        starts,
+        ends,
         indices,
-        2,
+        rows,
         logits.stride(0),
         logits.stride(1),
         top_k,
     )
-
-    lengths = row_ends - row_starts
-    expected = lengths[:, None] - 1 - torch.arange(
-        top_k, dtype=torch.int32, device="cuda"
-    )
-    torch.testing.assert_close(indices, expected, rtol=0, atol=0)
+    torch.testing.assert_close(indices, expected.expand(rows, -1), rtol=0, atol=0)

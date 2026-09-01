@@ -191,7 +191,7 @@ void launch_persistent_topk(const torch::stable::Tensor& logits,
                       "row_states memset failed: ", cudaGetErrorString(mz_err));
     }
 
-    P::PersistentTopKParams params;
+    P::PersistentTopKParams params{};
     params.input = logits.const_data_ptr<float>();
     params.output = output.mutable_data_ptr<int32_t>();
     params.lengths = lengths.const_data_ptr<int32_t>();

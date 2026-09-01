@@ -121,6 +121,7 @@ struct RadixRowState {
   uint32_t prefix;
   int arrival_counter;
   int output_counter;
+  int completion_counter;
 };
 
 // ============================================================================
@@ -130,7 +131,10 @@ struct RadixRowState {
 struct PersistentTopKParams {
   const float* __restrict__ input;      // [num_rows, stride]
   int32_t* __restrict__ output;         // [num_rows, top_k]
+  uint64_t* __restrict__ output_keys;   // optional ordered-score/index keys
   const int32_t* __restrict__ lengths;  // [num_rows]
+  const int32_t* __restrict__ row_starts;  // optional packed-row starts
+  const int32_t* __restrict__ row_ends;    // optional packed-row ends
   RadixRowState* row_states;            // large path: per-group state
   uint32_t num_rows;
   uint32_t stride;
@@ -138,6 +142,7 @@ struct PersistentTopKParams {
   uint32_t chunk_size;      // large path: elements per CTA
   uint32_t ctas_per_group;  // 1=medium, >1=large
   uint32_t max_seq_len;     // max seq_len across all rows (for early CTA exit)
+  const uint32_t* fallback_flags;
 };
 
 // ============================================================================
@@ -556,6 +561,68 @@ __device__ __noinline__ void histogram_256_topk(
       break;
     }
 
+    if (pass == 3) {
+      if (thread_id == 0) {
+        uint32_t pivot = 0;
+        int pivot_index = -1;
+        int pivot_count = 0;
+        for (int j = 0; j < num_buffered; ++j) {
+          const int idx = buffered_indices[src_buffer][j];
+          const uint32_t key =
+              convert_to_uint32_v2(logits[idx + logits_offset]);
+          if ((key & 0xFF) == static_cast<uint32_t>(threshold_bin)) {
+            pivot = key;
+            pivot_index = idx;
+            break;
+          }
+        }
+        for (int j = 0; j < num_buffered; ++j) {
+          const int idx = buffered_indices[src_buffer][j];
+          const uint32_t key =
+              convert_to_uint32_v2(logits[idx + logits_offset]);
+          if (key == pivot) pivot_count = min(pivot_count + 1, 2);
+        }
+        shared_threshold_bin = static_cast<int>(pivot);
+        shared_buffered_count[0] = pivot_index;
+        shared_buffered_count[1] = pivot_count;
+      }
+      __syncthreads();
+      const uint32_t pivot = static_cast<uint32_t>(shared_threshold_bin);
+      const int take = remaining_k;
+      if (shared_buffered_count[1] == 1) {
+        if (thread_id == 0)
+          output_indices[TopK - take] = shared_buffered_count[0];
+        break;
+      }
+      shared_buffered_count[1] = 0;
+      __syncthreads();
+      for (int base = 0; base < seq_len; base += kThreadsPerBlock) {
+        const int reverse = seq_len - 1 - base - thread_id;
+        const bool selected =
+            reverse >= 0 &&
+            convert_to_uint32_v2(logits[reverse + logits_offset]) == pivot;
+        const unsigned mask = __ballot_sync(0xffffffff, selected);
+        const int warp = thread_id / 32;
+        const int lane = thread_id & 31;
+        if (lane == 0) shared_histogram[0][warp] = __popc(mask);
+        __syncthreads();
+        int warp_prefix = 0;
+        for (int w = 0; w < warp; ++w) warp_prefix += shared_histogram[0][w];
+        const int rank = shared_buffered_count[1] + warp_prefix +
+                         __popc(mask & ((1u << lane) - 1));
+        if (selected && rank < take)
+          output_indices[TopK - take + rank] = reverse;
+        __syncthreads();
+        if (thread_id == 0) {
+          for (int w = 0; w < 32; ++w)
+            shared_buffered_count[1] += shared_histogram[0][w];
+        }
+        __syncthreads();
+        if (shared_buffered_count[1] >= take) break;
+      }
+      break;
+    }
+
     __syncthreads();
     if (thread_id < RADIX + 1) {
       shared_histogram[0][thread_id] = 0;
@@ -655,7 +722,8 @@ __device__ __forceinline__ void wait_ge(int* ptr, int target_val,
 
 template <int TopK, uint32_t VEC_SIZE>
 __device__ void radix_topk(const float* __restrict__ row_input,
-                           int32_t* __restrict__ row_output, uint32_t seq_len,
+                           int32_t* __restrict__ row_output,
+                           uint64_t* __restrict__ row_keys, uint32_t seq_len,
                            uint32_t my_chunk_start, uint32_t chunk_size,
                            uint32_t* local_histogram, uint32_t* suffix_sum,
                            uint32_t* shared_scalars, uint32_t* shared_ordered,
@@ -672,26 +740,52 @@ __device__ void radix_topk(const float* __restrict__ row_input,
   {
     const uint32_t aligned_size = (actual_chunk_size / VEC_SIZE) * VEC_SIZE;
 
-    for (uint32_t i = tx * VEC_SIZE; i < aligned_size;
-         i += kThreadsPerBlock * VEC_SIZE) {
-      const float* src = row_input + my_chunk_start + i;
-      if constexpr (VEC_SIZE == 4) {
-        float4 v = *reinterpret_cast<const float4*>(src);
-        shared_ordered[i] = convert_to_uint32_v2(v.x);
-        shared_ordered[i + 1] = convert_to_uint32_v2(v.y);
-        shared_ordered[i + 2] = convert_to_uint32_v2(v.z);
-        shared_ordered[i + 3] = convert_to_uint32_v2(v.w);
-      } else if constexpr (VEC_SIZE == 2) {
-        float2 v = *reinterpret_cast<const float2*>(src);
-        shared_ordered[i] = convert_to_uint32_v2(v.x);
-        shared_ordered[i + 1] = convert_to_uint32_v2(v.y);
+    if constexpr (VEC_SIZE == 4) {
+      // Packed prefill rows are not guaranteed to start on a 16-byte
+      // boundary. Keep the vectorized path for aligned rows and use scalar
+      // loads for the (usually short) misaligned prefix/row instead of
+      // issuing an illegal float4 access.
+      const bool aligned =
+          (reinterpret_cast<uintptr_t>(row_input + my_chunk_start) & 15u) == 0;
+      if (aligned) {
+        for (uint32_t i = tx * 4; i < aligned_size;
+             i += kThreadsPerBlock * 4) {
+          const float4 v = *reinterpret_cast<const float4*>(
+              row_input + my_chunk_start + i);
+          shared_ordered[i] = convert_to_uint32_v2(v.x);
+          shared_ordered[i + 1] = convert_to_uint32_v2(v.y);
+          shared_ordered[i + 2] = convert_to_uint32_v2(v.z);
+          shared_ordered[i + 3] = convert_to_uint32_v2(v.w);
+        }
+        for (uint32_t i = aligned_size + tx; i < actual_chunk_size;
+             i += kThreadsPerBlock)
+          shared_ordered[i] = convert_to_uint32_v2(
+              row_input[my_chunk_start + i]);
       } else {
-        shared_ordered[i] = convert_to_uint32_v2(*src);
+        for (uint32_t i = tx; i < actual_chunk_size;
+             i += kThreadsPerBlock)
+          shared_ordered[i] = convert_to_uint32_v2(
+              row_input[my_chunk_start + i]);
+      }
+    } else {
+      for (uint32_t i = tx * VEC_SIZE; i < aligned_size;
+           i += kThreadsPerBlock * VEC_SIZE) {
+        const float* src = row_input + my_chunk_start + i;
+        if constexpr (VEC_SIZE == 2) {
+          const float2 v = *reinterpret_cast<const float2*>(src);
+          shared_ordered[i] = convert_to_uint32_v2(v.x);
+          shared_ordered[i + 1] = convert_to_uint32_v2(v.y);
+        } else {
+          shared_ordered[i] = convert_to_uint32_v2(*src);
+        }
       }
     }
-    for (uint32_t i = aligned_size + tx; i < actual_chunk_size;
-         i += kThreadsPerBlock) {
-      shared_ordered[i] = convert_to_uint32_v2(row_input[my_chunk_start + i]);
+    if constexpr (VEC_SIZE != 4) {
+      for (uint32_t i = aligned_size + tx; i < actual_chunk_size;
+           i += kThreadsPerBlock) {
+        shared_ordered[i] =
+            convert_to_uint32_v2(row_input[my_chunk_start + i]);
+      }
     }
   }
   __syncthreads();
@@ -806,15 +900,29 @@ __device__ void radix_topk(const float* __restrict__ row_input,
   if (tx == 0) suffix_sum[0] = 0;
   __syncthreads();
 
+  if (tx == 0) local_histogram[2] = 0;
+  __syncthreads();
   uint32_t my_gt_count = 0;
+  uint32_t my_eq_count = 0;
   for (uint32_t i = tx; i < actual_chunk_size; i += kThreadsPerBlock) {
-    if (shared_ordered[i] > ordered_pivot) my_gt_count++;
+    const auto value = shared_ordered[i];
+    if (value > ordered_pivot) {
+      my_gt_count++;
+    } else if (value == ordered_pivot) {
+      my_eq_count++;
+    }
   }
-  for (int offset = 16; offset > 0; offset /= 2) {
-    my_gt_count += __shfl_down_sync(0xffffffff, my_gt_count, offset);
-  }
+  uint64_t packed_counts = (static_cast<uint64_t>(my_gt_count) << 32) |
+                           static_cast<uint64_t>(my_eq_count);
+  for (int offset = 16; offset > 0; offset /= 2)
+    packed_counts += __shfl_down_sync(0xffffffff, packed_counts, offset);
+  my_gt_count = static_cast<uint32_t>(packed_counts >> 32);
+  my_eq_count = static_cast<uint32_t>(packed_counts);
   if (tx % 32 == 0 && my_gt_count > 0) {
     atomicAdd(&suffix_sum[0], my_gt_count);
+  }
+  if (tx % 32 == 0 && my_eq_count > 0) {
+    atomicAdd(&local_histogram[2], my_eq_count);
   }
   __syncthreads();
   const uint32_t local_gt_count = suffix_sum[0];
@@ -834,9 +942,14 @@ __device__ void radix_topk(const float* __restrict__ row_input,
       uint32_t local_pos = atomicAdd(&local_histogram[0], 1);
       int pos = static_cast<int>(local_histogram[1]) + local_pos;
       row_output[pos] = static_cast<int32_t>(my_chunk_start + i);
+      if (row_keys != nullptr) {
+        row_keys[pos] = (static_cast<uint64_t>(shared_ordered[i]) << 32) |
+                        static_cast<uint32_t>(my_chunk_start + i);
+      }
     }
   }
 
+  state->histogram[2][cta_in_group] = local_histogram[2];
   if (tx == 0) {
     red_release(&state->arrival_counter, 1);
   }
@@ -845,14 +958,71 @@ __device__ void radix_topk(const float* __restrict__ row_input,
   barrier_phase++;
   __syncthreads();
 
-  for (uint32_t i = tx; i < actual_chunk_size; i += kThreadsPerBlock) {
-    if (shared_ordered[i] == ordered_pivot) {
-      int pos = atomicAdd(&state->output_counter, 1);
-      if (pos < TopK) {
-        row_output[pos] = static_cast<int32_t>(my_chunk_start + i);
+  // Write pivot ties in a fixed global-index order.
+  // The previous atomic append made both the selected tie set and its order
+  // depend on CTA/warp scheduling.  CTA chunks are contiguous, so assigning
+  // chunks from high to low and scanning each chunk from high to low gives the
+  // same `(score descending, index descending)` rule as the BI selector.
+  if (tx == 0) {
+    local_histogram[1] = state->output_counter;
+    for (uint32_t cta = ctas_per_group; cta-- > cta_in_group + 1;) {
+      local_histogram[1] += state->histogram[2][cta];
+    }
+  }
+  __syncthreads();
+
+  const int tie_offset = local_histogram[1];
+  const int tie_count = local_histogram[2];
+  if (tie_count == 1) {
+    // With unique scores the pivot has exactly one matching element. Avoid
+    // the full ballot/barrier scan used for genuine tie groups.
+    for (uint32_t i = tx; i < actual_chunk_size; i += kThreadsPerBlock) {
+      if (shared_ordered[i] == ordered_pivot) {
+        row_output[tie_offset] =
+            static_cast<int32_t>(my_chunk_start + i);
+        if (row_keys != nullptr)
+          row_keys[tie_offset] =
+              (static_cast<uint64_t>(ordered_pivot) << 32) |
+              static_cast<uint32_t>(my_chunk_start + i);
       }
     }
   }
+  else if (tie_count > 0) {
+    if (tx == 0) local_histogram[3] = 0;
+    __syncthreads();
+    const int warp = tx / 32;
+    const int lane = tx & 31;
+    for (uint32_t base = 0; base < actual_chunk_size;
+         base += kThreadsPerBlock) {
+      const int reverse = static_cast<int>(actual_chunk_size - 1 - base) - tx;
+      const bool selected = reverse >= 0 &&
+                            shared_ordered[reverse] == ordered_pivot;
+      const unsigned mask = __ballot_sync(0xffffffff, selected);
+      if (lane == 0) local_histogram[4 + warp] = __popc(mask);
+      __syncthreads();
+      int warp_prefix = 0;
+      for (int w = 0; w < warp; ++w) warp_prefix += local_histogram[4 + w];
+      const int rank = warp_prefix +
+                       __popc(mask & ((1u << lane) - 1));
+      const int pos = local_histogram[3] + rank;
+      if (selected && pos < tie_count && tie_offset + pos < TopK) {
+        row_output[tie_offset + pos] =
+            static_cast<int32_t>(my_chunk_start + reverse);
+        if (row_keys != nullptr) {
+          row_keys[tie_offset + pos] =
+              (static_cast<uint64_t>(ordered_pivot) << 32) |
+              static_cast<uint32_t>(my_chunk_start + reverse);
+        }
+      }
+      __syncthreads();
+      if (tx == 0) {
+        for (int w = 0; w < 32; ++w)
+          local_histogram[3] += local_histogram[4 + w];
+      }
+      __syncthreads();
+    }
+  }
+
 }
 
 // ============================================================================
@@ -889,12 +1059,6 @@ __global__ void __launch_bounds__(kThreadsPerBlock, 2)
   uint32_t* shared_ordered =
       reinterpret_cast<uint32_t*>(smem_raw + kFixedSmemLarge);
 
-  // RadixRowState for multi-CTA cooperative radix.
-  // Zero-initialization is done host-side via cudaMemsetAsync in topk.cu
-  // before launch — that gives a stream-ordered happens-before edge for all
-  // CTAs, which the previous in-kernel init (CTA-0 only + intra-CTA
-  // __syncthreads) did not provide and which manifested as a race against
-  // CTA-1+'s first red_release on arrival_counter.
   RadixRowState* state = &params.row_states[group_id];
 
   int barrier_phase = 0;
@@ -904,10 +1068,19 @@ __global__ void __launch_bounds__(kThreadsPerBlock, 2)
     // Static round-robin: all CTAs in the group implicitly agree on the row
     uint32_t row_idx = group_id + iter * num_groups;
     if (row_idx >= params.num_rows) break;
+    if (params.fallback_flags != nullptr &&
+        params.fallback_flags[row_idx] == 0)
+      continue;
 
-    const uint32_t seq_len = params.lengths[row_idx];
+    const uint32_t row_start = params.row_starts == nullptr
+                                   ? 0
+                                   : params.row_starts[row_idx];
+    const uint32_t row_end = params.row_ends == nullptr
+                                 ? params.lengths[row_idx]
+                                 : params.row_ends[row_idx];
+    const uint32_t seq_len = row_end - row_start;
     int32_t* row_output = params.output + row_idx * params.top_k;
-    const float* row_input = params.input + row_idx * params.stride;
+    const float* row_input = params.input + row_idx * params.stride + row_start;
 
     if (seq_len <= RADIX_THRESHOLD) {
       if (cta_in_group == 0) {
@@ -917,7 +1090,7 @@ __global__ void __launch_bounds__(kThreadsPerBlock, 2)
                i += kThreadsPerBlock) {
             row_output[i] = (i < seq_len) ? static_cast<int32_t>(i) : -1;
           }
-        } else if (seq_len <= static_cast<uint32_t>(HIST2048_THRESHOLD)) {
+        } else if (seq_len < static_cast<uint32_t>(HIST2048_THRESHOLD)) {
           histogram_2048_topk<TopK>(row_input, row_output, seq_len);
         } else {
           histogram_256_topk<TopK>(row_input, row_output, 0, seq_len);
@@ -928,9 +1101,29 @@ __global__ void __launch_bounds__(kThreadsPerBlock, 2)
 
     const uint32_t my_chunk_start = cta_in_group * chunk_size;
     radix_topk<TopK, VEC_SIZE>(
-        row_input, row_output, seq_len, my_chunk_start, chunk_size,
+        row_input, row_output,
+        params.output_keys ? params.output_keys + row_idx * params.top_k : nullptr,
+        seq_len, my_chunk_start, chunk_size,
         local_histogram, suffix_sum, shared_scalars, shared_ordered, state,
         cta_in_group, ctas_per_group, barrier_phase, iter, tx);
+    // Ensure every CTA in the cooperative group has finished writing this row
+    // before any CTA advances to the next row assigned to the group.
+    if (tx == 0) red_release(&state->completion_counter, 1);
+    wait_ge(&state->completion_counter,
+            (iter + 1) * static_cast<int>(ctas_per_group), tx);
+    __syncthreads();
+
+    // Flagged rows perform an extra synchronization phase so the completion
+    // counter remains aligned with the iteration number for subsequent rows.
+    if (params.fallback_flags != nullptr &&
+        params.fallback_flags[row_idx] != 0) {
+      __syncthreads();
+      if (tx == 0) red_release(&state->completion_counter, 1);
+      wait_ge(&state->completion_counter,
+              (iter + 2) * static_cast<int>(ctas_per_group), tx);
+      __syncthreads();
+    }
+
   }
 }
 
@@ -1022,21 +1215,35 @@ __global__ void __launch_bounds__(FILTERED_TOPK_BLOCK_THREADS)
     FilteredTopKUnifiedKernel(const DType* __restrict__ input,
                               IdType* __restrict__ output,
                               const IdType* __restrict__ lengths,
+                              const IdType* __restrict__ row_starts,
+                              uint32_t* __restrict__ fallback_flags,
                               uint32_t num_rows, uint32_t top_k,
-                              uint32_t max_len) {
+                              uint32_t max_len, uint32_t shard_count) {
   constexpr uint32_t BLOCK_SIZE = FILTERED_TOPK_BLOCK_THREADS;
   constexpr int RADIX = 256;
   constexpr int SMEM_INPUT_SIZE = FILTERED_TOPK_SMEM_INPUT_SIZE;
 
   const uint32_t bid = blockIdx.x;
+  const uint32_t shard = blockIdx.y;
   const int tx = threadIdx.x;
 
   if (bid >= num_rows) return;
 
-  const int length =
-      (lengths != nullptr) ? lengths[bid] : static_cast<int>(max_len);
-  const DType* score = input + bid * max_len;
-  IdType* dst = output + bid * top_k;
+  const uint32_t full_start = row_starts != nullptr ? row_starts[bid] : 0;
+  const uint32_t full_end = lengths != nullptr ? lengths[bid] : max_len;
+  const uint32_t full_length = full_end - full_start;
+  const uint32_t shard_len = (full_length + shard_count - 1) / shard_count;
+  const uint32_t start_u = full_start + shard * shard_len;
+  const uint32_t end_u = min(full_end, start_u + shard_len);
+  const int flag_idx = static_cast<int>(bid * shard_count + shard);
+  if (fallback_flags != nullptr && tx == 0) fallback_flags[flag_idx] = 0;
+  __syncthreads();
+
+  const int start = static_cast<int>(start_u);
+  const int end = static_cast<int>(end_u);
+  const int length = end - start;
+  const DType* score = input + bid * max_len + start;
+  IdType* dst = output + (bid * shard_count + shard) * top_k;
 
   // Trivial case: length <= top_k
   if (length <= static_cast<int>(top_k)) {
@@ -1050,11 +1257,19 @@ __global__ void __launch_bounds__(FILTERED_TOPK_BLOCK_THREADS)
   if (length <= 32768) {
     extern __shared__ uint8_t _smem_reg[];
     if constexpr (UsePredicatedShortLoads) {
-      hist4096::histogram_4096_topk_predicated<MAX_K, 12, 8>(score, dst, length,
-                                                             _smem_reg);
+      hist4096::histogram_4096_topk_predicated<MAX_K, 12, 8>(
+          score, dst, length, _smem_reg);
     } else {
       hist4096::histogram_4096_topk<MAX_K, 12, 8>(score, dst, length,
                                                   _smem_reg);
+    }
+    if (fallback_flags != nullptr) {
+      // Route short rows through the exact deterministic selector so partial
+      // ties at the selection boundary cannot depend on atomic arrival order.
+      // The short histogram can leave a partial tie at the selection
+      // boundary; route every short row through the exact deterministic
+      // recompute so candidate selection never depends on atomic arrival.
+      fallback_flags[flag_idx] = 1u;
     }
     return;
   }
@@ -1064,6 +1279,9 @@ __global__ void __launch_bounds__(FILTERED_TOPK_BLOCK_THREADS)
   alignas(128) __shared__ int s_counter;
   alignas(128) __shared__ int s_threshold_bin_id;
   alignas(128) __shared__ int s_num_input[2];
+  alignas(128) __shared__ int s_overflow;
+  alignas(128) __shared__ int s_equal_count;
+  alignas(128) __shared__ int s_required_ties;
   alignas(128) __shared__ int s_indices[MAX_K];
 
   auto& s_histogram = s_histogram_buf[0];
@@ -1072,6 +1290,12 @@ __global__ void __launch_bounds__(FILTERED_TOPK_BLOCK_THREADS)
   extern __shared__ int s_input_idx[][SMEM_INPUT_SIZE];
 
   using Traits = FilteredTopKTraits<DType>;
+  if (tx == 0) {
+    s_overflow = 0;
+    s_equal_count = 0;
+    s_required_ties = 0;
+  }
+  __syncthreads();
   int topk = top_k;
 
   // Stage 1: 8-bit coarse histogram with vectorized loads
@@ -1171,6 +1395,8 @@ __global__ void __launch_bounds__(FILTERED_TOPK_BLOCK_THREADS)
           const auto ordered = Traits::ToOrdered(raw_input);
           const auto sub_bin = (ordered >> FIRST_SHIFT) & 0xFF;
           atomicAdd(&s_histogram[sub_bin], 1);
+        } else {
+          atomicExch(&s_overflow, 1);
         }
       }
     };
@@ -1212,6 +1438,11 @@ __global__ void __launch_bounds__(FILTERED_TOPK_BLOCK_THREADS)
 
       const int offset = FIRST_SHIFT - round * 8;
       const bool is_last_round = (round == NUM_ROUNDS - 1);
+      if (is_last_round && tx == 0) {
+        s_required_ties = s_last_remain;
+        s_equal_count = 0;
+      }
+      __syncthreads();
 
       if (topk == 0) {
         for (int i = tx; i < num_input; i += BLOCK_SIZE) {
@@ -1237,6 +1468,7 @@ __global__ void __launch_bounds__(FILTERED_TOPK_BLOCK_THREADS)
             s_indices[pos] = idx;
           } else if (static_cast<int>(bin) == threshold) {
             if (is_last_round) {
+              atomicAdd(&s_equal_count, 1);
               const auto pos = atomicAdd(&s_last_remain, -1);
               if (pos > 0) {
                 s_indices[top_k - pos] = idx;
@@ -1248,6 +1480,8 @@ __global__ void __launch_bounds__(FILTERED_TOPK_BLOCK_THREADS)
                 const auto bin32 = Traits::ToOrdered(raw_input);
                 const auto sub_bin = (bin32 >> (offset - 8)) & 0xFF;
                 atomicAdd(&s_histogram[sub_bin], 1);
+              } else {
+                atomicExch(&s_overflow, 1);
               }
             }
           }
@@ -1257,8 +1491,14 @@ __global__ void __launch_bounds__(FILTERED_TOPK_BLOCK_THREADS)
     }
   }
 
+  if (fallback_flags != nullptr) {
+    __syncthreads();
+    if (tx == 0 && (s_overflow != 0 ||
+                    (s_required_ties > 0 && s_equal_count > s_required_ties)))
+      fallback_flags[bid] = 1;
+  }
+
   // Output phase - mode-specific
-#pragma unroll 2
   for (int base = tx; base < static_cast<int>(top_k); base += BLOCK_SIZE) {
     const int idx = s_indices[base];
     dst[base] = static_cast<IdType>(idx);
@@ -1289,23 +1529,27 @@ template <typename DType, typename IdType, uint32_t MAX_K = 2048>
 cudaError_t FilteredTopKRaggedTransform(const DType* input,
                                         IdType* output_indices,
                                         const IdType* lengths,
+                                        const IdType* row_starts,
+                                        uint32_t* fallback_flags,
                                         uint32_t num_rows, uint32_t top_k_val,
                                         uint32_t max_len,
-                                        cudaStream_t stream = 0) {
+                                        cudaStream_t stream = 0,
+                                        uint32_t shard_count = 1) {
   constexpr size_t smem_size = FILTERED_TOPK_SMEM_DYNAMIC;
   constexpr int MAX_VEC = 16 / sizeof(DType);
 
-  dim3 grid(num_rows);
+  dim3 grid(num_rows, shard_count);
   dim3 block(FILTERED_TOPK_BLOCK_THREADS);
-  void* args[] = {&input,    &output_indices, &lengths,
-                  &num_rows, &top_k_val,      &max_len};
+  void* args[] = {&input, &output_indices, &lengths, &row_starts,
+                  &fallback_flags, &num_rows, &top_k_val, &max_len,
+                  &shard_count};
 
   const int vec_size = ComputeFilteredTopKVecSize<DType>(max_len);
 
 #define DISPATCH_VEC_SIZE(VS)                                                 \
   if (vec_size == VS) {                                                       \
     auto kernel =                                                             \
-        FilteredTopKUnifiedKernel<DType, IdType, VS, MAX_K, (VS != MAX_VEC)>; \
+        FilteredTopKUnifiedKernel<DType, IdType, VS, MAX_K, (VS != MAX_VEC)>;  \
     FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(                                \
         kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));     \
     FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, grid, block, args,   \
@@ -1332,9 +1576,24 @@ cudaError_t FilteredTopKRaggedTransform(const DType* input,
                                         const IdType* lengths,
                                         uint32_t num_rows, uint32_t top_k_val,
                                         uint32_t max_len,
-                                        cudaStream_t stream = 0) {
+                                        cudaStream_t stream = 0,
+                                        uint32_t shard_count = 1) {
   return filtered_topk::FilteredTopKRaggedTransform<DType, IdType, MAX_K>(
-      input, output_indices, lengths, num_rows, top_k_val, max_len, stream);
+      input, output_indices, lengths, nullptr, nullptr, num_rows, top_k_val,
+      max_len, stream, shard_count);
+}
+
+template <typename DType, typename IdType, uint32_t MAX_K = 2048>
+cudaError_t FilteredTopKBiTransform(const DType* input, IdType* output_indices,
+                                    const IdType* row_starts,
+                                    const IdType* row_ends, uint32_t num_rows,
+                                    uint32_t top_k_val, uint32_t stride,
+                                    uint32_t* fallback_flags = nullptr,
+                                    cudaStream_t stream = 0,
+                                    uint32_t shard_count = 1) {
+  return filtered_topk::FilteredTopKRaggedTransform<DType, IdType, MAX_K>(
+      input, output_indices, row_ends, row_starts, fallback_flags, num_rows,
+      top_k_val, stride, stream, shard_count);
 }
 
 }  // namespace vllm
