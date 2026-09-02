@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import functools
 import math
 import os
 from collections.abc import Callable
@@ -8,10 +9,6 @@ from typing import Any
 import torch
 
 import vllm.envs as envs
-from vllm.model_executor.layers.bi_splitk_matmul import (
-    matmul_splitk,
-    splitk_plan,
-)
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.mem_utils import get_max_shared_memory_bytes
@@ -133,23 +130,44 @@ def matmul_kernel_persistent(
         tl.store(c_ptrs, c, mask=c_mask)
 
 
+@functools.cache
+def _bi_gemm() -> Callable[..., torch.Tensor]:
+    from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+        require_batch_invariant_quant_kernel,
+    )
+
+    require_batch_invariant_quant_kernel()
+    return torch.ops.vllm_batch_invariant.bi_gemm
+
+
 def matmul_persistent(
     a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor | None = None
 ):
-    # Check constraints.
+    """Batch-invariant ``a @ b (+ bias)`` for 2D operands.
+
+    On CUDA this is the ``bi_gemm`` kernel (csrc/batch_invariant/bi_gemm.cu):
+    fp32 accumulation in ascending K from identical MMA instructions, with a
+    split-K schedule chosen from (K, N) only and reduced in fixed order, so
+    row m of the result depends only on row m of ``a``. Other platforms use
+    the Triton persistent kernel.
+    """
     assert a.shape[1] == b.shape[0], "Incompatible dimensions"
     assert a.dtype == b.dtype, "Incompatible dtypes"
     assert bias is None or bias.dim() == 1, (
         "Currently assuming bias is 1D, let Horace know if you run into this"
     )
+    if current_platform.is_cuda():
+        return _bi_gemm()(a, b, bias)
+    return _matmul_persistent_triton(a, b, bias)
+
+
+def _matmul_persistent_triton(
+    a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor | None = None
+):
     NUM_SMS = num_compute_units(a.device.index)
     M, K = a.shape
     K, N = b.shape
     dtype = a.dtype
-    if dtype == torch.bfloat16 and splitk_plan(K, N) is not None:
-        # skinny-N / long-K (e.g. DSv4 indexer weights_proj): the persistent
-        # kernel degenerates to one CTA walking all of K; use fixed split-K.
-        return matmul_splitk(a, b, bias, split_k=8, block_m=64)
     # Allocates output.
     c = torch.empty((M, N), device=a.device, dtype=dtype)
 
