@@ -8,6 +8,10 @@ from typing import Any
 import torch
 
 import vllm.envs as envs
+from vllm.model_executor.layers.bi_splitk_matmul import (
+    matmul_splitk,
+    splitk_plan,
+)
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.mem_utils import get_max_shared_memory_bytes
@@ -142,6 +146,10 @@ def matmul_persistent(
     M, K = a.shape
     K, N = b.shape
     dtype = a.dtype
+    if dtype == torch.bfloat16 and splitk_plan(K, N) is not None:
+        # skinny-N / long-K (e.g. DSv4 indexer weights_proj): the persistent
+        # kernel degenerates to one CTA walking all of K; use fixed split-K.
+        return matmul_splitk(a, b, bias, split_k=8, block_m=64)
     # Allocates output.
     c = torch.empty((M, N), device=a.device, dtype=dtype)
 
