@@ -142,7 +142,6 @@ struct PersistentTopKParams {
   uint32_t chunk_size;      // large path: elements per CTA
   uint32_t ctas_per_group;  // 1=medium, >1=large
   uint32_t max_seq_len;     // max seq_len across all rows (for early CTA exit)
-  const uint32_t* fallback_flags;
 };
 
 // ============================================================================
@@ -1062,16 +1061,13 @@ __global__ void __launch_bounds__(kThreadsPerBlock, 2)
   RadixRowState* state = &params.row_states[group_id];
 
   int barrier_phase = 0;
+  int completion_phase = 0;
   const uint32_t total_iters = (params.num_rows + num_groups - 1) / num_groups;
 
   for (uint32_t iter = 0; iter < total_iters; iter++) {
     // Static round-robin: all CTAs in the group implicitly agree on the row
     uint32_t row_idx = group_id + iter * num_groups;
     if (row_idx >= params.num_rows) break;
-    if (params.fallback_flags != nullptr &&
-        params.fallback_flags[row_idx] == 0)
-      continue;
-
     const uint32_t row_start = params.row_starts == nullptr
                                    ? 0
                                    : params.row_starts[row_idx];
@@ -1108,21 +1104,11 @@ __global__ void __launch_bounds__(kThreadsPerBlock, 2)
         cta_in_group, ctas_per_group, barrier_phase, iter, tx);
     // Ensure every CTA in the cooperative group has finished writing this row
     // before any CTA advances to the next row assigned to the group.
+    completion_phase++;
     if (tx == 0) red_release(&state->completion_counter, 1);
     wait_ge(&state->completion_counter,
-            (iter + 1) * static_cast<int>(ctas_per_group), tx);
+            completion_phase * static_cast<int>(ctas_per_group), tx);
     __syncthreads();
-
-    // Flagged rows perform an extra synchronization phase so the completion
-    // counter remains aligned with the iteration number for subsequent rows.
-    if (params.fallback_flags != nullptr &&
-        params.fallback_flags[row_idx] != 0) {
-      __syncthreads();
-      if (tx == 0) red_release(&state->completion_counter, 1);
-      wait_ge(&state->completion_counter,
-              (iter + 2) * static_cast<int>(ctas_per_group), tx);
-      __syncthreads();
-    }
 
   }
 }

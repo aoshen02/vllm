@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <mutex>
 #include <unordered_map>
+#include <vector>
 
 #include <ATen/cuda/CUDAContext.h>
 #include <ATen/Functions.h>
@@ -22,71 +23,47 @@ constexpr int kItemsPerThread = kChunkColumns / kThreads;
 constexpr int kMaxTopK = 2048;
 
 std::mutex workspace_mutex;
-std::unordered_map<uint64_t, at::Tensor> workspace_by_stream;
-std::unordered_map<uint64_t, at::Tensor> persistent_workspace_by_stream;
-std::unordered_map<uint64_t, at::Tensor> key_workspace_by_stream;
-std::unordered_map<uint64_t, at::Tensor> fallback_flag_by_stream;
+using WorkspacePool = std::unordered_map<uint64_t, std::vector<at::Tensor>>;
+WorkspacePool workspace_by_stream;
+WorkspacePool persistent_workspace_by_stream;
+WorkspacePool key_workspace_by_stream;
 
-at::Tensor get_workspace(const at::Tensor& logits, int64_t num_rows,
-                         int num_chunks, int64_t top_k) {
+at::Tensor get_cached_workspace(WorkspacePool& cache,
+                                const at::Tensor& logits, int64_t needed,
+                                at::ScalarType dtype) {
   const int device = logits.get_device();
   const auto stream = at::cuda::getCurrentCUDAStream(device);
   const uint64_t key = (static_cast<uint64_t>(device) << 32) ^
                        reinterpret_cast<uintptr_t>(stream.stream());
   std::lock_guard<std::mutex> lock(workspace_mutex);
-  auto& workspace = workspace_by_stream[key];
-  const auto needed = num_rows * num_chunks * top_k;
-  if (!workspace.defined() || workspace.numel() < needed ||
-      workspace.device() != logits.device()) {
-    workspace = at::empty({needed}, logits.options().dtype(at::kLong));
+  auto& allocations = cache[key];
+  if (allocations.empty() || allocations.back().numel() < needed ||
+      allocations.back().device() != logits.device()) {
+    allocations.push_back(at::empty({needed}, logits.options().dtype(dtype)));
   }
-  return workspace.narrow(0, 0, needed);
+  return allocations.back().narrow(0, 0, needed);
+}
+
+at::Tensor get_workspace(const at::Tensor& logits, int64_t num_rows,
+                         int num_chunks, int64_t top_k) {
+  const auto needed = num_rows * num_chunks * top_k;
+  return get_cached_workspace(workspace_by_stream, logits, needed,
+                              at::kLong);
 }
 
 at::Tensor get_persistent_workspace(const at::Tensor& logits,
                                     int64_t num_groups) {
-  const int device = logits.get_device();
-  const auto stream = at::cuda::getCurrentCUDAStream(device);
-  const uint64_t key = (static_cast<uint64_t>(device) << 32) ^
-                       reinterpret_cast<uintptr_t>(stream.stream());
-  std::lock_guard<std::mutex> lock(workspace_mutex);
-  auto& workspace = persistent_workspace_by_stream[key];
   const auto needed = num_groups * static_cast<int64_t>(
       sizeof(vllm::persistent::RadixRowState));
-  if (!workspace.defined() || workspace.numel() < needed ||
-      workspace.device() != logits.device()) {
-    workspace = at::empty({needed}, logits.options().dtype(at::kByte));
-  }
-  return workspace.narrow(0, 0, needed);
+  return get_cached_workspace(persistent_workspace_by_stream, logits, needed,
+                              at::kByte);
 }
 
 at::Tensor get_key_workspace(const at::Tensor& logits, int64_t num_rows,
                              int64_t top_k) {
-  const int device = logits.get_device();
-  const auto stream = at::cuda::getCurrentCUDAStream(device);
-  const uint64_t key = (static_cast<uint64_t>(device) << 32) ^
-                       reinterpret_cast<uintptr_t>(stream.stream());
-  std::lock_guard<std::mutex> lock(workspace_mutex);
-  auto& workspace = key_workspace_by_stream[key];
   const auto needed = num_rows * top_k;
-  if (!workspace.defined() || workspace.numel() < needed ||
-      workspace.device() != logits.device()) {
-    workspace = at::empty({needed}, logits.options().dtype(at::kLong));
-  }
-  return workspace.narrow(0, 0, needed);
-}
-
-at::Tensor get_fallback_flags(const at::Tensor& logits, int64_t num_rows) {
-  const int device = logits.get_device();
-  const auto stream = at::cuda::getCurrentCUDAStream(device);
-  const uint64_t key = (static_cast<uint64_t>(device) << 32) ^
-                       reinterpret_cast<uintptr_t>(stream.stream());
-  std::lock_guard<std::mutex> lock(workspace_mutex);
-  auto& flags = fallback_flag_by_stream[key];
-  if (!flags.defined() || flags.numel() < num_rows ||
-      flags.device() != logits.device())
-    flags = at::empty({num_rows}, logits.options().dtype(at::ScalarType::UInt32));
-  return flags.narrow(0, 0, num_rows);
+  return get_cached_workspace(key_workspace_by_stream, logits, needed,
+                              at::kLong);
 }
 
 __device__ __forceinline__ uint32_t ordered_float_bits(float value) {
@@ -99,7 +76,9 @@ __global__ __launch_bounds__(kThreads) void deterministic_top_k_chunk(
     uint64_t* output, int64_t stride0, int64_t stride1, int top_k) {
   using ScoreSort =
       cub::BlockRadixSort<uint64_t, kThreads, kItemsPerThread>;
-  __shared__ typename ScoreSort::TempStorage temp;
+  extern __shared__ unsigned char chunk_smem[];
+  auto& chunk_temp =
+      *reinterpret_cast<typename ScoreSort::TempStorage*>(chunk_smem);
 
   const int row = blockIdx.x;
   const int chunk = blockIdx.y;
@@ -129,7 +108,7 @@ __global__ __launch_bounds__(kThreads) void deterministic_top_k_chunk(
       score_keys[item] = 0;
     }
   }
-  ScoreSort(temp).SortDescendingBlockedToStriped(score_keys);
+  ScoreSort(chunk_temp).SortDescendingBlockedToStriped(score_keys);
   __syncthreads();
 
 #pragma unroll
@@ -147,7 +126,9 @@ __global__ __launch_bounds__(Threads) void deterministic_top_k_single_small(
     const float* logits, const int* row_starts, const int* row_ends,
     int* output, int64_t stride0, int64_t stride1, int top_k) {
   using ScoreSort = cub::BlockRadixSort<uint64_t, Threads, ItemsPerThread>;
-  __shared__ typename ScoreSort::TempStorage temp;
+  extern __shared__ unsigned char small_smem[];
+  auto& small_temp =
+      *reinterpret_cast<typename ScoreSort::TempStorage*>(small_smem);
   const int row = blockIdx.x;
   const int row_start = row_starts[row];
   const int row_end = row_ends[row];
@@ -164,7 +145,7 @@ __global__ __launch_bounds__(Threads) void deterministic_top_k_single_small(
       keys[item] = 0;
     }
   }
-  ScoreSort(temp).SortDescendingBlockedToStriped(keys);
+  ScoreSort(small_temp).SortDescendingBlockedToStriped(keys);
   __syncthreads();
 #pragma unroll
   for (int item = 0; item < ItemsPerThread; ++item) {
@@ -227,12 +208,30 @@ __global__ __launch_bounds__(MergeThreads) void merge_top_k_chunks(
         current[i] == 0 ? -1 : static_cast<int>(static_cast<uint32_t>(current[i]));
 }
 
+template <int Threads, int ItemsPerThread>
+void launch_single_small(const at::Tensor& logits, const at::Tensor& row_starts,
+                         const at::Tensor& row_ends, at::Tensor& indices,
+                         int64_t num_rows, int64_t stride0, int64_t stride1,
+                         int top_k, cudaStream_t stream) {
+  using ScoreSort = cub::BlockRadixSort<uint64_t, Threads, ItemsPerThread>;
+  constexpr size_t smem_size = sizeof(typename ScoreSort::TempStorage);
+  auto kernel = &deterministic_top_k_single_small<Threads, ItemsPerThread>;
+  cudaError_t attr_err = cudaFuncSetAttribute(
+      kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
+  TORCH_CHECK(attr_err == cudaSuccess,
+              "generic Top-K shared memory setup failed: ",
+              cudaGetErrorString(attr_err));
+  kernel<<<num_rows, Threads, smem_size, stream>>>(
+      logits.const_data_ptr<float>(), row_starts.const_data_ptr<int>(),
+      row_ends.const_data_ptr<int>(), indices.mutable_data_ptr<int>(), stride0,
+      stride1, top_k);
+}
+
 template <int TopK, int VecSize = 1>
 void launch_deterministic_persistent(
     const at::Tensor& logits, const at::Tensor& row_starts,
     const at::Tensor& row_ends, at::Tensor& indices, int64_t num_rows,
-    int64_t stride0, int64_t stride1, at::Tensor& key_output,
-    const at::Tensor& fallback_flags = at::Tensor()) {
+    int64_t stride0, int64_t stride1, at::Tensor& key_output) {
   namespace P = vllm::persistent;
   const auto* props = at::cuda::getCurrentDeviceProperties();
   const uint32_t max_len = static_cast<uint32_t>(logits.size(1));
@@ -282,9 +281,6 @@ void launch_deterministic_persistent(
   params.chunk_size = kChunk;
   params.ctas_per_group = ctas_per_group;
   params.max_seq_len = max_len;
-  params.fallback_flags = fallback_flags.defined()
-                              ? fallback_flags.const_data_ptr<uint32_t>()
-                              : nullptr;
 
   TORCH_CHECK(stride1 == 1,
               "persistent deterministic Top-K requires contiguous columns");
@@ -478,43 +474,27 @@ void ds4_top_k_per_row_prefill(
   if (stride1 == 1 &&
       (top_k == 512 || top_k == 1024 || top_k == 2048) &&
       logits.size(1) > vllm::persistent::RADIX_THRESHOLD) {
-    auto flags = get_fallback_flags(logits, num_rows);
     if (top_k == 512) {
       auto keys = get_key_workspace(logits, num_rows, 512);
-      const auto status = vllm::FilteredTopKBiTransform<float, int32_t, 512>(
-          logits.const_data_ptr<float>(), indices.mutable_data_ptr<int>(),
-          row_starts.const_data_ptr<int>(), row_ends.const_data_ptr<int>(),
-          num_rows, 512, stride0, flags.mutable_data_ptr<uint32_t>(), stream);
-      TORCH_CHECK(status == cudaSuccess, "FilteredTopK launch failed");
       launch_deterministic_persistent<512, 4>(
           logits, row_starts, row_ends, indices, num_rows, stride0, stride1,
-          keys, flags);
+          keys);
       canonicalize_top_k_logits<512, 128, 4><<<num_rows, 128, 0, stream>>>(
           logits.const_data_ptr<float>(), row_starts.const_data_ptr<int>(),
           indices.mutable_data_ptr<int>(), stride0);
     } else if (top_k == 1024) {
       auto keys = get_key_workspace(logits, num_rows, 1024);
-      const auto status = vllm::FilteredTopKBiTransform<float, int32_t, 1024>(
-          logits.const_data_ptr<float>(), indices.mutable_data_ptr<int>(),
-          row_starts.const_data_ptr<int>(), row_ends.const_data_ptr<int>(),
-          num_rows, 1024, stride0, flags.mutable_data_ptr<uint32_t>(), stream);
-      TORCH_CHECK(status == cudaSuccess, "FilteredTopK launch failed");
       launch_deterministic_persistent<1024, 4>(
           logits, row_starts, row_ends, indices, num_rows, stride0, stride1,
-          keys, flags);
+          keys);
       canonicalize_top_k_logits<1024, 256, 4><<<num_rows, 256, 0, stream>>>(
           logits.const_data_ptr<float>(), row_starts.const_data_ptr<int>(),
           indices.mutable_data_ptr<int>(), stride0);
     } else {
       auto keys = get_key_workspace(logits, num_rows, 2048);
-      const auto status = vllm::FilteredTopKBiTransform<float, int32_t, 2048>(
-          logits.const_data_ptr<float>(), indices.mutable_data_ptr<int>(),
-          row_starts.const_data_ptr<int>(), row_ends.const_data_ptr<int>(),
-          num_rows, 2048, stride0, flags.mutable_data_ptr<uint32_t>(), stream);
-      TORCH_CHECK(status == cudaSuccess, "FilteredTopK launch failed");
       launch_deterministic_persistent<2048, 4>(
           logits, row_starts, row_ends, indices, num_rows, stride0, stride1,
-          keys, flags);
+          keys);
       canonicalize_top_k_logits<2048, 512, 4><<<num_rows, 512, 0, stream>>>(
           logits.const_data_ptr<float>(), row_starts.const_data_ptr<int>(),
           indices.mutable_data_ptr<int>(), stride0);
@@ -526,7 +506,9 @@ void ds4_top_k_per_row_prefill(
   // The persistent histogram path handles medium-wide rows in a single CTA,
   // avoiding the chunk workspace/merge traffic.  Its exact tie behavior is
   // repaired by the key canonicalization below.
-  if (stride1 == 1 && logits.size(1) >= 8192) {
+  if (stride1 == 1 &&
+      (top_k == 512 || top_k == 1024 || top_k == 2048) &&
+      logits.size(1) >= 8192) {
     const bool persistent_keys =
         logits.size(1) > vllm::persistent::RADIX_THRESHOLD;
     if (top_k == 512) {
@@ -585,30 +567,36 @@ void ds4_top_k_per_row_prefill(
   const int num_chunks = (logits.size(1) + kChunkColumns - 1) / kChunkColumns;
   if (num_chunks == 1) {
     if (logits.size(1) <= 1024) {
-      deterministic_top_k_single_small<64, 16><<<num_rows, 64, 0, stream>>>(
-          logits.const_data_ptr<float>(), row_starts.const_data_ptr<int>(),
-          row_ends.const_data_ptr<int>(), indices.mutable_data_ptr<int>(), stride0,
-          stride1, static_cast<int>(top_k));
+      launch_single_small<64, 16>(logits, row_starts, row_ends, indices,
+                                  num_rows, stride0, stride1,
+                                  static_cast<int>(top_k), stream);
     } else if (logits.size(1) <= 2048) {
-      deterministic_top_k_single_small<128, 16><<<num_rows, 128, 0, stream>>>(
-          logits.const_data_ptr<float>(), row_starts.const_data_ptr<int>(),
-          row_ends.const_data_ptr<int>(), indices.mutable_data_ptr<int>(), stride0,
-          stride1, static_cast<int>(top_k));
+      launch_single_small<128, 16>(logits, row_starts, row_ends, indices,
+                                   num_rows, stride0, stride1,
+                                   static_cast<int>(top_k), stream);
     } else if (logits.size(1) <= 4096) {
-      deterministic_top_k_single_small<256, 16><<<num_rows, 256, 0, stream>>>(
-          logits.const_data_ptr<float>(), row_starts.const_data_ptr<int>(),
-          row_ends.const_data_ptr<int>(), indices.mutable_data_ptr<int>(), stride0,
-          stride1, static_cast<int>(top_k));
+      launch_single_small<256, 16>(logits, row_starts, row_ends, indices,
+                                   num_rows, stride0, stride1,
+                                   static_cast<int>(top_k), stream);
     } else {
-      deterministic_top_k_single_small<kThreads, kItemsPerThread>
-          <<<num_rows, kThreads, 0, stream>>>(
-          logits.const_data_ptr<float>(), row_starts.const_data_ptr<int>(),
-          row_ends.const_data_ptr<int>(), indices.mutable_data_ptr<int>(), stride0,
-          stride1, static_cast<int>(top_k));
+      launch_single_small<kThreads, kItemsPerThread>(
+          logits, row_starts, row_ends, indices, num_rows, stride0, stride1,
+          static_cast<int>(top_k), stream);
     }
   } else {
     auto keys = get_workspace(logits, num_rows, num_chunks, top_k);
-    deterministic_top_k_chunk<<<dim3(num_rows, num_chunks), kThreads, 0, stream>>>(
+    using ChunkScoreSort =
+        cub::BlockRadixSort<uint64_t, kThreads, kItemsPerThread>;
+    constexpr size_t chunk_smem_size =
+        sizeof(typename ChunkScoreSort::TempStorage);
+    cudaError_t attr_err = cudaFuncSetAttribute(
+        deterministic_top_k_chunk,
+        cudaFuncAttributeMaxDynamicSharedMemorySize, chunk_smem_size);
+    TORCH_CHECK(attr_err == cudaSuccess,
+                "chunk Top-K shared memory setup failed: ",
+                cudaGetErrorString(attr_err));
+    deterministic_top_k_chunk<<<dim3(num_rows, num_chunks), kThreads,
+                                chunk_smem_size, stream>>>(
         logits.const_data_ptr<float>(), row_starts.const_data_ptr<int>(),
         row_ends.const_data_ptr<int>(),
         reinterpret_cast<uint64_t*>(keys.mutable_data_ptr<int64_t>()), stride0,

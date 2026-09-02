@@ -141,3 +141,65 @@ def test_short_histogram_uses_high_index_for_partial_tie() -> None:
         top_k,
     )
     torch.testing.assert_close(indices, expected.expand(rows, -1), rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")
+@torch.inference_mode()
+def test_wide_rows_support_generic_topk_values() -> None:
+    library = os.environ.get("DS4_BI_TOPK_LIB")
+    if not library:
+        pytest.skip("DS4_BI_TOPK_LIB is not configured")
+    torch.ops.load_library(library)
+
+    rows, cols, top_k = 2, 8192, 64
+    logits = torch.ones((rows, cols), dtype=torch.float32, device="cuda")
+    starts = torch.zeros(rows, dtype=torch.int32, device="cuda")
+    ends = torch.full((rows,), cols, dtype=torch.int32, device="cuda")
+    indices = torch.empty((rows, top_k), dtype=torch.int32, device="cuda")
+    _top_k_per_row_prefill(
+        logits,
+        starts,
+        ends,
+        indices,
+        rows,
+        logits.stride(0),
+        logits.stride(1),
+        top_k,
+    )
+    torch.cuda.synchronize()
+    expected = torch.arange(
+        cols - 1, cols - top_k - 1, -1, dtype=torch.int32, device="cuda"
+    )
+    torch.testing.assert_close(indices, expected.expand(rows, -1), rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")
+@torch.inference_mode()
+def test_wide_rows_mix_short_and_large_sequences() -> None:
+    library = os.environ.get("DS4_BI_TOPK_LIB")
+    if not library:
+        pytest.skip("DS4_BI_TOPK_LIB is not configured")
+    torch.ops.load_library(library)
+
+    rows, cols, top_k = 64, 65536, 512
+    logits = torch.full((rows, cols), -1.0, dtype=torch.float32, device="cuda")
+    logits[:, :top_k] = 10.0
+    starts = torch.zeros(rows, dtype=torch.int32, device="cuda")
+    ends = torch.full((rows,), cols, dtype=torch.int32, device="cuda")
+    ends[::2] = 1024
+    indices = torch.empty((rows, top_k), dtype=torch.int32, device="cuda")
+    _top_k_per_row_prefill(
+        logits,
+        starts,
+        ends,
+        indices,
+        rows,
+        logits.stride(0),
+        logits.stride(1),
+        top_k,
+    )
+    torch.cuda.synchronize()
+    expected = torch.arange(
+        top_k - 1, -1, -1, dtype=torch.int32, device="cuda"
+    )
+    torch.testing.assert_close(indices, expected.expand(rows, -1), rtol=0, atol=0)
