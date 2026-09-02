@@ -16,7 +16,8 @@ void fused_silu_mul_per_token_group_quant(
     bool round_scale,
     bool scale_ue8m0,
     bool fuse_silu_and_mul,
-    const std::optional<torch::Tensor>& masked_m);
+    const std::optional<torch::Tensor>& masked_m,
+    int64_t token_blocks);
 
 }  // namespace vllm::batch_invariant
 
@@ -25,7 +26,7 @@ TORCH_LIBRARY(vllm_batch_invariant, ops) {
       "fused_silu_mul_per_token_group_quant(Tensor input, Tensor! output_q, "
       "Tensor! output_s, int group_size, float eps, float min_8bit, "
       "float max_8bit, float clamp_limit, bool round_scale, bool scale_ue8m0, "
-      "bool fuse_silu_and_mul, Tensor? masked_m) -> ()");
+      "bool fuse_silu_and_mul, Tensor? masked_m, int token_blocks=0) -> ()");
 }
 
 TORCH_LIBRARY_IMPL(vllm_batch_invariant, CUDA, ops) {

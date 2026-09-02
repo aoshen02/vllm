@@ -88,8 +88,14 @@ def fused_silu_mul_per_token_group_quant_fp8(
     masked_m: torch.Tensor | None,
     output_q: torch.Tensor | None = None,
     group_size: int = 128,
+    token_blocks: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Run the batch-invariant fused SiLU*up and per-token FP8 quant kernel."""
+    """Run the batch-invariant fused SiLU*up and per-token FP8 quant kernel.
+
+    ``token_blocks`` overrides the token-dimension grid size used for the
+    masked layout (blocks grid-stride over tokens, so it only affects launch
+    shape, never results). ``0`` keeps the kernel default.
+    """
     path = _batch_invariant_kernel_path()
     _load_batch_invariant_kernel_library(str(path))
     if round_scale is None:
@@ -154,6 +160,7 @@ def fused_silu_mul_per_token_group_quant_fp8(
         use_ue8m0,
         True,
         masked_m,
+        int(token_blocks),
     )
     return output_q, output_s
 
