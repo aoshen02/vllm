@@ -237,7 +237,7 @@ struct NaiveScheduler {
       int num_local_experts,
       int hidden_dim_num_groups,
       int64_t num_groups,
-      int token_blocks,
+      int num_tokens_per_expert,
       int& subwarps_per_block,
       dim3& grid,
       dim3& block) {
@@ -292,12 +292,8 @@ struct NaiveScheduler {
 };
 
 struct MaskedLayoutScheduler {
-  // Blocks grid-stride over tokens with stride gridDim.y, so any grid.y >= 1 is
-  // correct and only changes which block handles which token, never the
-  // per-group arithmetic. A fixed 128 avoids launching mostly-empty blocks when
-  // masked_m is far below the padded capacity (decode), at a small cost when
-  // every expert is full. `token_blocks` overrides it for tuning.
-  static constexpr int TOKEN_DIM_BLOCK_NUM_PER_EXPERT = 1024;
+  // Blocks grid-stride over tokens. A fixed 128 avoids launching mostly-empty
+  // blocks when masked_m is far below the padded capacity (decode).
   static constexpr int DEFAULT_TOKEN_DIM_BLOCKS = 128;
   static constexpr int SUBWARPS_PER_BLOCK = 16;
 
@@ -306,13 +302,13 @@ struct MaskedLayoutScheduler {
       int num_local_experts,
       int hidden_dim_num_groups,
       int64_t num_groups,
-      int token_blocks,
+      int num_tokens_per_expert,
       int& subwarps_per_block,
       dim3& grid,
       dim3& block) {
     subwarps_per_block = SUBWARPS_PER_BLOCK;
     TORCH_CHECK(hidden_dim_num_groups % subwarps_per_block == 0);
-    const int token_dim_blocks = std::max(1, std::min(TOKEN_DIM_BLOCK_NUM_PER_EXPERT, token_blocks));
+    const int token_dim_blocks = std::min(DEFAULT_TOKEN_DIM_BLOCKS, num_tokens_per_expert);
     grid = dim3(hidden_dim_num_groups / subwarps_per_block, token_dim_blocks, num_local_experts);
     block = dim3(subwarps_per_block * threads_per_subwarp);
   }
@@ -556,8 +552,7 @@ void fused_silu_mul_per_token_group_quant(
     bool round_scale,
     bool scale_ue8m0,
     bool fuse_silu_and_mul,
-    const std::optional<torch::Tensor>& masked_m,
-    int64_t token_blocks) {
+    const std::optional<torch::Tensor>& masked_m) {
   CHECK_INPUT(input);
   CHECK_INPUT(output_q);
   TORCH_CHECK(input.numel() > 0);
@@ -581,9 +576,6 @@ void fused_silu_mul_per_token_group_quant(
   TORCH_CHECK(!round_scale || is_column_major, "rounded FP32 scales require column-major output");
   const int hidden_dim_num_groups = static_cast<int>(output_q.size(-1)) / group_size;
   const int num_tokens_per_expert = static_cast<int>(output_q.size(-2));
-  const int64_t requested_token_blocks =
-      token_blocks > 0 ? token_blocks : MaskedLayoutScheduler::DEFAULT_TOKEN_DIM_BLOCKS;
-  const int token_dim_blocks = static_cast<int>(std::min<int64_t>(requested_token_blocks, num_tokens_per_expert));
   const int scale_expert_stride = masked_layout ? static_cast<int>(output_s.stride(0)) : 0;
   const int scale_hidden_stride = static_cast<int>(output_s.stride(-1));
 
@@ -596,7 +588,7 @@ void fused_silu_mul_per_token_group_quant(
         num_local_experts,                                                                                           \
         hidden_dim_num_groups,                                                                                       \
         num_groups,                                                                                                  \
-        token_dim_blocks,                                                                                            \
+        num_tokens_per_expert,                                                                                       \
         subwarps_per_block,                                                                                          \
         grid,                                                                                                        \
         block);                                                                                                      \
