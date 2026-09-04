@@ -516,6 +516,25 @@ class Worker(WorkerBase):
         with set_current_vllm_config(self.vllm_config):
             self.model_runner.reload_weights(*args, **kwargs)
 
+    def pull_weights(
+        self,
+        local_checkpoint_dir: str,
+        source_dir: str,
+        target_version: int,
+        pre_read_hook: str | None = None,
+    ) -> dict[str, Any]:
+        from vllm.utils.local_checkpoint import pull_checkpoint
+
+        pull_checkpoint(
+            local_checkpoint_dir=local_checkpoint_dir,
+            base_dir=self.model_config.model,
+            source_dir=source_dir,
+            target_version=target_version,
+            pre_read_hook=pre_read_hook,
+        )
+
+        return {"success": True, "weight_version": str(target_version)}
+
     @torch.inference_mode()
     def determine_available_memory(self) -> int:
         """Profiles the peak memory usage of the model to determine how much
