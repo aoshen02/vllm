@@ -12,6 +12,7 @@
 #include <cstdint>
 
 #include "topk_histogram_4096.cuh"
+#include "deterministic_topk.cuh"
 
 namespace vllm {
 namespace persistent {
@@ -129,13 +130,13 @@ struct RadixRowState {
 // ============================================================================
 
 struct PersistentTopKParams {
-  const float* __restrict__ input;      // [num_rows, stride]
-  int32_t* __restrict__ output;         // [num_rows, top_k]
-  uint64_t* __restrict__ output_keys;   // optional ordered-score/index keys
-  const int32_t* __restrict__ lengths;  // [num_rows]
+  const float* __restrict__ input;         // [num_rows, stride]
+  int32_t* __restrict__ output;            // [num_rows, top_k]
+  uint64_t* __restrict__ output_keys;      // optional ordered-score/index keys
+  const int32_t* __restrict__ lengths;     // [num_rows]
   const int32_t* __restrict__ row_starts;  // optional packed-row starts
   const int32_t* __restrict__ row_ends;    // optional packed-row ends
-  RadixRowState* row_states;            // large path: per-group state
+  RadixRowState* row_states;               // large path: per-group state
   uint32_t num_rows;
   uint32_t stride;
   uint32_t top_k;           // actual k value for output stride
@@ -425,7 +426,7 @@ __device__ __noinline__ void histogram_2048_topk(
 // by: DarkSharpness
 // which at the same time is an optimized topk kernel copied from tilelang
 // kernel
-template <int TopK>
+template <int TopK, bool Deterministic = false>
 __device__ __noinline__ void histogram_256_topk(
     const float* __restrict__ logits, int* __restrict__ output_indices,
     int logits_offset, int seq_len) {
@@ -522,6 +523,14 @@ __device__ __noinline__ void histogram_256_topk(
     }
   }
   __syncthreads();
+
+  if constexpr (Deterministic) {
+    if (shared_buffered_count[0] > MAX_BUFFERED_ITEMS) {
+      deterministic_topk::select_overflow<kThreadsPerBlock, TopK>(
+          logits + logits_offset, seq_len, output_indices, medium_smem);
+      return;
+    }
+  }
 
 #pragma unroll 4
   for (int pass = 0; pass < 4; ++pass) {
@@ -667,7 +676,8 @@ __device__ __forceinline__ int ld_acquire(int* ptr) {
 #if (__CUDA_ARCH__ >= 700)
   asm volatile("ld.global.acquire.gpu.b32 %0, [%1];\n"
                : "=r"(state)
-               : "l"(ptr));
+               : "l"(ptr)
+               : "memory");
 #else
   asm volatile("ld.cg.global.b32 %0, [%1];\n" : "=r"(state) : "l"(ptr));
 #endif
@@ -676,10 +686,11 @@ __device__ __forceinline__ int ld_acquire(int* ptr) {
 
 __device__ __forceinline__ void red_release(int* ptr, int val) {
 #if (__CUDA_ARCH__ >= 700)
-  asm volatile("fence.acq_rel.gpu;\n");
+  asm volatile("fence.acq_rel.gpu;\n" ::: "memory");
   asm volatile("red.relaxed.gpu.global.add.s32 [%0], %1;\n"
                :
-               : "l"(ptr), "r"(val));
+               : "l"(ptr), "r"(val)
+               : "memory");
 #else
   __threadfence();
   atomicAdd(ptr, val);
@@ -688,8 +699,11 @@ __device__ __forceinline__ void red_release(int* ptr, int val) {
 
 __device__ __forceinline__ void st_release(int* ptr, int val) {
 #if (__CUDA_ARCH__ >= 700)
-  asm volatile("fence.acq_rel.gpu;\n");
-  asm volatile("st.release.gpu.global.b32 [%0], %1;\n" : : "l"(ptr), "r"(val));
+  asm volatile("fence.acq_rel.gpu;\n" ::: "memory");
+  asm volatile("st.release.gpu.global.b32 [%0], %1;\n"
+               :
+               : "l"(ptr), "r"(val)
+               : "memory");
 #else
   __threadfence();
   atomicExch(ptr, val);
@@ -747,10 +761,9 @@ __device__ void radix_topk(const float* __restrict__ row_input,
       const bool aligned =
           (reinterpret_cast<uintptr_t>(row_input + my_chunk_start) & 15u) == 0;
       if (aligned) {
-        for (uint32_t i = tx * 4; i < aligned_size;
-             i += kThreadsPerBlock * 4) {
-          const float4 v = *reinterpret_cast<const float4*>(
-              row_input + my_chunk_start + i);
+        for (uint32_t i = tx * 4; i < aligned_size; i += kThreadsPerBlock * 4) {
+          const float4 v =
+              *reinterpret_cast<const float4*>(row_input + my_chunk_start + i);
           shared_ordered[i] = convert_to_uint32_v2(v.x);
           shared_ordered[i + 1] = convert_to_uint32_v2(v.y);
           shared_ordered[i + 2] = convert_to_uint32_v2(v.z);
@@ -758,13 +771,12 @@ __device__ void radix_topk(const float* __restrict__ row_input,
         }
         for (uint32_t i = aligned_size + tx; i < actual_chunk_size;
              i += kThreadsPerBlock)
-          shared_ordered[i] = convert_to_uint32_v2(
-              row_input[my_chunk_start + i]);
+          shared_ordered[i] =
+              convert_to_uint32_v2(row_input[my_chunk_start + i]);
       } else {
-        for (uint32_t i = tx; i < actual_chunk_size;
-             i += kThreadsPerBlock)
-          shared_ordered[i] = convert_to_uint32_v2(
-              row_input[my_chunk_start + i]);
+        for (uint32_t i = tx; i < actual_chunk_size; i += kThreadsPerBlock)
+          shared_ordered[i] =
+              convert_to_uint32_v2(row_input[my_chunk_start + i]);
       }
     } else {
       for (uint32_t i = tx * VEC_SIZE; i < aligned_size;
@@ -782,8 +794,7 @@ __device__ void radix_topk(const float* __restrict__ row_input,
     if constexpr (VEC_SIZE != 4) {
       for (uint32_t i = aligned_size + tx; i < actual_chunk_size;
            i += kThreadsPerBlock) {
-        shared_ordered[i] =
-            convert_to_uint32_v2(row_input[my_chunk_start + i]);
+        shared_ordered[i] = convert_to_uint32_v2(row_input[my_chunk_start + i]);
       }
     }
   }
@@ -797,6 +808,14 @@ __device__ void radix_topk(const float* __restrict__ row_input,
   __syncthreads();
 
   // -- Initial barrier --
+  // Short rows can skip radix rounds; initialize this row's first histogram
+  // rather than assuming the preceding row cleared the same rotating buffer.
+  if (cta_in_group == 0) {
+    for (uint32_t i = tx; i < RADIX; i += kThreadsPerBlock)
+      state->histogram[(iter * 4) % 3][i] = 0;
+    if (tx == 0) state->output_counter = 0;
+  }
+  __syncthreads();
   if (tx == 0) {
     red_release(&state->arrival_counter, 1);
   }
@@ -804,10 +823,6 @@ __device__ void radix_topk(const float* __restrict__ row_input,
           (barrier_phase + 1) * static_cast<int>(ctas_per_group), tx);
   barrier_phase++;
   __syncthreads();
-
-  if (cta_in_group == 0 && tx == 0) {
-    st_release(&state->output_counter, 0);
-  }
 
   // -- Stage 2: 4 rounds of radix select --
   for (uint32_t round = 0; round < 4; round++) {
@@ -845,6 +860,9 @@ __device__ void radix_topk(const float* __restrict__ row_input,
         next_hist[i] = 0;
       }
     }
+
+    // The release must publish every warp's histogram contribution.
+    __syncthreads();
 
     if (tx == 0) {
       red_release(&state->arrival_counter, 1);
@@ -948,8 +966,9 @@ __device__ void radix_topk(const float* __restrict__ row_input,
     }
   }
 
-  state->histogram[2][cta_in_group] = local_histogram[2];
+  __syncthreads();
   if (tx == 0) {
+    state->histogram[2][cta_in_group] = local_histogram[2];
     red_release(&state->arrival_counter, 1);
   }
   wait_ge(&state->arrival_counter,
@@ -972,21 +991,18 @@ __device__ void radix_topk(const float* __restrict__ row_input,
 
   const int tie_offset = local_histogram[1];
   const int tie_count = local_histogram[2];
-  if (tie_count == 1) {
+  if (tie_count == 1 && tie_offset < TopK) {
     // With unique scores the pivot has exactly one matching element. Avoid
     // the full ballot/barrier scan used for genuine tie groups.
     for (uint32_t i = tx; i < actual_chunk_size; i += kThreadsPerBlock) {
       if (shared_ordered[i] == ordered_pivot) {
-        row_output[tie_offset] =
-            static_cast<int32_t>(my_chunk_start + i);
+        row_output[tie_offset] = static_cast<int32_t>(my_chunk_start + i);
         if (row_keys != nullptr)
-          row_keys[tie_offset] =
-              (static_cast<uint64_t>(ordered_pivot) << 32) |
-              static_cast<uint32_t>(my_chunk_start + i);
+          row_keys[tie_offset] = (static_cast<uint64_t>(ordered_pivot) << 32) |
+                                 static_cast<uint32_t>(my_chunk_start + i);
       }
     }
-  }
-  else if (tie_count > 0) {
+  } else if (tie_count > 1 && tie_offset < TopK) {
     if (tx == 0) local_histogram[3] = 0;
     __syncthreads();
     const int warp = tx / 32;
@@ -994,15 +1010,14 @@ __device__ void radix_topk(const float* __restrict__ row_input,
     for (uint32_t base = 0; base < actual_chunk_size;
          base += kThreadsPerBlock) {
       const int reverse = static_cast<int>(actual_chunk_size - 1 - base) - tx;
-      const bool selected = reverse >= 0 &&
-                            shared_ordered[reverse] == ordered_pivot;
+      const bool selected =
+          reverse >= 0 && shared_ordered[reverse] == ordered_pivot;
       const unsigned mask = __ballot_sync(0xffffffff, selected);
       if (lane == 0) local_histogram[4 + warp] = __popc(mask);
       __syncthreads();
       int warp_prefix = 0;
       for (int w = 0; w < warp; ++w) warp_prefix += local_histogram[4 + w];
-      const int rank = warp_prefix +
-                       __popc(mask & ((1u << lane) - 1));
+      const int rank = warp_prefix + __popc(mask & ((1u << lane) - 1));
       const int pos = local_histogram[3] + rank;
       if (selected && pos < tie_count && tie_offset + pos < TopK) {
         row_output[tie_offset + pos] =
@@ -1021,7 +1036,6 @@ __device__ void radix_topk(const float* __restrict__ row_input,
       __syncthreads();
     }
   }
-
 }
 
 // ============================================================================
@@ -1030,7 +1044,7 @@ __device__ void radix_topk(const float* __restrict__ row_input,
 // see filtered_topk.cuh)
 // ============================================================================
 
-template <int TopK = 2048, uint32_t VEC_SIZE = 1>
+template <int TopK = 2048, uint32_t VEC_SIZE = 1, bool Deterministic = false>
 __global__ void __launch_bounds__(kThreadsPerBlock, 2)
     persistent_topk_kernel(PersistentTopKParams params) {
   const uint32_t tx = threadIdx.x;
@@ -1068,15 +1082,21 @@ __global__ void __launch_bounds__(kThreadsPerBlock, 2)
     // Static round-robin: all CTAs in the group implicitly agree on the row
     uint32_t row_idx = group_id + iter * num_groups;
     if (row_idx >= params.num_rows) break;
-    const uint32_t row_start = params.row_starts == nullptr
-                                   ? 0
-                                   : params.row_starts[row_idx];
+    const uint32_t row_start =
+        params.row_starts == nullptr ? 0 : params.row_starts[row_idx];
     const uint32_t row_end = params.row_ends == nullptr
                                  ? params.lengths[row_idx]
                                  : params.row_ends[row_idx];
-    const uint32_t seq_len = row_end - row_start;
+    const uint32_t seq_len =
+        Deterministic && row_end < row_start ? 0 : row_end - row_start;
     int32_t* row_output = params.output + row_idx * params.top_k;
     const float* row_input = params.input + row_idx * params.stride + row_start;
+
+    if constexpr (Deterministic) {
+      if (seq_len < HIST2048_THRESHOLD) {
+        continue;
+      }
+    }
 
     if (seq_len <= RADIX_THRESHOLD) {
       if (cta_in_group == 0) {
@@ -1089,7 +1109,8 @@ __global__ void __launch_bounds__(kThreadsPerBlock, 2)
         } else if (seq_len < static_cast<uint32_t>(HIST2048_THRESHOLD)) {
           histogram_2048_topk<TopK>(row_input, row_output, seq_len);
         } else {
-          histogram_256_topk<TopK>(row_input, row_output, 0, seq_len);
+          histogram_256_topk<TopK, Deterministic>(row_input, row_output, 0,
+                                                  seq_len);
         }
       }
       continue;
@@ -1098,18 +1119,19 @@ __global__ void __launch_bounds__(kThreadsPerBlock, 2)
     const uint32_t my_chunk_start = cta_in_group * chunk_size;
     radix_topk<TopK, VEC_SIZE>(
         row_input, row_output,
-        params.output_keys ? params.output_keys + row_idx * params.top_k : nullptr,
-        seq_len, my_chunk_start, chunk_size,
-        local_histogram, suffix_sum, shared_scalars, shared_ordered, state,
-        cta_in_group, ctas_per_group, barrier_phase, iter, tx);
+        params.output_keys ? params.output_keys + row_idx * params.top_k
+                           : nullptr,
+        seq_len, my_chunk_start, chunk_size, local_histogram, suffix_sum,
+        shared_scalars, shared_ordered, state, cta_in_group, ctas_per_group,
+        barrier_phase, iter, tx);
     // Ensure every CTA in the cooperative group has finished writing this row
     // before any CTA advances to the next row assigned to the group.
+    __syncthreads();
     completion_phase++;
     if (tx == 0) red_release(&state->completion_counter, 1);
     wait_ge(&state->completion_counter,
             completion_phase * static_cast<int>(ctas_per_group), tx);
     __syncthreads();
-
   }
 }
 
@@ -1243,8 +1265,8 @@ __global__ void __launch_bounds__(FILTERED_TOPK_BLOCK_THREADS)
   if (length <= 32768) {
     extern __shared__ uint8_t _smem_reg[];
     if constexpr (UsePredicatedShortLoads) {
-      hist4096::histogram_4096_topk_predicated<MAX_K, 12, 8>(
-          score, dst, length, _smem_reg);
+      hist4096::histogram_4096_topk_predicated<MAX_K, 12, 8>(score, dst, length,
+                                                             _smem_reg);
     } else {
       hist4096::histogram_4096_topk<MAX_K, 12, 8>(score, dst, length,
                                                   _smem_reg);
@@ -1512,30 +1534,26 @@ constexpr int ComputeFilteredTopKVecSize(uint32_t max_len) {
 }
 
 template <typename DType, typename IdType, uint32_t MAX_K = 2048>
-cudaError_t FilteredTopKRaggedTransform(const DType* input,
-                                        IdType* output_indices,
-                                        const IdType* lengths,
-                                        const IdType* row_starts,
-                                        uint32_t* fallback_flags,
-                                        uint32_t num_rows, uint32_t top_k_val,
-                                        uint32_t max_len,
-                                        cudaStream_t stream = 0,
-                                        uint32_t shard_count = 1) {
+cudaError_t FilteredTopKRaggedTransform(
+    const DType* input, IdType* output_indices, const IdType* lengths,
+    const IdType* row_starts, uint32_t* fallback_flags, uint32_t num_rows,
+    uint32_t top_k_val, uint32_t max_len, cudaStream_t stream = 0,
+    uint32_t shard_count = 1) {
   constexpr size_t smem_size = FILTERED_TOPK_SMEM_DYNAMIC;
   constexpr int MAX_VEC = 16 / sizeof(DType);
 
   dim3 grid(num_rows, shard_count);
   dim3 block(FILTERED_TOPK_BLOCK_THREADS);
-  void* args[] = {&input, &output_indices, &lengths, &row_starts,
-                  &fallback_flags, &num_rows, &top_k_val, &max_len,
-                  &shard_count};
+  void* args[] = {&input,      &output_indices, &lengths,
+                  &row_starts, &fallback_flags, &num_rows,
+                  &top_k_val,  &max_len,        &shard_count};
 
   const int vec_size = ComputeFilteredTopKVecSize<DType>(max_len);
 
 #define DISPATCH_VEC_SIZE(VS)                                                 \
   if (vec_size == VS) {                                                       \
     auto kernel =                                                             \
-        FilteredTopKUnifiedKernel<DType, IdType, VS, MAX_K, (VS != MAX_VEC)>;  \
+        FilteredTopKUnifiedKernel<DType, IdType, VS, MAX_K, (VS != MAX_VEC)>; \
     FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(                                \
         kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));     \
     FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, grid, block, args,   \
@@ -1557,13 +1575,10 @@ cudaError_t FilteredTopKRaggedTransform(const DType* input,
 }  // namespace filtered_topk
 
 template <typename DType, typename IdType, uint32_t MAX_K = 2048>
-cudaError_t FilteredTopKRaggedTransform(const DType* input,
-                                        IdType* output_indices,
-                                        const IdType* lengths,
-                                        uint32_t num_rows, uint32_t top_k_val,
-                                        uint32_t max_len,
-                                        cudaStream_t stream = 0,
-                                        uint32_t shard_count = 1) {
+cudaError_t FilteredTopKRaggedTransform(
+    const DType* input, IdType* output_indices, const IdType* lengths,
+    uint32_t num_rows, uint32_t top_k_val, uint32_t max_len,
+    cudaStream_t stream = 0, uint32_t shard_count = 1) {
   return filtered_topk::FilteredTopKRaggedTransform<DType, IdType, MAX_K>(
       input, output_indices, lengths, nullptr, nullptr, num_rows, top_k_val,
       max_len, stream, shard_count);
