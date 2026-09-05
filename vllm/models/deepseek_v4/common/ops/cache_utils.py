@@ -618,6 +618,9 @@ def combine_topk_swa_indices(
         )
         return combined_indices, combined_lens
 
+    if out is not None:
+        combined_indices.fill_(-1)
+
     if envs.VLLM_BATCH_INVARIANT and topk:
         # The prefill radix top-k kernel guarantees the selected set but not
         # its order. FlashMLA consumes indices in-order, so different legal

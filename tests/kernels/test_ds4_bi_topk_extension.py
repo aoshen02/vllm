@@ -159,7 +159,7 @@ def test_fused_c4_decode_indices_match_existing_pipeline(
     is_valid = torch.arange(rows, device="cuda") % 7 != 0
 
     expected_indices = torch.full(
-        (rows, output_width), -1, dtype=torch.int32, device="cuda"
+        (rows, output_width), 123, dtype=torch.int32, device="cuda"
     )
     expected_lens = torch.empty(rows, dtype=torch.int32, device="cuda")
     combine_topk_swa_indices(
