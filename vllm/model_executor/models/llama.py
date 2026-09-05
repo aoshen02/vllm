@@ -26,7 +26,7 @@
 
 from collections.abc import Iterable
 from itertools import islice
-from typing import ClassVar
+from typing import TYPE_CHECKING
 
 import torch
 from torch import nn
@@ -40,6 +40,7 @@ from vllm.model_executor.layers.attention import (
     Attention,
     EncoderOnlyAttention,
 )
+from vllm.model_executor.layers.fusion.fused_act_quant import maybe_fused_act_quant
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
@@ -115,7 +116,7 @@ class LlamaMLP(nn.Module):
 
     def forward(self, x):
         x, _ = self.gate_up_proj(x)
-        x = self.act_fn(x)
+        x = maybe_fused_act_quant(self.act_fn, x, self.down_proj)
         x, _ = self.down_proj(x)
         return x
 
@@ -274,7 +275,7 @@ class LlamaDecoderLayer(nn.Module):
         # By default, Llama uses causal attention as it is a decoder-only model.
         # You can override the HF config with `is_causal=False` to enable
         # bidirectional attention, which is used in some embedding models
-        # (e.g. parasail-ai/GritLM-7B-vllm)
+        # (e.g. nvidia/llama-nemotron-embed-1b-v2)
         if getattr(config, "is_causal", True):
             attn_type = AttentionType.DECODER
         else:
@@ -343,7 +344,7 @@ class LlamaDecoderLayer(nn.Module):
     },
 )
 class LlamaModel(nn.Module, EagleModelMixin):
-    hf_to_vllm_mapper: ClassVar[WeightsMapper] = WeightsMapper(
+    hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_stacked={
             # weight_name: (param_name, shard_id)
             ".q_proj": (".qkv_proj", "q"),
@@ -533,21 +534,36 @@ class LlamaForCausalLM(
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
 
+    def compute_logits_local(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        return self.logits_processor(self.lm_head, hidden_states, skip_gather=True)
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(
-            self,
-            skip_prefixes=(["lm_head."] if self.config.tie_word_embeddings else None),
-        )
+        loader = AutoWeightsLoader(self)
         return loader.load_weights(weights)
 
 
-class LlamaBidirectionalForSequenceClassification(as_seq_cls_model(LlamaForCausalLM)):
+if TYPE_CHECKING:
+    _LlamaBidirectionalForSequenceClassificationBase = LlamaForCausalLM
+    _LlamaBidirectionalModelBase = LlamaForCausalLM
+else:
+    _LlamaBidirectionalForSequenceClassificationBase = as_seq_cls_model(
+        LlamaForCausalLM
+    )
+    _LlamaBidirectionalModelBase = as_embedding_model(LlamaForCausalLM)
+
+
+class LlamaBidirectionalForSequenceClassification(
+    _LlamaBidirectionalForSequenceClassificationBase
+):
     # This class sets the correct attention type and pooling type
     # through LlamaBidirectionalConfig.
     pass
 
 
-class LlamaBidirectionalModel(as_embedding_model(LlamaForCausalLM)):
+class LlamaBidirectionalModel(_LlamaBidirectionalModelBase):
     # This class sets the correct attention type and pooling type
     # through LlamaBidirectionalConfig.
     pass

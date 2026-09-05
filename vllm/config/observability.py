@@ -45,6 +45,18 @@ class ObservabilityConfig:
     Note that collecting detailed timing information for each request can be
     expensive."""
 
+    per_request_spec_decode_metrics: Literal["none", "summary", "detailed"] = "none"
+    """Include per-request speculative-decoding acceptance metrics in the
+    response under `metrics.speculative_decoding`. `none` disables; `summary` adds mean
+    acceptance length, draft acceptance rate, and the step-by-draft-length
+    histogram; `detailed` additionally records the ordered per-step
+    accepted/proposed arrays (one entry per verify step). Only reported for
+    single-sequence requests (`n == 1`), mirroring the timing metrics. No effect
+    unless speculative decoding is enabled. Independent of `--disable-log-stats`.
+    This is the per-request response-body counterpart of the aggregate
+    `vllm:spec_decode_*` Prometheus metrics. The response field is experimental
+    and its shape may change in a future release."""
+
     kv_cache_metrics: bool = False
     """Enable KV cache residency metrics (lifetime, idle time, reuse gaps).
     Uses sampling to minimize overhead.
@@ -61,6 +73,12 @@ class ObservabilityConfig:
     """Enable layerwise NVTX tracing. This traces the execution of each layer or
     module in the model and attach information such as input/output shapes to
     nvtx range markers. Noted that this doesn't work with CUDA graphs enabled."""
+
+    debug_tensor_dump_output_folder: str | None = None
+    """Directory for opt-in decoder-layer tensor dumps."""
+
+    debug_tensor_dump_layers: list[int] | None = None
+    """Decoder layer indices to dump. Dumps all layers when unset."""
 
     enable_mfu_metrics: bool = False
     """Enable Model FLOPs Utilization (MFU) metrics."""
