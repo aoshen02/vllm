@@ -576,13 +576,8 @@ def combine_topk_swa_indices(
     M: int,
     N: int,
     out: tuple[torch.Tensor, torch.Tensor] | None = None,
+    decode_is_valid: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    if envs.VLLM_BATCH_INVARIANT and topk:
-        # The prefill radix top-k kernel guarantees the selected set but not
-        # its order. FlashMLA consumes indices in-order, so different legal
-        # permutations otherwise change the floating-point reduction and make
-        # repeated runs diverge once the candidate count exceeds ``topk``.
-        topk_indices = _canonicalize_sparse_topk_indices(topk_indices)
     num_tokens = topk_indices.shape[0]
     combined_topk = (
         (topk + window_size + _SPARSE_PREFILL_TOPK_ALIGNMENT - 1)
@@ -602,6 +597,34 @@ def combine_topk_swa_indices(
     else:
         combined_indices, combined_lens = out
 
+    use_fused_decode = (
+        envs.VLLM_BATCH_INVARIANT
+        and decode_is_valid is not None
+        and topk <= 512
+        and hasattr(torch.ops.ds4_bi, "combine_topk_swa_decode")
+    )
+    if use_fused_decode:
+        torch.ops.ds4_bi.combine_topk_swa_decode(
+            combined_indices,
+            combined_lens,
+            topk_indices,
+            seq_lens,
+            decode_is_valid,
+            M,
+            N,
+            topk,
+            compress_ratio,
+            window_size,
+        )
+        return combined_indices, combined_lens
+
+    if envs.VLLM_BATCH_INVARIANT and topk:
+        # The prefill radix top-k kernel guarantees the selected set but not
+        # its order. FlashMLA consumes indices in-order, so different legal
+        # permutations otherwise change the floating-point reduction and make
+        # repeated runs diverge once the candidate count exceeds ``topk``.
+        topk_indices = _canonicalize_sparse_topk_indices(topk_indices)
+
     _COMBINE_TOPK_SWA_INDICES_KERNEL(
         combined_indices,
         combined_lens,
@@ -615,6 +638,8 @@ def combine_topk_swa_indices(
         COMPRESS_RATIO=compress_ratio,
         WINDOW_SIZE=window_size,
     )
+    if decode_is_valid is not None:
+        zero_invalid_lens(combined_lens, decode_is_valid)
     return combined_indices, combined_lens
 
 
@@ -634,9 +659,7 @@ def _fill_c128_topk_kernel(
     offsets = tl.arange(0, TOP_K)
     length = tl.load(lens_ptr + row)
     values = tl.where(offsets < length, offsets, -1)
-    tl.store(
-        output_ptr + row * output_stride_0 + offsets * output_stride_1, values
-    )
+    tl.store(output_ptr + row * output_stride_0 + offsets * output_stride_1, values)
 
 
 def fill_c128_topk(output: torch.Tensor, lengths: torch.Tensor) -> None:
@@ -703,9 +726,9 @@ def _compute_gather_lens_kernel(
     row = tl.program_id(0)
     if row >= n_rows:
         return
-    query_len = tl.load(
-        query_start_ptr + (row + 1) * query_start_stride
-    ) - tl.load(query_start_ptr + row * query_start_stride)
+    query_len = tl.load(query_start_ptr + (row + 1) * query_start_stride) - tl.load(
+        query_start_ptr + row * query_start_stride
+    )
     seq_len = tl.load(seq_lens_ptr + row * seq_lens_stride)
     prefix_len = tl.minimum(tl.maximum(seq_len - query_len, 0), window_size - 1)
     tl.store(output_ptr + row * output_stride, query_len + prefix_len)

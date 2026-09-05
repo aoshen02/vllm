@@ -14,7 +14,6 @@ from vllm.models.deepseek_v4.common.ops import (
     compute_global_topk_indices_and_lens,
     dequantize_and_gather_k_cache,
     fill_c128_topk,
-    zero_invalid_lens,
 )
 from vllm.models.deepseek_v4.nvidia.ops.o_proj import (
     compute_fp8_einsum_recipe,
@@ -149,9 +148,7 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
             if not swa_only and self.compress_ratio == 128:
                 # Reserve the same C128 decode buffer used by the real path so
                 # workspace locking cannot be tripped by the first replay.
-                warmup_specs.append(
-                    ((self.max_num_batched_tokens, top_k), torch.int32)
-                )
+                warmup_specs.append(((self.max_num_batched_tokens, top_k), torch.int32))
             current_workspace_manager().get_simultaneous(
                 *warmup_specs,
             )
@@ -356,8 +353,7 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
         seq_lens = swa_metadata.seq_lens[request_start:request_end]
         seq_lens_cpu = swa_metadata.seq_lens_cpu[request_start:request_end]
         query_start_loc = (
-            swa_metadata.query_start_loc[request_start : request_end + 1]
-            - token_start
+            swa_metadata.query_start_loc[request_start : request_end + 1] - token_start
         )
         query_start_loc_cpu = (
             swa_metadata.query_start_loc_cpu[request_start : request_end + 1]
@@ -432,17 +428,31 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
         else:
             max_gather = int(gather_lens_cpu.numpy().max())
         workspace_width = max_compressed + max_gather
+        use_fused_c128_decode = (
+            envs.VLLM_BATCH_INVARIANT
+            and not swa_only
+            and self.compress_ratio == 128
+            and hasattr(torch.ops.ds4_bi, "combine_c128_swa_decode")
+        )
+        use_fused_topk_decode = (
+            envs.VLLM_BATCH_INVARIANT
+            and top_k <= 512
+            and hasattr(torch.ops.ds4_bi, "combine_topk_swa_decode")
+        )
+        if use_fused_c128_decode:
+            top_k = min(top_k, round_up(max_compressed, 128))
         combined_topk = round_up(top_k + self.window_size, 128)
         specs: list[tuple[tuple[int, ...], torch.dtype]] = [
             ((num_decodes, workspace_width, q.shape[-1]), torch.bfloat16),
             ((num_decode_tokens, combined_topk), torch.int32),
             ((num_decode_tokens,), torch.int32),
         ]
-        if not swa_only and self.compress_ratio == 128:
+        if not swa_only and self.compress_ratio == 128 and not use_fused_c128_decode:
             specs.append(((num_decode_tokens, top_k), torch.int32))
         workspace = current_workspace_manager().get_simultaneous(*specs)
         kv, combined_indices_out, combined_lens_out = workspace[:3]
-        combined_indices_out.fill_(-1)
+        if not (use_fused_topk_decode or use_fused_c128_decode):
+            combined_indices_out.fill_(-1)
 
         if not swa_only:
             assert attn_metadata is not None
@@ -468,30 +478,45 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
             offset=max_compressed,
         )
 
-        if not swa_only and self.compress_ratio == 128:
+        if use_fused_c128_decode:
+            torch.ops.ds4_bi.combine_c128_swa_decode(
+                combined_indices_out,
+                combined_lens_out,
+                seq_lens,
+                swa_metadata.is_valid_token[token_start:token_end],
+                workspace_width,
+                max_compressed,
+                top_k,
+                self.compress_ratio,
+                self.window_size,
+            )
+            combined_indices, combined_lens = (
+                combined_indices_out,
+                combined_lens_out,
+            )
+        elif not swa_only and self.compress_ratio == 128:
             local_topk = workspace[3]
+            assert attn_metadata is not None
             assert attn_metadata.c128a_decode_topk_lens is not None
             fill_c128_topk(
                 local_topk,
                 attn_metadata.c128a_decode_topk_lens[token_start:token_end],
             )
-        assert local_topk is not None
-        combined_indices, combined_lens = combine_topk_swa_indices(
-            local_topk,
-            query_start_loc,
-            seq_lens,
-            gather_lens,
-            self.window_size,
-            self.compress_ratio,
-            top_k,
-            workspace_width,
-            max_compressed,
-            out=(combined_indices_out, combined_lens_out),
-        )
-        zero_invalid_lens(
-            combined_lens,
-            swa_metadata.is_valid_token[token_start:token_end],
-        )
+        if not use_fused_c128_decode:
+            assert local_topk is not None
+            combined_indices, combined_lens = combine_topk_swa_indices(
+                local_topk,
+                query_start_loc,
+                seq_lens,
+                gather_lens,
+                self.window_size,
+                self.compress_ratio,
+                top_k,
+                workspace_width,
+                max_compressed,
+                out=(combined_indices_out, combined_lens_out),
+                decode_is_valid=swa_metadata.is_valid_token[token_start:token_end],
+            )
         flash_mla_sparse_fwd(
             q=q,
             kv=kv.view(-1, 1, q.shape[-1]),
