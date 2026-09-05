@@ -183,39 +183,47 @@ void ds4_top_k_per_row_prefill(const at::Tensor& logits,
 }
 
 constexpr int kCombineThreads = 256;
-constexpr int kCombineItemsPerThread = 2;
-
-__global__
-__launch_bounds__(kCombineThreads) void combine_topk_swa_decode_kernel(
+template <int Capacity>
+__global__ __launch_bounds__(128) void combine_topk_swa_decode_kernel(
     int* combined_indices, int* combined_lens, const int* topk_indices,
     const int* seq_lens, const bool* is_valid, int64_t output_stride,
     int64_t topk_stride, int output_width, int M, int N, int top_k,
     int compress_ratio, int window_size) {
-  using Sort =
-      cub::BlockRadixSort<int, kCombineThreads, kCombineItemsPerThread>;
+  constexpr int threads = 128;
+  constexpr int items = Capacity / threads;
+  using Sort = cub::BlockRadixSort<unsigned, threads, items, cub::NullType, 5>;
   __shared__ typename Sort::TempStorage sort_storage;
   const int row = blockIdx.x;
   const int seq_len = seq_lens[row];
   const int topk_len = min(seq_len / compress_ratio, top_k);
   const int swa_len = min(seq_len, window_size);
   const int row_base = M * row;
-  int sorted_indices[kCombineItemsPerThread];
+  unsigned sorted_indices[items];
 
 #pragma unroll
-  for (int item = 0; item < kCombineItemsPerThread; ++item) {
-    const int column = threadIdx.x * kCombineItemsPerThread + item;
+  for (int item = 0; item < items; ++item) {
+    const int column = threadIdx.x * items + item;
     sorted_indices[item] =
         column < topk_len
-            ? topk_indices[static_cast<int64_t>(row) * topk_stride + column]
-            : -1;
+            ? static_cast<unsigned>(
+                  topk_indices[static_cast<int64_t>(row) * topk_stride +
+                               column]) +
+                  1U
+            : 0U;
   }
-  Sort(sort_storage).SortDescendingBlockedToStriped(sorted_indices);
+  // Request-local indices are in [-1, N). Encoding +1 makes padding zero;
+  // only the bits needed for [0, N] participate in the exact integer sort.
+  if (topk_len > 1) {
+    const int end_bit = 32 - __clz(static_cast<unsigned>(max(N, 1)));
+    Sort(sort_storage)
+        .SortDescendingBlockedToStriped(sorted_indices, 0, end_bit);
+  }
 
   for (int column = threadIdx.x; column < output_width; column += blockDim.x) {
     int value = -1;
     if (column < topk_len) {
-      const int item = column / kCombineThreads;
-      value = sorted_indices[item] + row_base;
+      const int item = column / threads;
+      value = static_cast<int>(sorted_indices[item]) - 1 + row_base;
     } else if (column < topk_len + swa_len) {
       value = row_base + N + column - topk_len;
     }
@@ -256,9 +264,8 @@ void ds4_combine_topk_swa_decode(at::Tensor& combined_indices,
               "index rows must be contiguous");
   TORCH_CHECK(top_k >= 0 && top_k <= topk_indices.size(1),
               "top_k exceeds the input width");
-  TORCH_CHECK(top_k <= kCombineThreads * kCombineItemsPerThread,
-              "fused decode combine supports top_k <= 512");
-  TORCH_CHECK(compress_ratio > 0 && window_size >= 0,
+  TORCH_CHECK(top_k <= 512, "fused decode combine supports top_k <= 512");
+  TORCH_CHECK(compress_ratio > 0 && window_size >= 0 && N >= 0,
               "invalid sparse attention dimensions");
   if (num_rows == 0) {
     return;
@@ -266,14 +273,23 @@ void ds4_combine_topk_swa_decode(at::Tensor& combined_indices,
 
   const c10::cuda::CUDAGuard device_guard(combined_indices.device());
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-  combine_topk_swa_decode_kernel<<<num_rows, kCombineThreads, 0, stream>>>(
-      combined_indices.mutable_data_ptr<int>(),
-      combined_lens.mutable_data_ptr<int>(), topk_indices.const_data_ptr<int>(),
-      seq_lens.const_data_ptr<int>(), is_valid.const_data_ptr<bool>(),
-      combined_indices.stride(0), topk_indices.stride(0),
-      combined_indices.size(1), static_cast<int>(M), static_cast<int>(N),
-      static_cast<int>(top_k), static_cast<int>(compress_ratio),
-      static_cast<int>(window_size));
+  const auto launch = [&]<int Capacity>() {
+    combine_topk_swa_decode_kernel<Capacity><<<num_rows, 128, 0, stream>>>(
+        combined_indices.mutable_data_ptr<int>(),
+        combined_lens.mutable_data_ptr<int>(),
+        topk_indices.const_data_ptr<int>(), seq_lens.const_data_ptr<int>(),
+        is_valid.const_data_ptr<bool>(), combined_indices.stride(0),
+        topk_indices.stride(0), combined_indices.size(1), static_cast<int>(M),
+        static_cast<int>(N), static_cast<int>(top_k),
+        static_cast<int>(compress_ratio), static_cast<int>(window_size));
+  };
+  if (top_k <= 128) {
+    launch.template operator()<128>();
+  } else if (top_k <= 256) {
+    launch.template operator()<256>();
+  } else {
+    launch.template operator()<512>();
+  }
 }
 
 __global__

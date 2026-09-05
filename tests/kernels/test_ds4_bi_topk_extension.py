@@ -123,9 +123,11 @@ def test_standalone_topk_has_no_packed_width_limit(width: int) -> None:
 
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")
+@pytest.mark.parametrize("top_k", [0, 31, 128, 129, 256, 257, 512])
 @torch.inference_mode()
 def test_fused_c4_decode_indices_match_existing_pipeline(
     monkeypatch: pytest.MonkeyPatch,
+    top_k: int,
 ) -> None:
     library = os.environ.get("DS4_BI_TOPK_LIB")
     if not library:
@@ -134,12 +136,11 @@ def test_fused_c4_decode_indices_match_existing_pipeline(
     torch.ops.load_library(library)
 
     rows = 128
-    top_k = 512
     window_size = 128
     compress_ratio = 4
     row_stride = 4224
     compressed_width = 4096
-    output_width = 640
+    output_width = (top_k + window_size + 15) // 16 * 16
     boundary_lens = torch.tensor(
         [0, 1, 3, 4, 127, 128, 511, 512, 2047, 2048, 2049, 16048],
         dtype=torch.int32,
@@ -235,6 +236,74 @@ def test_fused_c4_decode_indices_match_existing_pipeline(
     torch.testing.assert_close(
         single_lens[0], actual_lens[selected_row], rtol=0, atol=0
     )
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")
+@pytest.mark.parametrize("width", [1, 127, 128, 129, 8191, 8192, 8193, 65537, 262144])
+@pytest.mark.parametrize("top_k", [0, 1, 32, 127, 128, 129, 255, 256, 257, 512])
+@torch.inference_mode()
+def test_fused_index_radix_range_matches_full_sort_after_graph_replay(
+    width: int, top_k: int
+) -> None:
+    """N bounds encoded indices, including power-of-two and capacity edges."""
+    library = os.environ.get("DS4_BI_TOPK_LIB")
+    if not library:
+        pytest.skip("DS4_BI_TOPK_LIB is not configured")
+    torch.ops.load_library(library)
+    rows, window = 128, 128
+    row_ids = torch.arange(rows, device="cuda", dtype=torch.int32)
+    columns = torch.arange(top_k, device="cuda")
+    seq = torch.empty(rows, device="cuda", dtype=torch.int32)
+    valid = torch.empty(rows, device="cuda", dtype=torch.bool)
+    indices = torch.empty((rows, top_k + 7), device="cuda", dtype=torch.int32)[
+        :, :top_k
+    ]
+    output_width = (top_k + window + 15) // 16 * 16
+    output = torch.empty((rows, output_width + 7), device="cuda", dtype=torch.int32)[
+        :, :output_width
+    ]
+    lens = torch.empty_like(seq)
+    row_stride = width + window
+
+    def call() -> None:
+        torch.ops.ds4_bi.combine_topk_swa_decode(
+            output, lens, indices, seq, valid, row_stride, width, top_k, 4, window
+        )
+
+    def populate(iteration: int) -> tuple[torch.Tensor, torch.Tensor]:
+        seq.copy_((row_ids * 107 + iteration) % (4 * width + 1))
+        seq[-1] = 4 * width
+        valid.copy_((row_ids + iteration) % 7 != 0)
+        count = (seq // 4).clamp_max(top_k)
+        indices.random_(0, width)
+        if top_k:
+            indices[:, 0] = width - 1
+        indices.masked_fill_(columns[None, :] >= count[:, None], -1)
+        swa = seq.clamp_max(window)
+        out_cols = torch.arange(output_width, device="cuda")[None, :]
+        expected = torch.full_like(output, -1)
+        if top_k:
+            expected[:, :top_k] = indices.sort(descending=True).values
+        expected = torch.where(
+            out_cols < count[:, None], expected + row_ids[:, None] * row_stride, -1
+        )
+        expected = torch.where(
+            (out_cols >= count[:, None]) & (out_cols < (count + swa)[:, None]),
+            row_ids[:, None] * row_stride + width + out_cols - count[:, None],
+            expected,
+        ).to(torch.int32)
+        return expected, torch.where(valid, count + swa, 0)
+
+    populate(0)
+    call()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        call()
+    for iteration in range(3):
+        expected, expected_lens = populate(iteration)
+        graph.replay()
+        torch.testing.assert_close(output, expected, rtol=0, atol=0)
+        torch.testing.assert_close(lens, expected_lens, rtol=0, atol=0)
 
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")
