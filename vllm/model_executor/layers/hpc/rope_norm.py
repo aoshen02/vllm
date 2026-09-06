@@ -8,6 +8,7 @@ Decoupled from HpcAttentionImpl; extra params are passed via layer attrs.
 from __future__ import annotations
 
 import importlib.util
+from collections.abc import Callable
 from enum import IntEnum
 from typing import Any
 
@@ -18,6 +19,8 @@ from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.layers.hpc.hpc_module import HpcModule
+from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from vllm.model_executor.utils import set_weight_attrs
 from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backends.hpc_attn import HpcAttnMetadata
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
@@ -95,13 +98,26 @@ direct_register_custom_op(
 )
 
 
+def _make_norm_weight_loader(
+    norm_weight: torch.Tensor, base_loader: Callable[..., None]
+) -> Callable[..., None]:
+    def weight_loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
+        base_loader(param, loaded_weight)
+        if not param.is_meta:
+            norm_weight.copy_(param.data)
+
+    return weight_loader
+
+
 @CustomOp.register("hpc_rope_norm")
 class HpcRopeNorm(CustomOp, HpcModule):
     """HPC fused RoPE + QK-Norm + KV-Cache-Write (+ optional FP8 Q quant).
 
     Registered as a sub-module in model layers (e.g. HunYuanAttention).
-    Norm weights are extracted from fallback norm modules via
-    process_weights_after_loading() after all weights are loaded.
+    Float32 norm weight mirrors are populated eagerly by wrapped
+    weight_loaders installed on the fallback norm modules, so every
+    load path (cold start, weight refit, layerwise reload) keeps them
+    in sync without a separate post-load hook.
 
     forward() is dispatched by CustomOp framework:
     - In compiled mode: forward_cuda() calls torch.ops.vllm.hpc_rope_norm_forward
@@ -149,25 +165,15 @@ class HpcRopeNorm(CustomOp, HpcModule):
 
         self.head_per_group = num_heads // num_kv_heads
 
-        # Pre-allocate norm weight tensors as Parameters so they are tracked by
-        # CuMemAllocator (for sleep/wake_up) and have stable addresses for CUDA
-        # Graph replay. process_weights_after_loading() updates them inplace via
-        # copy_() so refit does not invalidate captured graph tensor pointers.
-        # Shape is [head_dim] to match the HPC kernel's q/k_norm_weight layout.
+        qnorm_weight = knorm_weight = None
         if use_qk_norm and fallback_qnorm is not None:
-            self.qnorm_weight: torch.nn.Parameter | None = torch.nn.Parameter(
-                torch.empty(head_dim, dtype=torch.float32),
-                requires_grad=False,
-            )
-        else:
-            self.qnorm_weight = None
+            qnorm_weight = torch.ones(head_dim, dtype=torch.float32)
         if use_qk_norm and fallback_knorm is not None:
-            self.knorm_weight: torch.nn.Parameter | None = torch.nn.Parameter(
-                torch.empty(head_dim, dtype=torch.float32),
-                requires_grad=False,
-            )
-        else:
-            self.knorm_weight = None
+            knorm_weight = torch.ones(head_dim, dtype=torch.float32)
+        self.register_buffer("qnorm_weight", qnorm_weight, persistent=False)
+        self.register_buffer("knorm_weight", knorm_weight, persistent=False)
+        self._install_norm_weight_loader(fallback_qnorm, qnorm_weight)
+        self._install_norm_weight_loader(fallback_knorm, knorm_weight)
 
         self.use_fp8 = "fp8" in kv_cache_dtype
         # The RMSNorm/RoPE ordering is model dependent (e.g. HunYuan V3 applies
@@ -225,19 +231,21 @@ class HpcRopeNorm(CustomOp, HpcModule):
         logger.info_once("enable hpc rope_norm")
         return True
 
-    def process_weights_after_loading(self, model: torch.nn.Module = None) -> None:
-        """Copy norm weights (float32) from fallback norm modules inplace.
-
-        Uses copy_() to preserve tensor addresses for CUDA Graph / refit
-        compatibility. Called by the model's load_weights() after all weights
-        are loaded (and generically from the model loader for DummyModelLoader
-        / sleep-wake_up reload paths).
-        """
-        if self.use_qk_norm:
-            if self.fallback_qnorm is not None and self.qnorm_weight is not None:
-                self.qnorm_weight.data.copy_(self.fallback_qnorm.weight.data.float())
-            if self.fallback_knorm is not None and self.knorm_weight is not None:
-                self.knorm_weight.data.copy_(self.fallback_knorm.weight.data.float())
+    def _install_norm_weight_loader(
+        self,
+        fallback_norm: torch.nn.Module | None,
+        norm_weight: torch.Tensor | None,
+    ) -> None:
+        if fallback_norm is None or norm_weight is None:
+            return
+        weight = fallback_norm.weight
+        base_loader = getattr(weight, "weight_loader", default_weight_loader)
+        if hasattr(weight, "weight_loader"):
+            delattr(weight, "weight_loader")
+        set_weight_attrs(
+            weight,
+            {"weight_loader": _make_norm_weight_loader(norm_weight, base_loader)},
+        )
 
     def register_layer_name(self, layer_name: str) -> None:
         """Register layer_name and add self to the global registry.

@@ -1,7 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import gc
+import importlib.machinery
 import inspect
+import sys
+import types
 from unittest.mock import Mock
 from weakref import WeakKeyDictionary, ref
 
@@ -910,6 +913,100 @@ def test_layerwise_reload_updates_loaded_non_persistent_buffers(monkeypatch):
     assert torch.equal(layer.scale, loaded_scale)
     assert "scale" in layer._non_persistent_buffers_set
     assert "0.scale" not in model.state_dict()
+
+
+@pytest.fixture
+def hpc_rope_norm(monkeypatch, default_vllm_config):
+    """Import HpcRopeNorm with a stub ``hpc`` package and an isolated registry."""
+    stub = types.ModuleType("hpc")
+    stub.__spec__ = importlib.machinery.ModuleSpec("hpc", loader=None)
+    monkeypatch.setitem(sys.modules, "hpc", stub)
+
+    import vllm.model_executor.layers.hpc.rope_norm as rope_norm
+
+    monkeypatch.setattr(rope_norm, "_hpc_rope_norm_instances", {})
+    return rope_norm
+
+
+def _make_hpc_qk_norm_layer(rope_norm, head_dim: int = 128) -> torch.nn.Module:
+    """Mirror HYV3Attention: q/k RMSNorm built first, then HpcRopeNorm."""
+    from vllm.model_executor.layers.layernorm import RMSNorm
+
+    layer = torch.nn.Module()
+    layer.q_norm = RMSNorm(head_dim, 1e-6)
+    layer.k_norm = RMSNorm(head_dim, 1e-6)
+    layer.hpc_rope_norm = rope_norm.HpcRopeNorm(
+        num_heads=8,
+        num_kv_heads=1,
+        head_dim=head_dim,
+        cos_sin_cache=torch.ones(16, head_dim),
+        use_qk_norm=True,
+        fallback_qnorm=layer.q_norm,
+        fallback_knorm=layer.k_norm,
+        kv_cache_dtype="auto",
+        layer_name="hpc_test_layer",
+    )
+    return layer
+
+
+def test_hpc_rope_norm_derives_weights_during_loading(hpc_rope_norm):
+    layer = _make_hpc_qk_norm_layer(hpc_rope_norm)
+    rnorm = layer.hpc_rope_norm
+
+    assert torch.equal(rnorm.qnorm_weight, torch.ones(128))
+    assert "qnorm_weight" not in dict(rnorm.named_parameters())
+    assert "qnorm_weight" in rnorm._non_persistent_buffers_set
+
+    qnorm_ptr = rnorm.qnorm_weight.data_ptr()
+    knorm_ptr = rnorm.knorm_weight.data_ptr()
+
+    new_q = torch.full((128,), 0.5, dtype=torch.bfloat16)
+    new_k = torch.full((128,), 2.0, dtype=torch.bfloat16)
+    layer.q_norm.weight.weight_loader(layer.q_norm.weight, new_q)
+    layer.k_norm.weight.weight_loader(layer.k_norm.weight, new_k)
+
+    assert rnorm.qnorm_weight.dtype == torch.float32
+    assert torch.allclose(rnorm.qnorm_weight, new_q.float())
+    assert torch.allclose(rnorm.knorm_weight, new_k.float())
+    assert rnorm.qnorm_weight.data_ptr() == qnorm_ptr
+    assert rnorm.knorm_weight.data_ptr() == knorm_ptr
+
+
+def test_hpc_rope_norm_refresh_on_layerwise_reload(monkeypatch, hpc_rope_norm):
+    layer = _make_hpc_qk_norm_layer(hpc_rope_norm)
+    model = torch.nn.Sequential(layer)
+    rnorm = layer.hpc_rope_norm
+
+    def materialize_with_sentinel(meta_tensor):
+        t = torch.empty_strided(
+            size=tuple(meta_tensor.size()),
+            stride=tuple(meta_tensor.stride()),
+            dtype=meta_tensor.dtype,
+            requires_grad=False,
+        )
+        t.fill_(-123.0)
+        t.__class__ = meta_tensor.__class__
+        t.__dict__ = meta_tensor.__dict__.copy()
+        return t
+
+    monkeypatch.setattr(
+        reload_meta, "materialize_meta_tensor", materialize_with_sentinel
+    )
+
+    first_q = torch.full((128,), 0.5, dtype=torch.bfloat16)
+    layer.q_norm.weight.weight_loader(layer.q_norm.weight, first_q)
+
+    qnorm_ptr = rnorm.qnorm_weight.data_ptr()
+
+    record_metadata_for_reloading(model)
+    initialize_layerwise_reload(model)
+
+    second_q = torch.full((128,), 2.0, dtype=torch.bfloat16)
+    layer.q_norm.weight.weight_loader(layer.q_norm.weight, second_q)
+    finalize_layerwise_reload(model, model_config=None)
+
+    assert torch.allclose(rnorm.qnorm_weight, second_q.float())
+    assert rnorm.qnorm_weight.data_ptr() == qnorm_ptr
 
 
 @pytest.mark.parametrize(
