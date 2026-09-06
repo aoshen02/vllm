@@ -19,6 +19,10 @@ from vllm.model_executor.layers.attention import MMEncoderAttention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.linear import QKVParallelLinear
 from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
+from vllm.model_executor.model_loader.post_load import (
+    PostLoadPhase,
+    iter_post_load_modules,
+)
 from vllm.model_executor.model_loader.reload.layerwise import (
     finalize_layerwise_reload,
     initialize_layerwise_reload,
@@ -118,7 +122,7 @@ class _ReloadableMMEncoderAttention(MMEncoderAttention):
         self.weight.weight_loader = default_weight_loader
         self.post_load_called = False
 
-    def process_weights_after_loading(self, act_dtype: torch.dtype) -> None:
+    def process_weights_after_loading(self, act_dtype=None) -> None:
         self.post_load_called = True
 
 
@@ -138,7 +142,7 @@ class _ReloadableAttentionLayer(
     def get_kv_cache_spec(self, vllm_config):
         return None
 
-    def process_weights_after_loading(self, act_dtype: torch.dtype) -> None:
+    def process_weights_after_loading(self, act_dtype=None) -> None:
         self.post_load_called = True
 
 
@@ -154,6 +158,145 @@ def test_move_metatensors():
     assert tensor.shape == meta_tensor.shape == materialized_tensor.shape
     assert tensor.__class__ == meta_tensor.__class__ == materialized_tensor.__class__
     assert tensor.__dict__ == meta_tensor.__dict__ == materialized_tensor.__dict__
+
+
+class _OrderQuantMethod(QuantizeMethodBase):
+    def __init__(self, log: list, tag: str):
+        self.log = log
+        self.tag = tag
+
+    def create_weights(self, layer, *args, **kwargs):
+        pass
+
+    def apply(self, layer, *args, **kwargs):
+        raise NotImplementedError
+
+    def process_weights_after_loading(self, layer):
+        self.log.append(("quant", self.tag))
+
+
+class _OrderAttentionLayer(_ReloadableAttentionLayer):
+    def __init__(self, log: list, tag: str):
+        super().__init__()
+        self.log = log
+        self.tag = tag
+        self.quant_method = _OrderQuantMethod(log, tag)
+
+    def process_weights_after_loading(self, act_dtype=None) -> None:
+        self.log.append(("attn", self.tag, act_dtype))
+
+
+class _OrderModel(torch.nn.Module):
+    def __init__(self, log: list):
+        super().__init__()
+        self.log = log
+        self.attn_a = _OrderAttentionLayer(log, "a")
+        self.linear = torch.nn.Linear(2, 2)
+        self.linear.weight.weight_loader = default_weight_loader
+        self.linear.bias.weight_loader = default_weight_loader
+        self.linear.quant_method = _OrderQuantMethod(log, "linear")
+        self.attn_b = _OrderAttentionLayer(log, "b")
+
+    def process_weights_after_loading(self):
+        self.log.append(("model",))
+
+
+_PLAIN_MODEL_CONFIG = types.SimpleNamespace(
+    word_embeddings_untied_by_checkpoint=False, quantization=None
+)
+
+
+def test_post_load_iteration_order():
+    """Every module first, deferred attention-like layers again after all of
+    them, then the model-level hook only if the model defines one."""
+    model = _OrderModel([])
+    assert [(name, phase) for name, _, phase in iter_post_load_modules(model)] == [
+        ("", PostLoadPhase.LAYER),
+        ("attn_a", PostLoadPhase.LAYER),
+        ("linear", PostLoadPhase.LAYER),
+        ("attn_b", PostLoadPhase.LAYER),
+        ("attn_a", PostLoadPhase.ATTENTION),
+        ("attn_b", PostLoadPhase.ATTENTION),
+        ("", PostLoadPhase.MODEL),
+    ]
+
+    no_hook = torch.nn.Sequential(_ReloadableAttentionLayer(), torch.nn.Linear(2, 2))
+    assert [phase for _, _, phase in iter_post_load_modules(no_hook)] == [
+        PostLoadPhase.LAYER,
+        PostLoadPhase.LAYER,
+        PostLoadPhase.LAYER,
+        PostLoadPhase.ATTENTION,
+    ]
+
+
+def test_cold_start_post_load_dispatch_order():
+    """Cold-start processing runs every quant method (attention layers'
+    included) before any attention hook, calls the attention hook with no
+    dtype argument, and runs the model-level hook exactly once, last."""
+    from vllm.model_executor.model_loader.utils import process_weights_after_loading
+
+    log: list = []
+    model = _OrderModel(log)
+    process_weights_after_loading(model, _PLAIN_MODEL_CONFIG, torch.device("cpu"))
+
+    assert log == [
+        ("quant", "a"),
+        ("quant", "linear"),
+        ("quant", "b"),
+        ("attn", "a", None),
+        ("attn", "b", None),
+        ("model",),
+    ]
+
+
+def test_reload_post_load_dispatch_order():
+    """Layerwise finalize processes a partially loaded ordinary layer before
+    any deferred attention layer, finalizes each attention layer once, and
+    never runs the model-level hook."""
+    log: list = []
+    model = _OrderModel(log)
+    layers = (model.attn_a, model.linear, model.attn_b)
+    loaded = [torch.full_like(layer.weight, 7.0) for layer in layers]
+
+    record_metadata_for_reloading(model)
+    initialize_layerwise_reload(model)
+    # Load only `weight` of the linear layer so it stays partial until finalize.
+    for layer, weight in zip(layers, loaded):
+        layer.weight.weight_loader(layer.weight, weight)
+    assert log == []
+
+    finalize_layerwise_reload(model)
+
+    assert log == [
+        ("quant", "linear"),
+        ("quant", "a"),
+        ("attn", "a", None),
+        ("quant", "b"),
+        ("attn", "b", None),
+    ]
+
+
+def test_attention_hook_defaults_to_layer_dtype():
+    """`Attention.process_weights_after_loading()` forwards the layer's own
+    dtype to the backend impl unless a dtype is passed explicitly."""
+    from vllm.model_executor.layers.attention import Attention
+    from vllm.model_executor.layers.attention.attention import (
+        set_default_quant_scales,
+    )
+
+    seen: list[torch.dtype] = []
+    layer = torch.nn.Module()
+    layer.impl = types.SimpleNamespace(
+        process_weights_after_loading=lambda act_dtype: seen.append(act_dtype)
+    )
+    layer.dtype = torch.bfloat16
+    layer.quant_config = None
+    set_default_quant_scales(layer, register_buffer=True)
+
+    Attention.process_weights_after_loading(layer)
+    Attention.process_weights_after_loading(layer, torch.float16)
+
+    assert seen == [torch.bfloat16, torch.float16]
 
 
 @pytest.mark.parametrize(
