@@ -153,12 +153,10 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsScheme):
                 layer.logical_widths,
                 getattr(layer, "input_scale", None),
             )
-            weight = weight.t()
         elif self.strategy == QuantizationStrategy.CHANNEL:
             weight, weight_scale, input_scale = process_fp8_weight_channel_strategy(
                 layer.weight, layer.weight_scale, getattr(layer, "input_scale", None)
             )
-            weight = weight.t()
 
         elif self.strategy == QuantizationStrategy.BLOCK:
             assert self.is_static_input_scheme is False
@@ -182,14 +180,11 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsScheme):
         layer.weight.input_dim = 0
         layer.weight.output_dim = 1
         layer.weight_scale = Parameter(weight_scale.data, requires_grad=False)
-        if input_scale is not None:
-            layer.input_scale = Parameter(input_scale.data, requires_grad=False)
-
-        # INPUT SCALE
-        if self.is_static_input_scheme and hasattr(layer, "input_scale"):
-            layer.input_scale = Parameter(layer.input_scale.max(), requires_grad=False)
-        else:
-            layer.input_scale = None
+        layer.input_scale = (
+            Parameter(input_scale.data, requires_grad=False)
+            if input_scale is not None
+            else None
+        )
 
         if hasattr(self, "fp8_linear"):
             self.fp8_linear.process_weights_after_loading(layer)

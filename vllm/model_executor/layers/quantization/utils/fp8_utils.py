@@ -1349,7 +1349,16 @@ def process_fp8_weight_tensor_strategy(
     logical_widths: list[int],
     input_scale: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-    """Process weights for tensor-wise quantization strategy."""
+    """Turn checkpoint-layout per-tensor FP8 weights into what the scaled-mm
+    kernels consume: the weight transposed to ``(K, N)`` and requantized to a
+    single scale across the fused shards, and the static input scale (if any)
+    collapsed to one value the same way.
+
+    ``weight`` may be rewritten in place (requantization of fused shards, and
+    FNUZ normalization on platforms that need it). The returned weight is a
+    view of it, except when ROCm padding is applied and allocates new storage.
+    The caller decides how to store the results.
+    """
     from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
         normalize_e4m3fn_to_e4m3fnuz,
         requantize_with_max_scale,
@@ -1367,7 +1376,9 @@ def process_fp8_weight_tensor_strategy(
         logical_widths=logical_widths,
     )
 
-    weight = _maybe_pad_fp8_weight(weight)
+    weight = _maybe_pad_fp8_weight(weight).t()
+    if input_scale is not None:
+        input_scale = input_scale.max()
     return weight, weight_scale, input_scale
 
 
@@ -1376,7 +1387,14 @@ def process_fp8_weight_channel_strategy(
     weight_scale: torch.Tensor,
     input_scale: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-    """Process weights for channel-wise quantization strategy."""
+    """Turn checkpoint-layout per-channel FP8 weights into what the scaled-mm
+    kernels consume: the weight transposed to ``(K, N)``, and the static input
+    scale (if any) collapsed to a single value.
+
+    ``weight`` may be rewritten in place by FNUZ normalization on platforms
+    that need it; the returned weight is a view of it. The caller decides how
+    to store the results.
+    """
     from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
         normalize_e4m3fn_to_e4m3fnuz,
     )
@@ -1386,7 +1404,9 @@ def process_fp8_weight_channel_strategy(
             weight=weight, weight_scale=weight_scale, input_scale=input_scale
         )
 
-    return weight, weight_scale, input_scale
+    if input_scale is not None:
+        input_scale = input_scale.max()
+    return weight.t(), weight_scale, input_scale
 
 
 def process_fp8_weight_block_strategy(
