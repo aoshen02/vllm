@@ -37,6 +37,7 @@ __all__ = [
     "initialize_layerwise_reload",
     "finalize_layerwise_processing",
     "finalize_layerwise_reload",
+    "abort_layerwise_reload",
 ]
 
 
@@ -288,6 +289,33 @@ def finalize_layerwise_processing(model: torch.nn.Module, model_config: ModelCon
 
 def finalize_layerwise_reload(*args, **kwargs):
     finalize_layerwise_processing(*args, **kwargs)
+
+
+def abort_layerwise_reload(model: torch.nn.Module) -> None:
+    """Undo `initialize_layerwise_reload` for every layer still mid-reload.
+
+    Puts the saved kernel tensors back on each such layer, unwraps the
+    weight loaders and drops whatever it had buffered, so the model is loadable
+    again. This is not a rollback: layers that already finished keep their new
+    weights, and tensors loaded in place (`SKIP_TENSORS`) keep whatever was
+    written to them.
+    """
+    for layer in model.modules():
+        info = LAYERWISE_INFO.get(layer)
+        if info is None or not info.can_load():
+            continue
+        if info.kernel_tensors is not None:
+            _place_kernel_tensors(layer, info)
+        # Tensors that never left the layer (SKIP_TENSORS) were wrapped in place
+        for param in get_layer_tensors(layer).values():
+            if _get_weight_loader(param).__name__ == "online_process_loader":
+                param.weight_loader = _get_original_loader(param)
+        info.reset()
+
+    if hasattr(model, "_original_do_torchao_reload"):
+        model._do_torchao_reload = model._original_do_torchao_reload
+
+    LOADING_LAYERS.clear()
 
 
 def _finalize_attention_layer(
