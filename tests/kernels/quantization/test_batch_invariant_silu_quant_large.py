@@ -36,7 +36,7 @@ def _quant(x: torch.Tensor, use_ue8m0: bool) -> tuple[torch.Tensor, torch.Tensor
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="requires CUDA")
 @pytest.mark.skipif(
-    not fp8_utils.is_batch_invariant_quant_kernel_enabled(),
+    not fp8_utils.batch_invariant_quant_kernel_available(),
     reason="batch-invariant kernel library not available",
 )
 @pytest.mark.parametrize("use_ue8m0", [True, False])
