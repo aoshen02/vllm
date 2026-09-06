@@ -109,15 +109,21 @@ class SharedExperts(torch.nn.Module):
             return True
         return self._moe_config.moe_parallel_config.dp_size > 1
 
+    @property
+    def _mk_overlap_is_starved(self) -> bool:
+        """DeepEP LL over MNNVL performs the combine stores on the GPU itself, so
+        the modular kernel's internal overlap has no idle window left to fill."""
+        return (
+            self._moe_config.moe_parallel_config.use_deepep_ll_kernels
+            and envs.VLLM_DEEPEP_LOW_LATENCY_USE_MNNVL
+        )
+
     def _determine_shared_experts_order(
         self,
         hidden_states: torch.Tensor,
     ) -> SharedExpertsOrder:
         if self._disable_shared_experts_overlap:
             return SharedExpertsOrder.NO_OVERLAP
-
-        if self._mk_can_overlap_shared_experts():
-            return SharedExpertsOrder.MK_INTERNAL_OVERLAPPED
 
         should_run_shared_in_aux_stream = (
             current_platform.is_cuda_alike()
@@ -126,6 +132,14 @@ class SharedExperts(torch.nn.Module):
             <= envs.VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD
             and self._should_enable_stream_overlap_heuristic
         )
+
+        if self._mk_can_overlap_shared_experts():
+            if not (self._mk_overlap_is_starved and should_run_shared_in_aux_stream):
+                return SharedExpertsOrder.MK_INTERNAL_OVERLAPPED
+            logger.info_once(
+                "DeepEP LL over MNNVL: running shared experts on the aux stream "
+                "instead of the modular kernel's internal overlap"
+            )
 
         if should_run_shared_in_aux_stream:
             return SharedExpertsOrder.MULTI_STREAM_OVERLAPPED
