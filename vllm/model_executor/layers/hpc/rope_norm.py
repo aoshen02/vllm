@@ -100,8 +100,8 @@ class HpcRopeNorm(CustomOp, HpcModule):
     """HPC fused RoPE + QK-Norm + KV-Cache-Write (+ optional FP8 Q quant).
 
     Registered as a sub-module in model layers (e.g. HunYuanAttention).
-    Norm weights are extracted from fallback norm modules via
-    process_weights_after_loading() after all weights are loaded.
+    The QK-Norm weights are read directly from the fallback norm modules
+    (built in float32 when HPC is active), eliminating the derived copy.
 
     forward() is dispatched by CustomOp framework:
     - In compiled mode: forward_cuda() calls torch.ops.vllm.hpc_rope_norm_forward
@@ -148,26 +148,6 @@ class HpcRopeNorm(CustomOp, HpcModule):
         self.fallback_knorm = fallback_knorm
 
         self.head_per_group = num_heads // num_kv_heads
-
-        # Pre-allocate norm weight tensors as Parameters so they are tracked by
-        # CuMemAllocator (for sleep/wake_up) and have stable addresses for CUDA
-        # Graph replay. process_weights_after_loading() updates them inplace via
-        # copy_() so refit does not invalidate captured graph tensor pointers.
-        # Shape is [head_dim] to match the HPC kernel's q/k_norm_weight layout.
-        if use_qk_norm and fallback_qnorm is not None:
-            self.qnorm_weight: torch.nn.Parameter | None = torch.nn.Parameter(
-                torch.empty(head_dim, dtype=torch.float32),
-                requires_grad=False,
-            )
-        else:
-            self.qnorm_weight = None
-        if use_qk_norm and fallback_knorm is not None:
-            self.knorm_weight: torch.nn.Parameter | None = torch.nn.Parameter(
-                torch.empty(head_dim, dtype=torch.float32),
-                requires_grad=False,
-            )
-        else:
-            self.knorm_weight = None
 
         self.use_fp8 = "fp8" in kv_cache_dtype
         # The RMSNorm/RoPE ordering is model dependent (e.g. HunYuan V3 applies
@@ -224,20 +204,6 @@ class HpcRopeNorm(CustomOp, HpcModule):
 
         logger.info_once("enable hpc rope_norm")
         return True
-
-    def process_weights_after_loading(self, model: torch.nn.Module = None) -> None:
-        """Copy norm weights (float32) from fallback norm modules inplace.
-
-        Uses copy_() to preserve tensor addresses for CUDA Graph / refit
-        compatibility. Called by the model's load_weights() after all weights
-        are loaded (and generically from the model loader for DummyModelLoader
-        / sleep-wake_up reload paths).
-        """
-        if self.use_qk_norm:
-            if self.fallback_qnorm is not None and self.qnorm_weight is not None:
-                self.qnorm_weight.data.copy_(self.fallback_qnorm.weight.data.float())
-            if self.fallback_knorm is not None and self.knorm_weight is not None:
-                self.knorm_weight.data.copy_(self.fallback_knorm.weight.data.float())
 
     def register_layer_name(self, layer_name: str) -> None:
         """Register layer_name and add self to the global registry.
@@ -440,12 +406,9 @@ class HpcRopeNorm(CustomOp, HpcModule):
         k_scale = attn_layer._k_scale.reshape(1)
         v_scale = attn_layer._v_scale.reshape(1)
 
-        q_norm_weight = (
-            self.qnorm_weight if self.qk_norm_policy != QkNormPolicy.NONE else None
-        )
-        k_norm_weight = (
-            self.knorm_weight if self.qk_norm_policy != QkNormPolicy.NONE else None
-        )
+        use_norm = self.qk_norm_policy != QkNormPolicy.NONE
+        q_norm_weight = self.fallback_qnorm.weight if use_norm else None
+        k_norm_weight = self.fallback_knorm.weight if use_norm else None
 
         # --- Prefill ---
         if num_prefill_reqs > 0:
