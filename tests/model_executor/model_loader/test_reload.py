@@ -22,6 +22,11 @@ from vllm.model_executor.model_loader.reload.layerwise import (
     initialize_online_processing,
     record_metadata_for_reloading,
 )
+from vllm.model_executor.model_loader.reload.lifecycle import (
+    abort_reload,
+    finish_reload,
+    start_reload,
+)
 from vllm.model_executor.model_loader.reload.meta import (
     capture_layer_to_meta,
     get_numel_loaded,
@@ -216,6 +221,46 @@ def test_reload_lifecycle():
         assert tensor.shape == materialized_tensor.shape
         assert tensor.__class__ == materialized_tensor.__class__
         assert tensor.__dict__ == materialized_tensor.__dict__
+
+
+def test_abort_reload_restores_pending_layers():
+    """Aborting mid-reload puts a layer that was still waiting for weights back
+    on its original tensors and loaders, keeps everything already written
+    (it is not a rollback), and leaves the model ready for the next reload."""
+    model = torch.nn.Sequential(torch.nn.Linear(2, 2), torch.nn.Linear(2, 2))
+    done, pending = model[0], model[1]
+    for layer in (done, pending):
+        layer.weight.weight_loader = default_weight_loader
+        layer.bias.weight_loader = default_weight_loader
+    originals = dict(model.named_parameters())
+    before = {name: tensor.clone() for name, tensor in originals.items()}
+    new_weight = torch.full_like(done.weight, 7.0)
+    new_bias = torch.full_like(done.bias, 8.0)
+    record_metadata_for_reloading(model)
+
+    start_reload(model)
+    done.weight.weight_loader(done.weight, new_weight)
+    done.bias.weight_loader(done.bias, new_bias)
+    # `bias` is in SKIP_TENSORS: loaded in place while `weight` waits on meta.
+    pending.bias.weight_loader(pending.bias, new_bias)
+    assert pending.weight.is_meta
+    abort_reload(model)
+
+    for name, tensor in model.named_parameters():
+        assert tensor is originals[name]
+        assert tensor.weight_loader is default_weight_loader
+    assert torch.equal(done.weight, new_weight)
+    assert torch.equal(done.bias, new_bias)
+    assert torch.equal(pending.weight, before["1.weight"])
+    assert torch.equal(pending.bias, new_bias)
+    assert not reload_layerwise.get_layerwise_info(pending).can_load()
+
+    start_reload(model)
+    pending.weight.weight_loader(pending.weight, new_weight)
+    pending.bias.weight_loader(pending.bias, new_bias)
+    finish_reload(model, None)
+    assert torch.equal(pending.weight, new_weight)
+    assert pending.weight is originals["1.weight"]
 
 
 def test_restore_layer_replaces_postprocessed_tensor_attribute():
