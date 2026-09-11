@@ -300,3 +300,73 @@ def test_cumem_with_cudagraph():
 
     # output content is as expected
     assert torch.allclose(y, x + 1)
+
+
+@pytest.mark.parametrize("level", [1, 2], ids=["sleep-1", "sleep-2"])
+@create_new_process_for_each_test("fork" if current_platform.is_cuda() else "spawn")
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="cuMem CUDA graph pool")
+def test_cudagraph_pool_survives_sleep(level, monkeypatch):
+    """The cuMem graph pool is CPU-backed at both sleep levels: waking
+    weights remaps it at the same addresses with its contents intact."""
+    from vllm.device_allocator.sleep_mode_backend import CuMemBackend
+
+    allocator = get_mem_allocator_instance()
+    with allocator.use_memory_pool("weights"):
+        weight = torch.full((1 << 20,), 2.0, device=DEVICE_TYPE)
+    x = torch.ones_like(weight)
+
+    graph_pool = current_platform.graph_pool_handle()
+    graph = torch.cuda.CUDAGraph()
+    with (
+        allocator.use_cudagraph_pool(graph_pool) as pool,
+        torch.cuda.graph(graph, pool=pool),
+    ):
+        # Pool memory the graph reads but never writes, like a captured
+        # constant: only a CPU backup can preserve it.
+        const = torch.empty_like(x)
+        y = x * weight + const
+    const.fill_(3.0)
+
+    def graph_ptrs() -> set[int]:
+        return {
+            ptr
+            for ptr, data in allocator.pointer_to_data.items()
+            if data.tag == allocator.cudagraph_tag
+        }
+
+    ptrs = graph_ptrs()
+    assert ptrs
+
+    # Poison every remapped page so a discarded allocation cannot pass.
+    original_create_and_map = cumem.create_and_map
+
+    def create_and_map_with_poison(handle) -> None:
+        original_create_and_map(handle)
+        cumem.libcudart.cudaMemset(handle[2], 0xA5, handle[1])
+
+    monkeypatch.setattr(cumem, "create_and_map", create_and_map_with_poison)
+
+    backend = CuMemBackend()
+    backend.suspend(level=level)
+    assert mapped_usage(allocator) == 0
+
+    backend.resume(tags=["kv_cache"])
+    assert mapped_usage(allocator) == 0
+
+    backend.resume(tags=["weights"])
+    assert graph_ptrs() == ptrs
+    assert all(not allocator.pointer_to_data[ptr].is_asleep for ptr in ptrs)
+    if level == 2:
+        weight.fill_(2.0)  # Level 2 discards weights; emulate the reload.
+
+    x.fill_(4.0)
+    graph.replay()
+    assert torch.equal(y, torch.full_like(y, 11.0))
+
+    # A live graph keeps the pool; it is released once the graph is gone.
+    allocator.release_cudagraph_pool(graph_pool)
+    assert graph_pool in allocator.allocator_and_pools
+    del graph, y, const
+    allocator.release_cudagraph_pool(graph_pool)
+    assert graph_pool not in allocator.allocator_and_pools
+    assert not graph_ptrs()
