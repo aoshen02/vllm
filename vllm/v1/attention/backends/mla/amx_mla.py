@@ -50,9 +50,7 @@ from vllm.model_executor.layers.attention.mla_attention import (
     MLACommonImpl,
     MLACommonMetadata,
     MLACommonMetadataBuilder,
-)
-from vllm.model_executor.layers.quantization.utils.quant_utils import (
-    get_and_maybe_dequant_weights,
+    split_kv_b_proj,
 )
 from vllm.platforms import current_platform
 from vllm.v1.attention.backend import AttentionLayer, AttentionType, MultipleOf
@@ -216,14 +214,13 @@ class AMXMLAImpl(MLACommonImpl[MLACommonMetadata]):
         # impl derives its own copies from self.kv_b_proj (already available
         # via the constructor) and VNNI-packs them once, ahead of time, for
         # use with bmm_cpu in forward_mha.
-        kv_b_proj_weight = get_and_maybe_dequant_weights(
-            self.kv_b_proj, out_dtype=act_dtype
-        ).T
-        kv_b_proj_weight = kv_b_proj_weight.view(
-            self.kv_lora_rank, self.num_heads, self.qk_nope_head_dim + self.v_head_dim
-        )
-        w_uk, w_uv = kv_b_proj_weight.split(
-            [self.qk_nope_head_dim, self.v_head_dim], dim=-1
+        w_uk, w_uv = split_kv_b_proj(
+            self.kv_b_proj,
+            act_dtype,
+            self.kv_lora_rank,
+            self.num_heads,
+            self.qk_nope_head_dim,
+            self.v_head_dim,
         )
         # bmm_cpu computes out[b] = mat1[b] @ mat2[b]^T (Linear-weight
         # convention: mat2[b] is (OUT, IN)).
