@@ -21,6 +21,7 @@ from vllm.model_executor.models.utils import (
     WeightsMapper,
     get_draft_quant_config,
     maybe_prefix,
+    update_derived_buffers,
 )
 from vllm.models.common.ops.fused_allreduce_rms_norm import fused_allreduce_rms_norm
 from vllm.models.kimi_k3.nvidia.mla import MultiHeadLatentAttention
@@ -204,12 +205,13 @@ class K3DSparkModel(nn.Module):
     ) -> None:
         """Project target-derived context into each draft layer's latent cache."""
         if not hasattr(self, "_num_context_layers"):
-            self._build_fused_context_kv_metadata()
+            self.refresh_derived_buffers()
         self._precompute_fused_context_kv(
             context_states, context_positions, context_slot_mapping
         )
 
-    def _build_fused_context_kv_metadata(self) -> None:
+    @torch.no_grad()
+    def refresh_derived_buffers(self) -> None:
         """Build cross-layer metadata after checkpoint loading."""
         attentions = [layer.self_attn for layer in self.layers]
         assert attentions
@@ -225,9 +227,12 @@ class K3DSparkModel(nn.Module):
                 and attn.kv_a_layernorm.variance_epsilon
                 == attn0.kv_a_layernorm.variance_epsilon
             ), "All MLA DSpark layers must share their latent KV geometry."
-        self._context_kv_norm_weights = torch.stack(
-            [attn.kv_a_layernorm.weight.detach() for attn in attentions], dim=0
-        ).contiguous()
+        update_derived_buffers(
+            self,
+            _context_kv_norm_weights=torch.stack(
+                [attn.kv_a_layernorm.weight.detach() for attn in attentions]
+            ),
+        )
         self._num_context_layers = len(attentions)
         self._context_kv_width = kv_width
         self._context_kv_lora_rank = attn0.kv_lora_rank
@@ -483,6 +488,4 @@ class K3DSparkForCausalLM(nn.Module):
         loader = AutoWeightsLoader(self)
         # read: 1. all weights. 2. context kv weights
         weights = _duplicate_context_kv_weights(weights, len(self.model.layers))
-        loaded_weights = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
-        self.model._build_fused_context_kv_metadata()
-        return loaded_weights
+        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)

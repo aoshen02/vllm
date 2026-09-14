@@ -47,6 +47,7 @@ from .utils import (
     get_draft_quant_config,
     maybe_prefix,
     process_eagle_weight,
+    update_derived_buffers,
 )
 
 logger = init_logger(__name__)
@@ -468,22 +469,21 @@ class DFlashQwen3Model(nn.Module):
     ) -> None:
         self._hidden_norm_weight = self.hidden_norm.weight.data
 
-        # KV projection weights: [num_layers * 2 * kv_size, hidden_size]
-        kv_weights = [a.qkv_proj.weight[a.q_size :] for a in layers_attn]
-        self._fused_kv_weight = torch.cat(kv_weights, dim=0)
-        if has_bias:
-            kv_biases = [a.qkv_proj.bias[a.q_size :] for a in layers_attn]
-            self._fused_kv_bias: torch.Tensor | None = torch.cat(kv_biases, dim=0)
-        else:
-            self._fused_kv_bias = None
+        update_derived_buffers(
+            self,
+            _fused_kv_weight=torch.cat(
+                [a.qkv_proj.weight[a.q_size :] for a in layers_attn], dim=0
+            ),
+            _fused_kv_bias=torch.cat(
+                [a.qkv_proj.bias[a.q_size :] for a in layers_attn], dim=0
+            )
+            if has_bias
+            else None,
+            _k_norm_weights=torch.stack([a.k_norm.weight.data for a in layers_attn]),
+        )
 
-        # K-norm weights stacked into one contiguous [num_layers, head_dim]
-        # tensor so the per-layer K-norm runs as a single grouped kernel.
-        self._k_norm_weights = torch.stack(
-            [a.k_norm.weight.data for a in layers_attn], dim=0
-        ).contiguous()
-
-    def _build_fused_kv_buffers(self) -> None:
+    @torch.no_grad()
+    def refresh_derived_buffers(self) -> None:
         """Build fused weight buffers for precompute_and_store_context_kv.
 
         Must be called after weights are loaded. Stacks the KV-projection
@@ -592,7 +592,7 @@ class DFlashQwen3Model(nn.Module):
                 "DFlash buffer initialization was skipped. If dummy weights are not "
                 "in use, this may indicate an error in weight loading."
             )
-            self._build_fused_kv_buffers()
+            self.refresh_derived_buffers()
 
         num_ctx = context_states.shape[0]
         L = self._num_attn_layers
@@ -834,7 +834,6 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         mapper = WeightsMapper(orig_to_new_substr=orig_to_new_substr)
         loader = AutoWeightsLoader(self)
         loader.load_weights(model_weights.items(), mapper=mapper)
-        self.model._build_fused_kv_buffers()
 
     def _read_mask_embedding(self) -> torch.Tensor | None:
         """Checks for an override mask embedding in `mask_embedding.pt` and returns it.

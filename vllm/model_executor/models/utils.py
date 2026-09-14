@@ -43,6 +43,25 @@ logger = init_logger(__name__)
 ShardId: TypeAlias = str | int | tuple[int, ...]
 
 
+@torch.no_grad()
+def update_derived_buffers(module: nn.Module, **buffers: torch.Tensor | None) -> None:
+    """Refresh non-checkpoint buffers in place to preserve captured references."""
+    for name, value in buffers.items():
+        old = getattr(module, name, None)
+        if value is not None and value.is_meta:
+            raise RuntimeError(f"Cannot build {name} from meta weights")
+        if old is None:
+            module.register_buffer(name, value, persistent=False)
+        else:
+            if value is None or (old.shape, old.dtype, old.device) != (
+                value.shape,
+                value.dtype,
+                value.device,
+            ):
+                raise RuntimeError(f"Cannot change the layout of derived buffer {name}")
+            old.copy_(value)
+
+
 @dataclass
 class WeightsMapper:
     """Maps the name of each weight if they match the following patterns.

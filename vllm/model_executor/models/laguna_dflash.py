@@ -37,6 +37,7 @@ from .utils import (
     get_draft_quant_config,
     maybe_prefix,
     process_eagle_weight,
+    update_derived_buffers,
 )
 
 logger = init_logger(__name__)
@@ -157,21 +158,19 @@ class DFlashLagunaModel(DFlashQwen3Model, EagleModelMixin):
         layers_attn: list[nn.Module],
         has_bias: bool,
     ) -> None:
-        self._kv_weights = torch.stack(
-            [a.qkv_proj.weight[a.q_size :] for a in layers_attn], dim=0
-        ).contiguous()
-        if has_bias:
-            self._kv_biases: torch.Tensor | None = torch.stack(
-                [a.qkv_proj.bias[a.q_size :] for a in layers_attn], dim=0
-            ).contiguous()
-        else:
-            self._kv_biases = None
-        self._input_layernorm_weights = torch.stack(
-            [layer.input_layernorm.weight.data for layer in self.layers], dim=0
-        ).contiguous()
-        self._k_norm_weights = torch.stack(
-            [a.k_norm.weight.data for a in layers_attn], dim=0
-        ).contiguous()
+        update_derived_buffers(
+            self,
+            _kv_weights=torch.stack(
+                [a.qkv_proj.weight[a.q_size :] for a in layers_attn]
+            ),
+            _kv_biases=torch.stack([a.qkv_proj.bias[a.q_size :] for a in layers_attn])
+            if has_bias
+            else None,
+            _input_layernorm_weights=torch.stack(
+                [layer.input_layernorm.weight.data for layer in self.layers]
+            ),
+            _k_norm_weights=torch.stack([a.k_norm.weight.data for a in layers_attn]),
+        )
 
     def _project_context_kv(
         self,
@@ -332,5 +331,4 @@ class DFlashLagunaForCausalLM(nn.Module, SupportsEagle3):
         loaded_weight_names = loader.load_weights(model_weights.items())
         loaded_weight_names.add("lm_head.weight")
         loaded_weight_names.add("model.embed_tokens.weight")
-        self.model._build_fused_kv_buffers()
         return loaded_weight_names
