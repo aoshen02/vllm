@@ -289,9 +289,10 @@ def finalize_layerwise_processing(model: torch.nn.Module, model_config: ModelCon
 @torch.no_grad()
 def finalize_layerwise_reload(model: torch.nn.Module, model_config: ModelConfig):
     finalize_layerwise_processing(model, model_config)
-    # Opt in: cold-start hooks may destructively repack unchanged weights.
-    if getattr(model, "supports_model_post_load_reload", False):
-        model.process_weights_after_loading()
+    # Cross-layer buffers require all parameters and caches to be restored.
+    for module in model.modules():
+        if hasattr(module, "refresh_derived_buffers"):
+            module.refresh_derived_buffers()
 
 
 def _finalize_attention_layer(

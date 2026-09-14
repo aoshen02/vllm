@@ -224,8 +224,6 @@ def _insert_context_kv(
 class DSparkDeepseekV4ForCausalLM(nn.Module):
     """XPU DSpark draft model entry point for DeepSeek-V4."""
 
-    supports_model_post_load_reload = True
-
     has_own_embed_tokens = False
     has_own_lm_head = False
 
@@ -407,10 +405,11 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
                 weight_loader(param, loaded_weight)
                 loaded_params.add(name)
 
+        self._finalize_moe()
         logger.info_once("DSpark XPU draft model loaded: %d params", len(loaded_params))
         return loaded_params
 
-    def process_weights_after_loading(self) -> None:
+    def _finalize_moe(self) -> None:
         for layer in self.model.layers:
             layer.ffn.finalize_mega_moe_weights()
 

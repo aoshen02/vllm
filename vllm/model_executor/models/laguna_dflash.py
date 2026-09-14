@@ -37,7 +37,7 @@ from .utils import (
     get_draft_quant_config,
     maybe_prefix,
     process_eagle_weight,
-    update_derived_buffer,
+    update_derived_buffers,
 )
 
 logger = init_logger(__name__)
@@ -158,30 +158,18 @@ class DFlashLagunaModel(DFlashQwen3Model, EagleModelMixin):
         layers_attn: list[nn.Module],
         has_bias: bool,
     ) -> None:
-        update_derived_buffer(
+        update_derived_buffers(
             self,
-            "_kv_weights",
-            torch.stack([a.qkv_proj.weight[a.q_size :] for a in layers_attn], dim=0),
-        )
-        if has_bias:
-            update_derived_buffer(
-                self,
-                "_kv_biases",
-                torch.stack([a.qkv_proj.bias[a.q_size :] for a in layers_attn], dim=0),
-            )
-        else:
-            self._kv_biases = None
-        update_derived_buffer(
-            self,
-            "_input_layernorm_weights",
-            torch.stack(
-                [layer.input_layernorm.weight.data for layer in self.layers], dim=0
+            _kv_weights=torch.stack(
+                [a.qkv_proj.weight[a.q_size :] for a in layers_attn]
             ),
-        )
-        update_derived_buffer(
-            self,
-            "_k_norm_weights",
-            torch.stack([a.k_norm.weight.data for a in layers_attn], dim=0),
+            _kv_biases=torch.stack([a.qkv_proj.bias[a.q_size :] for a in layers_attn])
+            if has_bias
+            else None,
+            _input_layernorm_weights=torch.stack(
+                [layer.input_layernorm.weight.data for layer in self.layers]
+            ),
+            _k_norm_weights=torch.stack([a.k_norm.weight.data for a in layers_attn]),
         )
 
     def _project_context_kv(
@@ -247,8 +235,6 @@ class DFlashLagunaModel(DFlashQwen3Model, EagleModelMixin):
 
 
 class DFlashLagunaForCausalLM(nn.Module, SupportsEagle3):
-    supports_model_post_load_reload = True
-
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         nn.Module.__init__(self)
         speculative_config = vllm_config.speculative_config
@@ -346,6 +332,3 @@ class DFlashLagunaForCausalLM(nn.Module, SupportsEagle3):
         loaded_weight_names.add("lm_head.weight")
         loaded_weight_names.add("model.embed_tokens.weight")
         return loaded_weight_names
-
-    def process_weights_after_loading(self) -> None:
-        self.model._build_fused_kv_buffers()

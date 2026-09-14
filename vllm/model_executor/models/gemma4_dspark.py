@@ -25,7 +25,7 @@ from vllm.transformers_utils.configs.gemma4 import gemma4_layer_config
 from .gemma4_mtp import Gemma4MTPAttention, Gemma4MTPDecoderLayer
 from .qwen3_dflash import DFlashQwen3Model, _dflash_layer_causal
 from .qwen3_dspark import DSparkMarkovHead, Qwen3DSparkForCausalLM
-from .utils import extract_layer_index, maybe_prefix, update_derived_buffer
+from .utils import extract_layer_index, maybe_prefix, update_derived_buffers
 
 
 class Gemma4DSparkAttention(Gemma4MTPAttention):
@@ -192,7 +192,7 @@ class Gemma4DSparkModel(DFlashQwen3Model):
         return self.embed_tokens(input_ids) * self.normalizer
 
     @torch.no_grad()
-    def _build_fused_kv_buffers(self) -> None:
+    def refresh_derived_buffers(self) -> None:
         layers_attn = [layer.self_attn for layer in self.layers]
         attn0 = layers_attn[0]
         assert all(a.use_k_eq_v for a in layers_attn), (
@@ -213,27 +213,16 @@ class Gemma4DSparkModel(DFlashQwen3Model):
         self, layers_attn: list[nn.Module], has_bias: bool
     ) -> None:
         self._hidden_norm_weight = self.hidden_norm.weight.data
-        update_derived_buffer(
+        k_norm_weights = torch.stack([a.k_norm.weight.data for a in layers_attn])
+        update_derived_buffers(
             self,
-            "_fused_k_weight",
-            torch.cat([a.k_proj.weight for a in layers_attn], dim=0),
-        )
-        if has_bias:
-            update_derived_buffer(
-                self,
-                "_fused_k_bias",
-                torch.cat([a.k_proj.bias for a in layers_attn], dim=0),
-            )
-        else:
-            self._fused_k_bias = None
-        update_derived_buffer(
-            self,
-            "_k_norm_weights",
-            torch.stack([a.k_norm.weight.data for a in layers_attn], dim=0),
-        )
-        # v_norm has no learnable scale; ones matching the K-norm call shape.
-        update_derived_buffer(
-            self, "_v_norm_weights", torch.ones_like(self._k_norm_weights)
+            _fused_k_weight=torch.cat([a.k_proj.weight for a in layers_attn]),
+            _fused_k_bias=torch.cat([a.k_proj.bias for a in layers_attn])
+            if has_bias
+            else None,
+            _k_norm_weights=k_norm_weights,
+            # v_norm has no learnable scale.
+            _v_norm_weights=torch.ones_like(k_norm_weights),
         )
 
     def _project_context_kv(

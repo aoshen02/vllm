@@ -167,6 +167,11 @@ def process_weights_after_loading(
     if hasattr(model, "process_weights_after_loading"):
         model.process_weights_after_loading()
 
+    # Cross-layer derived buffers use the final runtime weights.
+    for module in model.modules():
+        if hasattr(module, "refresh_derived_buffers"):
+            module.refresh_derived_buffers()
+
     # Needed for torchao model reloading via model.reload_weights
     # @kylesayrs @jerryzh168 this can be removed if callers move to `reload_weights`
     if model_config.quantization == "torchao":

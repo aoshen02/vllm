@@ -44,21 +44,22 @@ ShardId: TypeAlias = str | int | tuple[int, ...]
 
 
 @torch.no_grad()
-def update_derived_buffer(module: nn.Module, name: str, value: torch.Tensor) -> None:
-    """Refresh a non-checkpoint buffer without invalidating CUDA graph references."""
-    if value.is_meta:
-        raise RuntimeError(f"Cannot build {name} from meta weights after loading")
-    buffer = getattr(module, name, None)
-    if buffer is None:
-        module.register_buffer(name, value.detach(), persistent=False)
-    else:
-        if (buffer.shape, buffer.dtype, buffer.device) != (
-            value.shape,
-            value.dtype,
-            value.device,
-        ):
-            raise RuntimeError(f"Cannot change the layout of derived buffer {name}")
-        buffer.copy_(value)
+def update_derived_buffers(module: nn.Module, **buffers: torch.Tensor | None) -> None:
+    """Refresh non-checkpoint buffers in place to preserve captured references."""
+    for name, value in buffers.items():
+        old = getattr(module, name, None)
+        if value is not None and value.is_meta:
+            raise RuntimeError(f"Cannot build {name} from meta weights")
+        if old is None:
+            module.register_buffer(name, value, persistent=False)
+        else:
+            if value is None or (old.shape, old.dtype, old.device) != (
+                value.shape,
+                value.dtype,
+                value.device,
+            ):
+                raise RuntimeError(f"Cannot change the layout of derived buffer {name}")
+            old.copy_(value)
 
 
 @dataclass
