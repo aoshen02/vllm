@@ -43,6 +43,24 @@ logger = init_logger(__name__)
 ShardId: TypeAlias = str | int | tuple[int, ...]
 
 
+@torch.no_grad()
+def update_derived_buffer(module: nn.Module, name: str, value: torch.Tensor) -> None:
+    """Refresh a non-checkpoint buffer without invalidating CUDA graph references."""
+    if value.is_meta:
+        raise RuntimeError(f"Cannot build {name} from meta weights after loading")
+    buffer = getattr(module, name, None)
+    if buffer is None:
+        module.register_buffer(name, value.detach(), persistent=False)
+    else:
+        if (buffer.shape, buffer.dtype, buffer.device) != (
+            value.shape,
+            value.dtype,
+            value.device,
+        ):
+            raise RuntimeError(f"Cannot change the layout of derived buffer {name}")
+        buffer.copy_(value)
+
+
 @dataclass
 class WeightsMapper:
     """Maps the name of each weight if they match the following patterns.

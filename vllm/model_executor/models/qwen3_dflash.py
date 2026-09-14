@@ -47,6 +47,7 @@ from .utils import (
     get_draft_quant_config,
     maybe_prefix,
     process_eagle_weight,
+    update_derived_buffer,
 )
 
 logger = init_logger(__name__)
@@ -470,19 +471,22 @@ class DFlashQwen3Model(nn.Module):
 
         # KV projection weights: [num_layers * 2 * kv_size, hidden_size]
         kv_weights = [a.qkv_proj.weight[a.q_size :] for a in layers_attn]
-        self._fused_kv_weight = torch.cat(kv_weights, dim=0)
+        update_derived_buffer(self, "_fused_kv_weight", torch.cat(kv_weights, dim=0))
         if has_bias:
             kv_biases = [a.qkv_proj.bias[a.q_size :] for a in layers_attn]
-            self._fused_kv_bias: torch.Tensor | None = torch.cat(kv_biases, dim=0)
+            update_derived_buffer(self, "_fused_kv_bias", torch.cat(kv_biases, dim=0))
         else:
             self._fused_kv_bias = None
 
         # K-norm weights stacked into one contiguous [num_layers, head_dim]
         # tensor so the per-layer K-norm runs as a single grouped kernel.
-        self._k_norm_weights = torch.stack(
-            [a.k_norm.weight.data for a in layers_attn], dim=0
-        ).contiguous()
+        update_derived_buffer(
+            self,
+            "_k_norm_weights",
+            torch.stack([a.k_norm.weight.data for a in layers_attn], dim=0),
+        )
 
+    @torch.no_grad()
     def _build_fused_kv_buffers(self) -> None:
         """Build fused weight buffers for precompute_and_store_context_kv.
 
@@ -686,6 +690,7 @@ class DFlashQwen3Model(nn.Module):
 
 
 class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
+    supports_model_post_load_reload = True
     model_cls = DFlashQwen3Model
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
@@ -834,6 +839,8 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         mapper = WeightsMapper(orig_to_new_substr=orig_to_new_substr)
         loader = AutoWeightsLoader(self)
         loader.load_weights(model_weights.items(), mapper=mapper)
+
+    def process_weights_after_loading(self) -> None:
         self.model._build_fused_kv_buffers()
 
     def _read_mask_embedding(self) -> torch.Tensor | None:

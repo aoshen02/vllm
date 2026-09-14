@@ -286,8 +286,12 @@ def finalize_layerwise_processing(model: torch.nn.Module, model_config: ModelCon
     LOADING_LAYERS.clear()
 
 
-def finalize_layerwise_reload(*args, **kwargs):
-    finalize_layerwise_processing(*args, **kwargs)
+@torch.no_grad()
+def finalize_layerwise_reload(model: torch.nn.Module, model_config: ModelConfig):
+    finalize_layerwise_processing(model, model_config)
+    # Opt in: cold-start hooks may destructively repack unchanged weights.
+    if getattr(model, "supports_model_post_load_reload", False):
+        model.process_weights_after_loading()
 
 
 def _finalize_attention_layer(

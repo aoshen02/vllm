@@ -175,6 +175,62 @@ def test_attention_reload_defers_post_load(default_vllm_config, layer_cls):
     assert torch.equal(layer.weight, loaded_weight)
 
 
+def test_model_post_load_runs_after_reload_restores_all_layers():
+    """Cross-layer buffers see new weights, untouched weights and restored caches."""
+    from types import SimpleNamespace
+
+    from vllm.model_executor.models.utils import update_derived_buffer
+
+    class Model(torch.nn.Module):
+        supports_model_post_load_reload = True
+
+        def __init__(self):
+            super().__init__()
+            self.updated = _ReloadableAttentionLayer()
+            self.untouched = torch.nn.Linear(2, 2, bias=False)
+            self.register_buffer("rope", torch.arange(4.0), persistent=False)
+            self.calls = 0
+
+        def process_weights_after_loading(self):
+            assert self.updated.post_load_called
+            assert not self.rope.is_meta
+            update_derived_buffer(
+                self, "fused", torch.cat([self.updated.weight, self.untouched.weight])
+            )
+            self.calls += 1
+
+    model = Model()
+    record_metadata_for_reloading(model)
+    model.updated.post_load_called = True
+    model.process_weights_after_loading()
+    fused = model.fused
+    untouched = model.untouched.weight.detach().clone()
+    rope = model.rope
+    for value in (2.0, 3.0):
+        model.updated.post_load_called = False
+        initialize_layerwise_reload(model)
+        weight = model.updated.weight
+        weight.weight_loader(weight, torch.full((2, 2), value))
+        assert model.untouched.weight.is_meta
+        finalize_layerwise_reload(model, SimpleNamespace(dtype=torch.float32))
+        assert model.fused is fused
+        assert model.rope is rope
+        torch.testing.assert_close(model.fused[:2], torch.full((2, 2), value))
+        torch.testing.assert_close(model.fused[2:], untouched)
+    assert model.calls == 3
+    assert "fused" not in model.state_dict()
+
+
+def test_reload_does_not_repeat_cold_start_model_hook():
+    model = torch.nn.Linear(2, 2, bias=False)
+    model.process_weights_after_loading = Mock(side_effect=AssertionError)
+    record_metadata_for_reloading(model)
+    initialize_layerwise_reload(model)
+    model.weight.weight_loader(model.weight, torch.ones(2, 2))
+    finalize_layerwise_reload(model, model_config=None)
+    model.process_weights_after_loading.assert_not_called()
+
+
 @pytest.mark.parametrize(
     "layer_cls",
     [_ReloadableMMEncoderAttention, _ReloadableAttentionLayer],
