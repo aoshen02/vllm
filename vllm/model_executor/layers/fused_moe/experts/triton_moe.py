@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Triton-based MoE expert implementations."""
 
+import os
+
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
@@ -577,6 +579,22 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
         self.moe_sum(intermediate_cache3, output)
 
     def moe_sum(self, input: torch.Tensor, output: torch.Tensor) -> None:
+        if os.environ.get("NEMOTRON_EP_SLOT_DIAGNOSTIC") == "1":
+            from vllm.distributed import get_ep_group
+
+            parallel = self.moe_config.moe_parallel_config
+            assert parallel.use_ep and parallel.tp_size == 1
+            assert parallel.all2all_backend == "allgather_reducescatter"
+            assert input.ndim == 3 and input.shape[1:] == (6, 2688)
+            assert input.dtype == torch.bfloat16
+            group = get_ep_group()
+            # Each slot has one expert owner; join slots before BF16 reduction.
+            joined = group.all_reduce(input)
+            ops.moe_sum(joined, output)
+            # The existing finalize still sums rank outputs: contribute once.
+            if group.rank_in_group != 0:
+                output.zero_()
+            return
         ops.moe_sum(input, output)
 
 

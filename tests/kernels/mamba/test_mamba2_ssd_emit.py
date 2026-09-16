@@ -36,10 +36,11 @@ def _paged(num_slots, shape, dtype, device):
 
 @pytest.mark.parametrize("chunk_size", [64, 128, 256])
 @pytest.mark.parametrize("seed", [0, 1])
-def test_emit_matches_single_shot_prefill_at_every_position(chunk_size, seed):
+@pytest.mark.parametrize("shape", [(8, 64, 1, 64), (64, 64, 8, 128)])
+def test_emit_matches_single_shot_prefill_at_every_position(chunk_size, seed, shape):
     torch.manual_seed(seed)
     device = torch.device(DEVICE)
-    nheads, head_dim, ngroups, dstate = 8, 64, 1, 64
+    nheads, head_dim, ngroups, dstate = shape
     dtype = torch.bfloat16
     seqlen = 3 * chunk_size + 17
 
