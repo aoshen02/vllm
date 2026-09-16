@@ -28,6 +28,7 @@ from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
     kNvfp4Dynamic,
+    kNvfp4DynamicToken,
     kNvfp4Static,
 )
 from vllm.model_executor.utils import is_weights_pre_processed
@@ -226,8 +227,33 @@ class TrtLlmNvFp4ExpertsBase:
         """Supports Nvfp4 quantization."""
         SUPPORTED_W_A = [
             (kNvfp4Static, kNvfp4Dynamic),
+            (kNvfp4Static, kNvfp4DynamicToken),
         ]
         return (weight_key, activation_key) in SUPPORTED_W_A
+
+    @staticmethod
+    def is_supported_config(
+        cls: type[mk.FusedMoEExperts],
+        moe_config: FusedMoEConfig,
+        weight_key: QuantKey | None,
+        activation_key: QuantKey | None,
+        activation_format: mk.FusedMoEActivationFormat,
+    ) -> tuple[bool, str | None]:
+        if (weight_key, activation_key) == (
+            kNvfp4Static,
+            kNvfp4DynamicToken,
+        ) and not moe_config.is_act_and_mul:
+            return False, (
+                "kernel does not support per-token NVFP4 activation scaling "
+                "for non-gated MoE"
+            )
+        return mk.FusedMoEExperts.is_supported_config(
+            cls,
+            moe_config,
+            weight_key,
+            activation_key,
+            activation_format,
+        )
 
     @staticmethod
     def _supports_activation(activation: MoEActivation) -> bool:
