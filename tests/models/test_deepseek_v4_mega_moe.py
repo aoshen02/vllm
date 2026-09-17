@@ -620,6 +620,17 @@ def test_deepseek_v4_mega_moe_finalizes_native_shared_expert_weights(
         experts._transformed_shared_l1_weights[0].data_ptr()
         == shared_experts.gate_up_proj.weight.data_ptr()
     )
+    # Every kernel-format tensor must be reachable through named_buffers();
+    # plain attributes are invisible to sleep mode and weight reload.
+    registered = {t.data_ptr() for _, t in experts.named_buffers()}
+    for transformed in (
+        experts._transformed_l1_weights,
+        experts._transformed_l2_weights,
+        experts._transformed_shared_l2_weights,
+    ):
+        for tensor in transformed:
+            assert tensor.data_ptr() in registered
+    assert experts._transformed_shared_l1_weights[1].data_ptr() in registered
     assert (
         experts._transformed_shared_l2_weights[0].data_ptr()
         == shared_experts.down_proj.weight.data_ptr()

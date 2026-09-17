@@ -68,6 +68,53 @@ def set_weight_attrs(
         setattr(weight, key, value)
 
 
+def set_derived_buffer(
+    module: torch.nn.Module, name: str, value: torch.Tensor | None
+) -> None:
+    """Store a tensor derived from loaded weights in a registered buffer.
+
+    ``name`` must already be registered with
+    ``register_buffer(name, None, persistent=False)`` so that
+    ``named_buffers()``, and with it sleep mode and weight reload, can see
+    the memory.  Once the buffer holds a tensor, later values are copied in
+    place (via ``.data.copy_``) so the address stays valid for captured
+    graphs.  Never rebind a derived buffer by plain assignment; always go
+    through this helper.
+
+    Because level-2 sleep snapshots every registered buffer to CPU, large
+    derived tensors (e.g. MegaMoE kernel-format weights whose raw params
+    have been dropped) add to the wake-snapshot RAM — this is required when
+    no recompute-on-wake hook exists.
+
+    Raises:
+        KeyError: ``name`` is not a registered buffer of ``module``.
+        ValueError: the buffer already holds a tensor of another shape, dtype or device.
+
+    """
+    if name not in module._buffers:
+        raise KeyError(
+            f"{name!r} is not a registered buffer of {type(module).__name__}; "
+            "register it in __init__ with "
+            "register_buffer(name, None, persistent=False)"
+        )
+    current = module._buffers[name]
+    if current is None or value is None:
+        module._buffers[name] = value
+        return
+    if (
+        current.shape != value.shape
+        or current.dtype != value.dtype
+        or current.device != value.device
+    ):
+        raise ValueError(
+            f"{type(module).__name__}.{name}: derived buffer is "
+            f"{tuple(current.shape)}/{current.dtype}/{current.device}, "
+            f"new value is "
+            f"{tuple(value.shape)}/{value.dtype}/{value.device}"
+        )
+    current.data.copy_(value)
+
+
 def replace_parameter(
     layer: torch.nn.Module,
     param_name: str,
