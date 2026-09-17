@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 import torch.nn as nn
 
-from vllm.model_executor.utils import set_weight_attrs
+from vllm.model_executor.utils import set_derived_buffer, set_weight_attrs
 from vllm.models.deepseek_v4.nvidia.model import DeepseekV4MegaMoEExperts
 from vllm.utils.flashinfer_moe_ep import (
     build_fi_mega_layer,
@@ -141,7 +141,8 @@ class DeepseekV4MegaMoEExpertsFI(DeepseekV4MegaMoEExperts):
         self._activation_clamp = activation_clamp
         self._mega_layer: MoEEpMegaLayer | None = None
         self._fast_ctx: tuple[Any, Any, Any, int, bool] | None = None
-        self._epilogue_alphas: tuple[torch.Tensor, torch.Tensor] | None = None
+        self.register_buffer("_fc1_alpha", None, persistent=False)
+        self.register_buffer("_fc2_alpha", None, persistent=False)
         self._nvfp4_prequant = ckpt_uses_nvfp4_experts(vllm_config)
         if self._nvfp4_prequant:
             megakernel = fi_moe_ep_backend_spec(
@@ -246,7 +247,8 @@ class DeepseekV4MegaMoEExpertsFI(DeepseekV4MegaMoEExperts):
                 self.w2_weight_scale_2.data,
                 intermediate_size=self.intermediate_size,
             )
-            self._epilogue_alphas = (fc1_alpha, fc2_alpha)
+            set_derived_buffer(self, "_fc1_alpha", fc1_alpha)
+            set_derived_buffer(self, "_fc2_alpha", fc2_alpha)
         else:
             weights = mega_moe_weight_pack_from_params(
                 self.w13_weight,
@@ -339,9 +341,8 @@ class DeepseekV4MegaMoEExpertsFI(DeepseekV4MegaMoEExperts):
         # Fast path: after the first successful full forward the layer is
         # immutable, so skip MoEEpMegaLayer.forward()'s per-call validation
         # and go straight to the kernel backend's stage_inputs + compute.
-        alphas = self._epilogue_alphas
-        fc1_alpha = alphas[0] if alphas is not None else None
-        fc2_alpha = alphas[1] if alphas is not None else None
+        fc1_alpha = self._fc1_alpha
+        fc2_alpha = self._fc2_alpha
 
         fast = self._fast_ctx
         if fast is not None:

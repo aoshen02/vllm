@@ -31,6 +31,7 @@ from vllm.model_executor.layers.mamba.ops.scatter_states import scatter_states
 from vllm.model_executor.model_loader.weight_utils import sharded_weight_loader
 from vllm.model_executor.utils import (
     maybe_disable_graph_partition,
+    set_derived_buffer,
     set_weight_attrs,
 )
 from vllm.platforms import current_platform
@@ -274,7 +275,8 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         self.v_conv1d.weight.data = self.v_conv1d.weight.data.unsqueeze(1)
         # Lazily-built merged q|k|v conv weight (built on first forward, after
         # weights are loaded). See _forward.
-        self._merged_conv_weight: torch.Tensor | None = None
+        self._merged_conv_weight: torch.Tensor | None
+        self.register_buffer("_merged_conv_weight", None, persistent=False)
 
         self.A_log = nn.Parameter(
             torch.empty(1, 1, self.local_num_heads, 1, dtype=torch.float32)
@@ -507,10 +509,14 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             def _w(m):
                 return m.weight.view(m.weight.size(0), m.weight.size(2))
 
-            self._merged_conv_weight = torch.cat(
-                [_w(self.q_conv1d), _w(self.k_conv1d), _w(self.v_conv1d)],
-                dim=0,
-            ).contiguous()
+            set_derived_buffer(
+                self,
+                "_merged_conv_weight",
+                torch.cat(
+                    [_w(self.q_conv1d), _w(self.k_conv1d), _w(self.v_conv1d)],
+                    dim=0,
+                ).contiguous(),
+            )
         conv_weights = self._merged_conv_weight
         conv_bias = self.q_conv1d.bias
 
