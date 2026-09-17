@@ -210,8 +210,6 @@ def test_rocm_compute_logits_local_skips_gather() -> None:
 
 
 class _FakeLanguageModel(nn.Module):
-    finalizes_weights_during_load = False
-
     def __init__(self) -> None:
         super().__init__()
         self.tensor_a = nn.Parameter(torch.zeros(1))
@@ -225,7 +223,7 @@ class _FakeLanguageModel(nn.Module):
         return hidden_states + 1
 
 
-def test_vl_wrapper_streams_then_delegates_finalization() -> None:
+def _make_vl_wrapper():
     from vllm.models.deepseek_v4.common.vl_model import (
         DeepseekV4ForConditionalGeneration,
     )
@@ -236,6 +234,13 @@ def test_vl_wrapper_streams_then_delegates_finalization() -> None:
     model.vision = nn.Module()
     model.vision.tensor_b = nn.Parameter(torch.zeros(1))
     model.hf_to_vllm_mapper = WeightsMapper()
+    return model
+
+
+def test_vl_wrapper_streams_then_delegates_finalization() -> None:
+    """load_weights only loads; the loader's model-level post-load hook
+    is what finalizes the language model, after every weight is in."""
+    model = _make_vl_wrapper()
 
     def interleaved_weights():
         yield "language_model.tensor_a", torch.tensor([1.0])
@@ -259,75 +264,13 @@ def test_vl_wrapper_streams_then_delegates_finalization() -> None:
     assert torch.equal(
         model.compute_logits_local(torch.tensor([4.0])), torch.tensor([5.0])
     )
+
+
+def test_vl_wrapper_delegates_finalization_without_load_weights() -> None:
+    """DummyModelLoader bypasses load_weights; the post-load hook must still
+    reach the language model."""
+    model = _make_vl_wrapper()
+
     model.process_weights_after_loading()
-    assert model.language_model.finalized_values == [(1.0, 3.0)]
 
-
-class _FakeFinalizingLanguageModel(_FakeLanguageModel):
-    finalizes_weights_during_load = True
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.load_calls = 0
-
-    def load_weights(self, weights) -> set[str]:
-        self.load_calls += 1
-        loaded = set()
-        for name, value in weights:
-            getattr(self, name).data.copy_(value)
-            loaded.add(name)
-        self.process_weights_after_loading()
-        return loaded
-
-
-def test_vl_wrapper_groups_child_that_finalizes_during_load() -> None:
-    from vllm.models.deepseek_v4.common.vl_model import (
-        DeepseekV4ForConditionalGeneration,
-    )
-
-    model = object.__new__(DeepseekV4ForConditionalGeneration)
-    nn.Module.__init__(model)
-    model.language_model = _FakeFinalizingLanguageModel()
-    model.vision = nn.Module()
-    model.vision.tensor_b = nn.Parameter(torch.zeros(1))
-    model.hf_to_vllm_mapper = WeightsMapper()
-
-    loaded = model.load_weights(
-        iter(
-            (
-                ("language_model.tensor_a", torch.tensor([1.0])),
-                ("vision.tensor_b", torch.tensor([2.0])),
-                ("language_model.tensor_c", torch.tensor([3.0])),
-            )
-        )
-    )
-
-    assert loaded == {
-        "language_model.tensor_a",
-        "vision.tensor_b",
-        "language_model.tensor_c",
-    }
-    assert model.language_model.load_calls == 1
-    assert model.language_model.finalized_values == [(1.0, 3.0)]
-
-    # The framework's later model-level hook must not double-finalize a child
-    # which already completed this work in load_weights.
-    model.process_weights_after_loading()
-    assert model.language_model.finalized_values == [(1.0, 3.0)]
-
-
-def test_vl_wrapper_dummy_load_delegates_finalization() -> None:
-    from vllm.models.deepseek_v4.common.vl_model import (
-        DeepseekV4ForConditionalGeneration,
-    )
-
-    model = object.__new__(DeepseekV4ForConditionalGeneration)
-    nn.Module.__init__(model)
-    model.language_model = _FakeFinalizingLanguageModel()
-
-    # DummyModelLoader bypasses model.load_weights(), so no finalized marker
-    # exists and the framework-level hook must still delegate to the child.
-    model.process_weights_after_loading()
-    assert model.language_model.finalized_values == [(0.0, 0.0)]
-    model.process_weights_after_loading()
     assert model.language_model.finalized_values == [(0.0, 0.0)]
