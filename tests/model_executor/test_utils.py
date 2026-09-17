@@ -6,7 +6,7 @@ import pytest
 import torch
 
 from vllm.model_executor.parameter import ModelWeightParameter, PackedvLLMParameter
-from vllm.model_executor.utils import replace_parameter
+from vllm.model_executor.utils import replace_parameter, set_derived_buffer
 
 
 @pytest.fixture
@@ -281,3 +281,67 @@ def test_replace_parameter_attributes_from_the_layers_own_parameter(
     if param_kind != "plain":
         for public_name in ("output_dim", "input_dim", "packed_dim", "packed_factor"):
             assert getattr(layer.weight, public_name, None) is None
+
+
+def test_set_derived_buffer_requires_registration() -> None:
+    module = torch.nn.Module()
+    with pytest.raises(KeyError):
+        set_derived_buffer(module, "derived", torch.zeros(2))
+
+
+def test_set_derived_buffer_fills_placeholder_then_copies_in_place() -> None:
+    """A derived tensor lands in named_buffers() and keeps its address."""
+    module = torch.nn.Module()
+    module.register_buffer("derived", None, persistent=False)
+
+    set_derived_buffer(module, "derived", torch.ones(2))
+    first = module.derived
+    assert dict(module.named_buffers())["derived"] is first
+    assert "derived" not in module.state_dict()
+
+    set_derived_buffer(module, "derived", torch.full((2,), 3.0))
+    assert module.derived is first
+    assert torch.equal(first, torch.full((2,), 3.0))
+
+    with pytest.raises(ValueError):
+        set_derived_buffer(module, "derived", torch.ones(3))
+    set_derived_buffer(module, "derived", None)
+    assert module.derived is None
+
+
+def test_set_derived_buffer_survives_layerwise_reload() -> None:
+    """None-placeholder buffers must survive restore_layer_on_meta so
+    that set_derived_buffer can fill them after a reload."""
+    from vllm.model_executor.model_loader.reload.meta import (
+        capture_layer_to_meta,
+        restore_layer_on_meta,
+    )
+    from vllm.model_executor.model_loader.reload.types import (
+        LayerReloadingInfo,
+    )
+
+    module = torch.nn.Module()
+    module.register_buffer("derived", None, persistent=False)
+    module.weight = torch.nn.Parameter(torch.ones(4))
+
+    # Capture metadata while the derived buffer is still None
+    info = LayerReloadingInfo(
+        restore_metadata=capture_layer_to_meta(module),
+        restore_device=torch.device("cpu"),
+    )
+
+    # Simulate cold start filling the buffer
+    set_derived_buffer(module, "derived", torch.full((3,), 7.0))
+    assert module.derived is not None
+
+    # Simulate reload: restore_layer_on_meta wipes and re-registers
+    restore_layer_on_meta(module, info)
+
+    # The None placeholder must be back as a registered buffer
+    assert "derived" in module._buffers
+    assert module._buffers["derived"] is None
+
+    # set_derived_buffer must succeed on the restored placeholder
+    set_derived_buffer(module, "derived", torch.full((3,), 9.0))
+    assert torch.equal(module.derived, torch.full((3,), 9.0))
+    assert "derived" in dict(module.named_buffers())
