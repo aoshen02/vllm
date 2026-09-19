@@ -6,19 +6,24 @@ Every caller that streams checkpoint-format weights into an already-built model
 goes through these three functions rather than naming the mechanism behind
 them, so the mechanism can change in one place::
 
-    start_reload(model)
+    start_reload(model, mode)
     try:
         model.load_weights(weights)
         finish_reload(model, model_config)
     except BaseException:
         abort_reload(model)
         raise
+
+``mode`` is a value of ``WeightTransferConfig.reload_mode``. It is chosen at
+``start_reload``; ``finish_reload`` and ``abort_reload`` complete whichever
+mode was started.
 """
 
 import torch
 
 from vllm.config import ModelConfig
 
+from .direct import direct_abort, direct_finish, direct_start
 from .layerwise import (
     abort_layerwise_reload,
     finalize_layerwise_reload,
@@ -27,21 +32,38 @@ from .layerwise import (
 
 __all__ = ["start_reload", "finish_reload", "abort_reload"]
 
+_STARTED_MODE = "_reload_started_mode"
 
-def start_reload(model: torch.nn.Module) -> None:
+
+def start_reload(model: torch.nn.Module, mode: str = "layerwise") -> None:
     """Prepare ``model`` to receive checkpoint-format weights."""
-    initialize_layerwise_reload(model)
+    if mode == "direct":
+        direct_start(model)
+    elif mode == "layerwise":
+        initialize_layerwise_reload(model)
+    else:
+        raise ValueError(f"unknown reload mode {mode!r}")
+    model.__dict__[_STARTED_MODE] = mode
 
 
 def finish_reload(model: torch.nn.Module, model_config: ModelConfig) -> None:
-    """Complete a reload once every weight has been loaded."""
-    finalize_layerwise_reload(model, model_config)
+    """Complete the reload that ``start_reload`` began."""
+    mode = model.__dict__.pop(_STARTED_MODE, None)
+    if mode is None:
+        raise RuntimeError("finish_reload called without a matching start_reload")
+    if mode == "direct":
+        direct_finish(model)
+    else:
+        finalize_layerwise_reload(model, model_config)
 
 
 def abort_reload(model: torch.nn.Module) -> None:
-    """Discard an in-progress reload and leave the model loadable again.
-
-    Not a rollback: layers still waiting for weights get their pre-reload
-    tensors back, but anything already written stays written.
-    """
-    abort_layerwise_reload(model)
+    """Discard the in-progress reload. Not a rollback: layerwise puts the
+    pre-reload tensors back on layers still waiting for weights; direct leaves
+    everything written and the model undefined. A no-op when nothing was
+    started, so it is safe on any error path."""
+    mode = model.__dict__.pop(_STARTED_MODE, None)
+    if mode == "direct":
+        direct_abort(model)
+    elif mode == "layerwise":
+        abort_layerwise_reload(model)

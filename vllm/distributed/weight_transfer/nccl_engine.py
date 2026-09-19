@@ -161,7 +161,7 @@ class NCCLWeightTransferEngine(
         """Prepare the model to receive checkpoint-format weights."""
         from vllm.model_executor.model_loader.reload import start_reload
 
-        start_reload(self.model)
+        start_reload(self.model, self.config.reload_mode)
 
     def finish_weight_update(self) -> None:
         """Complete the reload after all weights have been received."""
