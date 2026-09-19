@@ -685,6 +685,18 @@ def _hd256_config(
 
 
 @blackwell_only
+def test_fa4_stays_selected_with_batch_invariance(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from vllm import envs
+    from vllm.v1.attention.backends.fa_utils import get_flash_attn_version
+
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
+    with _blackwell(_hd256_config(head_size=128)):
+        assert get_flash_attn_version(head_size=128, kv_cache_block_size=16) == 4
+
+
+@blackwell_only
 @pytest.mark.parametrize(
     "kwargs,config_kwargs,expected",
     [

@@ -6,6 +6,8 @@
 
 import torch
 
+from vllm import envs
+
 # isort: off
 # We need to import the CUDA kernels after importing torch
 # Use relative import to support build-from-source installation in vLLM
@@ -462,6 +464,7 @@ def flash_attn_varlen_func(
             k_descale=k_descale,
             v_descale=v_descale,
             output_scale=output_scale,
+            batch_invariant=envs.VLLM_BATCH_INVARIANT,
         )
     else:
         raise ValueError(f"Unsupported FA version: {fa_version}")
@@ -558,6 +561,7 @@ def compile_flash_attn_varlen_func_from_specs(
         return_lse=return_softmax_lse,
         out=out,
         lse=lse,
+        batch_invariant=envs.VLLM_BATCH_INVARIANT,
         compile_only=True,
     )
 

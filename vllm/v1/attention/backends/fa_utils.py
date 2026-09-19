@@ -3,7 +3,6 @@
 
 from typing import Any
 
-import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import is_quantized_kv_cache
@@ -165,15 +164,6 @@ def get_flash_attn_version(
                     scope="local",
                 )
                 fa_version = 4
-
-        # FA4 currently uses batch-shape-dependent scheduling
-        # heuristics on SM100+, which breaks batch invariance.
-        if envs.VLLM_BATCH_INVARIANT and fa_version == 4:
-            logger.warning_once(
-                "Cannot use FA version 4 with batch invariance, "
-                "defaulting to FA version 2.",
-            )
-            fa_version = 2
 
         if fa_version == 4 and uses_fa4_hd256_kernel(head_size, head_size_v):
             if not supports_fa4_hd256:
