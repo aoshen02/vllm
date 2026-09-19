@@ -162,19 +162,22 @@ class IPCWeightTransferEngine(
         """Prepare the model to receive checkpoint-format weights."""
         from vllm.model_executor.model_loader.reload import start_reload
 
-        start_reload(self.model)
+        start_reload(self.model, self.config.reload_mode)
 
     def finish_weight_update(self) -> None:
         """Complete the reload after all weights have been received."""
         from vllm.model_executor.model_loader.reload import finish_reload
 
-        finish_reload(self.model, self.model_config)
-        # Every reduce_tensor call is a fresh export with its own refcount
-        # slot, so releasing once per update always balances this update's
-        # export and lets the trainer reclaim its staging buffer. Callers
-        # that skip finish are still covered by the replace-on-next-export
-        # path inside the importer.
-        self._packed_importer.close()
+        try:
+            finish_reload(self.model, self.model_config)
+        finally:
+            # Every reduce_tensor call is a fresh export with its own refcount
+            # slot, so releasing once per update always balances this update's
+            # export and lets the trainer reclaim its staging buffer. Callers
+            # that skip finish are still covered by the replace-on-next-export
+            # path inside the importer; a failed direct finish is not, since it
+            # refuses every later update.
+            self._packed_importer.close()
 
     def receive_weights(self, update_info: IPCWeightTransferUpdateInfo) -> None:
         """Receive weights from the trainer via CUDA IPC handles and load them.

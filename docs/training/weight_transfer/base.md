@@ -504,6 +504,26 @@ The base class provides:
     its `drain_pending()` joins both queues and syncs both streams before
     `finish_reload` runs.
 
+### Reload mode
+
+`WeightTransferConfig.reload_mode` selects how the `nccl` and `ipc` engines
+write received weights into the model. The engines pass it to `start_reload`;
+`finish_reload` / `abort_reload` complete whichever mode was started.
+
+| Mode | What happens | When to use it |
+| ---- | ------------ | -------------- |
+| `layerwise` (default) | Each layer is loaded into a temporary copy, post-processed and copied back into the captured storage | Any model. Holds a temporary copy of every layer that has started but not finished loading |
+| `direct` | Each `weight_loader` writes into the live parameters; no post-processing runs; `finish_reload` checks that no parameter or buffer changed storage or layout | Models whose post-load step leaves the parameters as the checkpoint has them, such as an unquantized dense model. Nothing verifies this |
+
+```bash
+vllm serve ... --weight-transfer-config '{"backend": "nccl", "reload_mode": "direct"}'
+```
+
+A `direct` update has no rollback: any failure after `start_reload` leaves the
+model undefined, it refuses further updates and the engine must be restarted.
+In both modes the sender must send every tensor; an omitted tensor or shard
+keeps its previous values. `sparse_nccl` and `sharded_rdt` ignore the setting.
+
 ### Request Classes
 
 The API-level request classes provide backend-agnostic serialization using plain dictionaries.
