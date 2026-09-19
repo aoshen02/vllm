@@ -112,21 +112,24 @@ llm.collective_rpc("reload_weights", kwargs={"weights_iterator": weights_iterato
 | `_copy_and_restore_kernel_tensors` | Copy processed weights into original tensor locations to affect compiled cuda graphs, etc. | Called by `_layerwise_process` after `process_weights_after_loading` | Not called. There is no compiled cuda graph yet |
 | `finalize_layerwise_processing` | Catch any layers which did not load all weights (for example attention weights or weights with padding) | Called by `BaseModelLoader` | Called by `BaseModelLoader` |
 
-You can plug into this lifecycle directly by calling the `initialize_layerwise_reload`, loading weights, then calling `finalize_layerwise_processing`:
+You can plug into this lifecycle directly through the public reload entry points: call `start_reload`, load weights, then `finish_reload`. If either step fails part-way, `abort_reload` puts every layer that was still waiting for weights back on its pre-reload tensors so the model is loadable again (it is not a rollback — weights already written stay written):
 
 ```python
 from vllm import LLM
-from vllm.model_executor.model_loader.reload import initialize_layerwise_reload, finalize_layerwise_processing
+from vllm.model_executor.model_loader.reload import start_reload, finish_reload, abort_reload
 
 llm = LLM("Qwen/Qwen3-0.6B")
 
 # this model path requires `VLLM_ENABLE_V1_MULTIPROCESSING=0` and is not stable
 model = llm.llm_engine.engine_core.engine_core.model_executor.driver_worker.worker.get_model()
 
-# layerwise reload
-initialize_layerwise_reload(model)
-model.load_weights(...)
-finalize_layerwise_processing(model, llm.model_config)
+start_reload(model)
+try:
+    model.load_weights(...)
+    finish_reload(model, llm.model_config)
+except BaseException:
+    abort_reload(model)
+    raise
 ```
 
 ## Troubleshooting Excessive Memory Usage
