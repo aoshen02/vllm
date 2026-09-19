@@ -972,6 +972,13 @@ class OpenPanguDecoderLayer(nn.Module):
         return hidden_states, residual
 
 
+def run_post_weight_load(root: nn.Module) -> None:
+    """Rebuild every submodule's weight-derived tensors."""
+    for module in root.modules():
+        if hasattr(module, "post_weight_load"):
+            module.post_weight_load()
+
+
 @support_torch_compile
 class OpenPanguModel(nn.Module):
     fall_back_to_pt_during_load = False
@@ -1087,13 +1094,6 @@ class OpenPanguModel(nn.Module):
         loader = AutoWeightsLoader(self)
         return loader.load_weights(self._filter_spec_layers(weights), mapper=mapper)
 
-    def post_weight_load(self) -> None:
-        for name, module in self.named_modules():
-            if module is self:
-                continue
-            if hasattr(module, "post_weight_load"):
-                module.post_weight_load()
-
 
 class OpenPanguModelBase(nn.Module, SupportsPP, SupportsLoRA):
     packed_modules_mapping = {
@@ -1163,7 +1163,7 @@ class OpenPanguModelBase(nn.Module, SupportsPP, SupportsLoRA):
         return loader.load_weights(weights)
 
     def process_weights_after_loading(self) -> None:
-        self.model.post_weight_load()
+        run_post_weight_load(self)
 
 
 class OpenPanguMoEModel(OpenPanguModelBase, MixtureOfExperts):
