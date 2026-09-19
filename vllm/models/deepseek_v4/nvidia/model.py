@@ -446,23 +446,33 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         # with its 128x128 DeepGEMM layout.
         checkpoint_scale_dtypes = (torch.float8_e8m0fnu, torch.uint8)
         if (
-            gate_up_scale.dtype in checkpoint_scale_dtypes
-            and down_scale.dtype in checkpoint_scale_dtypes
+            gate_up_scale.dtype not in checkpoint_scale_dtypes
+            or down_scale.dtype not in checkpoint_scale_dtypes
         ):
-            gate_up_scale = self._prepare_shared_expert_scale(
-                deep_gemm,
-                gate_up,
-                gate_up_scale,
-                gate_up_weight.shape[0],
-                gate_up_weight.shape[1],
+            logger.warning(
+                "Disabling native MegaMoE shared-expert fusion for %s: shared "
+                "FP8 scales are not in checkpoint layout (%s, %s).",
+                self.prefix,
+                gate_up_scale.dtype,
+                down_scale.dtype,
             )
-            down_scale = self._prepare_shared_expert_scale(
-                deep_gemm,
-                down,
-                down_scale,
-                down_weight.shape[0],
-                down_weight.shape[1],
-            )
+            self.num_shared_experts = 0
+            return
+
+        gate_up_scale = self._prepare_shared_expert_scale(
+            deep_gemm,
+            gate_up,
+            gate_up_scale,
+            gate_up_weight.shape[0],
+            gate_up_weight.shape[1],
+        )
+        down_scale = self._prepare_shared_expert_scale(
+            deep_gemm,
+            down,
+            down_scale,
+            down_weight.shape[0],
+            down_weight.shape[1],
+        )
 
         if gate_up_scale is None or down_scale is None:
             self.num_shared_experts = 0
@@ -1954,6 +1964,8 @@ class DeepseekV4ForCausalLM(
     SupportsLoRA,
     DeepseekV4MixtureOfExperts,
 ):
+    # Shared-expert scales must be read before the per-layer quant hook.
+    finalizes_weights_during_load = True
     model_cls = DeepseekV4Model
 
     # Default mapper assumes the original FP4-expert checkpoint layout.
@@ -2051,7 +2063,9 @@ class DeepseekV4ForCausalLM(
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        loaded_params = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        self.process_weights_after_loading()
+        return loaded_params
 
     def process_weights_after_loading(self) -> None:
         self.model.finalize_mega_moe_weights()

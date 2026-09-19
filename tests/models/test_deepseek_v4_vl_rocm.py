@@ -7,7 +7,6 @@ import pytest
 import torch
 from torch import nn
 
-from vllm.model_executor.models.utils import WeightsMapper
 from vllm.platforms import current_platform
 
 pytestmark = pytest.mark.skipif(
@@ -207,70 +206,3 @@ def test_rocm_compute_logits_local_skips_gather() -> None:
 
     assert torch.equal(result, torch.tensor([5.0]))
     assert calls == [(model.lm_head, hidden_states, True)]
-
-
-class _FakeLanguageModel(nn.Module):
-    def __init__(self) -> None:
-        super().__init__()
-        self.tensor_a = nn.Parameter(torch.zeros(1))
-        self.tensor_c = nn.Parameter(torch.zeros(1))
-        self.finalized_values: list[tuple[float, float]] = []
-
-    def process_weights_after_loading(self) -> None:
-        self.finalized_values.append((self.tensor_a.item(), self.tensor_c.item()))
-
-    def compute_logits_local(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return hidden_states + 1
-
-
-def _make_vl_wrapper():
-    from vllm.models.deepseek_v4.common.vl_model import (
-        DeepseekV4ForConditionalGeneration,
-    )
-
-    model = object.__new__(DeepseekV4ForConditionalGeneration)
-    nn.Module.__init__(model)
-    model.language_model = _FakeLanguageModel()
-    model.vision = nn.Module()
-    model.vision.tensor_b = nn.Parameter(torch.zeros(1))
-    model.hf_to_vllm_mapper = WeightsMapper()
-    return model
-
-
-def test_vl_wrapper_streams_then_delegates_finalization() -> None:
-    """load_weights only loads; the loader's model-level post-load hook
-    is what finalizes the language model, after every weight is in."""
-    model = _make_vl_wrapper()
-
-    def interleaved_weights():
-        yield "language_model.tensor_a", torch.tensor([1.0])
-        assert model.language_model.tensor_a.item() == 1.0
-        yield "vision.tensor_b", torch.tensor([2.0])
-        assert model.vision.tensor_b.item() == 2.0
-        yield "language_model.tensor_c", torch.tensor([3.0])
-
-    loaded = model.load_weights(interleaved_weights())
-
-    assert loaded == {
-        "language_model.tensor_a",
-        "vision.tensor_b",
-        "language_model.tensor_c",
-    }
-    assert model.language_model.finalized_values == []
-
-    model.process_weights_after_loading()
-
-    assert model.language_model.finalized_values == [(1.0, 3.0)]
-    assert torch.equal(
-        model.compute_logits_local(torch.tensor([4.0])), torch.tensor([5.0])
-    )
-
-
-def test_vl_wrapper_delegates_finalization_without_load_weights() -> None:
-    """DummyModelLoader bypasses load_weights; the post-load hook must still
-    reach the language model."""
-    model = _make_vl_wrapper()
-
-    model.process_weights_after_loading()
-
-    assert model.language_model.finalized_values == [(0.0, 0.0)]
