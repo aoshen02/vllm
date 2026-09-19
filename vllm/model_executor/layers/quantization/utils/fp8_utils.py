@@ -1373,7 +1373,12 @@ def process_fp8_weight_tensor_strategy(
     logical_widths: list[int],
     input_scale: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-    """Process weights for tensor-wise quantization strategy."""
+    """Requantize fused shards to one scale and return ``(K, N)`` weight.
+
+    Weight may be mutated in place (requantization, FNUZ, ROCm padding).
+    ``input_scale``, when not None, is collapsed via ``.max()`` for static
+    activation schemes; pass None for dynamic schemes.
+    """
     from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
         normalize_e4m3fn_to_e4m3fnuz,
         requantize_with_max_scale,
@@ -1391,7 +1396,9 @@ def process_fp8_weight_tensor_strategy(
         logical_widths=logical_widths,
     )
 
-    weight = _maybe_pad_fp8_weight(weight)
+    weight = _maybe_pad_fp8_weight(weight).t()
+    if input_scale is not None:
+        input_scale = input_scale.max()
     return weight, weight_scale, input_scale
 
 
@@ -1400,7 +1407,11 @@ def process_fp8_weight_channel_strategy(
     weight_scale: torch.Tensor,
     input_scale: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-    """Process weights for channel-wise quantization strategy."""
+    """Normalize FNUZ if needed and return ``(K, N)`` weight.
+
+    Weight may be mutated in place (FNUZ normalization).
+    ``input_scale``, when not None, is collapsed via ``.max()``.
+    """
     from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
         normalize_e4m3fn_to_e4m3fnuz,
     )
@@ -1410,14 +1421,19 @@ def process_fp8_weight_channel_strategy(
             weight=weight, weight_scale=weight_scale, input_scale=input_scale
         )
 
-    return weight, weight_scale, input_scale
+    if input_scale is not None:
+        input_scale = input_scale.max()
+    return weight.t(), weight_scale, input_scale
 
 
 def process_fp8_weight_block_strategy(
     weight: torch.Tensor,
     weight_scale: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Process weights for block-wise quantization strategy."""
+    """Normalize FNUZ if needed and return ``(N, K)`` weight (no transpose).
+
+    Block kernels consume the checkpoint layout directly.
+    """
     from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
         normalize_e4m3fn_to_e4m3fnuz,
     )
