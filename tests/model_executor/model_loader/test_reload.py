@@ -198,6 +198,34 @@ def test_attention_first_load_processes_weights(default_vllm_config, layer_cls):
     assert torch.equal(layer.weight, loaded_weight)
 
 
+class _ModelWithDerivedState(torch.nn.Module):
+    """Rebuilds derived state in the model-level hook, as OpenPangu does."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.zeros(4))
+        self.weight.weight_loader = default_weight_loader
+        self.derived: torch.Tensor | None = None
+
+    def process_weights_after_loading(self) -> None:
+        self.derived = self.weight * 2
+
+
+def test_finalize_layerwise_reload_runs_the_model_level_hook():
+    """Reload has no loader to run the hook, so the finalizer must."""
+    model = _ModelWithDerivedState()
+    record_metadata_for_reloading(model)
+    model.process_weights_after_loading()
+    assert torch.equal(model.derived, torch.zeros(4))
+
+    initialize_layerwise_reload(model)
+    model.weight.weight_loader(model.weight, torch.full((4,), 5.0))
+    finalize_layerwise_reload(model, model_config=None)
+
+    assert torch.equal(model.weight, torch.full((4,), 5.0))
+    assert torch.equal(model.derived, torch.full((4,), 10.0))
+
+
 def test_reload_lifecycle():
     layer = torch.nn.Linear(2, 3)
     info = LayerReloadingInfo(
