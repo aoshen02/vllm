@@ -28,7 +28,7 @@ from vllm.model_executor.models.deepseek_v2 import (
     DeepseekV32IndexerCache,
     yarn_get_mscale,
 )
-from vllm.model_executor.utils import maybe_disable_graph_partition
+from vllm.model_executor.utils import maybe_disable_graph_partition, set_derived_buffer
 from vllm.models.glm5next.nvidia.ops.kpool_compress import fwht128_quant_fp8
 from vllm.models.glm5next.sparse_indexer import SparseAttnIndexerKpool
 from vllm.platforms import current_platform
@@ -273,7 +273,8 @@ class Indexer(nn.Module):
         self.scale_fmt = "ue8m0"
         self.quant_block_size = 128  # TODO: get from config
         self.topk_indices_buffer = topk_indices_buffer
-        self._wp_fp32: torch.Tensor | None = None
+        self._wp_fp32: torch.Tensor | None
+        self.register_buffer("_wp_fp32", None, persistent=False)
 
         # NOTE: (zyongye) we use fp8 naive cache,
         #       where we store value in fp8 and scale in fp32
@@ -324,11 +325,13 @@ class Indexer(nn.Module):
         kw, _ = self.wk_weights_proj(hidden_states)
         k = kw[:, : self.head_dim]
         if self._wp_fp32 is None:
-            self._wp_fp32 = (
+            set_derived_buffer(
+                self,
+                "_wp_fp32",
                 self.wk_weights_proj.weight.data[self.head_dim :, :]
                 .t()
                 .contiguous()
-                .float()
+                .float(),
             )
         weights = torch.mm(hidden_states.float(), self._wp_fp32)
 
