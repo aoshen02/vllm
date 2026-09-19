@@ -36,7 +36,12 @@ class BaseModelLoader(ABC):
     @abstractmethod
     def load_weights(self, model: nn.Module, model_config: ModelConfig) -> None:
         """Load weights into a model. This standalone API allows
-        inplace weights loading for an already-initialized model"""
+        inplace weights loading for an already-initialized model.
+
+        Loading does not finalize: a caller that bypasses `load_model`, or a
+        loader that overrides it, must dispatch
+        `process_weights_after_loading` itself.
+        """
         raise NotImplementedError
 
     def create_model(

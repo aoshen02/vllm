@@ -289,8 +289,13 @@ def finalize_layerwise_processing(
     LOADING_LAYERS.clear()
 
 
-def finalize_layerwise_reload(*args, **kwargs):
-    finalize_layerwise_processing(*args, **kwargs)
+def finalize_layerwise_reload(
+    model: torch.nn.Module, model_config: ModelConfig
+) -> None:
+    """Reload has no loader to run the model-level hook, so run it here."""
+    finalize_layerwise_processing(model, model_config)
+    if hasattr(model, "process_weights_after_loading"):
+        model.process_weights_after_loading()
 
 
 def _finalize_attention_layer(layer: torch.nn.Module, info: LayerReloadingInfo) -> None:
