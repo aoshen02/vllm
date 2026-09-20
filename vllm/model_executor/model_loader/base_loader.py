@@ -40,7 +40,9 @@ class BaseModelLoader(ABC):
 
         Loading does not finalize: a caller that bypasses `load_model`, or a
         loader that overrides it, must dispatch
-        `process_weights_after_loading` itself.
+        `process_weights_after_loading` itself. Models that set
+        `finalizes_weights_during_load` are the exception: they finalize
+        inside `load_weights`, before the per-layer quantization hook.
         """
         raise NotImplementedError
 

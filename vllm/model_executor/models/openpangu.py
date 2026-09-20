@@ -1092,7 +1092,9 @@ class OpenPanguModel(nn.Module):
             orig_to_new_stacked=stacked,
         )
         loader = AutoWeightsLoader(self)
-        return loader.load_weights(self._filter_spec_layers(weights), mapper=mapper)
+        loaded = loader.load_weights(self._filter_spec_layers(weights), mapper=mapper)
+        run_post_weight_load(self)
+        return loaded
 
 
 class OpenPanguModelBase(nn.Module, SupportsPP, SupportsLoRA):
