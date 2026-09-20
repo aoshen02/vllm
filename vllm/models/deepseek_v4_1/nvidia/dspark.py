@@ -497,7 +497,16 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
             else:
                 if "attn_sink" in name:
                     narrow = loaded_weight[head_start:head_end]
-                    params_dict[name][: narrow.shape[0]].copy_(narrow)
+                    param = params_dict[name]
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
+                    padded = torch.nn.functional.pad(
+                        narrow,
+                        (0, param.shape[0] - narrow.shape[0]),
+                        value=-float("inf"),
+                    )
+                    weight_loader(param, padded)
                     loaded_params.add(name)
                     continue
                 if name.endswith(".ffn.gate.bias"):
