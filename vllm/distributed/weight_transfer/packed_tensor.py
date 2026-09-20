@@ -141,6 +141,88 @@ def pack_tensors(
 # ── NCCL packed broadcast ──────────────────────────────────────────────
 
 
+def _groups_by_size(iterator, size_bytes, limit):
+    """Share wire boundaries; oversized items always occupy their own group."""
+    if limit <= 0:
+        raise ValueError("Packed buffer size must be positive")
+    items, total = [], 0
+    for item in iterator:
+        size = size_bytes(item)
+        if items and total + size > limit:
+            yield items
+            items, total = [], 0
+        items.append(item)
+        total += size
+        if total >= limit:
+            yield items
+            items, total = [], 0
+    if items:
+        yield items
+
+
+def _broadcast_host_tensor(tensor, group, src, buffer_size_bytes):
+    """Copy each byte chunk out before reusing its GPU staging storage."""
+    staging = torch.empty(
+        min(tensor.numel(), buffer_size_bytes), dtype=torch.uint8, device=group.device
+    )
+    stream = torch.cuda.current_stream(group.device)
+    for offset in range(0, tensor.numel(), buffer_size_bytes):
+        host_slice = tensor[offset : offset + buffer_size_bytes]
+        device_slice = staging[: host_slice.numel()]
+        if group.rank == src:
+            device_slice.copy_(host_slice)
+        group.broadcast(device_slice, src=src, stream=stream)
+        if group.rank != src:
+            host_slice.copy_(device_slice)
+        stream.synchronize()
+
+
+def _chunked_producer(iterator, group, src, post_iter_func, limit):
+    size_bytes = lambda item: item[1].numel() * item[1].element_size()
+    stream = torch.cuda.current_stream(group.device)
+    for items in _groups_by_size(iterator, size_bytes, limit):
+        if size_bytes(items[0]) > limit:
+            packed = (
+                post_iter_func(items[0]).contiguous().view(torch.uint8).view(-1).cpu()
+            )
+            _broadcast_host_tensor(packed, group, src, limit)
+        else:
+            chunk = pack_tensors(iter(items), post_iter_func, limit)
+            assert chunk is not None
+            packed = chunk.packed_tensor.to(group.device)
+            group.broadcast(packed, src=src, stream=stream)
+            stream.synchronize()
+            del chunk
+        del packed
+
+
+def _chunked_consumer(iterator, group, src, post_unpack_func, limit, device):
+    size_bytes = lambda item: math.prod(item[1][0]) * item[1][1].itemsize
+    stream = torch.cuda.current_stream(group.device)
+    for items in _groups_by_size(iterator, size_bytes, limit):
+        sizes = [size_bytes(item) for item in items]
+        host = sizes[0] > limit
+        packed = torch.empty(
+            sum(sizes), dtype=torch.uint8, device="cpu" if host else device
+        )
+        if host:
+            _broadcast_host_tensor(packed, group, src, limit)
+        else:
+            group.broadcast(packed, src=src, stream=stream)
+        post_unpack_func(
+            unpack_tensor(
+                packed,
+                [name for name, _ in items],
+                [shape for _, (shape, _) in items],
+                [dtype for _, (_, dtype) in items],
+                sizes,
+            )
+        )
+        stream.synchronize()
+        # Deferred loaders keep their own views; do not retain an extra assembly.
+        del packed
+
+
 def packed_nccl_broadcast_producer(
     iterator: Iterator[tuple[str, torch.Tensor]],
     group: Any,
@@ -148,6 +230,7 @@ def packed_nccl_broadcast_producer(
     post_iter_func: Callable[[tuple[str, torch.Tensor]], torch.Tensor],
     buffer_size_bytes: int = DEFAULT_PACKED_BUFFER_SIZE_BYTES,
     num_buffers: int = DEFAULT_PACKED_NUM_BUFFERS,
+    chunk_large_tensors: bool = False,
 ) -> None:
     """Broadcast tensors in a packed manner from trainer to workers.
 
@@ -163,6 +246,10 @@ def packed_nccl_broadcast_producer(
                     Both producer and consumer must use the same value.
 
     """
+    if chunk_large_tensors:
+        return _chunked_producer(
+            iterator, group, src, post_iter_func, buffer_size_bytes
+        )
     streams = _get_streams(torch.accelerator.current_device_index(), num_buffers)
     # Keep references to in-flight chunks so their packed_tensors
     # aren't freed while an async broadcast is still reading them.
@@ -199,6 +286,7 @@ def packed_nccl_broadcast_consumer(
     buffer_size_bytes: int = DEFAULT_PACKED_BUFFER_SIZE_BYTES,
     num_buffers: int = DEFAULT_PACKED_NUM_BUFFERS,
     device: torch.device | str = "cuda",
+    chunk_large_tensors: bool = False,
 ) -> None:
     """Consume packed tensors and unpack them into a list of tensors.
 
@@ -216,6 +304,10 @@ def packed_nccl_broadcast_consumer(
                 communicator was created on (the worker's assigned device).
 
     """
+    if chunk_large_tensors:
+        return _chunked_consumer(
+            iterator, group, src, post_unpack_func, buffer_size_bytes, device
+        )
     target_packed_tensor_size = buffer_size_bytes
 
     streams = _get_streams(torch.accelerator.current_device_index(), num_buffers)

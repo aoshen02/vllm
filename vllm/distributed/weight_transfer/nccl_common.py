@@ -100,6 +100,7 @@ class NCCLWeightTransferInitInfo(WeightTransferInitInfo):
     packed: bool = False
     packed_buffer_size_bytes: int = DEFAULT_PACKED_BUFFER_SIZE_BYTES
     packed_num_buffers: int = DEFAULT_PACKED_NUM_BUFFERS
+    packed_chunk_large_tensors: bool = False
 
     def __post_init__(self) -> None:
         _ = self.nccl_unique_id_bytes
@@ -119,7 +120,12 @@ def worker_init_payload(init_info: NCCLWeightTransferInitInfo) -> dict:
     the unset rendezvous field (the UID in TCP mode) so the wire payload carries
     only the mode actually in use. Shared by the dense and sparse trainer
     engines so the two cannot drift."""
-    return {key: value for key, value in asdict(init_info).items() if value is not None}
+    payload = {
+        key: value for key, value in asdict(init_info).items() if value is not None
+    }
+    if not init_info.packed_chunk_large_tensors:
+        payload.pop("packed_chunk_large_tensors")
+    return payload
 
 
 class NCCLRendezvous(Protocol):
