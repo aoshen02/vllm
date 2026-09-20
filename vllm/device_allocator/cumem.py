@@ -354,6 +354,10 @@ class CuMemAllocator:
                         cpu_ptr = cpu_backup_tensor.data_ptr()
                         libcudart.cudaMemcpy(ptr, cpu_ptr, size_in_bytes)
                         data.cpu_backup_tensor = None
+                        del cpu_backup_tensor
+
+        # L1 backups must not compete with subsequent CPU weight staging.
+        torch._C._host_emptyCache()
 
     @contextmanager
     def use_memory_pool(self, tag: str | None = None):
