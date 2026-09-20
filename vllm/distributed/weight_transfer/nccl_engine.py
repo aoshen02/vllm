@@ -79,6 +79,7 @@ class NCCLTrainerInitInfo(TrainerInitInfo):
     packed: bool = True
     packed_buffer_size_bytes: int = DEFAULT_PACKED_BUFFER_SIZE_BYTES
     packed_num_buffers: int = DEFAULT_PACKED_NUM_BUFFERS
+    packed_chunk_large_tensors: bool = False
 
 
 @dataclass
@@ -140,6 +141,7 @@ class NCCLWeightTransferEngine(
         self.packed = False
         self.packed_buffer_size_bytes = DEFAULT_PACKED_BUFFER_SIZE_BYTES
         self.packed_num_buffers = DEFAULT_PACKED_NUM_BUFFERS
+        self.packed_chunk_large_tensors = False
 
     def init_transfer_engine(self, init_info: NCCLWeightTransferInitInfo) -> None:
         """
@@ -154,6 +156,7 @@ class NCCLWeightTransferEngine(
         self.packed = init_info.packed
         self.packed_buffer_size_bytes = init_info.packed_buffer_size_bytes
         self.packed_num_buffers = init_info.packed_num_buffers
+        self.packed_chunk_large_tensors = init_info.packed_chunk_large_tensors
         self.model_update_group = worker_init_process_group(
             init_info, self.parallel_config
         )
@@ -215,6 +218,7 @@ class NCCLWeightTransferEngine(
                     buffer_size_bytes=self.packed_buffer_size_bytes,
                     num_buffers=self.packed_num_buffers,
                     device=self.device,
+                    chunk_large_tensors=self.packed_chunk_large_tensors,
                 )
             else:
                 # Use simple one-by-one broadcasting
@@ -262,11 +266,13 @@ class NCCLTrainerWeightTransferEngine(TrainerWeightTransferEngine[NCCLTrainerIni
         packed: bool = True,
         packed_buffer_size_bytes: int = DEFAULT_PACKED_BUFFER_SIZE_BYTES,
         packed_num_buffers: int = DEFAULT_PACKED_NUM_BUFFERS,
+        packed_chunk_large_tensors: bool = False,
     ) -> None:
         super().__init__(client=client, source=source, is_sender=is_sender)
         self.packed = packed
         self.packed_buffer_size_bytes = packed_buffer_size_bytes
         self.packed_num_buffers = packed_num_buffers
+        self.packed_chunk_large_tensors = packed_chunk_large_tensors
         self.model_update_group: PyNcclCommunicator | None = None
 
     @classmethod
@@ -286,6 +292,7 @@ class NCCLTrainerWeightTransferEngine(TrainerWeightTransferEngine[NCCLTrainerIni
             packed=init_info.packed,
             packed_buffer_size_bytes=init_info.packed_buffer_size_bytes,
             packed_num_buffers=init_info.packed_num_buffers,
+            packed_chunk_large_tensors=init_info.packed_chunk_large_tensors,
         )
         if not engine.is_sender:
             # Non-sender trainer ranks aren't part of the transfer NCCL group and
@@ -302,6 +309,7 @@ class NCCLTrainerWeightTransferEngine(TrainerWeightTransferEngine[NCCLTrainerIni
             packed=init_info.packed,
             packed_buffer_size_bytes=init_info.packed_buffer_size_bytes,
             packed_num_buffers=init_info.packed_num_buffers,
+            packed_chunk_large_tensors=init_info.packed_chunk_large_tensors,
         )
 
         # The inference workers block inside init_weight_transfer_engine waiting
@@ -383,6 +391,7 @@ class NCCLTrainerWeightTransferEngine(TrainerWeightTransferEngine[NCCLTrainerIni
                 post_iter_func=lambda item: item[1],
                 buffer_size_bytes=self.packed_buffer_size_bytes,
                 num_buffers=self.packed_num_buffers,
+                chunk_large_tensors=self.packed_chunk_large_tensors,
             )
         else:
             stream = torch.cuda.current_stream()
