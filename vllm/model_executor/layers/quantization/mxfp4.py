@@ -774,6 +774,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             self.moe_kernel.fused_experts.process_weights_after_loading(layer)
 
     def process_weights_after_loading(self, layer):
+        # Level-2 sleep discards the CUDA storage behind cached indices.
+        self._cache_permute_indices.clear()
         w13 = layer.w13_weight
         w2 = layer.w2_weight
         w13_scale = layer.w13_weight_scale
