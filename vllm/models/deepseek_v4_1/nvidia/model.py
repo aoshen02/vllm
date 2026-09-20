@@ -797,7 +797,14 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                         continue
                     narrow_weight = loaded_weight[head_rank_start:head_rank_end]
                     n = narrow_weight.shape[0]
-                    params_dict[name][:n].copy_(narrow_weight)
+                    param = params_dict[name]
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
+                    padded_weight = torch.nn.functional.pad(
+                        narrow_weight, (0, param.shape[0] - n), value=-float("inf")
+                    )
+                    weight_loader(param, padded_weight)
                     loaded_params.add(name)
                     continue
                 else:
