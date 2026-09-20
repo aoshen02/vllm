@@ -285,6 +285,10 @@ def finalize_layerwise_processing(model: torch.nn.Module, model_config: ModelCon
 
     LOADING_LAYERS.clear()
 
+    # Match cold loading: model-level processing follows all layer processing.
+    if hasattr(model, "process_weights_after_loading"):
+        model.process_weights_after_loading()
+
 
 def finalize_layerwise_reload(*args, **kwargs):
     finalize_layerwise_processing(*args, **kwargs)
