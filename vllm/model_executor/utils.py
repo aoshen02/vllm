@@ -68,6 +68,25 @@ def set_weight_attrs(
         setattr(weight, key, value)
 
 
+def set_derived_buffer(
+    module: torch.nn.Module, name: str, value: torch.Tensor | None
+) -> None:
+    """Write a weight-derived tensor into a pre-registered non-persistent
+    buffer, copying in place when the buffer already holds a tensor."""
+    if name not in module._buffers:
+        raise KeyError(name)
+    old = module._buffers[name]
+    if old is not None and value is not None:
+        if old.shape != value.shape or old.dtype != value.dtype:
+            raise ValueError(
+                f"cannot copy {tuple(value.shape)}/{value.dtype} into "
+                f"existing {tuple(old.shape)}/{old.dtype} buffer"
+            )
+        old.data.copy_(value)
+    else:
+        module._buffers[name] = value
+
+
 def replace_parameter(
     layer: torch.nn.Module,
     param_name: str,

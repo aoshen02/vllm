@@ -415,3 +415,10 @@ def _place_kernel_tensors(layer: torch.nn.Module, info: LayerReloadingInfo):
         layer.register_parameter(name, param)
     for name, buffer in buffers.items():
         layer.register_buffer(name, buffer, persistent=name not in non_persistent)
+
+    # Re-register None-placeholder derived buffers that were excluded from
+    # kernel_tensors so set_derived_buffer / PWAL can fill them.
+    _, restore_bufs = info.restore_metadata
+    for name, buf in restore_bufs.items():
+        if buf is None and name not in parameters and name not in buffers:
+            layer.register_buffer(name, None, persistent=name not in non_persistent)
