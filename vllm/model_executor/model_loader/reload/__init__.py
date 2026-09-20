@@ -31,6 +31,7 @@ import torch
 
 from vllm.config import ModelConfig
 
+from .derived import check_post_load_is_reload_safe
 from .direct import direct_finish, direct_start
 from .layerwise import (
     finalize_layerwise_processing,
@@ -56,6 +57,7 @@ def start_reload(model: torch.nn.Module, mode: str = "layerwise") -> None:
     ``mode`` is latched on the model, so ``finish_reload`` completes whichever
     one was started rather than re-reading a config that may have changed.
     """
+    check_post_load_is_reload_safe(model)
     if mode == "direct":
         direct_start(model)
     elif mode == "layerwise":

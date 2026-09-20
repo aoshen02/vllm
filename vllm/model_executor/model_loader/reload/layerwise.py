@@ -17,6 +17,7 @@ from vllm.model_executor.model_loader.post_load import (
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
+from .derived import refresh_model_derived_state
 from .meta import (
     SKIP_LOAD_TENSORS,
     capture_layer_to_meta,
@@ -55,6 +56,13 @@ LAYERWISE_INFO: WeakKeyDictionary[torch.nn.Module, LayerReloadingInfo] = (
 
 # Global set used to track loading for logging purposes only
 LOADING_LAYERS: WeakSet[torch.nn.Module] = WeakSet()
+
+# Weights a reload loaded into a layer that does not keep them, recorded by
+# `_copy_and_restore_kernel_tensors` and reported by `finalize_layerwise_reload`.
+# Reported there rather than where it is found so that the sharded-RDT bake,
+# which drives `load_weights` over fake tensors purely to record a plan and then
+# aborts, is unaffected: it discards every value by design.
+ORPHANED_WEIGHTS: WeakKeyDictionary[torch.nn.Module, list[str]] = WeakKeyDictionary()
 
 
 def get_layerwise_info(layer: torch.nn.Module) -> LayerReloadingInfo:
@@ -245,7 +253,7 @@ def finalize_layerwise_processing(
         model._do_torchao_reload = model._original_do_torchao_reload
 
     for _, layer, phase in iter_post_load_modules(model):
-        # Reload has never run the model-level hook; cold start does.
+        # The model-level hook runs once, after every layer (finalize_layerwise_reload).
         if phase is PostLoadPhase.MODEL:
             continue
         # Deferred attention-like layers are only finalized in their own pass.
@@ -292,12 +300,35 @@ def finalize_layerwise_processing(
 def finalize_layerwise_reload(
     model: torch.nn.Module, model_config: ModelConfig
 ) -> None:
-    """Finalize a reload. The model-level hook is NOT dispatched here: it is
-    a cold-start contract and may replace parameters (ROCm DeepSeek-V4 calls
-    replace_parameter), which would swap storage a CUDA graph captured.
-    Models that need derived state refreshed on every load path do so inside
-    load_weights. See RFC vllm-project/vllm#54477 for the in-place hook."""
+    """Finalize a reload: the per-layer work, then the model-level hook."""
     finalize_layerwise_processing(model, model_config)
+    _refuse_orphaned_weights(model)
+    refresh_model_derived_state(model)
+
+
+def _refuse_orphaned_weights(model: torch.nn.Module) -> None:
+    """Raise if any layer dropped weights the checkpoint just loaded into it.
+
+    Whatever consumed the cold-start value -- the MegaMoE fusion, which lives on
+    the model rather than on the layer -- does not run inside the layer's
+    window, so those weights are gone. Refreshing the model-level derived state
+    afterwards cannot recover them: its input is what was dropped. Reporting a
+    clean update would leave the layer serving the previous checkpoint.
+    """
+    orphaned = {
+        name or type(module).__name__: names
+        for name, module in model.named_modules()
+        if (names := ORPHANED_WEIGHTS.pop(module, None))
+    }
+    if not orphaned:
+        return
+    detail = "; ".join(f"{k}: {', '.join(v)}" for k, v in orphaned.items())
+    raise RuntimeError(
+        "the checkpoint supplied weights that the model does not keep after "
+        "post-processing, so they were dropped and those layers still serve "
+        f"the previous checkpoint ({detail}). Reloading this model needs a "
+        "restore step that neither reload mode has yet."
+    )
 
 
 def _finalize_attention_layer(layer: torch.nn.Module, info: LayerReloadingInfo) -> None:
@@ -403,6 +434,26 @@ def _copy_and_restore_kernel_tensors(layer: torch.nn.Module, info: LayerReloadin
     parameters, buffers = info.kernel_tensors
     non_persistent = info.kernel_non_persistent_buffers
     loaded_tensor_names = {name for name, _ in info.loaded_weights}
+
+    # A name the checkpoint filled that `_place_kernel_tensors` is about to
+    # delete, and that has no kernel tensor to be copied into, loses its new
+    # weights. The set it deletes is exactly `get_layer_tensors`, so test
+    # against that rather than `hasattr`: a name a quant method consumed and
+    # left registered as None (`Dynamic4bitLinearKernel` folds `weight_scale`
+    # into the packed weight) or replaced with a plain-attribute kernel wrapper
+    # (MXFP4 installs `triton_kernels` tensors over `w13_weight`) is not
+    # deleted and keeps its value. What is left is a parameter consumed at cold
+    # start by a hook the reload does not re-run, such as the MegaMoE fusion,
+    # which lives on the model and not on the layer.
+    live = get_layer_tensors(layer)
+    orphaned = sorted(
+        name
+        for name in loaded_tensor_names
+        if name not in parameters and name not in buffers and name in live
+    )
+    if orphaned:
+        ORPHANED_WEIGHTS[layer] = orphaned
+
     for name, param in parameters.items():
         param.data.copy_(getattr(layer, name))
     for name, buffer in buffers.items():
