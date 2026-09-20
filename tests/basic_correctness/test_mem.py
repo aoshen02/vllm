@@ -12,6 +12,7 @@ from vllm import LLM, AsyncEngineArgs, AsyncLLMEngine, SamplingParams
 from vllm.device_allocator import get_mem_allocator_instance
 from vllm.platforms import current_platform
 from vllm.utils.mem_constants import GiB_bytes
+from vllm.utils.torch_utils import PIN_MEMORY
 
 from ..utils import create_new_process_for_each_test, requires_fp8
 
@@ -108,6 +109,38 @@ def test_basic_cumem():
     # they can be used together
     output = x + y + z
     assert torch.allclose(output, torch.ones_like(output) * 3)
+
+
+@create_new_process_for_each_test("fork" if current_platform.is_cuda() else "spawn")
+@pytest.mark.skipif(not PIN_MEMORY, reason="Pinned host memory is unavailable")
+@pytest.mark.parametrize("disable_pin_memory", [False, True])
+def test_sleep_weight_backup_pin_memory(monkeypatch, disable_pin_memory: bool):
+    monkeypatch.setenv(
+        "VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY",
+        str(int(disable_pin_memory)),
+    )
+    envs.disable_envs_cache()
+
+    allocator = get_mem_allocator_instance()
+    with allocator.use_memory_pool("weights"):
+        weights = torch.ones(1024, device=DEVICE_TYPE)
+
+    allocator.sleep(offload_tags="weights")
+    backups = [
+        data.cpu_backup_tensor
+        for data in allocator.pointer_to_data.values()
+        if data.tag == "weights"
+    ]
+    assert backups
+    assert all(backup is not None for backup in backups)
+    assert all(
+        backup.is_pinned() == (PIN_MEMORY and not disable_pin_memory)
+        for backup in backups
+        if backup is not None
+    )
+
+    allocator.wake_up()
+    assert torch.allclose(weights, torch.ones_like(weights))
 
 
 @create_new_process_for_each_test("fork" if current_platform.is_cuda() else "spawn")

@@ -17,6 +17,7 @@ from typing import Any
 
 import torch
 
+import vllm.envs as envs
 from vllm.device_allocator import AllocationData, HandleType
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
@@ -248,6 +249,7 @@ class CuMemAllocator:
         total_bytes = 0
         backup_bytes = 0
         has_policy_conflict = False
+        pin_backup = PIN_MEMORY and not envs.VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY
 
         for ptr, data in self.pointer_to_data.items():
             if data.is_asleep:
@@ -265,7 +267,7 @@ class CuMemAllocator:
                     size_in_bytes,
                     dtype=torch.uint8,
                     device="cpu",
-                    pin_memory=PIN_MEMORY,
+                    pin_memory=pin_backup,
                 )
                 cpu_ptr = cpu_backup_tensor.data_ptr()
                 libcudart.cudaMemcpy(cpu_ptr, ptr, size_in_bytes)
