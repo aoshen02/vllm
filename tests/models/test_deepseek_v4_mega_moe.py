@@ -11,12 +11,13 @@ from vllm.models.deepseek_v4.nvidia.model import (
     make_deepseek_v4_expert_params_mapping,
 )
 from vllm.models.deepseek_v4.nvidia.ops.prepare_megamoe import prepare_megamoe_inputs
-from vllm.platforms import current_platform
-
-pytestmark = pytest.mark.skipif(
-    not current_platform.is_cuda(),
-    reason="DeepSeek V4 MegaMoE requires CUDA",
+from vllm.model_executor.model_loader.reload import (
+    finalize_layerwise_reload,
+    freeze_load_plan,
+    initialize_layerwise_reload,
+    record_metadata_for_reloading,
 )
+from vllm.model_executor.model_loader.reload.plan import load_source
 
 
 def test_deepseek_v4_mega_moe_expert_mapping():
@@ -105,6 +106,117 @@ def test_deepseek_v4_mega_moe_weight_loader_uses_ep_expert_ownership():
     assert torch.equal(experts.w13_weight[0, 128:], w3)
     assert torch.equal(experts.w2_weight[0], w2)
     assert torch.count_nonzero(experts.w13_weight[1]) == 0
+
+
+class _FakeDeepGemm:
+    @staticmethod
+    def transform_sf_into_required_layout(
+        scale: torch.Tensor, *args: object
+    ) -> torch.Tensor:
+        return scale.add(1)
+
+    @staticmethod
+    def transform_weights_for_mega_moe(
+        l1: tuple[torch.Tensor, torch.Tensor],
+        l2: tuple[torch.Tensor, torch.Tensor],
+    ) -> tuple[tuple[torch.Tensor, torch.Tensor], tuple[torch.Tensor, torch.Tensor]]:
+        return (
+            (l1[0].view(torch.uint8).add(10), l1[1].to(torch.int32).add(20)),
+            (l2[0].view(torch.uint8).add(30), l2[1].to(torch.int32).add(40)),
+        )
+
+
+def test_deepseek_v4_mega_moe_layerwise_reload_reuses_runtime_storage(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from vllm.utils import deep_gemm
+
+    vllm_config = SimpleNamespace(
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=4),
+        compilation_config=SimpleNamespace(static_forward_context={}),
+    )
+    experts = DeepseekV4MegaMoEExperts(
+        vllm_config,
+        num_experts=1,
+        num_local_experts=1,
+        experts_start_idx=0,
+        top_k=1,
+        hidden_size=128,
+        intermediate_size=128,
+    )
+    monkeypatch.setattr(experts, "_check_runtime_supported", lambda: None)
+    monkeypatch.setattr(deep_gemm, "_import_deep_gemm", lambda: _FakeDeepGemm())
+
+    def load(value: int) -> None:
+        applications = (
+            ("w13_weight", "w1", (128, 64), value),
+            ("w13_weight", "w3", (128, 64), value),
+            ("w13_weight_scale", "w1", (128, 4), 128),
+            ("w13_weight_scale", "w3", (128, 4), 128),
+            ("w2_weight", "w2", (128, 64), value + 1),
+            ("w2_weight_scale", "w2", (128, 4), 128),
+        )
+        for index, (param_name, shard_id, shape, fill) in enumerate(applications):
+            param = getattr(experts, param_name)
+            with load_source(f"experts.0.{shard_id}.{index}"):
+                param.weight_loader(
+                    param,
+                    torch.full(shape, fill, dtype=torch.uint8),
+                    param_name,
+                    shard_id=shard_id,
+                    expert_id=0,
+                    return_success=True,
+                )
+
+    model = torch.nn.Module()
+    model.experts = experts
+    record_metadata_for_reloading(model)
+    load(1)
+    freeze_load_plan(model)
+    experts.quant_method.process_weights_after_loading(experts)
+    pointers = [
+        experts.w13_weight.data_ptr(),
+        experts.w13_weight_scale.data_ptr(),
+        experts.w2_weight.data_ptr(),
+        experts.w2_weight_scale.data_ptr(),
+    ]
+
+    initialize_layerwise_reload(model)
+    assert "experts.w13_weight_scale" in dict(model.named_parameters())
+    assert experts.w13_weight.dtype == torch.uint8
+    assert experts.w13_weight_scale.dtype == torch.uint8
+    load(3)
+    finalize_layerwise_reload(model, model_config=None)
+
+    assert [
+        experts.w13_weight.data_ptr(),
+        experts.w13_weight_scale.data_ptr(),
+        experts.w2_weight.data_ptr(),
+        experts.w2_weight_scale.data_ptr(),
+    ] == pointers
+    experts.finalize_weights()
+    assert [
+        experts.w13_weight.data_ptr(),
+        experts.w13_weight_scale.data_ptr(),
+        experts.w2_weight.data_ptr(),
+        experts.w2_weight_scale.data_ptr(),
+    ] == pointers
+    torch.testing.assert_close(
+        experts.w13_weight,
+        torch.full((1, 256, 64), 13, dtype=torch.uint8),
+    )
+    torch.testing.assert_close(
+        experts.w13_weight_scale,
+        torch.full((1, 256, 4), 23, dtype=torch.int32),
+    )
+    torch.testing.assert_close(
+        experts.w2_weight,
+        torch.full((1, 128, 64), 34, dtype=torch.uint8),
+    )
+    torch.testing.assert_close(
+        experts.w2_weight_scale,
+        torch.full((1, 128, 4), 43, dtype=torch.int32),
+    )
 
 
 @pytest.mark.skipif(
