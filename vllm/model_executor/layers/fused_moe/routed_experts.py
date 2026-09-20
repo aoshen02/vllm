@@ -474,6 +474,26 @@ class RoutedExperts(PluggableLayer):
                     expert_data = expert_data.narrow(dim, 0, loaded_weight.shape[dim])
         return expert_data
 
+    @staticmethod
+    def _copy_expert_data_with_padding(
+        expert_data: torch.Tensor,
+        loaded_weight: torch.Tensor,
+        hidden_dim: int,
+        shard_dim: int,
+    ) -> None:
+        for dim in (hidden_dim, shard_dim):
+            if (
+                0 <= dim < expert_data.ndim
+                and dim < loaded_weight.ndim
+                and expert_data.shape[dim] > loaded_weight.shape[dim]
+            ):
+                size = loaded_weight.shape[dim]
+                tail = expert_data.narrow(dim, size, expert_data.shape[dim] - size)
+                tail.copy_(torch.zeros_like(tail))
+                # Shrink before the next dimension so corners are counted once.
+                expert_data = expert_data.narrow(dim, 0, size)
+        expert_data.copy_(loaded_weight)
+
     def _load_w13(
         self,
         expert_data: torch.Tensor,
@@ -517,13 +537,12 @@ class RoutedExperts(PluggableLayer):
             assert shard_id == "w3"
             expert_data = expert_data.narrow(shard_dim, shard_size, shard_size)
         hidden_dim = self._get_hidden_dim(shard_dim, expert_data.ndim)
-        expert_data = self._narrow_expert_data_for_padding(
+        self._copy_expert_data_with_padding(
             expert_data,
             loaded_weight,
             hidden_dim=hidden_dim,
             shard_dim=shard_dim,
         )
-        expert_data.copy_(loaded_weight)
 
     def _load_w2(
         self,
@@ -552,13 +571,12 @@ class RoutedExperts(PluggableLayer):
             loaded_weight = loaded_weight.narrow(shard_dim, start_offset, narrow_size)
         # w2, down_proj: Load into only logical weight of w2.
         hidden_dim = self._get_hidden_dim(shard_dim, expert_data.ndim)
-        expert_data = self._narrow_expert_data_for_padding(
+        self._copy_expert_data_with_padding(
             expert_data,
             loaded_weight,
             hidden_dim=hidden_dim,
             shard_dim=shard_dim,
         )
-        expert_data.copy_(loaded_weight)
 
     def _load_single_value(
         self, param: torch.nn.Parameter, loaded_weight: torch.Tensor, expert_id: int
