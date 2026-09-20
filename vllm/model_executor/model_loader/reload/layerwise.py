@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import inspect
 from collections import Counter
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from functools import wraps
 from weakref import WeakKeyDictionary, WeakSet
 
@@ -92,7 +92,11 @@ def record_metadata_for_reloading(model: torch.nn.Module):
 
 
 @torch.no_grad()
-def initialize_layerwise_reload(model: torch.nn.Module):
+def initialize_layerwise_reload(
+    model: torch.nn.Module,
+    *,
+    excluded_layers: Collection[torch.nn.Module] = (),
+):
     """
     Set up layerwise weight loading with deferred processing.
 
@@ -106,12 +110,18 @@ def initialize_layerwise_reload(model: torch.nn.Module):
     2. Load all cached weights
     3. Run quantization processing if applicable
     4. Copy processed values back to original tensor storage
+
+    Args:
+        excluded_layers: Layers owned by another active model transaction.
     """
     # disable torchao reloading to avoid infinite recursion
     model._original_do_torchao_reload = getattr(model, "_do_torchao_reload", False)
     model._do_torchao_reload = False
 
+    excluded = set(excluded_layers)
     for layer in model.modules():
+        if layer in excluded:
+            continue
         info = get_layerwise_info(layer)
 
         # Armed by online quantization before any plan existed, so its storage
@@ -249,11 +259,22 @@ def _declines(
     return original_loader(*probe.args, **probe.kwargs) is False
 
 
-def validate_layerwise_reload(model: torch.nn.Module) -> None:
+def validate_layerwise_reload(
+    model: torch.nn.Module,
+    *,
+    excluded_layers: Collection[torch.nn.Module] = (),
+) -> None:
     """Fail closed on a missing application, but not an extra one, because an
-    EP rank loads a filtered set from disk yet is offered every expert."""
+    EP rank loads a filtered set from disk yet is offered every expert.
+
+    Args:
+        excluded_layers: Layers owned by another active model transaction.
+    """
     missing: list[str] = []
+    excluded = set(excluded_layers)
     for layer in model.modules():
+        if layer in excluded:
+            continue
         info = get_layerwise_info(layer)
         if not info.can_load():
             continue
@@ -282,6 +303,7 @@ def finalize_layerwise_processing(
     model_config: ModelConfig,
     *,
     fail_on_incomplete: bool = True,
+    excluded_layers: Collection[torch.nn.Module] = (),
 ):
     """
     Apply processing to any layers which were not layerwise processed during loading.
@@ -294,16 +316,20 @@ def finalize_layerwise_processing(
     Args:
         model: model to finalize processing for
         model_config: config needed for applying processing to attention layers
+        excluded_layers: Layers owned by another active model transaction.
     """
     if fail_on_incomplete:
-        validate_layerwise_reload(model)
+        validate_layerwise_reload(model, excluded_layers=excluded_layers)
 
     if hasattr(model, "_original_do_torchao_reload"):
         model._do_torchao_reload = model._original_do_torchao_reload
 
     deferred_attn: list[tuple[torch.nn.Module, LayerReloadingInfo]] = []
 
+    excluded = set(excluded_layers)
     for layer in model.modules():
+        if layer in excluded:
+            continue
         info = get_layerwise_info(layer)
         if not info.can_load():
             info.reset()
