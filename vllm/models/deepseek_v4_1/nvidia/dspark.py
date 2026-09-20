@@ -326,6 +326,8 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
             prefix=maybe_prefix(prefix, "lm_head"),
         )
         self.logits_processor = LogitsProcessor(self.config.vocab_size)
+        # Track presence across buckets; None preserves dummy initialization.
+        self._loaded_confidence_head: bool | None = None
 
     # --- Hooks used by the speculator -------------------------------------
 
@@ -391,6 +393,8 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
         Non-mtp weights (embed/head/main layers) belong to the target model and
         are skipped here. ``embed_tokens``/``lm_head`` are aliased from the target.
         """
+        if self._loaded_confidence_head is None:
+            self._loaded_confidence_head = False
         first_layer = self.model.layers[0]
         use_mega_moe = first_layer.ffn.use_mega_moe
         # Draft MoE layers use the dspark_* expert counts, not the
@@ -426,7 +430,6 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
 
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
-        loaded_confidence_head = False
 
         tp_size = get_tensor_model_parallel_world_size()
         tp_rank = get_tensor_model_parallel_rank()
@@ -440,7 +443,7 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
                 continue
             name = mapped
             if "confidence_head." in name:
-                loaded_confidence_head = True
+                self._loaded_confidence_head = True
 
             # ``.scale`` -> per-method scale suffix.
             if name.endswith(".scale"):
@@ -509,9 +512,7 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
                 weight_loader(param, loaded_weight)
                 loaded_params.add(name)
 
-        if self.model.confidence_head is not None and not loaded_confidence_head:
-            self.model.confidence_head = None
-        self.process_weights_after_loading()
+        self._finalize_moe()
         logger.info_once("DSpark draft model loaded: %d params", len(loaded_params))
         return loaded_params
 
@@ -521,6 +522,11 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
 
     def process_weights_after_loading(self) -> None:
         self._finalize_moe()
+        if (
+            self.model.confidence_head is not None
+            and self._loaded_confidence_head is False
+        ):
+            self.model.confidence_head = None
 
     def _remap_dspark_name(self, name: str) -> str | None:
         """Map a checkpoint ``mtp.{i}.*`` name to this model's parameter path.
