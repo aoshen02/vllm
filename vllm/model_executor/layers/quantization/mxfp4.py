@@ -764,13 +764,22 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
         # Build kernel (modular or monolithic)
         if self.moe_quant_config is not None and self.experts_cls is not None:
-            self.moe_kernel = make_mxfp4_moe_kernel(
+            kernel = make_mxfp4_moe_kernel(
                 moe_quant_config=self.moe_quant_config,
                 moe_config=self.moe,
                 mxfp4_backend=self.mxfp4_backend,
                 experts_cls=self.experts_cls,
                 routing_tables=layer._expert_routing_tables(),
             )
+            if self.moe_kernel is not None:
+                # Refresh discarded constants at the addresses captured by graphs.
+                for name in ("gemm1_alpha", "gemm1_beta", "gemm1_clamp_limit"):
+                    old = getattr(self.moe_kernel.fused_experts, name, None)
+                    new = getattr(kernel.fused_experts, name, None)
+                    if old is not None and new is not None:
+                        old.copy_(new)
+                        setattr(kernel.fused_experts, name, old)
+            self.moe_kernel = kernel
             self.moe_kernel.fused_experts.process_weights_after_loading(layer)
 
     def process_weights_after_loading(self, layer):
