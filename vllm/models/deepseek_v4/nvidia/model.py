@@ -828,7 +828,13 @@ class DeepseekV4DecoderLayer(nn.Module):
             ),
             requires_grad=False,
         )
-        self.hc_attn_fn_broadcast: torch.Tensor | None = None
+        self.register_buffer(
+            "hc_attn_fn_broadcast",
+            torch.empty((mix_hc, self.hidden_size), dtype=torch.float32),
+        )
+        set_weight_attrs(
+            self.hc_attn_fn, {"weight_loader": self.load_hc_attn_fn}
+        )
         self.hc_ffn_fn = nn.Parameter(
             torch.empty(
                 (mix_hc, hc_dim),
@@ -863,6 +869,16 @@ class DeepseekV4DecoderLayer(nn.Module):
                 dtype=torch.float32,
             ),
             requires_grad=False,
+        )
+
+    def load_hc_attn_fn(
+        self, param: torch.Tensor, loaded_weight: torch.Tensor
+    ) -> None:
+        default_weight_loader(param, loaded_weight)
+        self.hc_attn_fn_broadcast.copy_(
+            param.detach()
+            .view(-1, self.hc_mult, self.hidden_size)
+            .sum(dim=1)
         )
 
     def forward(
@@ -1301,18 +1317,6 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         for layer in islice(self.layers, self.start_layer, self.end_layer):
             layer.ffn.finalize_mega_moe_weights()
 
-    def finalize_mhc_broadcast_weights(self) -> None:
-        if not get_pp_group().is_first_rank or self.start_layer >= self.end_layer:
-            return
-        layer = self.layers[self.start_layer]
-        if isinstance(layer, DeepseekV4DecoderLayer):
-            layer.hc_attn_fn_broadcast = (
-                layer.hc_attn_fn.detach()
-                .view(-1, layer.hc_mult, layer.hidden_size)
-                .sum(dim=1)
-            )
-
-
 def _make_deepseek_v4_weights_mapper(expert_dtype: str) -> WeightsMapper:
     if expert_dtype == "fp4":
         # MXFP4 experts use Mxfp4MoEMethod, which registers scales as
@@ -1474,7 +1478,6 @@ class DeepseekV4ForCausalLM(
         loader = AutoWeightsLoader(self, skip_substrs=["mtp."])
         loaded_params = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
         self.model.finalize_mega_moe_weights()
-        self.model.finalize_mhc_broadcast_weights()
         return loaded_params
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:

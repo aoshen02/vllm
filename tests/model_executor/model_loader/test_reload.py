@@ -115,6 +115,20 @@ class _NonPersistentBufferLayer(torch.nn.Module):
         self.scale.weight_loader = default_weight_loader
 
 
+class _DerivedBufferLayer(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.empty(4, 6))
+        self.register_buffer("broadcast", torch.empty(4, 3))
+        self.weight.weight_loader = self.weight_loader
+
+    def weight_loader(
+        self, param: torch.Tensor, loaded_weight: torch.Tensor
+    ) -> None:
+        default_weight_loader(param, loaded_weight)
+        self.broadcast.copy_(param.view(-1, 2, 3).sum(dim=1))
+
+
 class _ReloadableMMEncoderAttention(MMEncoderAttention):
     """Minimal stand-in to test reload lifecycle without encoder initialization."""
 
@@ -225,6 +239,27 @@ def test_reload_lifecycle():
         assert tensor.shape == materialized_tensor.shape
         assert tensor.__class__ == materialized_tensor.__class__
         assert tensor.__dict__ == materialized_tensor.__dict__
+
+
+def test_reload_preserves_derived_buffer_storage():
+    layer = _DerivedBufferLayer()
+    model = torch.nn.Sequential(layer)
+    first_weight = torch.arange(24, dtype=torch.float32).view(4, 6)
+    second_weight = first_weight + 100
+
+    record_metadata_for_reloading(model)
+    with load_source("weight"):
+        layer.weight.weight_loader(layer.weight, first_weight)
+    freeze_load_plan(model)
+    broadcast_ptr = layer.broadcast.data_ptr()
+
+    initialize_layerwise_reload(model)
+    with load_source("weight"):
+        layer.weight.weight_loader(layer.weight, second_weight)
+
+    assert layer.broadcast.data_ptr() == broadcast_ptr
+    assert torch.equal(layer.weight, second_weight)
+    assert torch.equal(layer.broadcast, second_weight.view(-1, 2, 3).sum(dim=1))
 
 
 def test_materialize_layer_preserves_non_meta_tensors():
