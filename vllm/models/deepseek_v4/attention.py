@@ -44,6 +44,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.utils import set_weight_attrs
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.models.deepseek_v4.common.rope import build_deepseek_v4_rope
 from vllm.models.deepseek_v4.compressor import DeepseekCompressor
@@ -65,6 +66,13 @@ from vllm.v1.kv_cache_interface import (
 )
 
 logger = init_logger(__name__)
+
+
+def attn_sink_weight_loader(
+    param: torch.Tensor, loaded_weight: torch.Tensor
+) -> None:
+    param.fill_(-float("inf"))
+    param[: loaded_weight.shape[0]].copy_(loaded_weight)
 
 
 @triton.jit
@@ -220,6 +228,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             torch.full((self.padded_heads,), -float("inf"), dtype=torch.float32),
             requires_grad=False,
         )
+        set_weight_attrs(self.attn_sink, {"weight_loader": attn_sink_weight_loader})
 
         self.fused_wqa_wkv = MergedColumnParallelLinear(
             self.hidden_size,
