@@ -25,6 +25,7 @@ from .meta import (
     materialize_layer,
     restore_layer_on_meta,
 )
+from .owned import restore_owned_tensors, snapshot_module_owned_tensors
 from .types import LayerReloadingInfo
 from .utils import (
     get_info_size,
@@ -63,6 +64,11 @@ LOADING_LAYERS: WeakSet[torch.nn.Module] = WeakSet()
 # which drives `load_weights` over fake tensors purely to record a plan and then
 # aborts, is unaffected: it discards every value by design.
 ORPHANED_WEIGHTS: WeakKeyDictionary[torch.nn.Module, list[str]] = WeakKeyDictionary()
+
+# Off-tree tensors a layer's post-load pass replaced with something the old
+# storage cannot hold, recorded by `_layerwise_process` and reported alongside
+# the orphans. A graph capturing the old storage cannot be repaired from here.
+UNRESTORABLE_OWNED: WeakKeyDictionary[torch.nn.Module, list[str]] = WeakKeyDictionary()
 
 
 def get_layerwise_info(layer: torch.nn.Module) -> LayerReloadingInfo:
@@ -120,6 +126,7 @@ def initialize_layerwise_reload(model: torch.nn.Module):
         info.kernel_tensors = get_layer_params_buffers(layer)
         # snapshot now: restore_layer_on_meta drops alias buffers from the live set
         info.kernel_non_persistent_buffers = set(layer._non_persistent_buffers_set)
+        info.owned_tensors = snapshot_module_owned_tensors(layer)
 
         # Restore layer parameters/buffers onto meta device
         restore_layer_on_meta(layer, info)
@@ -303,7 +310,32 @@ def finalize_layerwise_reload(
     """Finalize a reload: the per-layer work, then the model-level hook."""
     finalize_layerwise_processing(model, model_config)
     _refuse_orphaned_weights(model)
+    _refuse_unrestorable_owned(model)
     refresh_model_derived_state(model)
+
+
+def _refuse_unrestorable_owned(model: torch.nn.Module) -> None:
+    """Raise if a layer's post-load pass moved off-tree state it cannot put back.
+
+    `restore_owned_tensors` repairs a rebuilt kernel's constants by writing them
+    into the storage the previous one used. It cannot when the slot is empty or
+    now holds a different shape, stride or dtype, and a captured graph still
+    reads the storage that left behind.
+    """
+    unrestorable = {
+        name or type(module).__name__: names
+        for name, module in model.named_modules()
+        if (names := UNRESTORABLE_OWNED.pop(module, None))
+    }
+    if not unrestorable:
+        return
+    detail = "; ".join(f"{k}: {', '.join(v)}" for k, v in unrestorable.items())
+    raise RuntimeError(
+        "a weight reload rebuilt state these layers reach outside the module "
+        f"tree, and it cannot be written back into the storage a CUDA graph may "
+        f"have captured ({detail}). The model is in an undefined state and the "
+        "engine must be restarted."
+    )
 
 
 def _refuse_orphaned_weights(model: torch.nn.Module) -> None:
@@ -404,6 +436,16 @@ def _layerwise_process(layer: torch.nn.Module, info: LayerReloadingInfo):
         # otherwise break replicated (disable_tp) weights on a subsequent reload.
         if hasattr(layer, "update_param_tp_status"):
             layer.update_param_tp_status()
+
+    # The same for tensors the hook reaches through objects the layer owns:
+    # rebuilding a kernel allocates fresh constants and caches, and a captured
+    # graph still reads the old ones.
+    if info.owned_tensors is not None:
+        unrestorable = restore_owned_tensors(
+            info.owned_tensors, snapshot_module_owned_tensors(layer)
+        )
+        if unrestorable:
+            UNRESTORABLE_OWNED[layer] = unrestorable
 
     # Copy processed values into original tensor storage (preserves cudagraph refs)
     # this code is a no-op if not reloading (because kernel tensors is empty)

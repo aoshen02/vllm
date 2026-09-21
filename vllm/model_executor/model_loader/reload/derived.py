@@ -25,6 +25,8 @@ below then runs as a second line of defence rather than as the only one.
 
 import torch
 
+from .owned import snapshot_owned_tensors
+
 __all__ = [
     "RELOAD_SAFE",
     "check_post_load_is_reload_safe",
@@ -80,7 +82,8 @@ def tensor_layouts(model: torch.nn.Module) -> dict[str, tuple]:
     each is a name a graph may read through, and rebinding one to the storage
     another already points at would otherwise go unnoticed.
 
-    Plain attribute tensors count too. They are the easier mistake to make --
+    Plain attribute tensors count too, including ones a module reaches only
+    through an object it owns. They are the easier mistake to make --
     ``self.x = torch.stack(...)`` in a post-load hook allocates every time --
     and forward reads them exactly as it reads a buffer, so a captured graph is
     left pointing at freed storage just the same.
@@ -92,10 +95,8 @@ def tensor_layouts(model: torch.nn.Module) -> dict[str, tuple]:
             *model.named_buffers(remove_duplicate=False),
         )
     }
-    for prefix, module in model.named_modules():
-        for attr, value in module.__dict__.items():
-            if isinstance(value, torch.Tensor):
-                layouts[f"{prefix}.{attr}" if prefix else attr] = _layout(value)
+    for name, owned in snapshot_owned_tensors(model).items():
+        layouts[name] = _layout(owned.tensor)
     return layouts
 
 
@@ -107,9 +108,6 @@ def relocated_names(before: dict[str, tuple], after: dict[str, tuple]) -> list[s
     Consuming a parameter is only safe at cold start, before capture, which is
     why a model that does it in this hook does not get to opt in.
 
-    This sees tensors a module holds directly. One reachable only through a
-    container it owns (``self.cache[0] = ...``) is a blind spot, so the
-    per-model review, not this check, is what admits a hook.
     """
     return [name for name, layout in before.items() if after.get(name) != layout]
 
