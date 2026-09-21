@@ -507,6 +507,9 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
         logger.info_once("DSpark draft model loaded: %d params", len(loaded_params))
         return loaded_params
 
+    # Nothing to redo, so a weight reload can re-run the hook below.
+    reload_safe_post_load = True
+
     def process_weights_after_loading(self) -> None:
         # ROCm linears and fused-MoE runners finalize their own quantized
         # parameters. NVIDIA-only MegaMoE/WO-A requantization is not needed.

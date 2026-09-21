@@ -508,9 +508,11 @@ The base class provides:
 
 `WeightTransferConfig.reload_mode` selects how the `nccl` and `ipc` engines write
 received weights into the model. `layerwise` (the default) is correct for every
-model. `direct` has each `weight_loader` write into the live parameters and runs
-no post-processing, which suits a model whose post-load step leaves the
-parameters as the checkpoint has them, such as an unquantized dense model:
+model whose model-level post-load hook, if it has one, is declared reload-safe
+(see below). `direct` has each `weight_loader` write into the live parameters and
+runs no per-layer post-processing, which suits a model whose per-layer post-load
+step leaves the parameters as the checkpoint has them, such as an unquantized
+dense model. Both rebuild model-level derived state at `finish_reload`:
 
 ```bash
 vllm serve ... --weight-transfer-config '{"backend": "nccl", "reload_mode": "direct"}'
@@ -521,6 +523,40 @@ any failure after `start_reload` leaves the model undefined, refuses further
 updates and requires an engine restart. In both modes the sender must send every
 tensor; an omitted one keeps its previous values. `sparse_nccl` and `sharded_rdt`
 ignore the setting.
+
+#### Model-level derived state
+
+A root model's `process_weights_after_loading` builds state that spans layers —
+Kimi K3 fuses its MegaMoE experts there. No reload path dispatched it, so an
+updated model kept serving state derived from the previous checkpoint, silently.
+
+Dispatching it is not enough to fix that, because it is a cold-start contract
+and re-running one is only correct for a hook written to allow it. A hook may
+guard on whether it has *ever* built its state rather than on whether that state
+is stale, and return without rebuilding; it may rebind a tensor a CUDA graph
+captured; it may need an input the cold-start pass consumed and dropped; or it
+may do something no tensor snapshot can see, such as compiling a submodule that
+is already compiled.
+
+So `start_reload` **refuses** — before any weight is written — a model whose
+root defines the hook and does not set:
+
+```python
+class MyModel(nn.Module):
+    reload_safe_post_load = True
+```
+
+which records that the hook has been reviewed against those four conditions.
+For a model that opts in, both modes run the hook after the weights land and
+then check that every parameter, buffer and plain attribute tensor kept its
+address and layout; one that rebinds is named and refused, and the weights are
+then undefined and the engine must be restarted.
+
+Separately, `finish_reload` refuses when a layer dropped weights the checkpoint
+had just loaded into it — the value had no kernel tensor to be copied into, so
+the layer would keep serving the previous checkpoint. An aborted load is
+unaffected, so the sharded-RDT bake, which drives `load_weights` over fake
+tensors only to record a plan, still works.
 
 ### Request Classes
 

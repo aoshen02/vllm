@@ -1269,6 +1269,10 @@ class MiniCPMVBaseModel(nn.Module, SupportsMultiModal, SupportsPP):
 
         self.make_empty_intermediate_tensors = self.llm.make_empty_intermediate_tensors
 
+    # The hook below only moves the resampler to its device, which is a no-op
+    # once it is there, so a weight reload can re-run it.
+    reload_safe_post_load = True
+
     def process_weights_after_loading(self) -> None:
         # Only move device, DO NOT touch dtype (fp8 quant needs its own dtype)
         self.resampler.to(current_platform.device_type)

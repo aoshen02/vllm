@@ -315,6 +315,8 @@ def test_attention_first_load_processes_weights(default_vllm_config, layer_cls):
 class _ModelWithDerivedState(torch.nn.Module):
     """Rebuilds derived state inside load_weights, as OpenPangu does."""
 
+    reload_safe_post_load = True
+
     def __init__(self) -> None:
         super().__init__()
         self.weight = torch.nn.Parameter(torch.zeros(4))
@@ -335,10 +337,11 @@ class _ModelWithDerivedState(torch.nn.Module):
         self.hook_calls += 1
 
 
-def test_reload_does_not_dispatch_the_cold_start_hook():
-    """The model-level hook may replace parameters, so reload must not run
-    it; derived state that has to survive a reload is rebuilt in
-    load_weights."""
+def test_reload_dispatches_the_model_level_hook():
+    """A model that declares `reload_safe_post_load` has its hook run, so state
+    derived across layers is rebuilt from the new weights. Models that do not
+    declare it, and hooks that rebind rather than write through, are refused
+    (see test_derived_state.py)."""
     model = _ModelWithDerivedState()
     record_metadata_for_reloading(model)
 
@@ -348,7 +351,7 @@ def test_reload_does_not_dispatch_the_cold_start_hook():
 
     assert torch.equal(model.weight, torch.full((4,), 5.0))
     assert torch.equal(model.derived, torch.full((4,), 10.0))
-    assert model.hook_calls == 0
+    assert model.hook_calls == 1
 
 
 def test_reload_lifecycle():

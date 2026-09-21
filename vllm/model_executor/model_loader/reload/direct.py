@@ -4,12 +4,19 @@
 
 `start` records where every parameter and buffer lives, `model.load_weights`
 runs unchanged so each `weight_loader` `copy_`s into that storage, and `finish`
-checks nothing moved. Nothing inspects the model: choosing the mode is the
-operator's statement that no post-load processing needs redoing. There is no
-rollback -- a failure leaves the model undefined and the engine must restart.
+rebuilds the model-level derived state and checks nothing moved. Nothing
+inspects the model beforehand: choosing the mode is the operator's statement
+that no *per-layer* post-load processing needs redoing. There is no rollback --
+a failure leaves the model undefined and the engine must restart.
 """
 
 import torch
+
+from .derived import (
+    refresh_model_derived_state,
+    relocated_names,
+    tensor_layouts,
+)
 
 __all__ = ["direct_start", "direct_finish"]
 
@@ -29,14 +36,14 @@ def direct_start(model: torch.nn.Module) -> None:
         raise RuntimeError(
             "torchao models re-quantize after loading; use reload_mode=layerwise"
         )
-    model.__dict__[_LIVE] = _tensor_layouts(model)
+    model.__dict__[_LIVE] = tensor_layouts(model)
     setattr(model, _UNDEFINED, True)
 
 
 def direct_finish(model: torch.nn.Module) -> None:
     before = model.__dict__.pop(_LIVE)
-    after = _tensor_layouts(model)
-    moved = [n for n, rec in before.items() if after.get(n) != rec]
+    refresh_model_derived_state(model)
+    moved = relocated_names(before, tensor_layouts(model))
     if moved:
         raise RuntimeError(
             f"direct weight reload relocated {', '.join(moved[:5])}"
@@ -45,15 +52,3 @@ def direct_finish(model: torch.nn.Module) -> None:
             "dtype. The weights are undefined and the engine must be restarted."
         )
     setattr(model, _UNDEFINED, False)
-
-
-def _tensor_layouts(model: torch.nn.Module) -> dict[str, tuple]:
-    # Layout as well as address: a same-storage transpose keeps `data_ptr()`.
-    # Not deduplicated: every name a graph may read through is checked.
-    return {
-        name: (t.data_ptr(), tuple(t.shape), t.stride(), t.dtype)
-        for name, t in (
-            *model.named_parameters(remove_duplicate=False),
-            *model.named_buffers(remove_duplicate=False),
-        )
-    }
