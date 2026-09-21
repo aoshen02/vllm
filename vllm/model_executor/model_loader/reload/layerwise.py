@@ -25,6 +25,7 @@ from .meta import (
     materialize_layer,
     restore_layer_on_meta,
 )
+from .owned import refresh_owned_state, snapshot_module_owned_tensors
 from .types import LayerReloadingInfo
 from .utils import (
     get_info_size,
@@ -120,6 +121,7 @@ def initialize_layerwise_reload(model: torch.nn.Module):
         info.kernel_tensors = get_layer_params_buffers(layer)
         # snapshot now: restore_layer_on_meta drops alias buffers from the live set
         info.kernel_non_persistent_buffers = set(layer._non_persistent_buffers_set)
+        info.owned_tensors = snapshot_module_owned_tensors(layer)
 
         # Restore layer parameters/buffers onto meta device
         restore_layer_on_meta(layer, info)
@@ -404,6 +406,12 @@ def _layerwise_process(layer: torch.nn.Module, info: LayerReloadingInfo):
         # otherwise break replicated (disable_tp) weights on a subsequent reload.
         if hasattr(layer, "update_param_tp_status"):
             layer.update_param_tp_status()
+
+    # Rebuild whatever the layer's own objects derived from the weights. The
+    # storage they sit in is preserved elsewhere; what no path rebuilt is the
+    # value, and a guard on "have I ever built this" is what left it stale.
+    if info.owned_tensors is not None:
+        refresh_owned_state(layer)
 
     # Copy processed values into original tensor storage (preserves cudagraph refs)
     # this code is a no-op if not reloading (because kernel tensors is empty)

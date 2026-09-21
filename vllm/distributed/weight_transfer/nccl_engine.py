@@ -188,11 +188,11 @@ class NCCLWeightTransferEngine(
                 "Call init_transfer_engine() first."
             )
 
-        from vllm.model_executor.model_loader.mtp_validation import (
-            disable_mtp_completeness_check,
+        from vllm.model_executor.model_loader.completeness import (
+            streaming_a_checkpoint,
         )
 
-        with disable_mtp_completeness_check():
+        with streaming_a_checkpoint():
             if self.packed:
                 # Build iterator of (name, (shape, dtype)) from update_info
                 def state_dict_info_iterator():

@@ -1,0 +1,158 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""A reload keeps the storage of tensors a layer reaches outside the module tree.
+
+Shapes mirror MXFP4: `quant_method.moe_kernel.fused_experts` holds the SwiGLU
+constants a graph reads, and the quant method holds permutation indices in a
+dict. `process_weights_after_loading` rebuilds the kernel, which allocates both
+afresh.
+"""
+
+import torch
+
+from vllm.model_executor.model_loader.reload.owned import (
+    refresh_owned_state,
+    snapshot_owned_tensors,
+)
+
+# The traversal follows vLLM's own classes; these stand in for them.
+VLLM = "vllm.model_executor.layers.fused_moe.test_double"
+
+
+class _FusedExperts:
+    __module__ = VLLM
+
+    def __init__(self, alpha: float) -> None:
+        self.gemm1_alpha = torch.full((1,), alpha)
+        self.gemm1_clamp_limit = torch.full((1,), 7.0)
+
+
+class _Kernel:
+    __module__ = VLLM
+
+    def __init__(self, alpha: float) -> None:
+        self.fused_experts = _FusedExperts(alpha)
+        self.back_reference: object | None = None
+
+
+class _QuantMethod:
+    __module__ = VLLM
+
+    def __init__(self) -> None:
+        self.moe_kernel = _Kernel(1.702)
+        self._cache_permute_indices: dict[str, torch.Tensor] = {
+            "a": torch.zeros(4, dtype=torch.int32)
+        }
+        self.helper: torch.nn.Module | None = None
+
+    def rebuild(self) -> None:
+        """What `_setup_kernel` does: a fresh kernel, hence fresh constants."""
+        self.moe_kernel = _Kernel(2.5)
+
+
+class _Layer(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.w = torch.nn.Parameter(torch.zeros(2, 2))
+        self.quant_method = _QuantMethod()
+
+
+class _Model(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.experts = _Layer()
+
+
+def _names(model: torch.nn.Module) -> set[str]:
+    return set(snapshot_owned_tensors(model))
+
+
+def test_tensors_behind_owned_objects_are_found():
+    """`named_buffers` stops at the module tree, so nothing else sees these."""
+    assert _names(_Model()) == {
+        "experts.quant_method.moe_kernel.fused_experts.gemm1_alpha",
+        "experts.quant_method.moe_kernel.fused_experts.gemm1_clamp_limit",
+        "experts.quant_method._cache_permute_indices['a']",
+    }
+
+
+class _Foreign:
+    """Stands in for a third-party object a layer happens to hold."""
+
+    def __init__(self) -> None:
+        self.tensor = torch.zeros(2)
+
+
+def test_a_foreign_object_is_not_followed():
+    """Its identity is not ours to police, and its graph may be anything."""
+    model = _Model()
+    model.experts.foreign = _Foreign()
+    assert not any("foreign" in name for name in _names(model))
+
+
+def test_a_cycle_terminates():
+    model = _Model()
+    method = model.experts.quant_method
+    method.moe_kernel.back_reference = method
+    assert "experts.quant_method.moe_kernel.fused_experts.gemm1_alpha" in _names(model)
+
+
+def test_a_submodule_reached_through_an_owned_object_is_left_to_the_module_tree():
+    """It is already named by `named_parameters`; naming it twice would make a
+    parameter look relocated when only the alias went away."""
+    model = _Model()
+    model.experts.quant_method.helper = torch.nn.Linear(2, 2)
+    assert not any("helper" in name for name in _names(model))
+
+
+class _Runner:
+    """Stands in for `MoERunner`: derives a fused copy of the gate weights on
+    the first forward and guards on whether it has ever done so."""
+
+    __module__ = VLLM
+
+    def __init__(self, gate: torch.nn.Linear) -> None:
+        self.gate = gate
+        self.fused: torch.Tensor | None = None
+
+    def fuse_once(self) -> None:
+        if self.fused is None:
+            self.fused = torch.cat([self.gate.weight, self.gate.weight], dim=0)
+
+    def refresh_after_weight_reload(self) -> None:
+        if self.fused is not None:
+            with torch.no_grad():
+                self.fused.copy_(torch.cat([self.gate.weight, self.gate.weight], dim=0))
+
+
+class _RouterModel(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.gate = torch.nn.Linear(2, 2, bias=False)
+        self.runner = _Runner(self.gate)
+
+
+def test_state_derived_from_weights_is_refreshed_in_place():
+    """Preserving the storage is not enough: nothing rebuilds this, so after
+    an update the model would route with the previous checkpoint's gate."""
+    model = _RouterModel()
+    with torch.no_grad():
+        model.gate.weight.fill_(1.0)
+    model.runner.fuse_once()
+    fused = model.runner.fused
+    assert fused is not None
+    address = fused.data_ptr()
+
+    with torch.no_grad():
+        model.gate.weight.fill_(4.0)
+    assert fused.max().item() == 1.0, "stale until refreshed"
+
+    refresh_owned_state(model)
+    assert model.runner.fused is fused
+    assert model.runner.fused.data_ptr() == address
+    assert model.runner.fused.min().item() == 4.0
+
+
+def test_an_object_without_the_hook_is_left_alone():
+    model = _Model()
+    refresh_owned_state(model)  # must not raise

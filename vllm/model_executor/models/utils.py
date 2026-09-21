@@ -19,6 +19,7 @@ from vllm.distributed import (
 )
 from vllm.logger import init_logger
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
+from vllm.model_executor.model_loader.completeness import completeness_checks_enabled
 from vllm.model_executor.model_loader.reload import (
     support_quantized_model_reload_from_hp_weights,
 )
@@ -472,6 +473,10 @@ class AutoWeightsLoader:
     def _check_skipped_aliases(self, autoloaded_weights: set[str]) -> None:
         """Guard against skipping an alias whose canonical name never loads."""
         if not self._loaded_params_are_complete:
+            return
+        # One batch of a streamed update usually does not hold the canonical
+        # name, and its absence here says nothing about the update.
+        if not completeness_checks_enabled():
             return
         for alias, canonical in self._skipped_aliases.items():
             if canonical not in autoloaded_weights:
