@@ -155,3 +155,66 @@ def test_a_submodule_reached_through_an_owned_object_is_left_to_the_module_tree(
     model = _Model()
     model.experts.quant_method.helper = torch.nn.Linear(2, 2)
     assert not any("helper" in name for name in _names(model))
+
+
+class _Runner:
+    """Stands in for `MoERunner`: derives a fused copy of the gate weights on
+    the first forward and guards on whether it has ever done so."""
+
+    __module__ = VLLM
+
+    def __init__(self, gate: torch.nn.Linear) -> None:
+        self.gate = gate
+        self.fused: torch.Tensor | None = None
+
+    def fuse_once(self) -> None:
+        if self.fused is None:
+            self.fused = torch.cat([self.gate.weight, self.gate.weight], dim=0)
+
+    def refresh_after_weight_reload(self) -> None:
+        if self.fused is not None:
+            with torch.no_grad():
+                self.fused.copy_(torch.cat([self.gate.weight, self.gate.weight], dim=0))
+
+
+class _RouterModel(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.gate = torch.nn.Linear(2, 2, bias=False)
+        self.runner = _Runner(self.gate)
+
+
+def test_state_derived_from_weights_is_refreshed_in_place():
+    """Restoring storage is not enough: nothing rebuilds this, so after an
+    update the model would route with the previous checkpoint's gate."""
+    from vllm.model_executor.model_loader.reload.owned import refresh_owned_state
+
+    model = _RouterModel()
+    with torch.no_grad():
+        model.gate.weight.fill_(1.0)
+    model.runner.fuse_once()
+    fused = model.runner.fused
+    assert fused is not None
+    address = fused.data_ptr()
+
+    with torch.no_grad():
+        model.gate.weight.fill_(4.0)
+    assert fused.max().item() == 1.0, "stale until refreshed"
+
+    refresh_owned_state(model)
+    assert (
+        restore_owned_tensors(
+            snapshot_owned_tensors(model), snapshot_owned_tensors(model)
+        )
+        == []
+    )
+    assert model.runner.fused is fused
+    assert model.runner.fused.data_ptr() == address
+    assert model.runner.fused.min().item() == 4.0
+
+
+def test_an_object_without_the_hook_is_left_alone():
+    from vllm.model_executor.model_loader.reload.owned import refresh_owned_state
+
+    model = _Model()
+    refresh_owned_state(model)  # must not raise

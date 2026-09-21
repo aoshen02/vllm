@@ -23,10 +23,20 @@ import torch
 
 __all__ = [
     "OwnedTensor",
+    "REFRESH",
     "snapshot_module_owned_tensors",
     "snapshot_owned_tensors",
     "restore_owned_tensors",
+    "refresh_owned_state",
 ]
+
+# An object a module owns implements this to rebuild whatever it derived from
+# the weights. Restoring storage is not enough for state that is never rebuilt:
+# `MoERunner` fuses the router and shared-expert gate weights on the first
+# forward and guards on whether it has ever done so, so after an update it goes
+# on routing with the previous checkpoint's gate. The refresh must write through
+# the tensor it already holds, for the same reason everything else here must.
+REFRESH = "refresh_after_weight_reload"
 
 # How far to follow a module's own objects. A quant method reaches its constants
 # in three hops (`quant_method.moe_kernel.fused_experts.gemm1_alpha`); nothing
@@ -139,6 +149,46 @@ def restore_owned_tensors(
         old.tensor.copy_(new.tensor)
         new.set(old.tensor)
     return unrestorable
+
+
+def refresh_owned_state(module: torch.nn.Module) -> None:
+    """Have every object ``module`` owns rebuild what it derived from weights.
+
+    Runs before the storage snapshot is restored, so a refresh that allocates
+    instead of writing in place is caught by `restore_owned_tensors` rather than
+    left for a captured graph to read.
+    """
+    for owned in _owned_objects(module):
+        getattr(owned, REFRESH)()
+
+
+def _owned_objects(module: torch.nn.Module) -> Iterator[object]:
+    seen: set[int] = set()
+    for attr, value in vars(module).items():
+        if attr not in _MODULE_INTERNALS:
+            yield from _walk_objects(value, seen, 0)
+
+
+def _walk_objects(value: object, seen: set[int], depth: int) -> Iterator[object]:
+    if depth >= _MAX_DEPTH or isinstance(value, torch.Tensor) or id(value) in seen:
+        return
+    seen.add(id(value))
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            yield from _walk_objects(item, seen, depth + 1)
+        return
+    if isinstance(value, dict):
+        for item in value.values():
+            yield from _walk_objects(item, seen, depth + 1)
+        return
+    if isinstance(value, torch.nn.Module) or not type(value).__module__.startswith(
+        "vllm."
+    ):
+        return
+    if callable(getattr(value, REFRESH, None)):
+        yield value
+    for item in vars(value).values():
+        yield from _walk_objects(item, seen, depth + 1)
 
 
 def _walk(

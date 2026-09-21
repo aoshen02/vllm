@@ -351,6 +351,25 @@ class MoERunner(MoERunnerInterface):
                 dim=0,
             )
 
+    def refresh_after_weight_reload(self) -> None:
+        """Re-fuse the gate weights a reload just replaced.
+
+        The fused copy is a `torch.cat`, so an update to the gates does not
+        reach it, and `_maybe_fuse_gate_weights` only asks whether it has ever
+        been built. Without this the runner keeps routing with the previous
+        checkpoint's gate. Written in place because a captured graph reads it.
+        """
+        if self._combined_gate_weight is None:
+            return
+        assert self.gate is not None and self.shared_expert_gate is not None
+        with torch.no_grad():
+            self._combined_gate_weight.copy_(
+                torch.cat(
+                    [self.gate.weight, self.shared_expert_gate.weight],
+                    dim=0,
+                )
+            )
+
     @property
     def _quant_method(self) -> FusedMoEMethodBase:
         return self.routed_experts.quant_method

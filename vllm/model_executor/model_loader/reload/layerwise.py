@@ -25,7 +25,11 @@ from .meta import (
     materialize_layer,
     restore_layer_on_meta,
 )
-from .owned import restore_owned_tensors, snapshot_module_owned_tensors
+from .owned import (
+    refresh_owned_state,
+    restore_owned_tensors,
+    snapshot_module_owned_tensors,
+)
 from .types import LayerReloadingInfo
 from .utils import (
     get_info_size,
@@ -441,6 +445,7 @@ def _layerwise_process(layer: torch.nn.Module, info: LayerReloadingInfo):
     # rebuilding a kernel allocates fresh constants and caches, and a captured
     # graph still reads the old ones.
     if info.owned_tensors is not None:
+        refresh_owned_state(layer)
         unrestorable = restore_owned_tensors(
             info.owned_tensors, snapshot_module_owned_tensors(layer)
         )
