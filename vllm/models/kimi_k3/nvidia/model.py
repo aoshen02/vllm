@@ -10,7 +10,7 @@ import torch
 from torch import nn
 
 import vllm.envs as envs
-from vllm.config import VllmConfig
+from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import (
     get_ep_group,
     get_pp_group,
@@ -53,6 +53,9 @@ from vllm.model_executor.layers.quantization.compressed_tensors import (
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
+)
+from vllm.model_executor.model_loader.reload.derived import (
+    rebuilding_derived_state,
 )
 from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader,
@@ -368,6 +371,12 @@ class KimiK3MegaMoEExperts(DeepseekV4MegaMoEExperts):
         self.activation = activation
         self.activation_beta = activation_beta
         self.activation_linear_beta = activation_linear_beta
+        # Fusing consumes the raw params, and a weight update has to re-fuse
+        # from them. Kept only when the engine is configured to receive one,
+        # because they are the larger copy and nothing else reads them.
+        self._keep_raw_mega_weights = (
+            get_current_vllm_config().weight_transfer_config is not None
+        )
 
     def synchronize_first_launch(self) -> None:
         ep_group = get_ep_group()
@@ -380,14 +389,24 @@ class KimiK3MegaMoEExperts(DeepseekV4MegaMoEExperts):
         self._synchronized_ep_groups.add(key)
 
     def finalize_weights(self, shared_experts: DeepseekV4MLP | None = None) -> None:
-        if self._transformed_l1_weights is not None:
+        rebuilding = rebuilding_derived_state()
+        if self._transformed_l1_weights is not None and not rebuilding:
             return
 
         # Weight cache IPC engine: the daemon exported the transformed
-        # buffers; reuse them zero-copy and drop the raw packed params.
-        if self._mega_l1_packed is not None:
+        # buffers; reuse them zero-copy and drop the raw packed params. On a
+        # rebuild the fused copy is what went stale, so fall through: the raw
+        # params were kept for exactly this and `set_derived_buffer` writes the
+        # new values into the storage a captured graph reads.
+        if self._mega_l1_packed is not None and not rebuilding:
             self._drop_raw_mega_weights()
             return
+        if rebuilding and self.w13_weight is None:
+            raise RuntimeError(
+                f"{type(self).__name__} cannot re-fuse its MegaMoE weights: the "
+                "raw parameters were dropped after the initial load. Configure "
+                "weight transfer before the model is loaded so they are kept."
+            )
 
         self._check_runtime_supported()
         from vllm.utils.deep_gemm import _import_deep_gemm
@@ -419,6 +438,8 @@ class KimiK3MegaMoEExperts(DeepseekV4MegaMoEExperts):
         self._drop_raw_mega_weights()
 
     def _drop_raw_mega_weights(self) -> None:
+        if self._keep_raw_mega_weights:
+            return
         self.w13_weight = None
         self.w13_weight_scale = None
         self.w2_weight = None
