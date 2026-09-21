@@ -283,8 +283,15 @@ def finalize_layerwise_processing(model: torch.nn.Module, model_config: ModelCon
     LOADING_LAYERS.clear()
 
 
-def finalize_layerwise_reload(*args, **kwargs):
-    finalize_layerwise_processing(*args, **kwargs)
+def finalize_layerwise_reload(
+    model: torch.nn.Module, model_config: ModelConfig
+) -> None:
+    """Finalize a reload. The model-level hook is NOT dispatched here: it is
+    a cold-start contract and may replace parameters (ROCm DeepSeek-V4 calls
+    replace_parameter), which would swap storage a CUDA graph captured.
+    Models that need derived state refreshed on every load path do so inside
+    load_weights. See RFC vllm-project/vllm#54477 for the in-place hook."""
+    finalize_layerwise_processing(model, model_config)
 
 
 def _finalize_attention_layer(

@@ -62,6 +62,7 @@ class ModelExpressModelLoader(BaseModelLoader):
         model_config: ModelConfig,
         prefix: str = "",
     ) -> nn.Module:
+        # The delegate owns the whole call, post-load dispatch included.
         model = self._loader.load_model(
             vllm_config=vllm_config,
             model_config=model_config,
