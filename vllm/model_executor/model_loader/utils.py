@@ -26,6 +26,12 @@ from vllm.model_executor.model_loader.reload import (
     record_metadata_for_reloading,
     set_torchao_reload_attrs,
 )
+from vllm.model_executor.model_loader.reload.per_layer import (
+    observe as observe_per_layer_transform,
+)
+from vllm.model_executor.model_loader.reload.per_layer import (
+    signature as per_layer_signature,
+)
 from vllm.model_executor.model_loader.weight_tying import maybe_retie_word_embeddings
 from vllm.model_executor.models.interfaces import SupportsQuant
 from vllm.model_executor.utils import is_weights_pre_processed
@@ -142,8 +148,10 @@ def process_weights_after_loading(
                 if quant_method.requires_device_loading
                 else nullcontext()
             )
+            before = per_layer_signature(module)
             with loading_context:
                 quant_method.process_weights_after_loading(module)
+            observe_per_layer_transform(model, name, module, before)
             # process_weights_after_loading may swap in freshly-created
             # Parameters (e.g. FP8 requantization), which are stamped with the
             # global rank in BasevLLMParameter.__init__. Re-reconcile their TP

@@ -25,6 +25,9 @@ from vllm.config.cache import CacheDType
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.fusion.quant_activation import QuantizedActivation
 from vllm.model_executor.layers.quantization.utils.quant_utils import kMxfp8Dynamic
+from vllm.model_executor.model_loader.reload.derived import (
+    rebuilding_derived_state,
+)
 from vllm.models.deepseek_v41.common.ops import (
     combine_topk_swa_indices,
     compute_global_topk_indices_and_lens,
@@ -232,9 +235,12 @@ class DeepseekV4MegaAttnAttention(DeepseekV4FlashMLAAttention):
     def finalize_loaded_weights(self) -> None:
         """Permute wq_b rows / wo_a columns into the kernel's layouts.
 
-        Idempotent: a second post-load pass must not permute twice.
+        Idempotent: a second post-load pass must not permute twice. A weight
+        update is the exception -- it writes new, unpermuted rows through the
+        same storage, so the layouts have to be rebuilt or the kernel reads the
+        checkpoint's layout as if it were the fused one.
         """
-        if self._fused_layouts_ready:
+        if self._fused_layouts_ready and not rebuilding_derived_state():
             return
         permute_wq_b_(
             self.wq_b.weight.data, self.wq_b.weight_scale.data, self.n_local_heads

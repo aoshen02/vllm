@@ -305,3 +305,51 @@ def test_every_no_op_model_level_hook_is_declared():
         "these root hooks do nothing, so declare reload_safe_post_load rather "
         f"than refusing their reloads: {undeclared}"
     )
+
+
+class _GuardsOnExistence(_Fused):
+    """Kimi K3's shape: the fusion returns early once it has ever run, which at
+    cold start is the same question as whether the state is current."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.built = False
+
+    def process_weights_after_loading(self) -> None:
+        from vllm.model_executor.model_loader.reload.derived import (
+            rebuilding_derived_state,
+        )
+
+        if self.built and not rebuilding_derived_state():
+            return
+        self.built = True
+        self.fused.copy_(torch.stack([self.a.weight, self.b.weight]))
+
+
+@pytest.mark.parametrize("mode", MODES)
+def test_a_hook_that_guards_on_existence_is_told_it_is_a_rebuild(mode):
+    """Without the scope the guard fires and the model keeps serving the
+    previous checkpoint's fused weights."""
+    model = _GuardsOnExistence()
+    record_metadata_for_reloading(model)
+    model.process_weights_after_loading()  # cold start
+    fused = model.fused
+    address = fused.data_ptr()
+
+    _update(model, 7.0, mode)
+
+    assert model.fused is fused
+    assert model.fused.data_ptr() == address
+    assert torch.equal(model.fused, torch.full_like(model.fused, 7.0))
+
+
+def test_the_scope_is_closed_outside_a_reload():
+    """A cold-start call must see the same answer as before this existed."""
+    from vllm.model_executor.model_loader.reload.derived import (
+        rebuilding_derived_state,
+    )
+
+    assert not rebuilding_derived_state()
+    model = _GuardsOnExistence()
+    model.process_weights_after_loading()
+    assert not rebuilding_derived_state()

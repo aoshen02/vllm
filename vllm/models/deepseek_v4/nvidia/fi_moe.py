@@ -9,6 +9,9 @@ from typing import TYPE_CHECKING, Any
 import torch
 import torch.nn as nn
 
+from vllm.model_executor.model_loader.reload.derived import (
+    rebuilding_derived_state,
+)
 from vllm.model_executor.utils import set_derived_buffer, set_weight_attrs
 from vllm.models.deepseek_v4.nvidia.model import DeepseekV4MegaMoEExperts
 from vllm.utils.flashinfer_moe_ep import (
@@ -226,6 +229,15 @@ class DeepseekV4MegaMoEExpertsFI(DeepseekV4MegaMoEExperts):
         # The FlashInfer megakernel has no shared-expert fusion; the caller's
         # serial shared MLP path handles shared_experts.
         if self._mega_layer is not None:
+            if rebuilding_derived_state():
+                raise RuntimeError(
+                    f"{type(self).__name__} cannot rebuild its fused weights on "
+                    "a weight update: flashinfer's MoEEpMegaLayer owns them and "
+                    "offers no in-place update, so re-running would allocate "
+                    "storage a captured CUDA graph does not read. This model "
+                    "cannot take a weight update on the flashinfer moe_ep "
+                    "backends."
+                )
             return
         if self.w13_weight is None:
             return

@@ -5,6 +5,8 @@ from inspect import BoundArguments
 
 import torch
 
+from .owned import OwnedTensor
+
 __all__ = ["LayerTensors", "LayerReloadingInfo"]
 
 # encodes both parameters and buffers separately
@@ -32,6 +34,10 @@ class LayerReloadingInfo:
     # non-persistent buffer names captured with `kernel_tensors`, so buffer
     # persistence survives `_non_persistent_buffers_set` being mutated during reload
     kernel_non_persistent_buffers: set[str] = field(default_factory=set)
+
+    # tensors the layer reaches through objects it owns rather than through the
+    # module tree, captured alongside `kernel_tensors` and restored the same way
+    owned_tensors: dict[str, OwnedTensor] | None = None
 
     def reset(self):
         self.__init__(  # type: ignore[misc]

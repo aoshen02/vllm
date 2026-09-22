@@ -234,11 +234,11 @@ class IPCWeightTransferEngine(
                 weight = rebuild_cuda_tensor(*list_args)
                 weights.append((name, weight))
 
-        from vllm.model_executor.model_loader.mtp_validation import (
-            disable_mtp_completeness_check,
+        from vllm.model_executor.model_loader.completeness import (
+            streaming_a_checkpoint,
         )
 
-        with disable_mtp_completeness_check():
+        with streaming_a_checkpoint():
             self.model.load_weights(weights)
 
     def shutdown(self) -> None:
