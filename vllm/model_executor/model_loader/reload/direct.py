@@ -17,6 +17,7 @@ from .derived import (
     relocated_names,
     tensor_layouts,
 )
+from .per_layer import refuse_direct_reload_if_layers_transform
 
 __all__ = ["direct_start", "direct_finish"]
 
@@ -32,6 +33,7 @@ def direct_start(model: torch.nn.Module) -> None:
             "a previous direct weight reload failed; the weights are undefined "
             "and the engine must be restarted"
         )
+    refuse_direct_reload_if_layers_transform(model)
     if getattr(model, "_do_torchao_reload", False):
         raise RuntimeError(
             "torchao models re-quantize after loading; use reload_mode=layerwise"
