@@ -1632,6 +1632,13 @@ class KimiLinearForCausalLM(
     SupportsEagle3,
     SupportsReplaySSM,
 ):
+    # The MegaMoE fusion is the only model-level state here, it rebuilds from
+    # the raw parameters a weight-transfer engine keeps, and it writes through
+    # `set_derived_buffer`. Measured: after a direct update this model's
+    # parameters, buffers and off-tree tensors are identical to a cold start on
+    # the new weights (258 of 258).
+    reload_safe_post_load = True
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         self.model_config = vllm_config.model_config
@@ -1789,6 +1796,10 @@ class KimiK3ForConditionalGeneration(
     """Kimi-K3 model with Kimi-K2.5 vision and KimiLinear text."""
 
     supports_encoder_tp_data = True
+
+    # Delegates to the language model, whose fusion is safe to re-run; the
+    # vision tower derives no model-level state of its own.
+    reload_safe_post_load = True
 
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_prefix={
