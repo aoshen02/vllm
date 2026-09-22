@@ -102,11 +102,10 @@ class FlashInferCuteDSLExperts(mk.FusedMoEExpertsModular):
         weight_key: QuantKey | None,
         activation_key: QuantKey | None,
     ) -> bool:
-        SUPPORTED_W_A = [
-            (kNvfp4Static, kNvfp4Dynamic),
-            (kNvfp4Static, kNvfp4DynamicToken),
-        ]
-        return (weight_key, activation_key) in SUPPORTED_W_A
+        return weight_key == kNvfp4Static and activation_key in (
+            kNvfp4Dynamic,
+            kNvfp4DynamicToken,
+        )
 
     @staticmethod
     def _supports_activation(activation: MoEActivation) -> bool:
@@ -142,11 +141,8 @@ class FlashInferCuteDSLExperts(mk.FusedMoEExpertsModular):
         expert_tokens_meta: mk.ExpertTokensMetadata | None,
         activation: MoEActivation,
     ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
-        workspace1 = (0,)
-        workspace2 = (0,)
         assert self.hidden_dim == (K if self.expects_unquantized_inputs else K * 2)
-        output = (M, self.hidden_dim)
-        return (workspace1, workspace2, output)
+        return (0,), (0,), (M, self.hidden_dim)
 
     def apply(
         self,
@@ -170,21 +166,20 @@ class FlashInferCuteDSLExperts(mk.FusedMoEExpertsModular):
         assert self.w1_scale is not None
         assert self.w2_scale is not None
 
-        if self.expects_unquantized_inputs:
-            hidden_states, block_scale, per_token_scale = (
-                quantize_nvfp4_per_token_input(hidden_states)
+        per_token_scale = None
+        fc2_input_scale = self.a2_gscale
+        if self.per_token_activation:
+            hidden_states, a1q_scale, per_token_scale = quantize_nvfp4_per_token_input(
+                hidden_states
             )
             fc2_input_scale = self.per_token_global_scale
-        else:
-            block_scale, per_token_scale = a1q_scale, None
-            fc2_input_scale = self.a2_gscale
 
-        assert block_scale is not None
+        assert a1q_scale is not None
         assert fc2_input_scale is not None
 
         # Block scales are (M, K//16) float8_e4m3fn.
         # The functional API expects x_sf with trailing dim: (M, K//16, 1).
-        x_sf = block_scale.unsqueeze(-1)
+        x_sf = a1q_scale.unsqueeze(-1)
 
         # The kernel defaults swiglu_{alpha,beta,limit} to the plain-SwiGLU
         # values, so only forward the ones the model actually sets.
@@ -235,6 +230,6 @@ class FlashInferCuteDSLExperts(mk.FusedMoEExpertsModular):
             activation_type=activation_to_flashinfer_int(
                 MoEActivation.SILU if activation == MoEActivation.SITU else activation
             ),
-            **swiglu_kwargs,
             per_token_scale=per_token_scale,
+            **swiglu_kwargs,
         )
