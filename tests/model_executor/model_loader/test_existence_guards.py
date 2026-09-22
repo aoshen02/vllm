@@ -24,14 +24,6 @@ POST_LOAD_NAMES = (
 # `check_post_load_is_reload_safe` has to keep refusing it.
 KNOWN_NOT_RERUNNABLE = {
     (
-        "vllm/models/deepseek_v4/nvidia/fi_moe.py",
-        "finalize_weights",
-    ): (
-        "the fused weights are handed to flashinfer's MoEEpMegaLayer, a "
-        "third-party object with no in-place update, so re-running allocates "
-        "storage a captured graph does not read"
-    ),
-    (
         "vllm/models/deepseek_v4/xpu/model.py",
         "finalize_weights",
     ): (
@@ -63,6 +55,19 @@ def _existence_guard(node: ast.stmt, assigned_here: set[str]) -> str | None:
         return None
 
     test = node.test
+    # `if getattr(self, "flag", False): return` says the same thing.
+    if (
+        isinstance(test, ast.Call)
+        and isinstance(test.func, ast.Name)
+        and test.func.id == "getattr"
+        and test.args
+        and ast.unparse(test.args[0]) == "self"
+        and len(test.args) > 1
+        and isinstance(test.args[1], ast.Constant)
+        and isinstance(test.args[1].value, str)
+    ):
+        name = f"self.{test.args[1].value}"
+        return None if name in assigned_here else name
     if (
         isinstance(test, ast.Compare)
         and len(test.ops) == 1

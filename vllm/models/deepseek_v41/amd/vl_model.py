@@ -23,6 +23,9 @@ import torch
 from torch import nn
 
 from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.model_executor.model_loader.reload.derived import (
+    rebuilding_derived_state,
+)
 from vllm.model_executor.models.interfaces import (
     MultiModalEmbeddings,
     SupportsEagle3,
@@ -123,6 +126,16 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP, Supports
     """
 
     supports_encoder_tp_data = True
+
+    # The model-level pass delegates to the language model, whose finalizers
+    # rebuild rather than skip once told this is a rebuild, and write through
+    # the tensors they already hold. The flashinfer moe_ep backends are the
+    # exception and refuse outright rather than silently keeping the previous
+    # checkpoint's fused weights. Measured in layerwise mode: 206 of 206
+    # tensors identical to a cold start on the new weights, the remaining five
+    # being `torch.empty` attention scratch that two cold starts also disagree
+    # on.
+    reload_safe_post_load = True
 
     # The MoE router needs raw token ids to detect image-span tokens
     # (all carrying image_token_id, see common/mm_preprocess.py) and apply
@@ -344,6 +357,13 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP, Supports
         # Model-level post-load hook (called by the loader after any load
         # format). Under DummyModelLoader the child's load_weights — and
         # hence its finalize step — is bypassed, so run it here instead.
-        if getattr(self, "_weights_finalized", False):
+        #
+        # On a weight update the child did finalize during load_weights, but
+        # each finalizer guards on whether it has ever run, so it skipped the
+        # rebuild. This is the pass that carries `rebuilding_derived_state`,
+        # which is what lets them tell the difference, so it has to run.
+        if getattr(self, "_weights_finalized", False) and not (
+            rebuilding_derived_state()
+        ):
             return
         self.language_model.process_weights_after_loading()
