@@ -144,8 +144,7 @@ class FlashInferCuteDSLExperts(mk.FusedMoEExpertsModular):
     ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
         workspace1 = (0,)
         workspace2 = (0,)
-        expected_hidden_dim = K if self.expects_unquantized_inputs else K * 2
-        assert self.hidden_dim == expected_hidden_dim
+        assert self.hidden_dim == (K if self.expects_unquantized_inputs else K * 2)
         output = (M, self.hidden_dim)
         return (workspace1, workspace2, output)
 
@@ -177,15 +176,13 @@ class FlashInferCuteDSLExperts(mk.FusedMoEExpertsModular):
             )
             fc2_input_scale = self.per_token_global_scale
         else:
-            assert a1q_scale is not None
-            block_scale = a1q_scale
-            per_token_scale = None
+            block_scale, per_token_scale = a1q_scale, None
             fc2_input_scale = self.a2_gscale
 
         assert block_scale is not None
         assert fc2_input_scale is not None
 
-        # a1q_scale is (M, K//16) float8_e4m3fn from fp4_quantize.
+        # Block scales are (M, K//16) float8_e4m3fn.
         # The functional API expects x_sf with trailing dim: (M, K//16, 1).
         x_sf = block_scale.unsqueeze(-1)
 
@@ -218,9 +215,6 @@ class FlashInferCuteDSLExperts(mk.FusedMoEExpertsModular):
             }
         swiglu_kwargs = {k: v for k, v in swiglu_params.items() if v is not None}
 
-        per_token_kwargs = (
-            {"per_token_scale": per_token_scale} if self.per_token_activation else {}
-        )
         flashinfer_cute_dsl_fused_moe_nvfp4(
             x=hidden_states,
             x_sf=x_sf,
@@ -242,5 +236,5 @@ class FlashInferCuteDSLExperts(mk.FusedMoEExpertsModular):
                 MoEActivation.SILU if activation == MoEActivation.SITU else activation
             ),
             **swiglu_kwargs,
-            **per_token_kwargs,
+            per_token_scale=per_token_scale,
         )
