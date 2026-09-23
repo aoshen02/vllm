@@ -5,14 +5,26 @@
 import torch
 
 
-def rms_forward(x, weight, eps, residual=None):
-    from vllm.model_executor.layers.batch_invariant import rms_norm_batch_invariant
+def rms_forward(x, weight, eps, residual=None, *, inplace=False):
+    import vllm._custom_ops as ops
 
     if x.dtype != weight.dtype:
         raise ValueError("Shared RMS requires matching activation and weight dtype")
     if residual is None:
-        return rms_norm_batch_invariant(x, weight, eps)
-    return rms_norm_batch_invariant(x.clone(), weight, eps, residual.clone())
+        output = torch.empty(x.shape, dtype=x.dtype, device=x.device)
+        ops.rms_norm(output, x, weight, eps)
+        return output
+    if not (
+        inplace
+        and x.is_contiguous()
+        and residual.is_contiguous()
+        and x.storage_offset() == 0
+        and residual.storage_offset() == 0
+    ):
+        x = x.clone()
+        residual = residual.clone()
+    ops.fused_add_rms_norm(x, residual, weight, eps)
+    return x, residual
 
 
 @torch.library.custom_op("nemotron_alignment::gated_rms", mutates_args=())
