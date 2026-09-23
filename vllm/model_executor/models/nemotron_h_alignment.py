@@ -5,7 +5,7 @@
 import torch
 
 
-def rms_forward(x, weight, eps, residual=None):
+def rms_forward(x, weight, eps, residual=None, *, inplace=False):
     import vllm._custom_ops as ops
 
     if x.dtype != weight.dtype:
@@ -14,10 +14,11 @@ def rms_forward(x, weight, eps, residual=None):
         output = torch.empty(x.shape, dtype=x.dtype, device=x.device)
         ops.rms_norm(output, x, weight, eps)
         return output
-    output = x.clone()
-    residual_out = residual.clone()
-    ops.fused_add_rms_norm(output, residual_out, weight, eps)
-    return output, residual_out
+    if not (inplace and x.is_contiguous() and residual.is_contiguous()):
+        x = x.clone()
+        residual = residual.clone()
+    ops.fused_add_rms_norm(x, residual, weight, eps)
+    return x, residual
 
 
 @torch.library.custom_op("nemotron_alignment::gated_rms", mutates_args=())

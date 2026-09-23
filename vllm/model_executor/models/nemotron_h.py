@@ -94,7 +94,9 @@ class NemotronHRMSNorm(RMSNorm):
 
             if get_tensor_model_parallel_world_size() != 1:
                 raise ValueError("Shared Nemotron normalization requires TP=1")
-            return rms_forward(x, self.weight, self.variance_epsilon, residual)
+            return rms_forward(
+                x, self.weight, self.variance_epsilon, residual, inplace=True
+            )
         return super().forward(x, residual)
 
 
