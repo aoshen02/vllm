@@ -90,11 +90,7 @@ from vllm.transformers_utils.configs.nemotron_h import NemotronHConfig
 class NemotronHRMSNorm(RMSNorm):
     def forward(self, x, residual=None):
         if envs.VLLM_BATCH_INVARIANT:
-            from .nemotron_h_alignment import rms_forward
-
-            if get_tensor_model_parallel_world_size() != 1:
-                raise ValueError("Shared Nemotron normalization requires TP=1")
-            return rms_forward(x, self.weight, self.variance_epsilon, residual)
+            return super().forward_cuda(x, residual)
         return super().forward(x, residual)
 
 
