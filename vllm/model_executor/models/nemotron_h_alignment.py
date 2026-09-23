@@ -14,13 +14,7 @@ def rms_forward(x, weight, eps, residual=None, *, inplace=False):
         output = torch.empty(x.shape, dtype=x.dtype, device=x.device)
         ops.rms_norm(output, x, weight, eps)
         return output
-    if not (
-        inplace
-        and x.is_contiguous()
-        and residual.is_contiguous()
-        and x.storage_offset() == 0
-        and residual.storage_offset() == 0
-    ):
+    if not (inplace and x.is_contiguous() and residual.is_contiguous()):
         x = x.clone()
         residual = residual.clone()
     ops.fused_add_rms_norm(x, residual, weight, eps)
