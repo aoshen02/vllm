@@ -131,7 +131,7 @@ class SamplingMaskTensors(NamedTuple):
         return cls(token_ids, packed_mask, counts, vocab_size, logprobs)
 
     def to_cpu_nonblocking(self) -> SamplingMaskTensors:
-        if self.token_ids.device.type == "cpu":
+        if self.token_ids.device.type == "cpu" and self.logprobs is None:
             return self
         if self.logprobs is not None:
             counts = self.counts.cpu()

@@ -58,8 +58,8 @@ For score centering, add `--return-sampling-mask-logprobs` to return
 normalized over the post-filtering support and have the same order as the token
 IDs. This works with pure top-p (`top_k=-1`) without requesting full-vocabulary
 `logprobs=-1`. In streaming mode, each token chunk carries its own mask and
-scores. The server transfers only the actual support, although finding its
-length requires a GPU-to-CPU synchronization each step.
+scores. The server transfers each batch up to its widest support, which
+requires a GPU-to-CPU support-size readback each step.
 
 ## Requirements
 
@@ -119,5 +119,8 @@ consistent.
 - **Engine-level flag:** `--return-sampling-mask` globally disables the
   FlashInfer fused sampler. All requests pay the cost of the PyTorch sampling
   path, even if they don't need the mask.
-- **Streaming:** With paired logprobs enabled, token chunks contain aligned
-  masks and scores; otherwise the mask remains final-response-only.
+- **Streaming:** Token chunks contain aligned masks and, when enabled, paired
+  logprobs.
+- **Paired-logprob cost:** Compact copies require a GPU-to-CPU support-size
+  readback that blocks the launch thread; mixed batches copy to the widest
+  support, and a near-full-vocabulary support can produce a large response.

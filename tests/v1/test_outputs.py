@@ -88,6 +88,21 @@ def test_sampling_mask_lists_keep_logprobs_aligned_on_request_slice():
     assert sliced.logprobs.tolist() == [0.0]
 
 
+def test_sampling_mask_cpu_logprobs_follow_token_ids():
+    tensors = SamplingMaskTensors(
+        token_ids=torch.tensor([[2, 0, 0, 0]], dtype=torch.int32),
+        packed_mask=torch.tensor([[0b0101]], dtype=torch.uint8),
+        counts=torch.tensor([2], dtype=torch.int32),
+        vocab_size=4,
+        logprobs=torch.tensor([[-1.1, -2.0, -0.3, -3.0]]),
+    )
+
+    mask = tensors.to_cpu_nonblocking().tolists()
+
+    assert mask.token_ids.tolist() == [2, 0]
+    assert mask.logprobs.tolist() == pytest.approx([-0.3, -1.1])
+
+
 @pytest.mark.parametrize("max_num_kept", [512, 20_001])
 @pytest.mark.skipif(
     current_platform.is_xpu(),
