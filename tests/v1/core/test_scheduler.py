@@ -1603,6 +1603,16 @@ def test_sleep_abort_with_aux_output_connector():
     core.model_executor.sleep.assert_called_once_with(1)
 
 
+def test_aux_output_reset_allows_waiting_requests_while_paused():
+    scheduler = create_scheduler(enable_prefix_caching=True)
+    scheduler.aux_output_connector = Mock()
+    scheduler.set_pause_state(PauseState.PAUSED_NEW)
+    scheduler.add_request(create_requests(num_requests=1)[0])
+
+    assert scheduler.reset_prefix_cache(reset_running_requests=True)
+    scheduler.aux_output_connector.reset.assert_called_once_with()
+
+
 @pytest.mark.parametrize("reset_successful", [False, True])
 def test_aux_output_reset_follows_kv_reset_result(reset_successful: bool):
     scheduler = create_scheduler(enable_prefix_caching=True)
