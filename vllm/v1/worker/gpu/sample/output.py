@@ -10,6 +10,7 @@ import torch
 
 from vllm.triton_utils import tl, triton
 from vllm.v1.outputs import LogprobsTensors, SamplingMaskLists
+from vllm.v1.worker.gpu.sample.logprob import compute_token_logprobs
 
 
 @dataclass
@@ -86,6 +87,7 @@ class SamplingMaskTensors(NamedTuple):
     counts: torch.Tensor
     vocab_size: int
     logprobs: torch.Tensor | None = None
+    logits: torch.Tensor | None = None
 
     @classmethod
     def from_logits(
@@ -97,11 +99,7 @@ class SamplingMaskTensors(NamedTuple):
     ) -> SamplingMaskTensors:
         """Capture the finite-logit support of every row with a sampled token."""
         num_reqs, vocab_size = logits.shape
-        max_num_kept = (
-            vocab_size
-            if return_logprobs
-            else min(max_num_kept, vocab_size, MAX_COMPACT_SUPPORT)
-        )
+        max_num_kept = min(max_num_kept, vocab_size, MAX_COMPACT_SUPPORT)
         device = logits.device
 
         token_ids = torch.empty(
@@ -125,21 +123,47 @@ class SamplingMaskTensors(NamedTuple):
             max_num_kept,
             BLOCK_SIZE=8192,
         )
-        logprobs = None
-        if return_logprobs:
-            logprobs = torch.log_softmax(logits.float(), dim=-1)
-        return cls(token_ids, packed_mask, counts, vocab_size, logprobs)
+        return cls(
+            token_ids,
+            packed_mask,
+            counts,
+            vocab_size,
+            logits=logits if return_logprobs else None,
+        )
 
     def to_cpu_nonblocking(self) -> SamplingMaskTensors:
-        if self.token_ids.device.type == "cpu" and self.logprobs is None:
+        if self.token_ids.device.type == "cpu" and self.logits is None:
             return self
-        if self.logprobs is not None:
+        if self.logits is not None:
             counts = self.counts.cpu()
             width = int(counts.max())
-            ids = self.token_ids[:, :width]
+            token_ids = self.token_ids
+            if width > token_ids.shape[1]:
+                token_ids = torch.empty(
+                    (len(counts), width), dtype=torch.int32, device=self.logits.device
+                )
+                _compact_sampling_mask_kernel[(len(counts),)](
+                    self.logits,
+                    self.logits.stride(0),
+                    self.logits.stride(1),
+                    self.counts,
+                    token_ids,
+                    token_ids.stride(0),
+                    self.packed_mask,
+                    self.packed_mask.stride(0),
+                    self.counts,
+                    self.vocab_size,
+                    width,
+                    BLOCK_SIZE=8192,
+                )
+            ids = token_ids[:, :width]
             positions = torch.arange(width, device=ids.device)[None, :]
             safe_ids = torch.where(positions < self.counts[:, None], ids, 0)
-            scores = self.logprobs.gather(1, safe_ids.long())
+            scores = (
+                compute_token_logprobs(self.logits, safe_ids)
+                if width
+                else self.logits.new_empty((len(counts), 0), dtype=torch.float32)
+            )
             return SamplingMaskTensors(
                 ids.to("cpu", non_blocking=True),
                 self.packed_mask.to("cpu", non_blocking=True),

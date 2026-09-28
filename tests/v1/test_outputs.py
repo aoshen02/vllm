@@ -94,7 +94,7 @@ def test_sampling_mask_cpu_logprobs_follow_token_ids():
         packed_mask=torch.tensor([[0b0101]], dtype=torch.uint8),
         counts=torch.tensor([2], dtype=torch.int32),
         vocab_size=4,
-        logprobs=torch.tensor([[-1.1, -2.0, -0.3, -3.0]]),
+        logprobs=torch.tensor([[-0.3, -1.1, 0.0, 0.0]]),
     )
 
     mask = tensors.to_cpu_nonblocking().tolists()
@@ -200,6 +200,41 @@ def test_sampling_mask_logprobs_keep_support_wider_than_top_k():
     torch.testing.assert_close(
         torch.from_numpy(result.logprobs), torch.log_softmax(logits[0].cpu(), dim=-1)
     )
+
+
+def test_sampling_mask_logprobs_keep_support_wider_than_compact_buffer():
+    vocab_size = 10_000
+    support_sizes = [0, 1, 2_049, 8_192]
+    logits = torch.full((len(support_sizes), vocab_size), float("-inf"))
+    generator = torch.Generator().manual_seed(0)
+    expected_ids = []
+    expected_scores = []
+    for row, size in enumerate(support_sizes):
+        token_ids = torch.randperm(vocab_size, generator=generator)[:size].sort().values
+        logits[row, token_ids] = torch.randn(size, generator=generator)
+        expected_ids.append(token_ids.tolist())
+        expected_scores.append(
+            torch.log_softmax(logits[row], dim=-1)[token_ids] if size else None
+        )
+
+    tensors = SamplingMaskTensors.from_logits(
+        logits.to(DEVICE_TYPE),
+        torch.tensor([0, 1, 1, 1], device=DEVICE_TYPE),
+        max_num_kept=1,
+        return_logprobs=True,
+    )
+    assert tensors.token_ids.shape[1] == 1
+    result = tensors.to_cpu_nonblocking().tolists()
+    assert result.to_nested_list() == expected_ids
+    assert result.logprobs is not None
+    for row, expected in enumerate(expected_scores):
+        start, end = result.offsets[row : row + 2]
+        if expected is None:
+            assert start == end
+        else:
+            torch.testing.assert_close(
+                torch.from_numpy(result.logprobs[start:end]), expected
+            )
 
 
 def test_sampling_mask_preserves_top_k_boundary_ties():
