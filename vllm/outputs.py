@@ -27,6 +27,7 @@ class SamplingMask:
     """
 
     token_ids: list[list[int]]
+    logprobs: list[list[float]] | None = None
 
 
 @dataclass

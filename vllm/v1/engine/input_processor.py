@@ -149,11 +149,21 @@ class InputProcessor:
                 )
 
             if self.model_config.return_sampling_mask:
+                if (
+                    self.model_config.return_sampling_mask_logprobs
+                    and self.vllm_config.speculative_config is not None
+                ):
+                    raise ValueError(
+                        "sampling-mask logprobs do not support speculative decoding"
+                    )
                 if params.temperature <= 0:
                     raise ValueError(
                         "sampling distribution replay requires temperature > 0"
                     )
-                if params.top_k <= 0:
+                if (
+                    params.top_k <= 0
+                    and not self.model_config.return_sampling_mask_logprobs
+                ):
                     raise ValueError(
                         "sampling distribution replay requires top_k > 0 to "
                         "bound sampling mask size, reduce transfer overhead, "

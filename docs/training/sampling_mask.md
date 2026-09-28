@@ -53,14 +53,23 @@ The mask is also available via the `/inference/v1/generate` HTTP endpoint:
 }
 ```
 
+For score centering, add `--return-sampling-mask-logprobs` to return
+`sampling_mask_logprobs` alongside each row of `sampling_mask`. The scores are
+normalized over the post-filtering support and have the same order as the token
+IDs. This works with pure top-p (`top_k=-1`) without requesting full-vocabulary
+`logprobs=-1`. In streaming mode, each token chunk carries its own mask and
+scores. The server transfers only the actual support, although finding its
+length requires a GPU-to-CPU synchronization each step.
+
 ## Requirements
 
 | Requirement | Reason |
 | --- | --- |
 | `--return-sampling-mask` | Engine-level opt-in (disables FlashInfer sampler) |
+| `--return-sampling-mask-logprobs` | Optional paired logprobs; requires `--return-sampling-mask` |
 | `--logprobs-mode processed_logprobs` | Returned logprobs are normalized over the nucleus, not full vocab |
 | `temperature > 0` | Greedy has no truncated distribution |
-| `top_k > 0` | Bounds mask size; pure top-p can produce vocab-sized masks |
+| `top_k > 0` | Required without mask logprobs; paired logprobs also support pure top-p |
 | Model Runner V2 | Required by the async D2H copy pipeline |
 
 The engine rejects unsupported combinations at startup or request time:
@@ -76,9 +85,10 @@ The engine rejects unsupported combinations at startup or request time:
    logits to `-inf`.
 2. After sampling, `torch.isfinite(processed_logits)` identifies the surviving
    token IDs — this is the sampling mask.
-3. The mask is transferred GPU → CPU asynchronously alongside sampled tokens.
-4. On request completion, per-step masks are merged and converted to
-   `list[list[int]]` for the response.
+3. The mask is transferred GPU → CPU alongside sampled tokens. With paired
+   logprobs, the GPU computes post-filtering log-softmax and transfers only
+   the surviving IDs and their scores.
+4. Per-step masks are converted to `list[list[int]]` for the response.
 
 ## RL training usage
 
@@ -109,5 +119,5 @@ consistent.
 - **Engine-level flag:** `--return-sampling-mask` globally disables the
   FlashInfer fused sampler. All requests pay the cost of the PyTorch sampling
   path, even if they don't need the mask.
-- **No streaming support:** The mask is returned only in the final response,
-  not in intermediate streaming chunks.
+- **Streaming:** With paired logprobs enabled, token chunks contain aligned
+  masks and scores; otherwise the mask remains final-response-only.

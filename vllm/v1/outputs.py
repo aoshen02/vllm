@@ -65,11 +65,17 @@ class SamplingMaskLists(NamedTuple):
     offsets: np.ndarray | None = None
     # Unused with one position per request; kept for the wire layout.
     cu_num_generated_tokens: list[int] | None = None
+    logprobs: np.ndarray | None = None
 
     def slice_request(self, req_idx: int, num_positions: int) -> "SamplingMaskLists":
         assert num_positions == 1 and self.offsets is not None
         return SamplingMaskLists(
-            self.token_ids[self.offsets[req_idx] : self.offsets[req_idx + 1]]
+            self.token_ids[self.offsets[req_idx] : self.offsets[req_idx + 1]],
+            logprobs=(
+                self.logprobs[self.offsets[req_idx] : self.offsets[req_idx + 1]]
+                if self.logprobs is not None
+                else None
+            ),
         )
 
     def to_nested_list(self) -> list[list[int]]:

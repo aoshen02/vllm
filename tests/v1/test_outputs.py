@@ -13,6 +13,7 @@ from vllm.v1.outputs import (
     LogprobsLists,
     LogprobsTensors,
     ModelRunnerOutput,
+    SamplingMaskLists,
 )
 from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
 from vllm.v1.worker.gpu.sample.output import SamplingMaskTensors
@@ -76,6 +77,17 @@ def test_sampling_mask_lists_to_nested_list():
     assert SamplingMaskLists(np.array([7, 9])).to_nested_list() == [[7, 9]]
 
 
+def test_sampling_mask_lists_keep_logprobs_aligned_on_request_slice():
+    mask = SamplingMaskLists(
+        token_ids=np.array([10, 11, 20]),
+        offsets=np.array([0, 2, 3]),
+        logprobs=np.array([-0.3, -1.4, 0.0]),
+    )
+    sliced = mask.slice_request(1, 1)
+    assert sliced.token_ids.tolist() == [20]
+    assert sliced.logprobs.tolist() == [0.0]
+
+
 @pytest.mark.parametrize("max_num_kept", [512, 20_001])
 @pytest.mark.skipif(
     current_platform.is_xpu(),
@@ -133,6 +145,46 @@ def test_sampling_mask_matches_processed_top_k_top_p_support():
     result = tensors.tolists()
 
     assert result.to_nested_list() == [expected_token_ids]
+
+
+@pytest.mark.parametrize("top_k", [-1, 5])
+def test_sampling_mask_logprobs_match_processed_distribution(top_k):
+    logits = torch.tensor([[6.0, 5.0, 4.0, 3.0, 2.0, 1.0]], device=DEVICE_TYPE)
+    processed = apply_top_k_top_p(
+        logits,
+        k=torch.tensor([top_k], device=DEVICE_TYPE) if top_k > 0 else None,
+        p=torch.tensor([0.9], device=DEVICE_TYPE),
+    )
+    mask = (
+        SamplingMaskTensors.from_logits(
+            processed,
+            torch.tensor([1], device=DEVICE_TYPE),
+            max_num_kept=6,
+            return_logprobs=True,
+        )
+        .to_cpu_nonblocking()
+        .tolists()
+    )
+    expected_ids = torch.isfinite(processed[0]).nonzero().flatten()
+    expected_scores = torch.log_softmax(processed[0], dim=-1)[expected_ids]
+    assert mask.token_ids.tolist() == expected_ids.tolist()
+    torch.testing.assert_close(torch.from_numpy(mask.logprobs), expected_scores.cpu())
+    assert np.exp(mask.logprobs).sum() == pytest.approx(1.0)
+
+
+def test_sampling_mask_logprobs_keep_support_wider_than_top_k():
+    logits = torch.tensor([[5.0, 4.0, 3.0, 2.0]], device=DEVICE_TYPE)
+    mask = SamplingMaskTensors.from_logits(
+        logits,
+        torch.tensor([1], device=DEVICE_TYPE),
+        max_num_kept=2,
+        return_logprobs=True,
+    )
+    result = mask.to_cpu_nonblocking().tolists()
+    assert result.token_ids.tolist() == [0, 1, 2, 3]
+    torch.testing.assert_close(
+        torch.from_numpy(result.logprobs), torch.log_softmax(logits[0].cpu(), dim=-1)
+    )
 
 
 def test_sampling_mask_preserves_top_k_boundary_ties():

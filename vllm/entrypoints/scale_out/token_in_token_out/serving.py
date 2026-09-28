@@ -341,8 +341,10 @@ class ServingTokens(GenerateBaseServing):
             )
 
             sampling_mask = None
+            sampling_mask_logprobs = None
             if output.sampling_mask is not None:
                 sampling_mask = output.sampling_mask.token_ids
+                sampling_mask_logprobs = output.sampling_mask.logprobs
 
             choice_data = GenerateResponseChoice(
                 index=output.index,
@@ -351,6 +353,7 @@ class ServingTokens(GenerateBaseServing):
                 token_ids=as_list(output.token_ids),
                 routed_experts=routed_experts_b64,
                 sampling_mask=sampling_mask,
+                sampling_mask_logprobs=sampling_mask_logprobs,
             )
 
             choices.append(choice_data)
@@ -494,6 +497,16 @@ class ServingTokens(GenerateBaseServing):
                                 finish_reason=finish_reason,
                                 token_ids=as_list(delta_token_ids),
                                 routed_experts=routed_experts_b64,
+                                sampling_mask=(
+                                    output.sampling_mask.token_ids
+                                    if output.sampling_mask is not None
+                                    else None
+                                ),
+                                sampling_mask_logprobs=(
+                                    output.sampling_mask.logprobs
+                                    if output.sampling_mask is not None
+                                    else None
+                                ),
                             )
                         ],
                     )

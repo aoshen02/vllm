@@ -85,6 +85,7 @@ class SamplingMaskTensors(NamedTuple):
     # [num_requests]
     counts: torch.Tensor
     vocab_size: int
+    logprobs: torch.Tensor | None = None
 
     @classmethod
     def from_logits(
@@ -92,10 +93,15 @@ class SamplingMaskTensors(NamedTuple):
         logits: torch.Tensor,
         num_sampled_tokens: torch.Tensor,
         max_num_kept: int,
+        return_logprobs: bool = False,
     ) -> SamplingMaskTensors:
         """Capture the finite-logit support of every row with a sampled token."""
         num_reqs, vocab_size = logits.shape
-        max_num_kept = min(max_num_kept, vocab_size, MAX_COMPACT_SUPPORT)
+        max_num_kept = (
+            vocab_size
+            if return_logprobs
+            else min(max_num_kept, vocab_size, MAX_COMPACT_SUPPORT)
+        )
         device = logits.device
 
         token_ids = torch.empty(
@@ -119,16 +125,34 @@ class SamplingMaskTensors(NamedTuple):
             max_num_kept,
             BLOCK_SIZE=8192,
         )
-        return cls(token_ids, packed_mask, counts, vocab_size)
+        logprobs = None
+        if return_logprobs:
+            logprobs = torch.log_softmax(logits.float(), dim=-1)
+        return cls(token_ids, packed_mask, counts, vocab_size, logprobs)
 
     def to_cpu_nonblocking(self) -> SamplingMaskTensors:
         if self.token_ids.device.type == "cpu":
             return self
+        if self.logprobs is not None:
+            counts = self.counts.cpu()
+            width = int(counts.max())
+            ids = self.token_ids[:, :width]
+            positions = torch.arange(width, device=ids.device)[None, :]
+            safe_ids = torch.where(positions < self.counts[:, None], ids, 0)
+            scores = self.logprobs.gather(1, safe_ids.long())
+            return SamplingMaskTensors(
+                ids.to("cpu", non_blocking=True),
+                self.packed_mask.to("cpu", non_blocking=True),
+                counts,
+                self.vocab_size,
+                scores.to("cpu", non_blocking=True),
+            )
         return SamplingMaskTensors(
             self.token_ids.to("cpu", non_blocking=True),
             self.packed_mask.to("cpu", non_blocking=True),
             self.counts.to("cpu", non_blocking=True),
             self.vocab_size,
+            None,
         )
 
     def tolists(self) -> SamplingMaskLists:
@@ -150,4 +174,10 @@ class SamplingMaskTensors(NamedTuple):
         supports = [support(row) for row in range(len(counts))]
         offsets = np.zeros(len(supports) + 1, dtype=np.int64)
         np.cumsum([len(s) for s in supports], out=offsets[1:])
-        return SamplingMaskLists(np.concatenate(supports), offsets)
+        logprobs = None
+        if self.logprobs is not None:
+            scores = self.logprobs.cpu().numpy()
+            logprobs = np.concatenate(
+                [scores[row, :count] for row, count in enumerate(counts)]
+            )
+        return SamplingMaskLists(np.concatenate(supports), offsets, logprobs=logprobs)
