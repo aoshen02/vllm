@@ -169,8 +169,8 @@ class CuMemAllocator:
             return
 
         pool_entries = []
-        for key, entry in list(self.allocator_and_pools.items()):
-            use_count = entry[0].use_count()
+        for key in list(self.allocator_and_pools):
+            use_count = self.allocator_and_pools[key][0].use_count()
             if use_count != 1:
                 logger.warning(
                     "Keeping memory pool %s with %d live references", key, use_count
@@ -224,9 +224,6 @@ class CuMemAllocator:
             # still freeing the placeholder address.
             device, size, d_mem, _ = data.handle
             return (device, size, d_mem, [])
-        if data.is_asleep:
-            # sleep() released the memory; remap so the C++ free can unmap it.
-            create_and_map(data.handle)
         # Drain pending kernels before the C extension's cuMemUnmap.
         # The pluggable allocator path doesn't defer reclaim like the
         # regular caching allocator, so without this, in-flight work

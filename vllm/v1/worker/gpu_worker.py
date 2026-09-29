@@ -402,14 +402,15 @@ class Worker(WorkerBase):
             # This env var set by Ray causes exceptions with graph building.
             os.environ.pop("NCCL_ASYNC_ERROR_HANDLING", None)
             # See cumem_cudagraph_pool_enabled(); must precede communicator init.
-            if (
-                cumem_cudagraph_pool_enabled(self.vllm_config)
-                and os.environ.setdefault("NCCL_GRAPH_REGISTER", "0") != "0"
-            ):
-                raise ValueError(
-                    "NCCL_GRAPH_REGISTER must be 0 when sleep mode offloads "
-                    "Model Runner V2 CUDA graph pools; unset it."
-                )
+            if cumem_cudagraph_pool_enabled(self.vllm_config):
+                graph_register = os.environ.setdefault("NCCL_GRAPH_REGISTER", "0")
+                hook = os.getenv("TORCH_NCCL_USE_TENSOR_REGISTER_ALLOCATOR_HOOK", "0")
+                if graph_register != "0" or hook.lower() not in ("", "0", "false"):
+                    raise ValueError(
+                        "Unset NCCL_GRAPH_REGISTER and "
+                        "TORCH_NCCL_USE_TENSOR_REGISTER_ALLOCATOR_HOOK: sleep mode "
+                        "offloads Model Runner V2 CUDA graph pools."
+                    )
             parallel_config = self.parallel_config
             if (
                 parallel_config.distributed_executor_backend

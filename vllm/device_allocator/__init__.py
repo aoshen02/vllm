@@ -21,10 +21,11 @@ def cumem_cudagraph_pool_enabled(vllm_config: "VllmConfig") -> bool:
     """Whether decoder CUDA graphs are captured into cuMem pools that sleep
     mode offloads: Model Runner V2 with the cumem sleep backend on CUDA.
 
-    NCCL graph registration must then stay off (``NCCL_GRAPH_REGISTER=0``):
-    it retains the cuMem handles of graph buffers, pinning them through sleep,
-    and keeps stale registrations after wake remaps the pool, which causes
-    hangs or wrong results. An explicit opt-in is refused, not warned about.
+    NCCL buffer registration must then stay off (``NCCL_GRAPH_REGISTER=0``,
+    no ``TORCH_NCCL_USE_TENSOR_REGISTER_ALLOCATOR_HOOK``): it retains the cuMem
+    handles of graph buffers, pinning them through sleep, and keeps stale
+    registrations after wake remaps the pool, which causes hangs or wrong
+    results. An explicit opt-in is refused, not warned about.
     """
     return (
         vllm_config.use_v2_model_runner
@@ -49,15 +50,16 @@ def is_capturing_into_cumem_pool() -> bool:
     )
 
 
-_plain_cudagraph_pools: set[tuple[int, int]] = set()
+_plain_cudagraph_pool: tuple[int, int] | None = None
 
 
 def plain_cudagraph_pool_handle() -> tuple[int, int]:
     """A CUDA graph pool that is never routed through cuMem. Memory profiling
-    captures into it so that destroying its graphs frees it normally."""
-    pool = current_platform.graph_pool_handle()
-    _plain_cudagraph_pools.add(pool)
-    return pool
+    captures into it so that destroying its graphs frees it normally. Only the
+    latest one is kept; pool handles are never reused, so none can collide."""
+    global _plain_cudagraph_pool
+    _plain_cudagraph_pool = current_platform.graph_pool_handle()
+    return _plain_cudagraph_pool
 
 
 def use_cudagraph_pool(
@@ -66,7 +68,7 @@ def use_cudagraph_pool(
     """Route CUDA graph allocations through cuMem when sleep mode is enabled."""
     if (
         pool is not None
-        and pool not in _plain_cudagraph_pools
+        and pool != _plain_cudagraph_pool
         and cumem_cudagraph_pool_enabled(vllm_config)
     ):
         from vllm.device_allocator.cumem import CuMemAllocator
