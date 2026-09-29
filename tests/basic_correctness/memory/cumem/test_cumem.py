@@ -362,11 +362,3 @@ def test_cudagraph_pool_survives_sleep(level, monkeypatch):
     x.fill_(4.0)
     graph.replay()
     assert torch.equal(y, torch.full_like(y, 11.0))
-
-    # A live graph keeps the pool; it is released once the graph is gone.
-    allocator.release_cudagraph_pool(graph_pool)
-    assert graph_pool in allocator.allocator_and_pools
-    del graph, y, const
-    allocator.release_cudagraph_pool(graph_pool)
-    assert graph_pool not in allocator.allocator_and_pools
-    assert not graph_ptrs()

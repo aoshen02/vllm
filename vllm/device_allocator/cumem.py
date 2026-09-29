@@ -168,7 +168,6 @@ class CuMemAllocator:
         if not self.allocator_and_pools:
             return
 
-        gc.collect()
         pool_entries = []
         for key, entry in list(self.allocator_and_pools.items()):
             use_count = entry[0].use_count()
@@ -226,9 +225,7 @@ class CuMemAllocator:
             device, size, d_mem, _ = data.handle
             return (device, size, d_mem, [])
         if data.is_asleep:
-            # CUDA's free callback always unmaps its returned handle. Remap an
-            # empty allocation first because sleep() already released the old
-            # physical allocation.
+            # sleep() released the memory; remap so the C++ free can unmap it.
             create_and_map(data.handle)
         # Drain pending kernels before the C extension's cuMemUnmap.
         # The pluggable allocator path doesn't defer reclaim like the
@@ -462,30 +459,12 @@ class CuMemAllocator:
         old_tag = self.current_tag
         self.current_tag = self.cudagraph_tag
         try:
-            # capture_begin routes allocations itself; use_mem_pool would start
-            # recording to this pool twice.
+            # capture_begin routes allocations to this pool; no use_mem_pool.
             yield self.allocator_and_pools[pool][0].id
         finally:
             self.current_tag = old_tag
             if expandable_was_enabled:
                 set_alloc_conf(prev_conf)
-
-    def release_cudagraph_pool(self, pool: tuple[int, int]) -> None:
-        """Drop an unused profiling pool before its allocator wrapper."""
-        gc.collect()
-        entry = self.allocator_and_pools.get(pool)
-        if entry is None:
-            return
-        mem_pool, allocator = entry
-        use_count = mem_pool.use_count()
-        if use_count != 1:
-            logger.warning(
-                "Keeping CUDA graph pool %s with %d live references", pool, use_count
-            )
-            return
-        del self.allocator_and_pools[pool], entry, mem_pool
-        gc.collect()
-        del allocator
 
     def get_current_usage(self) -> int:
         """Get the total number of bytes allocated in the memory pool."""

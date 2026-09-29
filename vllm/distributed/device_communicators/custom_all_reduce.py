@@ -534,8 +534,7 @@ class CustomAllreduce:
             return None
         if self._IS_CAPTURING:
             if torch.cuda.is_current_stream_capturing():
-                # Graph buffers are IPC-registered after capture, which cuMem
-                # graph pools do not support; copy into the registered buffer.
+                # cuMem graph buffers cannot be IPC-registered; copy them instead.
                 return self.all_reduce(
                     input, registered=not is_capturing_into_cumem_pool()
                 )

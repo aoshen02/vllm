@@ -19,7 +19,13 @@ HandleType: TypeAlias = tuple[int, int, int, list[int] | int]
 
 def cumem_cudagraph_pool_enabled(vllm_config: "VllmConfig") -> bool:
     """Whether decoder CUDA graphs are captured into cuMem pools that sleep
-    mode offloads: Model Runner V2 with the cumem sleep backend on CUDA."""
+    mode offloads: Model Runner V2 with the cumem sleep backend on CUDA.
+
+    NCCL graph registration must then stay off (``NCCL_GRAPH_REGISTER=0``):
+    it retains the cuMem handles of graph buffers, pinning them through sleep,
+    and keeps stale registrations after wake remaps the pool, which causes
+    hangs or wrong results. An explicit opt-in is refused, not warned about.
+    """
     return (
         vllm_config.use_v2_model_runner
         and vllm_config.model_config.enable_sleep_mode
@@ -31,12 +37,10 @@ def cumem_cudagraph_pool_enabled(vllm_config: "VllmConfig") -> bool:
 def is_capturing_into_cumem_pool() -> bool:
     """Whether the ongoing CUDA graph capture allocates from a cuMem pool.
 
-    cuMem memory cannot be exported through legacy CUDA IPC
-    (``cudaIpcGetMemHandle``), so graph buffers allocated during such a
-    capture must not be IPC-registered.
+    Legacy CUDA IPC (``cudaIpcGetMemHandle``) rejects cuMem memory, so custom
+    allreduce copies such graph inputs into its pre-registered IPC buffer
+    instead of registering them after capture.
     """
-    if not current_platform.is_cuda():
-        return False
     from vllm.device_allocator.cumem import CuMemAllocator
 
     allocator = CuMemAllocator.instance
@@ -45,26 +49,30 @@ def is_capturing_into_cumem_pool() -> bool:
     )
 
 
+_plain_cudagraph_pools: set[tuple[int, int]] = set()
+
+
+def plain_cudagraph_pool_handle() -> tuple[int, int]:
+    """A CUDA graph pool that is never routed through cuMem. Memory profiling
+    captures into it so that destroying its graphs frees it normally."""
+    pool = current_platform.graph_pool_handle()
+    _plain_cudagraph_pools.add(pool)
+    return pool
+
+
 def use_cudagraph_pool(
     pool: tuple[int, int] | None, vllm_config: "VllmConfig"
 ) -> AbstractContextManager[tuple[int, int] | None]:
     """Route CUDA graph allocations through cuMem when sleep mode is enabled."""
-    if cumem_cudagraph_pool_enabled(vllm_config):
+    if (
+        pool is not None
+        and pool not in _plain_cudagraph_pools
+        and cumem_cudagraph_pool_enabled(vllm_config)
+    ):
         from vllm.device_allocator.cumem import CuMemAllocator
 
-        if pool is None:
-            raise ValueError("CUDA graph pool is required for cuMem capture")
         return CuMemAllocator.get_instance().use_cudagraph_pool(pool)
     return nullcontext(pool)
-
-
-def release_cudagraph_pool(pool: tuple[int, int]) -> None:
-    """Release a profiling pool after all its graphs have been destroyed."""
-    if current_platform.is_cuda():
-        from vllm.device_allocator.cumem import CuMemAllocator
-
-        if CuMemAllocator.instance is not None:
-            CuMemAllocator.instance.release_cudagraph_pool(pool)
 
 
 @dataclasses.dataclass

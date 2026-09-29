@@ -22,7 +22,7 @@ from vllm.compilation.cuda_graph import CUDAGraphStat, CUDAGraphWrapper
 from vllm.compilation.wrapper import TorchCompileWithNoGuardsWrapper
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.config.compilation import CUDAGraphMode
-from vllm.device_allocator import release_cudagraph_pool, use_cudagraph_pool
+from vllm.device_allocator import plain_cudagraph_pool_handle, use_cudagraph_pool
 from vllm.distributed.device_communicators.pynccl_allocator import set_graph_pool_id
 from vllm.distributed.parallel_state import (
     get_pp_group,
@@ -485,19 +485,21 @@ class CudaGraphManager:
                         if self._capture_mem_samples is not None:
                             torch.accelerator.synchronize()
                             free_before = torch.accelerator.get_memory_info()[0]
-                        with use_cudagraph_pool(self.pool, self.vllm_config) as pool:
+                        with (
+                            use_cudagraph_pool(self.pool, self.vllm_config) as pool,
+                            torch.cuda.graph(
+                                graph, pool, stream=self._capture_stream(desc)
+                            ),
+                        ):
                             set_graph_pool_id(
                                 pool or current_platform.graph_pool_handle()
                             )
-                            with torch.cuda.graph(
-                                graph, pool, stream=self._capture_stream(desc)
-                            ):
-                                forward_fn(CUDAGraphMode.NONE)
-                                # Join offloader's copy stream after forward to avoid
-                                # unjoined stream error. The last layer's start_prefetch
-                                # forks copy_stream, but wait_prefetch only happens in
-                                # the next forward pass.
-                                get_offloader().join_after_forward()
+                            forward_fn(CUDAGraphMode.NONE)
+                            # Join offloader's copy stream after forward to avoid
+                            # unjoined stream error. The last layer's start_prefetch
+                            # forks copy_stream, but wait_prefetch only happens in
+                            # the next forward pass.
+                            get_offloader().join_after_forward()
                         if self._capture_mem_samples is not None:
                             torch.accelerator.synchronize()
                             free_after = torch.accelerator.get_memory_info()[0]
@@ -901,7 +903,7 @@ def profile_cudagraph_memory(runner: "GPUModelRunner") -> int:
     # that pool ("use_count > 0 INTERNAL ASSERT FAILED").
     platform_cls = type(current_platform)
     saved_global_pool = platform_cls._global_graph_pool
-    throwaway_pool = current_platform.graph_pool_handle()
+    throwaway_pool = plain_cudagraph_pool_handle()
     platform_cls._global_graph_pool = throwaway_pool
 
     try:
@@ -971,7 +973,6 @@ def profile_cudagraph_memory(runner: "GPUModelRunner") -> int:
             _teardown_profiling_state(runner)
     finally:
         platform_cls._global_graph_pool = saved_global_pool
-        release_cudagraph_pool(throwaway_pool)
 
 
 def _extrapolate_full_graph_memory(mem_samples: list[int], total_graphs: int) -> int:

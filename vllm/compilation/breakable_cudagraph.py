@@ -382,20 +382,21 @@ class BreakableCUDAGraphWrapper:
         # pre-capture prefetches are complete and don't leak into the graph.
         get_offloader().sync_prev_onload()
 
-        with use_cudagraph_pool(self.graph_pool, self.vllm_config) as pool:
+        with (
+            use_cudagraph_pool(self.graph_pool, self.vllm_config) as pool,
+            BreakableCUDAGraphCapture(pool=pool) as capture,
+        ):
             set_graph_pool_id(pool or current_platform.graph_pool_handle())
-            capture = BreakableCUDAGraphCapture(pool=pool)
-            with capture:
-                output = self.runnable(*args, **kwargs)
-                # Join the offloader's copy stream while we still hold the last
-                # segment open, so the join is captured into the graph (otherwise
-                # we get an "unjoined stream" error on subsequent forwards).
-                get_offloader().join_after_forward()
-                # Convert output to a weak ref *inside* the capture context so the
-                # strong ref is dropped before the last segment closes, letting
-                # the cudagraph pool reclaim/reuse that memory immediately for
-                # the next batch descriptor's capture.
-                output = weak_ref_tensors(output)
+            output = self.runnable(*args, **kwargs)
+            # Join the offloader's copy stream while we still hold the last
+            # segment open, so the join is captured into the graph (otherwise
+            # we get an "unjoined stream" error on subsequent forwards).
+            get_offloader().join_after_forward()
+            # Convert output to a weak ref *inside* the capture context so the
+            # strong ref is dropped before the last segment closes, letting
+            # the cudagraph pool reclaim/reuse that memory immediately for
+            # the next batch descriptor's capture.
+            output = weak_ref_tensors(output)
 
         entry.capture = capture
         entry.output = weak_ref_tensors(output)
