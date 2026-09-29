@@ -219,6 +219,9 @@ async fn generate_chunk_stream(
                 } else {
                     None
                 };
+                let (sampling_mask, sampling_mask_logprobs) = output
+                    .sampling_mask
+                    .map_or((None, None), |mask| (Some(mask.rows), mask.logprobs));
 
                 let prompt_token_ids = prompt_token_ids.take();
                 y.yield_ok(GenerateStreamResponse {
@@ -228,6 +231,8 @@ async fn generate_chunk_stream(
                         logprobs,
                         finish_reason: finish_reason.map(|reason| reason.as_str().to_string()),
                         token_ids,
+                        sampling_mask,
+                        sampling_mask_logprobs,
                     }],
                     usage: include_continuous_usage
                         .then(|| Usage::from_token_usage(usage, enable_prompt_tokens_details)),
@@ -311,6 +316,9 @@ fn collect_generate(
         None
     };
     let finish_reason = collected.finish_reason.as_str().to_string();
+    let (sampling_mask, sampling_mask_logprobs) = collected
+        .sampling_mask
+        .map_or((None, None), |mask| (Some(mask.rows), mask.logprobs));
 
     if enable_log_requests {
         info!(
@@ -328,6 +336,8 @@ fn collect_generate(
             logprobs,
             finish_reason: Some(finish_reason),
             token_ids: collected.token_ids,
+            sampling_mask,
+            sampling_mask_logprobs,
         }],
         prompt_logprobs,
         prompt_token_ids: return_token_ids.then_some(collected.prompt_token_ids),
@@ -485,6 +495,7 @@ mod tests {
     use futures::{TryStreamExt as _, stream};
     use vllm_engine_core_client::protocol::multimodal::{MmModality, PlaceholderRange};
     use vllm_engine_core_client::protocol::output::RequestSpecDecodeMetrics;
+    use vllm_engine_core_client::protocol::sampling_mask::SamplingMask;
     use vllm_llm::GeneratePromptInfo;
 
     use super::*;
@@ -625,6 +636,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn generate_chunk_stream_returns_aligned_sampling_mask_logprobs() {
+        let mut output = stream_output(Some(&[11]), vec![33], Some(FinishReason::Length));
+        output.sampling_mask = Some(SamplingMask {
+            rows: vec![vec![33, 44]],
+            logprobs: Some(vec![vec![-0.1, -0.2]]),
+        });
+        let chunks = collect_chunks(vec![output], false, None).await;
+        let choice = &chunks[0].choices[0];
+        assert_eq!(choice.sampling_mask, Some(vec![vec![33, 44]]));
+        assert_eq!(choice.sampling_mask_logprobs, Some(vec![vec![-0.1, -0.2]]));
+    }
+
+    #[tokio::test]
     async fn generate_chunk_stream_omits_prompt_metadata_by_default() {
         let chunks = collect_chunks(
             vec![
@@ -758,7 +782,10 @@ mod tests {
             kv_transfer_params: None,
             ec_transfer_params: None,
             prompt_token_ids: vec![10, 20],
-            sampling_mask: None,
+            sampling_mask: Some(SamplingMask {
+                rows: vec![vec![30, 40]],
+                logprobs: Some(vec![vec![-0.1, -0.2]]),
+            }),
             spec_decode_metrics: None,
         };
 
@@ -779,6 +806,11 @@ mod tests {
 
         assert!(response.prompt_token_ids.is_none());
         assert!(response.mm_placeholders.is_none());
+        assert_eq!(response.choices[0].sampling_mask, Some(vec![vec![30, 40]]));
+        assert_eq!(
+            response.choices[0].sampling_mask_logprobs,
+            Some(vec![vec![-0.1, -0.2]])
+        );
     }
 
     #[test]

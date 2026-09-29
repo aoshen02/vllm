@@ -879,6 +879,7 @@ mod tests {
         let mut fin = finished(FinishReason::Length);
         fin.sampling_mask = Some(SamplingMask {
             rows: vec![vec![1, 10], vec![2, 20]],
+            ..Default::default()
         });
 
         let terminal =
