@@ -37,8 +37,9 @@ def _compact_sampling_mask_kernel(
     vocab_size,
     max_num_kept,
     BLOCK_SIZE: tl.constexpr,
+    STORE_PACKED_MASK: tl.constexpr,
 ):
-    """Per row: first ``max_num_kept`` finite-logit ids, the full count, the bitmask."""
+    """Per row: finite-logit ids, full count, and optionally the bitmask."""
     req_idx = tl.program_id(0)
     is_active = tl.load(num_sampled_tokens_ptr + req_idx) > 0
     count = tl.zeros((), dtype=tl.int32)
@@ -60,13 +61,16 @@ def _compact_sampling_mask_kernel(
         )
         count += tl.sum(keep_i32)
 
-        bits = tl.reshape(keep_i32, (BLOCK_SIZE // 8, 8)) << tl.arange(0, 8)[None, :]
-        byte_offsets = start_idx // 8 + tl.arange(0, BLOCK_SIZE // 8)
-        tl.store(
-            packed_mask_ptr + req_idx * packed_mask_row_stride + byte_offsets,
-            tl.sum(bits, axis=1).to(tl.uint8),
-            mask=byte_offsets < tl.cdiv(vocab_size, 8),
-        )
+        if STORE_PACKED_MASK:
+            bits = (
+                tl.reshape(keep_i32, (BLOCK_SIZE // 8, 8)) << tl.arange(0, 8)[None, :]
+            )
+            byte_offsets = start_idx // 8 + tl.arange(0, BLOCK_SIZE // 8)
+            tl.store(
+                packed_mask_ptr + req_idx * packed_mask_row_stride + byte_offsets,
+                tl.sum(bits, axis=1).to(tl.uint8),
+                mask=byte_offsets < tl.cdiv(vocab_size, 8),
+            )
 
     tl.store(counts_ptr + req_idx, count)
 
@@ -81,7 +85,7 @@ class SamplingMaskTensors(NamedTuple):
 
     # [num_requests, max_num_kept]
     token_ids: torch.Tensor
-    # [num_requests, ceil(vocab_size / 8)]
+    # [num_requests, ceil(vocab_size / 8)] or empty when returning logprobs
     packed_mask: torch.Tensor
     # [num_requests]
     counts: torch.Tensor
@@ -106,7 +110,9 @@ class SamplingMaskTensors(NamedTuple):
             (num_reqs, max_num_kept), dtype=torch.int32, device=device
         )
         packed_mask = torch.empty(
-            (num_reqs, (vocab_size + 7) // 8), dtype=torch.uint8, device=device
+            (num_reqs, 0 if return_logprobs else (vocab_size + 7) // 8),
+            dtype=torch.uint8,
+            device=device,
         )
         counts = torch.empty(num_reqs, dtype=torch.int32, device=device)
         _compact_sampling_mask_kernel[(num_reqs,)](
@@ -122,6 +128,7 @@ class SamplingMaskTensors(NamedTuple):
             vocab_size,
             max_num_kept,
             BLOCK_SIZE=8192,
+            STORE_PACKED_MASK=not return_logprobs,
         )
         return cls(
             token_ids,
@@ -155,6 +162,7 @@ class SamplingMaskTensors(NamedTuple):
                     self.vocab_size,
                     width,
                     BLOCK_SIZE=8192,
+                    STORE_PACKED_MASK=False,
                 )
             ids = token_ids[:, :width]
             positions = torch.arange(width, device=ids.device)[None, :]
@@ -166,7 +174,7 @@ class SamplingMaskTensors(NamedTuple):
             )
             return SamplingMaskTensors(
                 ids.to("cpu", non_blocking=True),
-                self.packed_mask.to("cpu", non_blocking=True),
+                torch.empty(0, dtype=torch.uint8, device="cpu"),
                 counts,
                 self.vocab_size,
                 scores.to("cpu", non_blocking=True),

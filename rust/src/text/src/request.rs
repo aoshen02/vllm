@@ -35,6 +35,33 @@ pub fn normalize_top_k(value: i64) -> std::result::Result<Option<u32>, String> {
     }
 }
 
+pub(crate) fn deserialize_top_k<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<u32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<i64>::deserialize(deserializer)?
+        .map(normalize_top_k)
+        .transpose()
+        .map(Option::flatten)
+        .map_err(serde::de::Error::custom)
+}
+
+pub fn deserialize_request_top_k<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<u32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    match Option::<i64>::deserialize(deserializer)? {
+        None => Ok(None),
+        Some(value) => normalize_top_k(value)
+            .map(|value| Some(value.unwrap_or(0)))
+            .map_err(serde::de::Error::custom),
+    }
+}
+
 /// One raw text-generation prompt.
 ///
 /// This supports either ordinary text that still needs tokenization or
@@ -74,7 +101,8 @@ pub struct SamplingParams {
     pub watermarking: bool,
     /// Cumulative probability threshold for nucleus sampling.
     pub top_p: Option<f32>,
-    /// Maximum number of top tokens to consider. `Some(0)` means all tokens.
+    /// Maximum number of top tokens to consider. `Some(0)` disables top-k.
+    #[serde(deserialize_with = "deserialize_request_top_k")]
     pub top_k: Option<u32>,
     /// Random seed used by the sampler when present.
     pub seed: Option<i64>,
@@ -290,6 +318,21 @@ impl TextRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sampling_params_accepts_disabled_top_k() {
+        for top_k in [-1, 0, 20] {
+            let params: SamplingParams =
+                serde_json::from_str(&format!(r#"{{"top_k":{top_k}}}"#)).unwrap();
+            assert_eq!(
+                params.top_k,
+                Some(normalize_top_k(top_k).unwrap().unwrap_or(0))
+            );
+        }
+        let params: SamplingParams = serde_json::from_str(r#"{"top_k":null}"#).unwrap();
+        assert_eq!(params.top_k, None);
+        assert!(serde_json::from_str::<SamplingParams>(r#"{"top_k":-2}"#).is_err());
+    }
 
     #[test]
     fn validate_rejects_empty_stop_string_at_shared_chokepoint() {

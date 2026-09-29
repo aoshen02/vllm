@@ -60,6 +60,8 @@ IDs. This works with pure top-p (`top_k=-1`) without requesting full-vocabulary
 `logprobs=-1`. In streaming mode, each token chunk carries its own mask and
 scores. The server transfers each batch up to its widest support, which
 requires a GPU-to-CPU support-size readback each step.
+Without top-k, set `top_p < 1` or `min_p > 0` to avoid returning the entire
+vocabulary. A large nucleus can still increase response size substantially.
 
 ## Requirements
 

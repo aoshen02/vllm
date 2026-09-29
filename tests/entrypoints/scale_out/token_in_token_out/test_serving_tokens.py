@@ -137,10 +137,6 @@ async def test_generate_rejects_min_tokens_above_filled_max_tokens(client):
 
 
 @pytest.mark.asyncio
-@pytest.mark.skipif(
-    envs.VLLM_USE_RUST_FRONTEND,
-    reason="sampling mask output is not supported by the Rust frontend",
-)
 @pytest.mark.parametrize(
     "server",
     [["--return-sampling-mask", "--logprobs-mode", "processed_logprobs"]],
@@ -185,10 +181,6 @@ async def test_generate_sampling_mask(client):
 
 
 @pytest.mark.asyncio
-@pytest.mark.skipif(
-    envs.VLLM_USE_RUST_FRONTEND,
-    reason="sampling mask output is not supported by the Rust frontend",
-)
 @pytest.mark.parametrize("stream", [False, True])
 @pytest.mark.parametrize(
     "server",
@@ -238,6 +230,37 @@ async def test_generate_sampling_mask_logprobs(client, stream):
         assert token_id in mask
         assert len(mask) == len(logprobs)
         assert sum(math.exp(logprob) for logprob in logprobs) == pytest.approx(1.0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "server",
+    [
+        [
+            "--return-sampling-mask",
+            "--return-sampling-mask-logprobs",
+            "--logprobs-mode",
+            "processed_logprobs",
+        ]
+    ],
+    indirect=True,
+)
+async def test_generate_sampling_mask_logprobs_rejects_full_vocab(client):
+    resp = await client.post(
+        GEN_ENDPOINT,
+        json={
+            "model": MODEL_NAME,
+            "token_ids": [1, 2, 3],
+            "sampling_params": {
+                "max_tokens": 4,
+                "temperature": 1.0,
+                "top_p": 1.0,
+                "top_k": -1,
+            },
+        },
+    )
+    assert resp.status_code == 400
+    assert "avoid returning the entire vocabulary" in resp.text
 
 
 @pytest.mark.asyncio
@@ -322,6 +345,8 @@ async def test_generate_stream(client):
         choice = chunk["choices"][0]
         assert "token_ids" in choice
         assert len(choice["token_ids"]) > 0
+        assert "sampling_mask" not in choice
+        assert "sampling_mask_logprobs" not in choice
         all_token_ids.extend(choice["token_ids"])
 
     # Last chunk should have a finish_reason

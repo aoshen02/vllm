@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use thiserror_ext::AsReport as _;
 
 use crate::error::{Error, Result};
-use crate::normalize_top_k;
+use crate::request::deserialize_top_k;
 
 /// Minimal subset of `tokenizer_config.json` needed by chat/EOS handling.
 #[derive(Debug, Default, Deserialize)]
@@ -119,21 +119,6 @@ pub(super) struct GenerationConfig {
     pub min_p: Option<f32>,
     pub repetition_penalty: Option<f32>,
     pub max_new_tokens: Option<u32>,
-}
-
-/// Deserialize a generation-config `top_k` into the text sampling model.
-///
-/// Null, `-1`, and `0` all disable top-k sampling; positive limits are
-/// preserved.
-fn deserialize_top_k<'de, D>(deserializer: D) -> std::result::Result<Option<u32>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    Option::<i64>::deserialize(deserializer)?
-        .map(normalize_top_k)
-        .transpose()
-        .map(Option::flatten)
-        .map_err(serde::de::Error::custom)
 }
 
 /// HF generation configs allow either one EOS id or a list of EOS ids.
