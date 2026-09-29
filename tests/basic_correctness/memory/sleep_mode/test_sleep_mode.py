@@ -193,6 +193,36 @@ def test_deep_sleep_lora_tp2(monkeypatch):
     assert output[0].outputs[0].text == output2[0].outputs[0].text
 
 
+@multi_gpu_test(num_gpus=2)
+def test_sleep_cudagraph_custom_allreduce_tp2(monkeypatch):
+    """TP=2 sleep/wake with Model Runner V2 CUDA graphs in cuMem graph pools
+    and the legacy custom allreduce. Capture must not IPC-register cuMem graph
+    buffers (``cudaIpcGetMemHandle`` rejects them and the worker dies)."""
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    monkeypatch.setenv("VLLM_ALLREDUCE_USE_FLASHINFER", "0")
+    monkeypatch.setenv("VLLM_ALLREDUCE_USE_SYMM_MEM", "0")
+    monkeypatch.delenv("NCCL_GRAPH_REGISTER", raising=False)
+
+    llm = LLM(
+        "hmellor/tiny-random-LlamaForCausalLM",
+        enable_sleep_mode=True,
+        tensor_parallel_size=2,
+        compilation_config={"pass_config": {"fuse_allreduce_rms": False}},
+    )
+    prompt = "How are you?"
+    sampling_params = SamplingParams(temperature=0, max_tokens=10)
+    expected = llm.generate(prompt, sampling_params)[0].outputs[0].text
+
+    for level in (1, 2):
+        llm.sleep(level=level)
+        llm.wake_up(tags=["weights"])
+        if level == 2:
+            llm.collective_rpc("reload_weights")
+        llm.wake_up(tags=["kv_cache"])
+        output = llm.generate(prompt, sampling_params)
+        assert output[0].outputs[0].text == expected
+
+
 @create_new_process_for_each_test()
 def test_deep_sleep_async(gpu_memory_cleared):
     async def test():

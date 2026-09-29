@@ -19,7 +19,10 @@ import torch.nn as nn
 import vllm.envs as envs
 from vllm.config import CUDAGraphMode, VllmConfig, set_current_vllm_config
 from vllm.config.compilation import CompilationMode
-from vllm.device_allocator import get_mem_allocator_instance
+from vllm.device_allocator import (
+    cumem_cudagraph_pool_enabled,
+    get_mem_allocator_instance,
+)
 from vllm.distributed import (
     ensure_model_parallel_initialized,
     init_distributed_environment,
@@ -398,6 +401,22 @@ class Worker(WorkerBase):
         if self.device_config.device_type == "cuda":
             # This env var set by Ray causes exceptions with graph building.
             os.environ.pop("NCCL_ASYNC_ERROR_HANDLING", None)
+            # With cuMem graph pools, NCCL graph registration retains the cuMem
+            # handles of graph buffers: they stay pinned through sleep, and once
+            # wake remaps new memory at the same address NCCL keeps using the
+            # stale registration (hangs or wrong results). Default it off before
+            # the communicators are created below; an explicit opt-in is a
+            # silent correctness hazard, so refuse it rather than warn.
+            if (
+                cumem_cudagraph_pool_enabled(self.vllm_config)
+                and os.environ.setdefault("NCCL_GRAPH_REGISTER", "0") != "0"
+            ):
+                raise ValueError(
+                    "NCCL_GRAPH_REGISTER must be 0 with sleep mode on Model "
+                    "Runner V2: CUDA graph pools are cuMem-backed and remapped on "
+                    "wake, which stale NCCL registrations do not survive. Unset "
+                    "NCCL_GRAPH_REGISTER."
+                )
             parallel_config = self.parallel_config
             if (
                 parallel_config.distributed_executor_backend

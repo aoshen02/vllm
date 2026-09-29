@@ -10,6 +10,7 @@ from torch.distributed import ProcessGroup
 
 import vllm.envs as envs
 from vllm import _custom_ops as ops
+from vllm.device_allocator import is_capturing_into_cumem_pool
 from vllm.distributed.device_communicators.all_reduce_utils import (
     CUSTOM_ALL_REDUCE_MAX_SIZES,
     gpu_p2p_access_check,
@@ -533,7 +534,11 @@ class CustomAllreduce:
             return None
         if self._IS_CAPTURING:
             if torch.cuda.is_current_stream_capturing():
-                return self.all_reduce(input, registered=True)
+                # Graph buffers are IPC-registered after capture, which cuMem
+                # graph pools do not support; copy into the registered buffer.
+                return self.all_reduce(
+                    input, registered=not is_capturing_into_cumem_pool()
+                )
             else:
                 # If warm up, mimic the allocation pattern since custom
                 # allreduce is out-of-place.
