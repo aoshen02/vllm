@@ -440,18 +440,19 @@ class RequestState:
 
         sampling_mask = None
         if self.sampling_mask_chunks and (finished or (delta and token_ids)):
-            chunks = self.sampling_mask_chunks[:]
+            chunks = self.sampling_mask_chunks
             if delta:
                 chunks = chunks[-len(token_ids) :] if token_ids else []
                 self.sampling_mask_chunks.clear()
             if chunks:
+                mask_logprobs = [
+                    chunk.logprobs.tolist()
+                    for chunk in chunks
+                    if chunk.logprobs is not None
+                ]
                 sampling_mask = SamplingMask(
                     [chunk.token_ids.tolist() for chunk in chunks],
-                    (
-                        [chunk.logprobs.tolist() for chunk in chunks]
-                        if chunks[0].logprobs is not None
-                        else None
-                    ),
+                    mask_logprobs or None,
                 )
 
         # Concatenate routed experts on finish

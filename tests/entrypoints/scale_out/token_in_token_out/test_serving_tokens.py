@@ -3,7 +3,6 @@
 
 import io
 import json
-import math
 
 import httpx
 import numpy as np
@@ -232,7 +231,7 @@ async def test_generate_sampling_mask_logprobs(client, stream):
     for token_id, mask, logprobs in zip(token_ids, masks, scores, strict=True):
         assert token_id in mask
         assert len(mask) == len(logprobs)
-        assert sum(math.exp(logprob) for logprob in logprobs) == pytest.approx(1.0)
+        assert np.exp(logprobs).sum() == pytest.approx(1.0)
 
 
 @pytest.mark.asyncio

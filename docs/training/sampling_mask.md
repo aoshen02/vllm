@@ -58,8 +58,7 @@ For score centering, add `--return-sampling-mask-logprobs` to return
 normalized over the post-filtering support and have the same order as the token
 IDs. This works with pure top-p (`top_k=-1`) without requesting full-vocabulary
 `logprobs=-1`. In streaming mode, each token chunk carries its own mask and
-scores. Only the surviving IDs and scores are transferred, which requires a
-GPU-to-CPU support-size readback each step.
+scores. Only the surviving IDs and scores are transferred.
 Without top-k, set `top_p < 1` or `min_p > 0` to avoid returning the entire
 vocabulary. A large nucleus can still increase response size substantially.
 

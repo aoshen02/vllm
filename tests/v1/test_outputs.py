@@ -187,21 +187,6 @@ def test_sampling_mask_logprobs_match_processed_distribution(top_k):
     assert np.exp(mask.logprobs).sum() == pytest.approx(1.0)
 
 
-def test_sampling_mask_logprobs_keep_support_wider_than_top_k():
-    logits = torch.tensor([[5.0, 4.0, 3.0, 2.0]], device=DEVICE_TYPE)
-    mask = SamplingMaskTensors.from_logits(
-        logits,
-        torch.tensor([1], device=DEVICE_TYPE),
-        max_num_kept=2,
-        return_logprobs=True,
-    )
-    result = mask.to_cpu_nonblocking().tolists()
-    assert result.token_ids.tolist() == [0, 1, 2, 3]
-    torch.testing.assert_close(
-        torch.from_numpy(result.logprobs), torch.log_softmax(logits[0].cpu(), dim=-1)
-    )
-
-
 def test_sampling_mask_logprobs_keep_support_wider_than_compact_buffer():
     vocab_size = 10_000
     support_sizes = [0, 1, 2_049, 8_192]

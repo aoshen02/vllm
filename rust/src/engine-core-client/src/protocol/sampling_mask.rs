@@ -169,18 +169,19 @@ impl WireSamplingMask {
             );
         }
 
-        let rows = offsets
-            .windows(2)
-            .map(|pair| token_ids[pair[0] as usize..pair[1] as usize].to_vec())
-            .collect();
-        let logprobs = logprobs.map(|values| {
-            offsets
-                .windows(2)
-                .map(|pair| values[pair[0] as usize..pair[1] as usize].to_vec())
-                .collect()
-        });
-        Ok(SamplingMask { rows, logprobs })
+        Ok(SamplingMask {
+            rows: split_rows(&token_ids, &offsets),
+            logprobs: logprobs.map(|values| split_rows(&values, &offsets)),
+        })
     }
+}
+
+/// Split CSR values into per-request rows using validated offsets.
+fn split_rows<T: Clone>(values: &[T], offsets: &[u32]) -> Vec<Vec<T>> {
+    offsets
+        .windows(2)
+        .map(|pair| values[pair[0] as usize..pair[1] as usize].to_vec())
+        .collect()
 }
 
 #[cfg(test)]

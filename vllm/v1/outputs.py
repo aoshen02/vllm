@@ -69,13 +69,10 @@ class SamplingMaskLists(NamedTuple):
 
     def slice_request(self, req_idx: int, num_positions: int) -> "SamplingMaskLists":
         assert num_positions == 1 and self.offsets is not None
+        rows = slice(self.offsets[req_idx], self.offsets[req_idx + 1])
         return SamplingMaskLists(
-            self.token_ids[self.offsets[req_idx] : self.offsets[req_idx + 1]],
-            logprobs=(
-                self.logprobs[self.offsets[req_idx] : self.offsets[req_idx + 1]]
-                if self.logprobs is not None
-                else None
-            ),
+            self.token_ids[rows],
+            logprobs=self.logprobs[rows] if self.logprobs is not None else None,
         )
 
     def to_nested_list(self) -> list[list[int]]:
