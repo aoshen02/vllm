@@ -90,17 +90,17 @@ def test_sampling_mask_lists_keep_logprobs_aligned_on_request_slice():
 
 def test_sampling_mask_cpu_logprobs_follow_token_ids():
     tensors = SamplingMaskTensors(
-        token_ids=torch.tensor([[2, 0, 0, 0]], dtype=torch.int32),
-        packed_mask=torch.tensor([[0b0101]], dtype=torch.uint8),
-        counts=torch.tensor([2], dtype=torch.int32),
+        token_ids=torch.tensor([0, 2, 1], dtype=torch.int32),
+        packed_mask=torch.empty((2, 0), dtype=torch.uint8),
+        counts=torch.tensor([2, 1], dtype=torch.int32),
         vocab_size=4,
-        logprobs=torch.tensor([[-0.3, -1.1, 0.0, 0.0]]),
+        logprobs=torch.tensor([-0.3, -1.1, 0.0]),
     )
 
     mask = tensors.to_cpu_nonblocking().tolists()
 
-    assert mask.token_ids.tolist() == [2, 0]
-    assert mask.logprobs.tolist() == pytest.approx([-0.3, -1.1])
+    assert mask.to_nested_list() == [[0, 2], [1]]
+    assert mask.logprobs.tolist() == pytest.approx([-0.3, -1.1, 0.0])
 
 
 @pytest.mark.parametrize("max_num_kept", [512, 20_001])
@@ -223,7 +223,8 @@ def test_sampling_mask_logprobs_keep_support_wider_than_compact_buffer():
         max_num_kept=1,
         return_logprobs=True,
     )
-    assert tensors.token_ids.shape[1] == 1
+    assert tensors.token_ids.shape == (sum(support_sizes),)
+    assert tensors.packed_mask.shape[1] == 0
     result = tensors.to_cpu_nonblocking().tolists()
     assert result.to_nested_list() == expected_ids
     assert result.logprobs is not None

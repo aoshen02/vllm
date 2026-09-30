@@ -6,9 +6,9 @@ import asyncio
 import time
 from collections.abc import AsyncGenerator
 from collections.abc import Sequence as GenericSequence
+from typing import Any
 
 import msgspec
-import numpy as np
 from fastapi import Request
 
 from vllm.engine.protocol import EngineClient
@@ -133,16 +133,6 @@ class ServingTokens(GenerateBaseServing):
             raw_request.state.request_metadata = request_metadata
 
         sampling_params = request.sampling_params
-        if (
-            self.model_config.return_sampling_mask_logprobs
-            and sampling_params.top_k <= 0
-            and np.float32(sampling_params.top_p) == 1.0
-            and np.float32(sampling_params.min_p) == 0.0
-        ):
-            return self.create_error_response(
-                "sampling distribution replay requires top_k > 0 or "
-                "top_p < 1 or min_p > 0 to avoid returning the entire vocabulary"
-            )
         max_num_seqs = self.engine_client.vllm_config.scheduler_config.max_num_seqs
         if sampling_params.n > max_num_seqs:
             return self.create_error_response(
@@ -542,7 +532,7 @@ class ServingTokens(GenerateBaseServing):
                             total_tokens=(num_prompt_tokens + num_generated_tokens[i]),
                         )
 
-                    exclude = {
+                    exclude: dict[str, Any] = {
                         name: True
                         for name in ("prompt_token_ids", "mm_placeholders", "metrics")
                         if getattr(chunk, name) is None

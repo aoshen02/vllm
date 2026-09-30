@@ -164,8 +164,10 @@ class InputProcessor:
 
             if self.model_config.return_sampling_mask:
                 if params.temperature <= 0:
-                    raise ValueError(
-                        "sampling distribution replay requires temperature > 0"
+                    raise VLLMValidationError(
+                        "sampling distribution replay requires temperature > 0",
+                        parameter="temperature",
+                        value=params.temperature,
                     )
                 if params.top_k <= 0 and (
                     not self.model_config.return_sampling_mask_logprobs
@@ -174,10 +176,12 @@ class InputProcessor:
                         and np.float32(params.min_p) == 0.0
                     )
                 ):
-                    raise ValueError(
+                    raise VLLMValidationError(
                         "sampling distribution replay requires top_k > 0 or "
                         "top_p < 1 or min_p > 0 to avoid returning the entire "
-                        "vocabulary"
+                        "vocabulary",
+                        parameter="top_k",
+                        value=params.top_k,
                     )
             if params.thinking_token_budget is not None and (
                 self.vllm_config.reasoning_config is None
