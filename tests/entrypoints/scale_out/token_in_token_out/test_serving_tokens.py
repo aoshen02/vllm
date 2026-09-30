@@ -348,8 +348,6 @@ async def test_generate_stream(client):
         choice = chunk["choices"][0]
         assert "token_ids" in choice
         assert len(choice["token_ids"]) > 0
-        assert "sampling_mask" not in choice
-        assert "sampling_mask_logprobs" not in choice
         all_token_ids.extend(choice["token_ids"])
 
     # Last chunk should have a finish_reason

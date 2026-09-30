@@ -6,7 +6,6 @@ import asyncio
 import time
 from collections.abc import AsyncGenerator
 from collections.abc import Sequence as GenericSequence
-from typing import Any
 
 import msgspec
 from fastapi import Request
@@ -532,17 +531,11 @@ class ServingTokens(GenerateBaseServing):
                             total_tokens=(num_prompt_tokens + num_generated_tokens[i]),
                         )
 
-                    exclude: dict[str, Any] = {
-                        name: True
+                    # Omit fields that are absent from token-bearing chunks.
+                    exclude = {
+                        name
                         for name in ("prompt_token_ids", "mm_placeholders", "metrics")
                         if getattr(chunk, name) is None
-                    }
-                    exclude["choices"] = {
-                        "__all__": {
-                            name
-                            for name in ("sampling_mask", "sampling_mask_logprobs")
-                            if getattr(chunk.choices[0], name) is None
-                        }
                     }
                     yield f"data: {chunk.model_dump_json(exclude=exclude)}\n\n"
 
