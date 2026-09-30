@@ -363,11 +363,6 @@ pub struct SharedRuntimeArgs {
     #[serde(default)]
     pub enable_scale_out: bool,
 
-    /// Return scores aligned with the sampling mask.
-    #[arg(long)]
-    #[serde(default)]
-    pub return_sampling_mask_logprobs: bool,
-
     /// Send an SSE keep-alive comment line every this many seconds when a
     /// streaming response is idle (queued, prefill, or between tokens), to
     /// prevent reverse proxies/tunnels with read timeouts from closing the
@@ -635,7 +630,6 @@ impl SharedRuntimeArgs {
             enable_prompt_tokens_details: self.enable_prompt_tokens_details,
             enable_request_id_headers: self.enable_request_id_headers,
             enable_scale_out: self.enable_scale_out,
-            return_sampling_mask_logprobs: self.return_sampling_mask_logprobs,
             sse_keep_alive_interval: (self.sse_keep_alive_interval > 0)
                 .then(|| Duration::from_secs(self.sse_keep_alive_interval)),
         }
@@ -818,11 +812,7 @@ impl ServeArgs {
             serde_json::to_string(&self.runtime.hf_overrides).expect("JSON object serializes")
         });
 
-        let mut managed_engine = self.managed_engine.clone();
-        if self.runtime.return_sampling_mask_logprobs {
-            managed_engine.python_args.push("--return-sampling-mask-logprobs".into());
-        }
-        managed_engine.into_config(
+        self.managed_engine.clone().into_config(
             self.runtime.model.clone(),
             self.runtime.revision.clone(),
             self.runtime.max_logprobs,

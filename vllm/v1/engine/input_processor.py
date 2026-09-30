@@ -6,8 +6,6 @@ from collections.abc import Callable, Mapping
 from functools import partial
 from typing import Any, Literal
 
-import numpy as np
-
 import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.exceptions import VLLMValidationError
@@ -36,6 +34,7 @@ from vllm.utils.diffusion import validate_diffusion_sampling_params
 from vllm.utils.jsontree import json_iter_leaves
 from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.kv_hints import KvHintsEnvelope
+from vllm.v1.outputs import MAX_COMPACT_SUPPORT
 
 logger = init_logger(__name__)
 
@@ -169,17 +168,22 @@ class InputProcessor:
                         parameter="temperature",
                         value=params.temperature,
                     )
-                if params.top_k <= 0 and (
-                    not self.model_config.return_sampling_mask_logprobs
-                    or (
-                        np.float32(params.top_p) == 1.0
-                        and np.float32(params.min_p) == 0.0
+                if params.top_k <= 0:
+                    raise VLLMValidationError(
+                        "sampling distribution replay requires top_k > 0 to "
+                        "bound sampling mask size, reduce transfer overhead, "
+                        "and avoid potential OOMs",
+                        parameter="top_k",
+                        value=params.top_k,
                     )
+                if (
+                    self.model_config.return_sampling_mask_logprobs
+                    and params.top_k > MAX_COMPACT_SUPPORT
                 ):
                     raise VLLMValidationError(
-                        "sampling distribution replay requires top_k > 0 or "
-                        "top_p < 1 or min_p > 0 to avoid returning the entire "
-                        "vocabulary",
+                        "sampling mask logprobs use a fixed "
+                        f"[num_requests, top_k] buffer capped at top_k <= "
+                        f"{MAX_COMPACT_SUPPORT}; lower top_k",
                         parameter="top_k",
                         value=params.top_k,
                     )

@@ -92,19 +92,6 @@ pub async fn generate(
     );
 
     let api_server_options = state.api_server_options;
-    if api_server_options.return_sampling_mask_logprobs {
-        let params = &prepared.text_request.sampling_params;
-        if params.top_k.unwrap_or(0) == 0
-            && params.top_p.unwrap_or(1.0) == 1.0
-            && params.min_p.unwrap_or(0.0) == 0.0
-        {
-            return ApiError::invalid_request(
-                "sampling distribution replay requires top_k > 0 or top_p < 1 or min_p > 0 to avoid returning the entire vocabulary",
-                Some("sampling_params"),
-            )
-            .into_response();
-        }
-    }
     let stream = prepared.stream;
     let raw_stream = match state
         .chat

@@ -197,6 +197,7 @@ async def test_generate_sampling_mask(client):
     indirect=True,
 )
 async def test_generate_sampling_mask_logprobs(client, stream):
+    top_k = 20
     payload = {
         "model": MODEL_NAME,
         "token_ids": [1, 2, 3],
@@ -204,7 +205,7 @@ async def test_generate_sampling_mask_logprobs(client, stream):
             "max_tokens": 4,
             "temperature": 1.0,
             "top_p": 0.9,
-            "top_k": -1,
+            "top_k": top_k,
             "ignore_eos": True,
             "seed": 42,
         },
@@ -229,6 +230,7 @@ async def test_generate_sampling_mask_logprobs(client, stream):
     ]
     assert len(token_ids) == len(masks) == len(scores) == 4
     for token_id, mask, logprobs in zip(token_ids, masks, scores, strict=True):
+        assert 0 < len(mask) <= top_k
         assert token_id in mask
         assert len(mask) == len(logprobs)
         assert np.exp(logprobs).sum() == pytest.approx(1.0)
@@ -247,7 +249,10 @@ async def test_generate_sampling_mask_logprobs(client, stream):
     ],
     indirect=True,
 )
-async def test_generate_sampling_mask_logprobs_rejects_full_vocab(client):
+@pytest.mark.parametrize("top_k", [-1, 4096], ids=["disabled", "above-cap"])
+async def test_generate_sampling_mask_logprobs_rejects_top_k(client, top_k):
+    """Mask logprobs use a fixed `[num_requests, top_k]` buffer: pure top-p
+    (`top_k <= 0`) and `top_k` above the buffer cap are rejected up front."""
     resp = await client.post(
         GEN_ENDPOINT,
         json={
@@ -256,13 +261,13 @@ async def test_generate_sampling_mask_logprobs_rejects_full_vocab(client):
             "sampling_params": {
                 "max_tokens": 4,
                 "temperature": 1.0,
-                "top_p": 1.0,
-                "top_k": -1,
+                "top_p": 0.9,
+                "top_k": top_k,
             },
         },
     )
     assert resp.status_code == 400
-    assert "avoid returning the entire vocabulary" in resp.text
+    assert "top_k" in resp.text
 
 
 @pytest.mark.asyncio

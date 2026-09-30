@@ -56,6 +56,12 @@ class LogprobsLists(NamedTuple):
         )
 
 
+# Bounds the [num_reqs, width] compact sampling-mask buffers. Without mask
+# logprobs, wider rows fall back to the bitmask; with mask logprobs, this caps
+# the request `top_k` and wider rows (top-k boundary ties) fail the request.
+MAX_COMPACT_SUPPORT = 2048
+
+
 class SamplingMaskLists(NamedTuple):
     """CSR sampling masks; a step slice holds one position (``offsets=None``)."""
 
@@ -65,7 +71,12 @@ class SamplingMaskLists(NamedTuple):
     offsets: np.ndarray | None = None
     # Unused with one position per request; kept for the wire layout.
     cu_num_generated_tokens: list[int] | None = None
+    # [num_kept_tokens] normalized logprobs aligned with ``token_ids``.
     logprobs: np.ndarray | None = None
+    # [num_positions] engine-internal: rows whose support did not fit the
+    # fixed-capacity logprobs buffer. Never sent on the wire (see
+    # `slice_request`); the scheduler fails those requests.
+    overflow: np.ndarray | None = None
 
     def slice_request(self, req_idx: int, num_positions: int) -> "SamplingMaskLists":
         assert num_positions == 1 and self.offsets is not None
@@ -74,6 +85,9 @@ class SamplingMaskLists(NamedTuple):
             self.token_ids[rows],
             logprobs=self.logprobs[rows] if self.logprobs is not None else None,
         )
+
+    def is_overflow(self, req_idx: int) -> bool:
+        return self.overflow is not None and bool(self.overflow[req_idx])
 
     def to_nested_list(self) -> list[list[int]]:
         token_ids = self.token_ids.tolist()
