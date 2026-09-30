@@ -140,7 +140,7 @@ class CuMemAllocator:
     def __init__(self):
         self.pointer_to_data: dict[int, AllocationData] = {}
         self.current_tag: str = CuMemAllocator.default_tag
-        self.allocator_and_pools: dict[str | tuple[int, int], Any] = {}
+        self.allocator_and_pools: dict[str, Any] = {}
         # Creating strong references to the two callbacks here to prevent
         # these ephemeral bound-method objects being garbage collected.
         # See discussions in https://github.com/vllm-project/vllm/pull/22724
@@ -242,7 +242,6 @@ class CuMemAllocator:
         """Put the allocator in sleep mode.
         All data in the memory allocation with the specified tag will be
         offloaded to CPU memory, and others will be discarded.
-        CUDA graph pools are always backed up to preserve captured constants.
 
         Args:
             offload_tags: The tags of the memory allocation that will be
@@ -257,8 +256,6 @@ class CuMemAllocator:
             offload_tags = (offload_tags,)
 
         assert isinstance(offload_tags, tuple)
-        # Graph pools can contain constants, including after level-2 sleep.
-        offload_tags = (*offload_tags, self.cudagraph_tag)
 
         total_bytes = 0
         backup_bytes = 0
@@ -343,7 +340,6 @@ class CuMemAllocator:
         """Wake up the allocator from sleep mode.
         All data that is previously offloaded will be loaded back to GPU
         memory, and the rest of the data will have empty memory.
-        Waking weights also restores CUDA graph pools.
 
         Args:
             tags: The tags of the memory allocation that will be loaded
@@ -351,9 +347,6 @@ class CuMemAllocator:
                 back to GPU memory.
 
         """
-        if tags is not None and "weights" in tags:
-            tags = [*tags, self.cudagraph_tag]
-
         gc.collect()
         torch.accelerator.empty_cache()
 
@@ -373,6 +366,17 @@ class CuMemAllocator:
                         cpu_ptr = cpu_backup_tensor.data_ptr()
                         libcudart.cudaMemcpy(ptr, cpu_ptr, size_in_bytes)
                         data.cpu_backup_tensor = None
+
+    def _get_or_create_pool(self, tag: str) -> tuple[Any, Any]:
+        """Return the tag's (MemPool, allocator), creating them on first use."""
+        if tag not in self.allocator_and_pools:
+            allocator = get_pluggable_allocator(
+                self.python_malloc_callback, self.python_free_callback
+            )
+            mem_pool = torch.cuda.memory.MemPool(allocator._allocator)
+            # Keep both alive (pytorch/pytorch#146431); re-entry reuses them.
+            self.allocator_and_pools[tag] = (mem_pool, allocator)
+        return self.allocator_and_pools[tag]
 
     @contextmanager
     def use_memory_pool(self, tag: str | None = None):
@@ -407,15 +411,9 @@ class CuMemAllocator:
         old_tag = self.current_tag
         self.current_tag = tag
         try:
-            with use_memory_pool_with_allocator(
-                self.python_malloc_callback, self.python_free_callback
-            ) as data:
-                # start to hit another PyTorch bug in PyTorch 2.6,
-                # possibly because of gc-related issue w.r.t. the allocator
-                # and the memory pool.
-                # to avoid the issue, we keep a reference of the data.
-                # see https://github.com/pytorch/pytorch/issues/146431 .
-                self.allocator_and_pools[tag] = data
+            is_new_pool = tag not in self.allocator_and_pools
+            mem_pool, _ = self._get_or_create_pool(tag)
+            with torch.cuda.memory.use_mem_pool(mem_pool):
                 yield
                 # PyTorch's bug, calling torch.cuda.empty_cache() will error
                 # when using pluggable allocator, see
@@ -428,7 +426,8 @@ class CuMemAllocator:
                 # TODO: we should expose `empty_cache` method in the memory
                 # pool.
                 # TODO: ask for help from PyTorch team to expose this method.
-                allocations = data[0].snapshot()
+                # Trim only a new pool: torch may reuse a re-entered one's free blocks.
+                allocations = mem_pool.snapshot() if is_new_pool else []
                 for allocation in allocations:
                     if allocation["allocated_size"] == 0:
                         handle = self._python_free_callback(allocation["address"])
@@ -439,29 +438,16 @@ class CuMemAllocator:
                 set_alloc_conf(prev_conf)
 
     @contextmanager
-    def use_cudagraph_pool(self, pool: tuple[int, int]) -> Iterator[tuple[int, int]]:
-        """Preserve graph pool sharing while tracking its allocations for sleep."""
-        if pool not in self.allocator_and_pools:
-            allocator = get_pluggable_allocator(
-                self.python_malloc_callback, self.python_free_callback
-            )
-            mem_pool = torch.cuda.MemPool(allocator._allocator)
-            self.allocator_and_pools[pool] = (mem_pool, allocator)
-
-        # Same expandable-segments handling as use_memory_pool().
-        prev_conf = current_alloc_conf()
-        expandable_was_enabled = conf_flag_enabled(prev_conf, EXPANDABLE_SEGMENTS)
-        if expandable_was_enabled:
-            set_alloc_conf(with_conf_flag(prev_conf, EXPANDABLE_SEGMENTS, False))
+    def use_cudagraph_pool(self) -> Iterator[tuple[int, int]]:
+        """Tag CUDA graph capture allocations and yield the graph pool id."""
+        mem_pool, _ = self._get_or_create_pool(self.cudagraph_tag)
         old_tag = self.current_tag
         self.current_tag = self.cudagraph_tag
         try:
             # capture_begin routes allocations to this pool; no use_mem_pool.
-            yield self.allocator_and_pools[pool][0].id
+            yield mem_pool.id
         finally:
             self.current_tag = old_tag
-            if expandable_was_enabled:
-                set_alloc_conf(prev_conf)
 
     def get_current_usage(self) -> int:
         """Get the total number of bytes allocated in the memory pool."""

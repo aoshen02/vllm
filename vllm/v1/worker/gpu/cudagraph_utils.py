@@ -22,7 +22,7 @@ from vllm.compilation.cuda_graph import CUDAGraphStat, CUDAGraphWrapper
 from vllm.compilation.wrapper import TorchCompileWithNoGuardsWrapper
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.config.compilation import CUDAGraphMode
-from vllm.device_allocator import plain_cudagraph_pool_handle, use_cudagraph_pool
+from vllm.device_allocator import plain_cudagraph_capture, use_cudagraph_pool
 from vllm.distributed.device_communicators.pynccl_allocator import set_graph_pool_id
 from vllm.distributed.parallel_state import (
     get_pp_group,
@@ -903,7 +903,7 @@ def profile_cudagraph_memory(runner: "GPUModelRunner") -> int:
     # that pool ("use_count > 0 INTERNAL ASSERT FAILED").
     platform_cls = type(current_platform)
     saved_global_pool = platform_cls._global_graph_pool
-    throwaway_pool = plain_cudagraph_pool_handle()
+    throwaway_pool = current_platform.graph_pool_handle()
     platform_cls._global_graph_pool = throwaway_pool
 
     try:
@@ -944,7 +944,8 @@ def profile_cudagraph_memory(runner: "GPUModelRunner") -> int:
             mem_samples: list[int] = []
             manager._capture_mem_samples = mem_samples
 
-            measured = int(runner.capture_model(profile_only=True))
+            with plain_cudagraph_capture():
+                measured = int(runner.capture_model(profile_only=True))
 
             # The measured delta covers PIECEWISE, encoder and speculator graphs
             # plus the sampled FULL graphs; swap the sampled FULL cost for the

@@ -315,12 +315,8 @@ def test_cudagraph_pool_survives_sleep(level, monkeypatch):
         weight = torch.full((1 << 20,), 2.0, device=DEVICE_TYPE)
     x = torch.ones_like(weight)
 
-    graph_pool = current_platform.graph_pool_handle()
     graph = torch.cuda.CUDAGraph()
-    with (
-        allocator.use_cudagraph_pool(graph_pool) as pool,
-        torch.cuda.graph(graph, pool=pool),
-    ):
+    with allocator.use_cudagraph_pool() as pool, torch.cuda.graph(graph, pool=pool):
         # Pool memory the graph reads but never writes, like a captured
         # constant: only a CPU backup can preserve it.
         const = torch.empty_like(x)
@@ -350,15 +346,38 @@ def test_cudagraph_pool_survives_sleep(level, monkeypatch):
     backend.suspend(level=level)
     assert mapped_usage(allocator) == 0
 
+    # Any wake, even a selective one, restores the graph pool.
     backend.resume(tags=["kv_cache"])
-    assert mapped_usage(allocator) == 0
-
-    backend.resume(tags=["weights"])
     assert graph_ptrs() == ptrs
     assert all(not allocator.pointer_to_data[ptr].is_asleep for ptr in ptrs)
+
+    backend.resume(tags=["weights"])
     if level == 2:
         weight.fill_(2.0)  # Level 2 discards weights; emulate the reload.
 
     x.fill_(4.0)
     graph.replay()
     assert torch.equal(y, torch.full_like(y, 11.0))
+
+
+@create_new_process_for_each_test("fork" if current_platform.is_cuda() else "spawn")
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="cuMem CUDA graph pool")
+def test_plain_cudagraph_capture_bypasses_cumem(monkeypatch):
+    """Captures route to the one cuMem graph pool, except under
+    plain_cudagraph_capture() (memory profiling)."""
+    import vllm.device_allocator as device_allocator
+
+    monkeypatch.setattr(
+        device_allocator, "cumem_cudagraph_pool_enabled", lambda _: True
+    )
+    allocator = get_mem_allocator_instance()
+    pool = current_platform.graph_pool_handle()
+    with device_allocator.use_cudagraph_pool(pool, None) as routed:
+        assert allocator.current_tag == "cudagraph"
+    assert routed == allocator.allocator_and_pools["cudagraph"][0].id
+    with (
+        device_allocator.plain_cudagraph_capture(),
+        device_allocator.use_cudagraph_pool(pool, None) as plain,
+    ):
+        assert allocator.current_tag == allocator.default_tag
+    assert plain == pool

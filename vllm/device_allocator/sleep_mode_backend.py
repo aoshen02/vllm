@@ -33,6 +33,9 @@ logger = init_logger(__name__)
 
 SleepModeState = Literal["RUNNING", "SUSPENDED", "RESUMING"]
 
+# These tags back every forward pass, so any wake restores them.
+_ALWAYS_RESTORED: tuple[str, ...] = ("cudagraph",)
+
 
 class SleepModeBackend(ABC):
     """Interface for a mechanism that frees and restores GPU state.
@@ -129,13 +132,17 @@ class CuMemBackend(SleepModeBackend):
 
         self._state = "SUSPENDED"
         allocator = get_mem_allocator_instance()
-        allocator.sleep(offload_tags=("weights",) if level == 1 else tuple())
+        # Graph pools are kept at every level; weights only at level 1.
+        offload_tags = ("weights", "cudagraph") if level == 1 else ("cudagraph",)
+        allocator.sleep(offload_tags=offload_tags)
 
     def resume(self, tags: list[str] | None = None) -> None:
         from vllm.device_allocator import get_mem_allocator_instance
 
         self._state = "RESUMING"
         allocator = get_mem_allocator_instance()
+        if tags is not None:
+            tags = [*tags, *_ALWAYS_RESTORED]
         allocator.wake_up(tags)
         self._state = "RUNNING"
 
