@@ -374,7 +374,7 @@ def test_plain_cudagraph_capture_bypasses_cumem(monkeypatch):
     pool = current_platform.graph_pool_handle()
     with device_allocator.use_cudagraph_pool(pool, None) as routed:
         assert allocator.current_tag == "cudagraph"
-    assert routed == allocator.allocator_and_pools["cudagraph"][0].id
+    assert routed == allocator.cudagraph_pool[0].id
     with (
         device_allocator.plain_cudagraph_capture(),
         device_allocator.use_cudagraph_pool(pool, None) as plain,
