@@ -314,6 +314,13 @@ def _reload_attention_scales(layer: torch.nn.Module, info: LayerReloadingInfo) -
         # Re-create scale Parameters with sentinel values so unloaded scales
         # are correctly detected by process_weights_after_loading
         quant_method.create_weights(layer)
+        if getattr(layer, "_preserve_checkpoint_scale_dtype", False):
+            # Nemotron reload must retain the initial load's scale rounding.
+            recorded_params, _ = info.restore_metadata
+            for name in ("q_scale", "k_scale", "v_scale", "prob_scale"):
+                param = getattr(layer, name, None)
+                if param is not None and name in recorded_params:
+                    param.data = param.data.to(dtype=recorded_params[name].dtype)
 
     for name, args in info.loaded_weights:
         param = getattr(layer, name)

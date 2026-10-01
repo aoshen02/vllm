@@ -1025,7 +1025,86 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
         replace_parameter(layer, "w2_weight_scale_2", w2_scale_2)
         replace_parameter(layer, "w2_input_scale", a2_scale)
 
-        self._build_moe_kernel(layer)
+        if not self._preserve_humming_reload_kernel(layer):
+            self._build_moe_kernel(layer)
+
+    def _preserve_humming_reload_kernel(self, layer: RoutedExperts) -> bool:
+        if not (
+            getattr(layer, "_preserve_humming_reload_kernel", False)
+            and self.nvfp4_backend == NvFp4MoeBackend.HUMMING
+        ):
+            return False
+
+        from vllm.model_executor.model_loader.reload.layerwise import LAYERWISE_INFO
+
+        info = LAYERWISE_INFO.get(layer)
+        if info is None or info.kernel_tensors is None:
+            return False
+
+        def require(condition: bool, reason: str) -> None:
+            if not condition:
+                raise RuntimeError(f"Cannot preserve Nemotron Humming reload: {reason}")
+
+        require(self.use_a16, "only W4A16 is supported")
+        kernel = getattr(self, "moe_kernel", None)
+        config = getattr(self, "moe_quant_config", None)
+        require(kernel is not None and config is not None, "missing original kernel")
+        experts = kernel.fused_experts
+        require(experts.quant_config is config, "quant config identity changed")
+        original, _ = info.kernel_tensors
+        for prefix, weight_config in (("w13", config._w1), ("w2", config._w2)):
+            for suffix, reference in (
+                ("weight_scale", weight_config.scale),
+                ("weight_scale_2", weight_config.alpha_or_gscale),
+            ):
+                name = f"{prefix}_{suffix}"
+                saved = original.get(name)
+                require(
+                    saved is not None
+                    and reference is not None
+                    and saved.numel() > 0
+                    and reference.data_ptr() == saved.data_ptr()
+                    and reference.untyped_storage().data_ptr()
+                    == saved.untyped_storage().data_ptr()
+                    and reference.storage_offset() == saved.storage_offset()
+                    and reference.shape == saved.shape
+                    and reference.stride() == saved.stride()
+                    and reference.dtype == saved.dtype
+                    and reference.device == saved.device,
+                    f"original {name} storage alias lost",
+                )
+            for suffix in ("weight", "weight_scale", "weight_scale_2", "input_scale"):
+                name = f"{prefix}_{suffix}"
+                saved = original.get(name)
+                current = getattr(layer, name, None)
+                if suffix == "input_scale" and saved is None and current is None:
+                    continue
+                require(
+                    saved is not None
+                    and current is not None
+                    and current.shape == saved.shape
+                    and current.stride() == saved.stride()
+                    and current.dtype == saved.dtype
+                    and current.device == saved.device,
+                    f"{name} layout changed",
+                )
+            require(
+                experts.humming_configs[prefix].to_str()
+                == layer.humming_configs[prefix].to_str(),
+                f"{prefix} Humming recipe changed",
+            )
+        require(
+            experts.compute_config
+            == {
+                "use_batch_invariant": envs.VLLM_BATCH_INVARIANT,
+                "use_f16_accum": envs.VLLM_HUMMING_USE_F16_ACCUM,
+                "gemm_type": experts.humming_gemm_type().value,
+            },
+            "Humming compute recipe changed",
+        )
+        # Layerwise restoration copies into the original registered storage next.
+        # Retain its consumers, including CUDA-graph-captured scales and locks.
+        return True
 
     def _build_moe_kernel(self, layer: RoutedExperts) -> None:
         """Build the modular MoE kernel from the (already in-format) weights."""

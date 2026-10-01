@@ -3,7 +3,71 @@
 
 from unittest.mock import Mock, patch
 
+import pytest
 import torch
+
+
+@pytest.mark.parametrize("batch_invariant", [False, True])
+def test_nemotron_copy_specs_cover_all_replay_buffers(monkeypatch, batch_invariant):
+    from vllm.model_executor.layers.mamba.mamba_utils import (
+        MambaStateCopyFuncCalculator,
+    )
+    from vllm.model_executor.models import nemotron_h
+
+    monkeypatch.setattr(nemotron_h.envs, "VLLM_BATCH_INVARIANT", batch_invariant)
+    funcs = nemotron_h.NemotronHForCausalLM.get_mamba_state_copy_func()
+    base = MambaStateCopyFuncCalculator.mamba2_state_copy_func()
+    assert funcs[:2] == base
+    assert len(funcs) == (5 if batch_invariant else 2)
+    state = torch.arange(3 * 4 * 2, dtype=torch.float32).reshape(3, 4, 2)
+    for copy_func in funcs[2:]:
+        spec = copy_func(state, [0, 2, 1], 1, 1)
+        assert spec.start_addr == state[2].data_ptr()
+        assert spec.num_elements == state[2].numel()
+    assert MambaStateCopyFuncCalculator.mamba2_state_copy_func() == base
+
+
+@pytest.mark.parametrize("batch_invariant", [False, True])
+@pytest.mark.parametrize("ll_eligible", [False, True])
+def test_nemotron_gate_bi_keeps_default_and_other_model_dispatch_isolated(
+    monkeypatch, batch_invariant, ll_eligible
+):
+    """CPU constructor policy only; GPU arithmetic is a separate router gate."""
+    from vllm.model_executor.models import nemotron_h
+
+    inherited = {
+        "allow_ll_bf16_gemm": ll_eligible,
+        "allow_specialized_router_gemm": True,
+        "allow_fp32_router_gemm": False,
+        "allow_bf16x3_router_gemm": False,
+        "allow_cublas_router_gemm": True,
+    }
+    constructor_calls = []
+
+    def fake_parent_init(self, *args, **kwargs):
+        torch.nn.Module.__init__(self)
+        constructor_calls.append((args, kwargs))
+        for name, value in inherited.items():
+            setattr(self, name, value)
+
+    monkeypatch.setattr(nemotron_h.GateLinear, "__init__", fake_parent_init)
+    monkeypatch.setattr(nemotron_h.envs, "VLLM_BATCH_INVARIANT", batch_invariant)
+    arguments = dict(
+        out_dtype=torch.float32,
+        force_fp32_compute=True,
+        prefix="backbone.layers.1.mixer.gate",
+    )
+    before = nemotron_h.GateLinear(2688, 128, **arguments)
+    candidate = nemotron_h.NemotronHGateLinear(2688, 128, **arguments)
+    after = nemotron_h.GateLinear(2688, 128, **arguments)
+    assert constructor_calls == [((2688, 128), arguments)] * 3
+    expected = dict(inherited)
+    if batch_invariant:
+        expected["allow_ll_bf16_gemm"] = False
+    for name in inherited:
+        assert getattr(candidate, name) == expected[name]
+        assert getattr(before, name) == inherited[name]
+        assert getattr(after, name) == inherited[name]
 
 
 def test_nemotron_h_lm_head_receives_quant_config():

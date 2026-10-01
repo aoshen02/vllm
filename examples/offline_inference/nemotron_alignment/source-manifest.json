@@ -1,0 +1,152 @@
+{
+  "scope": "Fork-only exact-source review snapshot, not unified-image RL delivery",
+  "base_commit": "7f1a5398e9610d96c473931a26c0e12bbe0d0423",
+  "dependency_commit": "f636a0918d",
+  "serving_image": "sha256:0689da16e5878bb6b783bdbd55824020908cedd568f7f00b9377bd7152037beb",
+  "files": {
+    "vllm/model_executor/kernels/linear/__init__.py": {
+      "source": "/mnt/data/aoshen/nvfp4-consistency-20260924/final-bi1-package-fp8-fa4-r1/vllm/model_executor/kernels/linear/__init__.py",
+      "sha256": "ddcf11a91d77e428d2913a8460a05b1441b5da109b06d4f36220899b64542d95"
+    },
+    "vllm/model_executor/layers/fused_moe/experts/flashinfer_cutedsl_w4a16_moe.py": {
+      "source": "/mnt/data/aoshen/nvfp4-consistency-20260924/final-bi1-package-fp8-fa4-r1/vllm/model_executor/layers/fused_moe/experts/flashinfer_cutedsl_w4a16_moe.py",
+      "sha256": "22e39a2c39191f3a0169297562ea365c1943425048d18aa4b2eb2bb61cf56d46"
+    },
+    "vllm/model_executor/layers/fused_moe/oracle/nvfp4.py": {
+      "source": "/mnt/data/aoshen/nvfp4-consistency-20260924/final-bi1-package-fp8-fa4-r1/vllm/model_executor/layers/fused_moe/oracle/nvfp4.py",
+      "sha256": "ce38f9fef11bcb94cd50dfe9faed8f9ee4139b3b5c4a0482b965ff0295a3c057"
+    },
+    "vllm/model_executor/layers/mamba/exact_replay.py": {
+      "source": "/mnt/data/aoshen/nvfp4-consistency-20260924/final-bi1-package-fp8-fa4-r1/vllm/model_executor/layers/mamba/exact_replay.py",
+      "sha256": "e291c48f40db23d348768851880e9e908704fa07ca80786d373102606053aaa3"
+    },
+    "vllm/model_executor/layers/mamba/mamba_mixer2.py": {
+      "source": "/mnt/data/aoshen/nvfp4-consistency-20260924/final-bi1-package-fp8-fa4-r1/vllm/model_executor/layers/mamba/mamba_mixer2.py",
+      "sha256": "f50dbe9cc0d83db0d99b34d2b67eb6e2209e5f8f8e8157c86097a970a3f0a2a4"
+    },
+    "vllm/model_executor/layers/mamba/mamba_utils.py": {
+      "source": "/mnt/data/aoshen/nvfp4-consistency-20260924/final-bi1-package-fp8-fa4-r1/vllm/model_executor/layers/mamba/mamba_utils.py",
+      "sha256": "dff61b8f29cb30b28885c406c80346ec194348a227284a5d57486d1515395428"
+    },
+    "vllm/model_executor/layers/mamba/ops/ssd_bmm.py": {
+      "source": "/mnt/data/aoshen/nvfp4-consistency-20260924/final-bi1-package-fp8-fa4-r1/vllm/model_executor/layers/mamba/ops/ssd_bmm.py",
+      "sha256": "97e7c38f143c8ce13b01d99f5bf4411f766b37c29ba085c827026e8afc6ebb90"
+    },
+    "vllm/model_executor/layers/mamba/ops/ssd_chunk_scan.py": {
+      "source": "/mnt/data/aoshen/nvfp4-consistency-20260924/final-bi1-package-fp8-fa4-r1/vllm/model_executor/layers/mamba/ops/ssd_chunk_scan.py",
+      "sha256": "f6ba1124a4aaf0144c9eb147f39b353a972da6e923d4163e8cb1f60bf1a9ace8"
+    },
+    "vllm/model_executor/layers/mamba/ops/ssd_chunk_state.py": {
+      "source": "/mnt/data/aoshen/nvfp4-consistency-20260924/final-bi1-package-fp8-fa4-r1/vllm/model_executor/layers/mamba/ops/ssd_chunk_state.py",
+      "sha256": "80eb9cd6a4190fc5122b40ce40b1dd34e6a59603f2ece06553616610ef63430e"
+    },
+    "vllm/model_executor/layers/mamba/ops/ssd_emit.py": {
+      "source": "/mnt/data/aoshen/nvfp4-consistency-20260924/final-bi1-package-fp8-fa4-r1/vllm/model_executor/layers/mamba/ops/ssd_emit.py",
+      "sha256": "9b4a0840a12c6034ad3f09738b121929d85fcd065b464aaf5c104ee2d2032c34"
+    },
+    "vllm/model_executor/layers/mamba/ops/ssd_state_passing.py": {
+      "source": "/mnt/data/aoshen/nvfp4-consistency-20260924/final-bi1-package-fp8-fa4-r1/vllm/model_executor/layers/mamba/ops/ssd_state_passing.py",
+      "sha256": "52b11b6573ce700173bb7aecff9bd035a9450da62cc7aeccebb0316fa854e3b2"
+    },
+    "vllm/model_executor/layers/mamba/ops/triton_helpers.py": {
+      "source": "/mnt/data/aoshen/nvfp4-consistency-20260924/final-bi1-package-fp8-fa4-r1/vllm/model_executor/layers/mamba/ops/triton_helpers.py",
+      "sha256": "dde207b7950646632cea4b4290db3da930dca1ae356cdfb8966b21f62b896dcc"
+    },
+    "vllm/model_executor/layers/quantization/modelopt.py": {
+      "source": "/mnt/data/aoshen/nvfp4-consistency-20260924/final-bi1-package-fp8-fa4-r1/vllm/model_executor/layers/quantization/modelopt.py",
+      "sha256": "ed4d11a5a81dc054f60d7d2b994dd78d642088643b8ad8f1acdf154658100440"
+    },
+    "vllm/model_executor/model_loader/reload/layerwise.py": {
+      "source": "/mnt/data/aoshen/nvfp4-consistency-20260924/final-bi1-package-fp8-fa4-r1/vllm/model_executor/model_loader/reload/layerwise.py",
+      "sha256": "c4ad0416b99fe0d5d5f3c163e1c21f7cbbbd389ba79621c102d38df3ffe32019"
+    },
+    "vllm/model_executor/models/nemotron_h.py": {
+      "source": "/mnt/data/aoshen/nvfp4-consistency-20260924/final-bi1-package-fp8-fa4-r1/vllm/model_executor/models/nemotron_h.py",
+      "sha256": "b313b43fc62b92c39374ee1d60d43f0fcb2a410000d5584987bf95c13e24ff2d"
+    },
+    "vllm/model_executor/models/nemotron_h_alignment.py": {
+      "source": "/mnt/data/aoshen/nvfp4-consistency-20260924/final-bi1-package-fp8-fa4-r1/vllm/model_executor/models/nemotron_h_alignment.py",
+      "sha256": "9ed9fa6c8b54da8d09fc95185e7529a5f890e05e478749d642f4464b81524c93"
+    },
+    "vllm/model_executor/models/nemotron_h_fa4.py": {
+      "source": "/mnt/data/aoshen/nvfp4-consistency-20260924/final-bi1-package-fp8-fa4-r1/vllm/model_executor/models/nemotron_h_fa4.py",
+      "sha256": "7ceb8489f8eb978b17a9eb7f7d9f36250eaff30a4d69121b6b15ec3296edd1f1"
+    },
+    "vllm/utils/flashinfer.py": {
+      "source": "/mnt/data/aoshen/nvfp4-consistency-20260924/final-bi1-package-fp8-fa4-r1/vllm/utils/flashinfer.py",
+      "sha256": "a75052fb1a1e12e1649d338cff2205a7682e53722d18f132c3adc7f7f14d9797"
+    },
+    "vllm/v1/attention/backends/mamba2_attn.py": {
+      "source": "/mnt/data/aoshen/nvfp4-consistency-20260924/final-bi1-package-fp8-fa4-r1/vllm/v1/attention/backends/mamba2_attn.py",
+      "sha256": "ff74714d5d93269385aafd0ccbae49eaa74438c54bc00a905c050ac5ff4ccc88"
+    },
+    "examples/offline_inference/nemotron_alignment/overlays/fi_w4a16_native_dlpack.cpp": {
+      "source": "/mnt/data/aoshen/nvfp4-consistency-20260924/scripts/fi_w4a16_native_dlpack.cpp",
+      "sha256": "9293fa21973420727e1a914abe76352ba1148cafe9be5560d0dfd8ed187b4a1e"
+    },
+    "examples/offline_inference/nemotron_alignment/overlays/humming_hybrid_shared_fi_worker.py": {
+      "source": "/mnt/lustre/aoshen/nemotron-dapo-five-20260927/proxy5-contiguous-r1/rl-fp8-candidate-r1/bi1/direct-fa4-rl-r4/scripts/humming_hybrid_shared_fi_worker.py",
+      "sha256": "c26c77d2955e75c93e8b02e4fb5aeeb90214a4982d49528bc2bac3e4e2ecd816"
+    },
+    "examples/offline_inference/nemotron_alignment/overlays/humming_hybrid_candidate.py": {
+      "source": "/mnt/lustre/aoshen/nemotron-dapo-five-20260927/proxy5-contiguous-r1/rl-fp8-candidate-r1/bi1/direct-fa4-rl-r4/scripts/humming_hybrid_candidate.py",
+      "sha256": "a18e1ee82cc1c8a4bf98a8576724aca3d81f1d07d376612e7461effcb790bb60"
+    },
+    "examples/offline_inference/nemotron_alignment/overlays/humming_n128_contract.py": {
+      "source": "/mnt/lustre/aoshen/nemotron-dapo-five-20260927/proxy5-contiguous-r1/rl-fp8-candidate-r1/bi1/direct-fa4-rl-r4/scripts/humming_n128_contract.py",
+      "sha256": "328e017d3be32a5999f36bc46b3a1123de065a364e44c833d82d9ad5850a40ec"
+    },
+    "examples/offline_inference/nemotron_alignment/overlays/humming_hybrid_contract.py": {
+      "source": "/mnt/lustre/aoshen/nemotron-dapo-five-20260927/proxy5-contiguous-r1/rl-fp8-candidate-r1/bi1/direct-fa4-rl-r4/scripts/humming_hybrid_contract.py",
+      "sha256": "ff3862a22028c81294cf730b53c620270a23412884da8377ed758d20d0dfed11"
+    },
+    "examples/offline_inference/nemotron_alignment/overlays/humming_shared_fi_worker.py": {
+      "source": "/mnt/lustre/aoshen/nemotron-dapo-five-20260927/proxy5-contiguous-r1/rl-fp8-candidate-r1/bi1/direct-fa4-rl-r4/scripts/humming_shared_fi_worker.py",
+      "sha256": "86516c1126e8d0785ff2631c08292098488faa07c8ecec90204f4f570f1b5b8a"
+    },
+    "examples/offline_inference/nemotron_alignment/overlays/humming_stage4_bench_worker.py": {
+      "source": "/mnt/lustre/aoshen/nemotron-dapo-five-20260927/proxy5-contiguous-r1/rl-fp8-candidate-r1/bi1/direct-fa4-rl-r4/scripts/humming_stage4_bench_worker.py",
+      "sha256": "8fc8bb12e5284243ea2f93ed12a7125ace854d241aa673024e2b58bc25241c76"
+    },
+    "examples/offline_inference/nemotron_alignment/overlays/fi_w4a16_bench_worker.py": {
+      "source": "/mnt/lustre/aoshen/nemotron-dapo-five-20260927/proxy5-contiguous-r1/rl-fp8-candidate-r1/bi1/direct-fa4-rl-r4/scripts/fi_w4a16_bench_worker.py",
+      "sha256": "ecfc64a7c6093a4509276b9bc924977e7e12bf2aefbd18f5ab9d272bc9f362c9"
+    },
+    "examples/offline_inference/nemotron_alignment/overlays/fi_w4a16_clean_worker.py": {
+      "source": "/mnt/lustre/aoshen/nemotron-dapo-five-20260927/proxy5-contiguous-r1/rl-fp8-candidate-r1/bi1/direct-fa4-rl-r4/scripts/fi_w4a16_clean_worker.py",
+      "sha256": "9d620320f6218f048012eef1786645504ccf985d45b41a07a536779b5e2a5902"
+    },
+    "examples/offline_inference/nemotron_alignment/overlays/fi_w4a16_native_dlpack_overlay.py": {
+      "source": "/mnt/lustre/aoshen/nemotron-dapo-five-20260927/proxy5-contiguous-r1/rl-fp8-candidate-r1/bi1/direct-fa4-rl-r4/scripts/fi_w4a16_native_dlpack_overlay.py",
+      "sha256": "947a65ba6568e3390aeffafadaab56ad05c767c8f644bbadab36285492d9e6a4"
+    },
+    "examples/offline_inference/nemotron_alignment/overlays/humming_stage4_bench_contract.py": {
+      "source": "/mnt/lustre/aoshen/nemotron-dapo-five-20260927/proxy5-contiguous-r1/rl-fp8-candidate-r1/bi1/direct-fa4-rl-r4/scripts/humming_stage4_bench_contract.py",
+      "sha256": "878c36fa770ffd1a1053d816a078401f1ff47f7b74869f4d5b0a6a576c068ce0"
+    },
+    "examples/offline_inference/nemotron_alignment/overlays/humming_stage4_candidate.py": {
+      "source": "/mnt/lustre/aoshen/nemotron-dapo-five-20260927/proxy5-contiguous-r1/rl-fp8-candidate-r1/bi1/direct-fa4-rl-r4/scripts/humming_stage4_candidate.py",
+      "sha256": "951c8fb0ed780730e33fda696a46ee39cf83ebf2af88f97fe9092e08b8fe98fe"
+    },
+    "examples/offline_inference/nemotron_alignment/overlays/humming_stage4_contract.py": {
+      "source": "/mnt/lustre/aoshen/nemotron-dapo-five-20260927/proxy5-contiguous-r1/rl-fp8-candidate-r1/bi1/direct-fa4-rl-r4/scripts/humming_stage4_contract.py",
+      "sha256": "8d6c498fcdb7c5d3d1f6c8c7a5c4e3c2ae884bed03772f2b0c1b2f4c58a97539"
+    },
+    "examples/offline_inference/nemotron_alignment/overlays/fi_w4a16_shared_overlay.py": {
+      "source": "/mnt/lustre/aoshen/nemotron-dapo-five-20260927/proxy5-contiguous-r1/rl-fp8-candidate-r1/bi1/direct-fa4-rl-r4/scripts/fi_w4a16_shared_overlay.py",
+      "sha256": "da76551156688b04bd247fc7748ea12e6a968c8a2363454aad8ed3280b6820d7"
+    }
+  },
+  "excluded": [
+    "compiled shared objects",
+    "model weights",
+    "Megatron and verl sources",
+    "RL cold-service controllers",
+    "Humming/FlashInfer vendored dependency sources",
+    "Incidental GDN kernel_o delta: not used by this Nemotron MambaMixer2 path"
+  ],
+  "limits": [
+    "Overlay files retain historical module names and experimental guards; no in-tree production integration or unified-image acceptance is claimed.",
+    "Removing the unrelated GDN kernel_o delta changes the package closure: hashes below bind only the included files, not the entire prior image."
+  ]
+}

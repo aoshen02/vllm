@@ -1083,7 +1083,10 @@ def init_nvfp4_linear_kernel(use_a16: bool = False) -> NvFp4LinearKernel:
     force_kernel: type[NvFp4LinearKernel] | None = None
     quantization = "nvfp4_w4a16" if use_a16 else "nvfp4_w4a4"
     linear_backend = _get_linear_backend(quantization=quantization)
-    if envs.VLLM_BATCH_INVARIANT:
+    if envs.VLLM_BATCH_INVARIANT and use_a16:
+        # Humming propagates BI to its compute config without quantizing A16.
+        force_kernel = HummingNvFp4LinearKernel
+    elif envs.VLLM_BATCH_INVARIANT:
         bi_supported, reason = CutlassNvFp4LinearKernel.is_supported()
         if bi_supported:
             if linear_backend not in ("auto", "cutlass"):
