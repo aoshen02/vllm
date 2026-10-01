@@ -1122,7 +1122,7 @@ def flashinfer_scaled_fp8_mm(
         scale_a,
         scale_b,
         out_dtype,
-        "auto",
+        "cutlass" if envs.VLLM_BATCH_INVARIANT else "auto",
     ).view(a.shape[0], b.shape[1])
 
     if bias is not None:
@@ -1157,7 +1157,7 @@ def flashinfer_scaled_fp8_mm_out(
         scale_b,
         out_dtype or out.dtype,
         out.unsqueeze(0),
-        "auto",
+        "cutlass" if envs.VLLM_BATCH_INVARIANT else "auto",
     )
     return out
 

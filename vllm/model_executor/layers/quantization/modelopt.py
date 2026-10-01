@@ -216,12 +216,12 @@ class ModelOptQuantConfigBase(QuantizationConfig):
         self, layer: torch.nn.Module, prefix: str
     ) -> "QuantizeMethodBase | None":
         # handle kv-cache first so we can focus only on weight quantization thereafter
-        if isinstance(layer, (Attention, MLAAttention)):
+        if isinstance(layer, Attention | MLAAttention):
             return self.KVCacheMethodCls(self)
 
         # handle exclusion
         if self.is_layer_excluded(prefix):
-            if isinstance(layer, (LinearBase, ParallelLMHead)):
+            if isinstance(layer, LinearBase | ParallelLMHead):
                 return UnquantizedLinearMethod()
             return None
 
@@ -238,7 +238,7 @@ class ModelOptQuantConfigBase(QuantizationConfig):
             return UnquantizedLinearMethod()
 
         # now, the layer is quantized, handle it here
-        if isinstance(layer, (LinearBase, ParallelLMHead)):
+        if isinstance(layer, LinearBase | ParallelLMHead):
             return build_linear_method(self, self.quant_method, prefix)
         elif isinstance(layer, RoutedExperts):
             quant_method = self.FusedMoEMethodCls(
@@ -1025,7 +1025,89 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
         replace_parameter(layer, "w2_weight_scale_2", w2_scale_2)
         replace_parameter(layer, "w2_input_scale", a2_scale)
 
-        self._build_moe_kernel(layer)
+        if not self._preserve_humming_reload_kernel(layer):
+            self._build_moe_kernel(layer)
+
+    def _preserve_humming_reload_kernel(self, layer: RoutedExperts) -> bool:
+        if not (
+            getattr(layer, "_preserve_humming_reload_kernel", False)
+            and self.nvfp4_backend == NvFp4MoeBackend.HUMMING
+        ):
+            return False
+
+        from vllm.model_executor.model_loader.reload.layerwise import LAYERWISE_INFO
+
+        info = LAYERWISE_INFO.get(layer)
+        if info is None or info.kernel_tensors is None:
+            return False
+
+        def require(condition: bool, reason: str) -> None:
+            if not condition:
+                raise RuntimeError(f"Cannot preserve Nemotron Humming reload: {reason}")
+
+        require(self.use_a16, "only W4A16 is supported")
+        kernel = getattr(self, "moe_kernel", None)
+        config = getattr(self, "moe_quant_config", None)
+        if kernel is None or config is None:
+            raise RuntimeError(
+                "Cannot preserve Nemotron Humming reload: missing kernel"
+            )
+        experts = kernel.fused_experts
+        require(experts.quant_config is config, "quant config identity changed")
+        original, _ = info.kernel_tensors
+        for prefix, weight_config in (("w13", config._w1), ("w2", config._w2)):
+            for suffix, reference in (
+                ("weight_scale", weight_config.scale),
+                ("weight_scale_2", weight_config.alpha_or_gscale),
+            ):
+                name = f"{prefix}_{suffix}"
+                saved = original.get(name)
+                require(
+                    saved is not None
+                    and reference is not None
+                    and saved.numel() > 0
+                    and reference.data_ptr() == saved.data_ptr()
+                    and reference.untyped_storage().data_ptr()
+                    == saved.untyped_storage().data_ptr()
+                    and reference.storage_offset() == saved.storage_offset()
+                    and reference.shape == saved.shape
+                    and reference.stride() == saved.stride()
+                    and reference.dtype == saved.dtype
+                    and reference.device == saved.device,
+                    f"original {name} storage alias lost",
+                )
+            for suffix in ("weight", "weight_scale", "weight_scale_2", "input_scale"):
+                name = f"{prefix}_{suffix}"
+                saved = original.get(name)
+                current = getattr(layer, name, None)
+                if suffix == "input_scale" and saved is None and current is None:
+                    continue
+                require(
+                    saved is not None
+                    and current is not None
+                    and current.shape == saved.shape
+                    and current.stride() == saved.stride()
+                    and current.dtype == saved.dtype
+                    and current.device == saved.device,
+                    f"{name} layout changed",
+                )
+            require(
+                experts.humming_configs[prefix].to_str()
+                == layer.humming_configs[prefix].to_str(),
+                f"{prefix} Humming recipe changed",
+            )
+        require(
+            experts.compute_config
+            == {
+                "use_batch_invariant": envs.VLLM_BATCH_INVARIANT,
+                "use_f16_accum": envs.VLLM_HUMMING_USE_F16_ACCUM,
+                "gemm_type": experts.humming_gemm_type().value,
+            },
+            "Humming compute recipe changed",
+        )
+        # Layerwise restoration copies into the original registered storage next.
+        # Retain its consumers, including CUDA-graph-captured scales and locks.
+        return True
 
     def _build_moe_kernel(self, layer: RoutedExperts) -> None:
         """Build the modular MoE kernel from the (already in-format) weights."""
@@ -1039,6 +1121,28 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
             routing_tables=layer._expert_routing_tables(),
         )
         self.moe_kernel.fused_experts.process_weights_after_loading(layer)
+
+        current = get_current_vllm_config_or_none()
+        hf_config = getattr(getattr(current, "model_config", None), "hf_config", None)
+        if (
+            envs.VLLM_BATCH_INVARIANT
+            and getattr(hf_config, "model_type", None) == "nemotron_h"
+            and getattr(hf_config, "hidden_size", None) == 2688
+            and self.use_a16
+            and self.nvfp4_backend == NvFp4MoeBackend.HUMMING
+            and self.moe.moe_parallel_config.tp_size == 1
+            and self.moe.moe_parallel_config.ep_size == 4
+        ):
+            from vllm.model_executor.layers.fused_moe.experts.fused_humming_moe import (
+                HummingIndexedExperts,
+            )
+            from vllm.model_executor.models.nemotron_h_moe import (
+                configure_nemotron_humming,
+            )
+
+            experts = self.moe_kernel.fused_experts
+            if type(experts) is HummingIndexedExperts:
+                configure_nemotron_humming(experts)
 
     def _restore_padded_moe_dims(self, layer: RoutedExperts) -> None:
         """Recover the padded ``moe_config`` dims from the exported weights."""
@@ -1760,13 +1864,13 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
 
         # Excluded layers
         if self.is_layer_excluded(prefix):
-            if isinstance(layer, (LinearBase, ParallelLMHead)):
+            if isinstance(layer, LinearBase | ParallelLMHead):
                 return UnquantizedLinearMethod()
             return None
 
         quant_algo = self._resolve_quant_algo(prefix)
 
-        if isinstance(layer, (LinearBase, ParallelLMHead)):
+        if isinstance(layer, LinearBase | ParallelLMHead):
             # Per-prefix algo -> its sub-config, then the generic linear method.
             # resolve() reads group_size off whichever sub-config it is handed.
             # Read-only — never write back, or a linear-only change leaks into
