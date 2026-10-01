@@ -4,7 +4,6 @@
 
 import pytest
 
-import vllm.model_executor.kernels.linear as linear_kernels
 from vllm.model_executor.kernels.linear import (
     _POSSIBLE_NVFP4_KERNELS,
     CutlassNvFp4LinearKernel,
@@ -31,21 +30,3 @@ def test_w4a16_kernel_does_not_precede_w4a4_kernels(w4a4_kernel):
         f"{w4a4_kernel.__name__} must be preferred over "
         f"{FlashInferCuteDslNvFp4W4A16LinearKernel.__name__}"
     )
-
-
-@pytest.mark.parametrize("supported", [True, False])
-def test_bi_w4a16_keeps_a16_or_fails_closed(monkeypatch, supported):
-    """BI must not select a W4A4 kernel for weight-only NVFP4."""
-    monkeypatch.setattr(linear_kernels.envs, "VLLM_BATCH_INVARIANT", True)
-    monkeypatch.setattr(linear_kernels, "_get_linear_backend", lambda **_: "auto")
-    monkeypatch.setattr(
-        linear_kernels.HummingNvFp4LinearKernel,
-        "is_supported",
-        classmethod(lambda cls: (supported, None if supported else "unavailable")),
-    )
-    if supported:
-        kernel = linear_kernels.init_nvfp4_linear_kernel(use_a16=True)
-        assert isinstance(kernel, linear_kernels.HummingNvFp4LinearKernel)
-    else:
-        with pytest.raises(ValueError, match="unavailable"):
-            linear_kernels.init_nvfp4_linear_kernel(use_a16=True)

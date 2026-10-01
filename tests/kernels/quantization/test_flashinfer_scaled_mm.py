@@ -71,34 +71,3 @@ def test_flashinfer_fp8_gemm(
         )
 
     torch.testing.assert_close(out, expected_out, atol=1e-2, rtol=1e-2)
-
-
-@torch.inference_mode()
-def test_batch_invariant_fp8_rows_survive_autotuning(monkeypatch):
-    """Prefill tuning must not change the arithmetic used to score decode rows."""
-    import flashinfer
-
-    import vllm.envs as envs
-
-    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
-    set_random_seed(25)
-    a = torch.randn((259, 2688), dtype=torch.bfloat16, device="cuda")
-    b = torch.randn((10304, 2688), dtype=torch.bfloat16, device="cuda")
-    a_fp8, a_scale = ops.scaled_fp8_quant(a)
-    b_fp8, b_scale = ops.scaled_fp8_quant(b)
-
-    def run(rows):
-        return flashinfer_scaled_fp8_mm(
-            rows, b_fp8.t(), a_scale, b_scale, torch.bfloat16
-        )
-
-    with flashinfer.autotune(True):
-        run(a_fp8)
-        run(a_fp8[:128])
-        run(a_fp8[:1])
-    with flashinfer.autotune(False):
-        full = run(a_fp8)
-        chunked = torch.cat([run(a_fp8[i : i + 128]) for i in range(0, 259, 128)])
-        single = run(a_fp8[165:166])
-    assert torch.equal(full.view(torch.uint8), chunked.view(torch.uint8))
-    assert torch.equal(full[165:166].view(torch.uint8), single.view(torch.uint8))

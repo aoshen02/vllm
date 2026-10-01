@@ -5,15 +5,11 @@
 #include <Python.h>
 #include <ATen/dlpack.h>
 
-#include <atomic>
 #include <cstdint>
 #include <limits>
 #include <new>
 
 namespace {
-std::atomic<long> live{0};
-std::atomic<long> released{0};
-
 struct Owner {
   DLManagedTensor managed{};
   int64_t shape[2];
@@ -23,8 +19,6 @@ struct Owner {
 void release(DLManagedTensor* managed) {
   auto* owner = static_cast<Owner*>(managed->manager_ctx);
   delete owner;
-  --live;
-  ++released;
 }
 
 void capsule_release(PyObject* capsule) {
@@ -65,20 +59,14 @@ PyObject* make_capsule(PyObject*, PyObject* args) {
   tensor.byte_offset = 0;
   owner->managed.manager_ctx = owner;
   owner->managed.deleter = release;
-  ++live;
   auto* capsule = PyCapsule_New(&owner->managed, "dltensor", capsule_release);
   if (!capsule) release(&owner->managed);
   return capsule;
 }
 
-PyObject* counts(PyObject*, PyObject*) {
-  return Py_BuildValue("ll", live.load(), released.load());
-}
-
 PyMethodDef methods[] = {
     {"make_capsule", make_capsule, METH_VARARGS,
      "Wrap borrowed uint8 memory with native DLPack metadata ownership."},
-    {"counts", counts, METH_NOARGS, "Live and released metadata owners."},
     {nullptr, nullptr, 0, nullptr}};
 PyModuleDef module = {PyModuleDef_HEAD_INIT, "_mnnvl_C", nullptr, -1, methods};
 }  // namespace

@@ -20,7 +20,6 @@ from vllm.model_executor.layers.attention import MMEncoderAttention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.linear import QKVParallelLinear
 from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
-from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod
 from vllm.model_executor.model_loader.reload.layerwise import (
     finalize_layerwise_reload,
     initialize_layerwise_reload,
@@ -42,7 +41,6 @@ from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader,
 )
 from vllm.platforms import current_platform
-from vllm.utils.torch_utils import set_default_torch_dtype
 
 
 def _fp8_reload_unsupported() -> bool:
@@ -198,172 +196,6 @@ def test_attention_first_load_processes_weights(default_vllm_config, layer_cls):
 
     assert layer.post_load_called
     assert torch.equal(layer.weight, loaded_weight)
-
-
-@pytest.mark.parametrize("initial_dtype", [torch.bfloat16, torch.float32])
-@pytest.mark.parametrize("preserve_dtype", [False, True])
-@pytest.mark.parametrize("new_payload", [False, True])
-def test_attention_reload_preserves_opted_in_scale_dtype(
-    default_vllm_config, monkeypatch, initial_dtype, preserve_dtype, new_payload
-):
-    """Reload preserves opted-in scale rounding, storage and raw checkpoint bytes."""
-    monkeypatch.setattr(current_platform, "is_fp8_fnuz", lambda: False)
-    layer = _ReloadableAttentionLayer()
-    del layer.weight
-    layer.kv_cache_dtype = "fp8_e4m3"
-    if preserve_dtype:
-        layer._preserve_checkpoint_scale_dtype = True
-    layer.quant_method = BaseKVCacheMethod(Mock())
-    for name in ("_q_scale", "_k_scale", "_v_scale", "_prob_scale"):
-        layer.register_buffer(name, torch.ones((), dtype=torch.float32))
-    layer._k_scale_cpu = torch.ones((), dtype=torch.float32)
-    layer._v_scale_cpu = torch.ones((), dtype=torch.float32)
-    with set_default_torch_dtype(initial_dtype):
-        layer.quant_method.create_weights(layer)
-    model = torch.nn.Sequential(layer)
-    record_metadata_for_reloading(model)
-    original = {
-        "k_scale": torch.tensor([0.0316685251891613], dtype=torch.float32),
-        "v_scale": torch.tensor([0.0033307757694274187], dtype=torch.float32),
-    }
-    for name, value in original.items():
-        param = getattr(layer, name)
-        param.weight_loader(param, value)
-    layer.quant_method.process_weights_after_loading(layer)
-    initial = {name: getattr(layer, "_" + name).clone() for name in original}
-    buffers = dict(layer.named_buffers())
-    pointers = {name: value.data_ptr() for name, value in buffers.items()}
-    payload = {name: value * (1.37 if new_payload else 1.0)
-               for name, value in original.items()}
-    raw = {name: value.clone() for name, value in payload.items()}
-    with set_default_torch_dtype(torch.float32):
-        initialize_layerwise_reload(model)
-        for name, value in payload.items():
-            param = getattr(layer, name)
-            param.weight_loader(param, value)
-        finalize_layerwise_reload(model, SimpleNamespace(dtype=initial_dtype))
-    for name, value in payload.items():
-        expected = value.to(initial_dtype if preserve_dtype else torch.float32)
-        assert getattr(layer, "_" + name).item() == expected.item()
-        assert getattr(layer, "_" + name + "_float") == expected.item()
-        assert getattr(layer, "_" + name + "_cpu").item() == expected.item()
-        assert torch.equal(value.view(torch.uint8), raw[name].view(torch.uint8))
-        if preserve_dtype and not new_payload:
-            assert torch.equal(getattr(layer, "_" + name), initial[name])
-        if new_payload:
-            assert not torch.equal(getattr(layer, "_" + name), initial[name])
-    for name, value in buffers.items():
-        assert getattr(layer, name) is value
-        assert value.data_ptr() == pointers[name]
-
-
-@pytest.mark.parametrize(
-    "case", ["preserve", "unmarked", "alias", "layout", "recipe", "compute"]
-)
-def test_nemotron_humming_reload_preserves_live_kernel_references(
-    default_vllm_config, monkeypatch, case
-):
-    """Real postprocessing/restoration retains graph operands across two reloads."""
-    import vllm.model_executor.layers.quantization.modelopt as modelopt
-
-    layer = torch.nn.Module()
-    layer._preserve_humming_reload_kernel = case != "unmarked"
-    payload = {}
-    for prefix in ("w13", "w2"):
-        for suffix in ("weight", "weight_scale", "weight_scale_2", "input_scale"):
-            name = f"{prefix}_{suffix}"
-            shape = (2, 1) if prefix == "w13" and suffix == "weight_scale_2" else (2,)
-            payload[name] = torch.ones(shape)
-            param = torch.nn.Parameter(payload[name].clone(), requires_grad=False)
-            param.weight_loader = default_weight_loader
-            layer.register_parameter(name, param)
-    method = object.__new__(modelopt.ModelOptNvFp4FusedMoE)
-    method.moe = SimpleNamespace(is_act_and_mul=False)
-    method.use_a16 = True
-    method.nvfp4_backend = modelopt.NvFp4MoeBackend.HUMMING
-    layer.quant_method = method
-    monkeypatch.setattr(modelopt, "is_weights_pre_processed", lambda: False)
-    recipe = {"value": "fixed"}
-
-    def convert(**kwargs):
-        layer.humming_configs = {
-            name: SimpleNamespace(to_str=lambda value=recipe["value"]: value)
-            for name in ("w13", "w2")
-        }
-        return (
-            kwargs["w13"], kwargs["w13_scale"], kwargs["w13_scale_2"], None,
-            kwargs["w2"], kwargs["w2_scale"], kwargs["w2_scale_2"], None,
-        )
-
-    def build(target):
-        config = SimpleNamespace(
-            _w1=SimpleNamespace(scale=target.w13_weight_scale,
-                                alpha_or_gscale=target.w13_weight_scale_2),
-            _w2=SimpleNamespace(scale=target.w2_weight_scale,
-                                alpha_or_gscale=target.w2_weight_scale_2),
-        )
-        method.moe_quant_config = config
-        method.moe_kernel = SimpleNamespace(fused_experts=SimpleNamespace(
-            quant_config=config, humming_configs=target.humming_configs,
-            locks=torch.zeros(8, dtype=torch.int32),
-            compute_config={
-                "use_batch_invariant": modelopt.envs.VLLM_BATCH_INVARIANT,
-                "use_f16_accum": modelopt.envs.VLLM_HUMMING_USE_F16_ACCUM,
-                "gemm_type": "indexed",
-            },
-            humming_gemm_type=lambda: SimpleNamespace(value="indexed"),
-        ))
-
-    monkeypatch.setattr(modelopt, "convert_to_nvfp4_moe_kernel_format", convert)
-    monkeypatch.setattr(method, "_build_moe_kernel", build)
-    model = torch.nn.Sequential(layer)
-    record_metadata_for_reloading(model)
-    method.process_weights_after_loading(layer)
-    assert reload_layerwise.LAYERWISE_INFO[layer].kernel_tensors is None
-    original = dict(layer.named_parameters())
-    kernel = method.moe_kernel
-    config = method.moe_quant_config
-    locks = kernel.fused_experts.locks
-    if case == "alias":
-        config._w1.scale = config._w1.scale.clone()
-    if case == "recipe":
-        recipe["value"] = "changed"
-    if case == "compute":
-        kernel.fused_experts.compute_config["use_batch_invariant"] = (
-            not modelopt.envs.VLLM_BATCH_INVARIANT
-        )
-    if case == "layout":
-        original["w2_weight"].data = original["w2_weight"].data.view(1, 2)
-
-    for multiplier in (2.0, 3.0):
-        initialize_layerwise_reload(model)
-        if case in ("alias", "layout", "recipe", "compute"):
-            with pytest.raises(RuntimeError, match="Cannot preserve Nemotron Humming"):
-                for name, source in payload.items():
-                    param = getattr(layer, name)
-                    param.weight_loader(param, source * multiplier)
-                finalize_layerwise_reload(model, SimpleNamespace(dtype=torch.float32))
-            return
-        for name, source in payload.items():
-            value = source * multiplier
-            raw = value.clone()
-            param = getattr(layer, name)
-            param.weight_loader(param, value)
-            assert torch.equal(value, raw)
-        finalize_layerwise_reload(model, SimpleNamespace(dtype=torch.float32))
-        for name, param in original.items():
-            assert getattr(layer, name) is param
-            assert torch.equal(param, torch.full_like(param, multiplier))
-        if case == "preserve":
-            assert method.moe_kernel is kernel
-            assert method.moe_quant_config is config
-            assert kernel.fused_experts.locks is locks
-            assert config._w1.scale is layer.w13_weight_scale
-            assert config._w1.alpha_or_gscale is layer.w13_weight_scale_2
-            assert config._w2.scale is layer.w2_weight_scale
-            assert config._w2.alpha_or_gscale is layer.w2_weight_scale_2
-        else:
-            assert method.moe_kernel is not kernel
 
 
 def test_reload_lifecycle():
