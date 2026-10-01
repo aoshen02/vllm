@@ -172,6 +172,16 @@ endif()
 #
 # Forward the non-CUDA device extensions to external CMake scripts.
 #
+if(VLLM_TARGET_DEVICE STREQUAL "cuda")
+  define_extension_target(
+    _mnnvl_C
+    DESTINATION vllm
+    LANGUAGE CXX
+    SOURCES csrc/mnnvl_workspace.cpp
+    USE_SABI 3.10
+    WITH_SOABI)
+endif()
+
 if (NOT VLLM_TARGET_DEVICE STREQUAL "cuda" AND
     NOT VLLM_TARGET_DEVICE STREQUAL "rocm")
     if (VLLM_TARGET_DEVICE STREQUAL "cpu")

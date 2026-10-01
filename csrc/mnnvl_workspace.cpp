@@ -1,9 +1,13 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
 #include <ATen/dlpack.h>
 
 #include <atomic>
 #include <cstdint>
+#include <limits>
 #include <new>
 
 namespace {
@@ -35,12 +39,13 @@ PyObject* make_capsule(PyObject*, PyObject* args) {
   unsigned long long pointer;
   long long rows, columns, row_stride;
   int device_type, device_id;
-  if (!PyArg_ParseTuple(args, "KLLLii", &pointer, &rows, &columns,
-                        &row_stride, &device_type, &device_id)) {
+  if (!PyArg_ParseTuple(args, "KLLLii", &pointer, &rows, &columns, &row_stride,
+                        &device_type, &device_id)) {
     return nullptr;
   }
   if (!pointer || rows <= 0 || columns <= 0 || row_stride < columns ||
-      (device_type != kDLCPU && device_type != kDLCUDA) || device_id < 0) {
+      (device_type != kDLCPU && device_type != kDLCUDA) || device_id < 0 ||
+      rows - 1 > (std::numeric_limits<int64_t>::max() - columns) / row_stride) {
     PyErr_SetString(PyExc_ValueError, "invalid uint8 strided workspace");
     return nullptr;
   }
@@ -72,13 +77,10 @@ PyObject* counts(PyObject*, PyObject*) {
 
 PyMethodDef methods[] = {
     {"make_capsule", make_capsule, METH_VARARGS,
-     "Wrap external uint8 memory; native metadata lifetime follows storage."},
-    {"counts", counts, METH_NOARGS, "Diagnostic live/released metadata counts."},
+     "Wrap borrowed uint8 memory with native DLPack metadata ownership."},
+    {"counts", counts, METH_NOARGS, "Live and released metadata owners."},
     {nullptr, nullptr, 0, nullptr}};
-PyModuleDef module = {PyModuleDef_HEAD_INIT, "fi_w4a16_native_dlpack", nullptr,
-                      -1, methods};
+PyModuleDef module = {PyModuleDef_HEAD_INIT, "_mnnvl_C", nullptr, -1, methods};
 }  // namespace
 
-PyMODINIT_FUNC PyInit_fi_w4a16_native_dlpack() {
-  return PyModule_Create(&module);
-}
+PyMODINIT_FUNC PyInit__mnnvl_C() { return PyModule_Create(&module); }

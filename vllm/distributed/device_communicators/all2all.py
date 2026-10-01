@@ -833,7 +833,17 @@ class FlashInferNVLinkOneSidedManager(All2AllManagerBase):
         # symmetric MNNVL fabric workspace.
         torch.accelerator.empty_cache()
 
-        self.moe_alltoall = MoeAlltoAll(
+        alltoall_cls = MoeAlltoAll
+        hf_config = get_current_vllm_config().model_config.hf_config
+        if (
+            envs.VLLM_BATCH_INVARIANT
+            and getattr(hf_config, "model_type", None) == "nemotron_h"
+            and getattr(hf_config, "hidden_size", None) == 2688
+        ):
+            from .flashinfer_workspace import NemotronMoeAlltoAll
+
+            alltoall_cls = NemotronMoeAlltoAll
+        self.moe_alltoall = alltoall_cls(
             mapping=self.mapping,
             max_num_tokens=self.max_num_tokens,
             top_k=self.top_k,

@@ -26,6 +26,99 @@ from ..utils import init_test_distributed_environment
 
 DEVICE = current_platform.device_type
 
+
+def test_native_workspace_metadata_lives_until_last_tensor_alias():
+    """DLPack consumption must release metadata once, not external storage."""
+    import gc
+
+    from vllm import _mnnvl_C
+
+    storage = torch.arange(32, dtype=torch.uint8)
+    live, released = _mnnvl_C.counts()
+    capsule = _mnnvl_C.make_capsule(storage.data_ptr(), 2, 8, 16, 1, 0)
+    tensor = torch.utils.dlpack.from_dlpack(capsule)
+    alias = tensor[:, :4]
+    assert tensor.shape == (2, 8) and tensor.stride() == (16, 1)
+    assert tensor.data_ptr() == storage.data_ptr()
+    del tensor, capsule
+    gc.collect()
+    assert _mnnvl_C.counts() == (live + 1, released)
+    alias.fill_(7)
+    assert torch.equal(storage[:4], torch.full((4,), 7, dtype=torch.uint8))
+    del alias
+    gc.collect()
+    assert _mnnvl_C.counts() == (live, released + 1)
+    assert storage.numel() == 32
+
+
+def test_native_workspace_unconsumed_capsule_releases_metadata():
+    import gc
+
+    from vllm import _mnnvl_C
+
+    storage = torch.zeros(16, dtype=torch.uint8)
+    live, released = _mnnvl_C.counts()
+    capsule = _mnnvl_C.make_capsule(storage.data_ptr(), 1, 16, 16, 1, 0)
+    del capsule
+    gc.collect()
+    assert _mnnvl_C.counts() == (live, released + 1)
+
+
+def test_native_workspace_is_cached_without_patching_flashinfer(monkeypatch):
+    from types import SimpleNamespace
+
+    from flashinfer.comm import mnnvl
+    from flashinfer.comm.trtllm_moe_alltoall import MoeAlltoAll
+
+    from vllm.distributed.device_communicators import flashinfer_workspace as workspace
+
+    storage = torch.zeros(32, dtype=torch.uint8)
+    original_packer = mnnvl.pack_strided_memory
+    parent_cache = MoeAlltoAll._WORKSPACE_CACHE.copy()
+    calls = []
+
+    class Memory:
+        comm = SimpleNamespace(Get_size=lambda: 2)
+        dev_id = 0
+
+        def __init__(self, mapping, size):
+            self.ptr = storage.data_ptr()
+            self.segment_size = size
+            self.rank_stride = 16
+
+    make_capsule = workspace._mnnvl_C.make_capsule
+
+    def capsule(ptr, rows, columns, stride, device_type, device_id):
+        assert device_type == 2 and device_id == 0
+        return make_capsule(ptr, rows, columns, stride, 1, 0)
+
+    monkeypatch.setattr(workspace, "MnnvlMemory", Memory)
+    monkeypatch.setattr(workspace._mnnvl_C, "make_capsule", capsule)
+
+    def initialize(*args):
+        calls.append(args)
+        return "metadata"
+
+    monkeypatch.setattr(workspace, "moe_a2a_initialize", initialize)
+    monkeypatch.setattr(workspace.NemotronMoeAlltoAll, "_WORKSPACE_CACHE", {})
+    first = workspace.NemotronMoeAlltoAll.get_workspace(8, 0, 2, 16, object())
+    second = workspace.NemotronMoeAlltoAll.get_workspace(8, 0, 2, 16, object())
+    assert first is second and len(calls) == 1
+    assert first["workspace"].data_ptr() == first["mnnvl_mem"].ptr
+    assert first["workspace"].stride() == (16, 1)
+    assert mnnvl.pack_strided_memory is original_packer
+    assert parent_cache == MoeAlltoAll._WORKSPACE_CACHE
+
+
+@pytest.mark.parametrize("rows,columns,stride", [(0, 8, 8), (2, 8, 4), (2**62, 8, 16)])
+def test_native_workspace_rejects_invalid_layout(rows, columns, stride):
+    from vllm import _mnnvl_C
+
+    storage = torch.zeros(16, dtype=torch.uint8)
+    with pytest.raises(ValueError, match="strided workspace"):
+        _mnnvl_C.make_capsule(storage.data_ptr(), rows, columns, stride, 1, 0)
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
