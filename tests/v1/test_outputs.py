@@ -13,6 +13,7 @@ from vllm.v1.outputs import (
     LogprobsLists,
     LogprobsTensors,
     ModelRunnerOutput,
+    SamplingMaskLists,
 )
 from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
 from vllm.v1.worker.gpu.sample.output import SamplingMaskTensors
@@ -76,6 +77,59 @@ def test_sampling_mask_lists_to_nested_list():
     assert SamplingMaskLists(np.array([7, 9])).to_nested_list() == [[7, 9]]
 
 
+def test_sampling_mask_lists_keep_logprobs_aligned_on_request_slice():
+    mask = SamplingMaskLists(
+        token_ids=np.array([10, 11, 20]),
+        offsets=np.array([0, 2, 3]),
+        logprobs=np.array([-0.3, -1.4, 0.0]),
+    )
+    sliced = mask.slice_request(1, 1)
+    assert sliced.token_ids.tolist() == [20]
+    assert sliced.logprobs.tolist() == [0.0]
+
+
+@pytest.mark.parametrize(
+    "counts,expected_ids,expected_overflow",
+    [
+        ([2, 0, 1], [[0, 2], [], [1]], None),
+        ([3, 3, 3], [[0, 2, 3], [5, 6, 7], [1, 4, 8]], None),
+        ([2, 5, 3], [[0, 2], [5, 6, 7], [1, 4, 8]], [False, True, False]),
+    ],
+    ids=["below-capacity", "at-capacity", "tie-overflow"],
+)
+def test_sampling_mask_logprobs_tolists_fixed_capacity(
+    counts, expected_ids, expected_overflow
+):
+    """With mask logprobs the device layout is a fixed `[num_reqs, C]` buffer:
+    `tolists` keeps the first `counts[i]` slots of each row (padding is
+    garbage) and flags, instead of truncating silently, rows whose support
+    did not fit (`counts[i] > C`, a top-k boundary tie)."""
+    token_ids = torch.tensor([[0, 2, 3], [5, 6, 7], [1, 4, 8]], dtype=torch.int32)
+    logprobs = -token_ids.float() / 10
+    tensors = SamplingMaskTensors(
+        token_ids=token_ids,
+        packed_mask=torch.empty((3, 0), dtype=torch.uint8),
+        counts=torch.tensor(counts, dtype=torch.int32),
+        vocab_size=16,
+        logprobs=logprobs,
+    )
+
+    mask = tensors.to_cpu_nonblocking().tolists()
+
+    assert mask.to_nested_list() == expected_ids
+    expected_logprobs = [-t / 10 for row in expected_ids for t in row]
+    assert mask.logprobs.tolist() == pytest.approx(expected_logprobs)
+    if expected_overflow is None:
+        assert mask.overflow is None
+    else:
+        assert mask.overflow.tolist() == expected_overflow
+    assert [mask.is_overflow(i) for i in range(3)] == (expected_overflow or [False] * 3)
+    # The per-request wire slice never carries the engine-internal flag.
+    sliced = mask.slice_request(2, 1)
+    assert sliced.overflow is None
+    assert sliced.token_ids.tolist() == expected_ids[2]
+
+
 @pytest.mark.parametrize("max_num_kept", [512, 20_001])
 @pytest.mark.skipif(
     current_platform.is_xpu(),
@@ -133,6 +187,105 @@ def test_sampling_mask_matches_processed_top_k_top_p_support():
     result = tensors.tolists()
 
     assert result.to_nested_list() == [expected_token_ids]
+
+
+@pytest.mark.parametrize("max_num_kept", [5, 6])
+def test_sampling_mask_logprobs_match_processed_distribution(max_num_kept):
+    """Paired logprobs are the log-softmax over the processed logits (i.e.
+    normalized over the nucleus), aligned with the support ids, whether the
+    support fills the fixed-capacity row or not."""
+    logits = torch.tensor([[6.0, 5.0, 4.0, 3.0, 2.0, 1.0]], device=DEVICE_TYPE)
+    processed = apply_top_k_top_p(
+        logits,
+        k=torch.tensor([5], device=DEVICE_TYPE),
+        p=torch.tensor([0.9], device=DEVICE_TYPE),
+    )
+    tensors = SamplingMaskTensors.from_logits(
+        processed,
+        torch.tensor([1], device=DEVICE_TYPE),
+        max_num_kept=max_num_kept,
+        return_logprobs=True,
+    )
+    assert tensors.token_ids.shape == (1, max_num_kept)
+    assert tensors.logprobs is not None
+    assert tensors.logprobs.shape == (1, max_num_kept)
+    assert tensors.packed_mask.shape == (1, 0)
+
+    mask = tensors.to_cpu_nonblocking().tolists()
+
+    expected_ids = torch.isfinite(processed[0]).nonzero().flatten()
+    expected_scores = torch.log_softmax(processed[0], dim=-1)[expected_ids]
+    assert mask.overflow is None
+    assert mask.token_ids.tolist() == expected_ids.tolist()
+    torch.testing.assert_close(torch.from_numpy(mask.logprobs), expected_scores.cpu())
+    assert np.exp(mask.logprobs).sum() == pytest.approx(1.0)
+
+
+def test_sampling_mask_logprobs_fixed_capacity_batch():
+    """Rows at, below and above capacity in one batch: exact ids and scores
+    up to `max_num_kept`; a wider row is reported as overflow rather than
+    falling back to a bitmask (none is written on this path)."""
+    from vllm.v1.worker.gpu.sample.output import MAX_COMPACT_SUPPORT
+
+    vocab_size = 10_000
+    support_sizes = [0, 1, MAX_COMPACT_SUPPORT, MAX_COMPACT_SUPPORT + 1, 40]
+    logits = torch.full((len(support_sizes), vocab_size), float("-inf"))
+    generator = torch.Generator().manual_seed(0)
+    expected_ids = []
+    expected_scores = []
+    for row, size in enumerate(support_sizes):
+        token_ids = torch.randperm(vocab_size, generator=generator)[:size].sort().values
+        logits[row, token_ids] = torch.randn(size, generator=generator)
+        expected_ids.append(token_ids.tolist())
+        expected_scores.append(torch.log_softmax(logits[row], dim=-1)[token_ids])
+    num_sampled = torch.tensor([0, 1, 1, 1, 1])
+    expected_ids[0] = []
+
+    tensors = SamplingMaskTensors.from_logits(
+        logits.to(DEVICE_TYPE),
+        num_sampled.to(DEVICE_TYPE),
+        max_num_kept=vocab_size,  # clamped to MAX_COMPACT_SUPPORT
+        return_logprobs=True,
+    )
+    assert tensors.token_ids.shape == (len(support_sizes), MAX_COMPACT_SUPPORT)
+    assert tensors.packed_mask.shape[1] == 0
+
+    result = tensors.to_cpu_nonblocking().tolists()
+
+    assert result.overflow.tolist() == [False, False, False, True, False]
+    nested = result.to_nested_list()
+    for row, size in enumerate(support_sizes):
+        if row == 3:
+            # Overflow row: only the first C ids are present; the scheduler
+            # fails the request instead of trusting them.
+            assert nested[row] == expected_ids[row][:MAX_COMPACT_SUPPORT]
+            continue
+        assert nested[row] == expected_ids[row]
+        start, end = result.offsets[row : row + 2]
+        torch.testing.assert_close(
+            torch.from_numpy(result.logprobs[start:end]), expected_scores[row][:size]
+        )
+
+
+def test_sampling_mask_logprobs_flag_top_k_boundary_ties():
+    """A top-k boundary tie keeps more than `max_num_kept` logits; with
+    paired logprobs there is no bitmask fallback, so the row is flagged."""
+    processed_logits = torch.tensor(
+        [[6.0, 5.0, 4.0, 4.0, 4.0, float("-inf"), float("-inf"), float("-inf")]],
+        device=DEVICE_TYPE,
+    )
+    result = (
+        SamplingMaskTensors.from_logits(
+            processed_logits,
+            num_sampled_tokens=torch.tensor([1], device=DEVICE_TYPE),
+            max_num_kept=3,
+            return_logprobs=True,
+        )
+        .to_cpu_nonblocking()
+        .tolists()
+    )
+    assert result.is_overflow(0)
+    assert result.to_nested_list() == [[0, 1, 2]]
 
 
 def test_sampling_mask_preserves_top_k_boundary_ties():

@@ -2138,6 +2138,29 @@ class Scheduler(SchedulerInterface):
                 request.resumable = False
                 stopped = True
 
+            sampling_masks = (
+                model_runner_output.sampling_masks
+                if self.return_sampling_mask
+                else None
+            )
+            if (
+                new_token_ids
+                and sampling_masks is not None
+                and sampling_masks.is_overflow(req_index)
+            ):
+                # Fixed-capacity mask logprobs cannot represent a support wider
+                # than the batch max top_k (a top-k boundary tie). Fail the
+                # request rather than return a truncated support.
+                logger.error(
+                    "Sampling support of request %s exceeds the mask logprobs "
+                    "buffer (max_num_kept = batch max top_k) because of top-k "
+                    "ties; lower top_k. Terminating request.",
+                    req_id,
+                )
+                request.status = RequestStatus.FINISHED_ERROR
+                request.resumable = False
+                stopped = True
+
             routed_experts = None
             should_emit_output = bool(
                 new_token_ids or pooler_output is not None or stopped
@@ -2187,12 +2210,10 @@ class Scheduler(SchedulerInterface):
                 else:
                     stopped_preempted_reqs.add(request)
 
-            if self.return_sampling_mask:
-                sampling_masks = model_runner_output.sampling_masks
-                if new_token_ids and sampling_masks is not None:
-                    new_sampling_mask = sampling_masks.slice_request(
-                        req_index, len(new_token_ids)
-                    )
+            if new_token_ids and sampling_masks is not None:
+                new_sampling_mask = sampling_masks.slice_request(
+                    req_index, len(new_token_ids)
+                )
 
             if num_nans_in_logits is not None and req_id in num_nans_in_logits:
                 request.num_nans_in_logits = num_nans_in_logits[req_id]

@@ -439,10 +439,24 @@ class RequestState:
             logprobs = logprobs[-num_new_tokens:] if num_new_tokens else logprobs[:0]
 
         sampling_mask = None
-        if finished and self.sampling_mask_chunks:
-            sampling_mask = SamplingMask(
-                [chunk.token_ids.tolist() for chunk in self.sampling_mask_chunks]
-            )
+        if self.sampling_mask_chunks and (finished or (delta and token_ids)):
+            chunks = self.sampling_mask_chunks
+            if delta:
+                chunks = chunks[-len(token_ids) :] if token_ids else []
+                self.sampling_mask_chunks.clear()
+            if chunks:
+                # Either every chunk carries aligned logprobs or none does.
+                mask_logprobs: list[list[float]] | None = None
+                if chunks[0].logprobs is not None:
+                    mask_logprobs = [
+                        chunk.logprobs.tolist()
+                        for chunk in chunks
+                        if chunk.logprobs is not None
+                    ]
+                sampling_mask = SamplingMask(
+                    [chunk.token_ids.tolist() for chunk in chunks],
+                    mask_logprobs,
+                )
 
         # Concatenate routed experts on finish
         routed_experts = None

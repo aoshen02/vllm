@@ -53,14 +53,31 @@ The mask is also available via the `/inference/v1/generate` HTTP endpoint:
 }
 ```
 
+For score centering, add `--return-sampling-mask-logprobs` to return
+`sampling_mask_logprobs` alongside each row of `sampling_mask`. The scores are
+normalized over the post-filtering support and have the same order as the token
+IDs, so the training side gets `π_old` over the whole nucleus without requesting
+full-vocabulary `logprobs=-1`. In streaming mode, each token chunk carries its
+own mask and scores.
+
+The paired transfer uses a fixed `[num_requests, max top_k]` device buffer
+(`max top_k` is the batch maximum, capped at 2048) that rides the same
+asynchronous GPU → CPU copy as the sampled tokens, so it never synchronizes
+with the device. Requests must set `0 < top_k <= 2048`. A top-k boundary tie
+that keeps more than `top_k` tokens cannot be represented in that buffer; the
+engine then fails the request (`finish_reason: "error"`) instead of returning
+a truncated support. Lower `top_k` (or avoid exact logit ties) if this occurs.
+
 ## Requirements
 
 | Requirement | Reason |
 | --- | --- |
 | `--return-sampling-mask` | Engine-level opt-in (disables FlashInfer sampler) |
+| `--return-sampling-mask-logprobs` | Optional paired logprobs; requires `--return-sampling-mask` |
 | `--logprobs-mode processed_logprobs` | Returned logprobs are normalized over the nucleus, not full vocab |
 | `temperature > 0` | Greedy has no truncated distribution |
 | `top_k > 0` | Bounds mask size; pure top-p can produce vocab-sized masks |
+| `top_k <= 2048` | With `--return-sampling-mask-logprobs`: sizes the fixed paired buffer |
 | Model Runner V2 | Required by the async D2H copy pipeline |
 
 The engine rejects unsupported combinations at startup or request time:
@@ -77,8 +94,10 @@ The engine rejects unsupported combinations at startup or request time:
 2. After sampling, `torch.isfinite(processed_logits)` identifies the surviving
    token IDs — this is the sampling mask.
 3. The mask is transferred GPU → CPU asynchronously alongside sampled tokens.
-4. On request completion, per-step masks are merged and converted to
-   `list[list[int]]` for the response.
+   With paired logprobs, the GPU gathers the post-filtering log-softmax at the
+   compacted support IDs into a fixed `[num_requests, max top_k]` buffer that
+   is transferred the same way.
+4. Per-step masks are converted to `list[list[int]]` for the response.
 
 ## RL training usage
 
@@ -109,5 +128,9 @@ consistent.
 - **Engine-level flag:** `--return-sampling-mask` globally disables the
   FlashInfer fused sampler. All requests pay the cost of the PyTorch sampling
   path, even if they don't need the mask.
-- **No streaming support:** The mask is returned only in the final response,
-  not in intermediate streaming chunks.
+- **Streaming:** Token chunks contain aligned masks and, when enabled, paired
+  logprobs.
+- **Paired-logprob capacity:** The paired buffer is sized by the batch maximum
+  `top_k` (at most 2048), with no per-step device synchronization. Ties at the
+  top-k boundary that exceed `top_k` fail the request rather than degrading
+  to the bitmask fallback used by the mask-only path.
