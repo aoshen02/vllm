@@ -22,6 +22,10 @@ Keep the exact tested revision separate from a future current-main rebase:
 upstream model, Mamba and quantization APIs have changed. A rebased candidate
 requires fresh correctness tests and model evaluation, not borrowed evidence.
 
+A disposable rebase onto upstream `87a4bf664f` was attempted and conflicted
+in `vllm/model_executor/layers/mamba/mamba_mixer2.py` while applying the
+dependency. It was aborted without changing the tested review branch.
+
 ## What is included
 
 - Nemotron-specific BI norms and FP8 quantizer/gate dispatch, with TP1 guards.
@@ -107,3 +111,17 @@ and Python AST checks pass; `git diff --check` passes. Full CI/pre-commit is
 not claimed. Non-mutating Ruff found three import-order issues and one long
 line in preserved overlays, plus five UP038 reports in `modelopt.py`; no
 hook-driven source rewrite was used to preserve the tested bytes.
+
+New checkout test attempt:
+
+```bash
+.venv/bin/python -m pytest \
+  tests/model_executor/test_nemotron_h_quantization.py \
+  tests/kernels/moe/test_flashinfer_cutedsl_layout.py \
+  tests/kernels/quantization/test_nvfp4_kernel_selection.py -q
+```
+
+Collection failed with two ImportErrors: this host's checkout lacks the CUDA
+FlashAttention extensions `_vllm_fa2_C` / `_vllm_fa3_C`. This is **not** a
+passing pytest result, and no new GPU suite or model evaluation is claimed
+for the relocated checkout. The immutable-image evidence above is separate.
