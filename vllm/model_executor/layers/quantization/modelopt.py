@@ -216,12 +216,12 @@ class ModelOptQuantConfigBase(QuantizationConfig):
         self, layer: torch.nn.Module, prefix: str
     ) -> "QuantizeMethodBase | None":
         # handle kv-cache first so we can focus only on weight quantization thereafter
-        if isinstance(layer, (Attention, MLAAttention)):
+        if isinstance(layer, Attention | MLAAttention):
             return self.KVCacheMethodCls(self)
 
         # handle exclusion
         if self.is_layer_excluded(prefix):
-            if isinstance(layer, (LinearBase, ParallelLMHead)):
+            if isinstance(layer, LinearBase | ParallelLMHead):
                 return UnquantizedLinearMethod()
             return None
 
@@ -238,7 +238,7 @@ class ModelOptQuantConfigBase(QuantizationConfig):
             return UnquantizedLinearMethod()
 
         # now, the layer is quantized, handle it here
-        if isinstance(layer, (LinearBase, ParallelLMHead)):
+        if isinstance(layer, LinearBase | ParallelLMHead):
             return build_linear_method(self, self.quant_method, prefix)
         elif isinstance(layer, RoutedExperts):
             quant_method = self.FusedMoEMethodCls(
@@ -1048,7 +1048,10 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
         require(self.use_a16, "only W4A16 is supported")
         kernel = getattr(self, "moe_kernel", None)
         config = getattr(self, "moe_quant_config", None)
-        require(kernel is not None and config is not None, "missing original kernel")
+        if kernel is None or config is None:
+            raise RuntimeError(
+                "Cannot preserve Nemotron Humming reload: missing kernel"
+            )
         experts = kernel.fused_experts
         require(experts.quant_config is config, "quant config identity changed")
         original, _ = info.kernel_tensors
@@ -1118,6 +1121,28 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
             routing_tables=layer._expert_routing_tables(),
         )
         self.moe_kernel.fused_experts.process_weights_after_loading(layer)
+
+        current = get_current_vllm_config_or_none()
+        hf_config = getattr(getattr(current, "model_config", None), "hf_config", None)
+        if (
+            envs.VLLM_BATCH_INVARIANT
+            and getattr(hf_config, "model_type", None) == "nemotron_h"
+            and getattr(hf_config, "hidden_size", None) == 2688
+            and self.use_a16
+            and self.nvfp4_backend == NvFp4MoeBackend.HUMMING
+            and self.moe.moe_parallel_config.tp_size == 1
+            and self.moe.moe_parallel_config.ep_size == 4
+        ):
+            from vllm.model_executor.layers.fused_moe.experts.fused_humming_moe import (
+                HummingIndexedExperts,
+            )
+            from vllm.model_executor.models.nemotron_h_moe import (
+                configure_nemotron_humming,
+            )
+
+            experts = self.moe_kernel.fused_experts
+            if type(experts) is HummingIndexedExperts:
+                configure_nemotron_humming(experts)
 
     def _restore_padded_moe_dims(self, layer: RoutedExperts) -> None:
         """Recover the padded ``moe_config`` dims from the exported weights."""
@@ -1839,13 +1864,13 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
 
         # Excluded layers
         if self.is_layer_excluded(prefix):
-            if isinstance(layer, (LinearBase, ParallelLMHead)):
+            if isinstance(layer, LinearBase | ParallelLMHead):
                 return UnquantizedLinearMethod()
             return None
 
         quant_algo = self._resolve_quant_algo(prefix)
 
-        if isinstance(layer, (LinearBase, ParallelLMHead)):
+        if isinstance(layer, LinearBase | ParallelLMHead):
             # Per-prefix algo -> its sub-config, then the generic linear method.
             # resolve() reads group_size off whichever sub-config it is handed.
             # Read-only — never write back, or a linear-only change leaks into

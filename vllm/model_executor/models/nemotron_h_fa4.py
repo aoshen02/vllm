@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Isolated fixed-schedule FA4 experiment for Nemotron-H attention."""
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Fixed-schedule FP8 attention for Nemotron-H batch invariance."""
 
 import torch
 
@@ -34,8 +35,10 @@ class NemotronHFixedFA4Impl(FlashAttentionImpl):
         sinks: torch.Tensor | None = None,
     ) -> None:
         config = get_current_vllm_config_or_none()
+        capability = current_platform.get_device_capability()
         if (
-            current_platform.get_device_capability().major != 10
+            capability is None
+            or capability.major != 10
             or (num_heads, num_kv_heads, head_size) != (32, 2, 128)
             or kv_cache_dtype not in ("fp8", "fp8_e4m3")
             or alibi_slopes is not None
@@ -80,9 +83,7 @@ class NemotronHFixedFA4Impl(FlashAttentionImpl):
         ):
             raise ValueError("Unsupported Nemotron-H fixed FA4 metadata")
 
-        key_cache, value_cache = kv_cache.transpose(1, 2).split(
-            self.head_size, dim=-1
-        )
+        key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_size, dim=-1)
         key_cache = canonicalize_singleton_dim_strides(key_cache).view(
             current_platform.fp8_dtype()
         )

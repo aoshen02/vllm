@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Explicit, experimental Nemotron W4A16 adapter; not an auto/BI backend."""
+"""Explicit Nemotron W4A16 routed-expert backend; not batch invariant."""
 
 import weakref
 
@@ -17,10 +17,10 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import kNvfp4Stat
 
 
 def nemotron_w4a16_support(config, model_type, batch_invariant):
-    """Constrain the experiment without changing stock backend selection."""
+    """Limit explicit backend selection to the supported Nemotron recipe."""
     parallel = config.moe_parallel_config
     if batch_invariant:
-        return False, "experimental W4A16 adapter has no BI/PD acceptance"
+        return False, "W4A16 routed backend does not support batch invariance"
     if model_type != "nemotron_h" or config.moe_backend != "flashinfer_cutedsl":
         return False, "requires explicit Nemotron flashinfer_cutedsl selection"
     if config.in_dtype != torch.bfloat16:

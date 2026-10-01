@@ -185,6 +185,41 @@ class NemotronHMLP(nn.Module):
         )
         self.act_fn = ReLUSquaredActivation()
 
+        if envs.VLLM_BATCH_INVARIANT and prefix.endswith(".shared_experts"):
+            self._select_shared_nvfp4_kernels()
+
+    def _select_shared_nvfp4_kernels(self) -> None:
+        from vllm.model_executor.kernels.linear.nvfp4.base import (
+            NvFp4LinearLayerConfig,
+        )
+        from vllm.model_executor.kernels.linear.nvfp4.flashinfer import (
+            NemotronSharedNvFp4LinearKernel,
+        )
+        from vllm.model_executor.layers.quantization.modelopt import (
+            ModelOptLinearMethod,
+        )
+        from vllm.model_executor.layers.quantization.utils.quant_utils import (
+            kNvfp4Static,
+        )
+
+        layers = (self.up_proj, self.down_proj)
+        if not all(
+            isinstance(layer.quant_method, ModelOptLinearMethod)
+            and layer.quant_method.spec.weight == kNvfp4Static
+            and layer.quant_method.spec.activation is None
+            for layer in layers
+        ):
+            return
+        if get_tensor_model_parallel_world_size() != 1:
+            raise ValueError("Aligned Nemotron shared W4A16 requires TP=1")
+        supported, reason = NemotronSharedNvFp4LinearKernel.is_supported()
+        if not supported:
+            raise ValueError(reason)
+        for layer in layers:
+            method = layer.quant_method
+            assert isinstance(method, ModelOptLinearMethod)
+            method.kernel = NemotronSharedNvFp4LinearKernel(NvFp4LinearLayerConfig())
+
     def forward(self, x: torch.Tensor):
         x, _ = self.up_proj(x)
         x = maybe_fused_act_quant(self.act_fn, x, self.down_proj)
@@ -883,6 +918,8 @@ class NemotronHForCausalLM(
             chunk_size=vllm_config.model_config.get_mamba_chunk_size(),
         )
         if cache_config.use_replayssm:
+            if len(base_shape) != 2:
+                raise ValueError("Mamba exact replay cannot be combined with ReplaySSM")
             return MambaStateShapeCalculator.append_replayssm_ring(
                 base_shapes=base_shape,
                 n_groups=hf_config.n_groups,
