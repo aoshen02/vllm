@@ -52,7 +52,8 @@ Compilation and prefix caching use the target version's defaults.
 
 For the explicit BI0 routed-expert baseline, use the same launch settings with
 `VLLM_BATCH_INVARIANT=0` and `--moe-backend flashinfer_cutedsl`; the indexed
-Humming environment variable is unnecessary. This selects the native FlashInfer
+Humming environment variable and the two replay block-size overrides are
+unnecessary and should be omitted. This selects the native FlashInfer
 CuTeDSL W4A16 adapter, not Humming or an experimental worker. BI0 does not select
 the aligned shared-expert kernel, fixed FA4 backend, or indexed BI schedule.
 This is a supported launch recipe, **not a fresh performance acceptance**.
