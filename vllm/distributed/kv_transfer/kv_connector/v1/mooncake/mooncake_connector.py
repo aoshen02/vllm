@@ -2188,10 +2188,8 @@ class MooncakeConnectorWorker:
         )
 
     def release_kv_caches(self) -> None:
-        """Release the Mooncake registration of the KV caches, once no transfer
-        uses them: no block is ready to be sent to D and no pull is in flight.
-        Raises TimeoutError if one still is after the abort timeout, after
-        which D gives up on a transfer. Idempotent."""
+        """Drop the Mooncake registration of the KV caches once no send or pull uses
+        them; TimeoutError past the abort timeout. Idempotent."""
         if not self.seen_base_addresses:
             return
         deadline = time.perf_counter() + envs.VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT
