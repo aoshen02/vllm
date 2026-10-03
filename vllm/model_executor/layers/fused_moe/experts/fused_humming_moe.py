@@ -177,6 +177,17 @@ class HummingExpertsBase(mk.FusedMoEExpertsModular):
         self.w13_tuning_config_str = json.dumps(self.w13_tuning_config)
         self.w2_tuning_config_str = json.dumps(self.w2_tuning_config)
 
+    def transform_tuning_configs(self, transform) -> None:
+        """Replace both tuning tables with transform(table), before any launch.
+
+        A model may tune launch geometry for its shapes; the transform must not
+        change the reduction (K tile, accumulation type).
+        """
+        self.w13_tuning_config = transform(self.w13_tuning_config)
+        self.w2_tuning_config = transform(self.w2_tuning_config)
+        self.w13_tuning_config_str = json.dumps(self.w13_tuning_config)
+        self.w2_tuning_config_str = json.dumps(self.w2_tuning_config)
+
     def process_input(
         self,
         sublayer_name: str,

@@ -1240,7 +1240,11 @@ def test_fused_marlin_moe_non_gated(
     torch.testing.assert_close(marlin_output, torch_output, atol=1e-1, rtol=0)
 
 
-def _make_humming_indexed_experts(activation: MoEActivation):
+def _make_humming_indexed_experts(
+    activation: MoEActivation,
+    num_experts: int = 12,
+    random_weights: bool = False,
+):
     pytest.importorskip("humming")
     from vllm.model_executor.layers.fused_moe.experts.fused_humming_moe import (
         HummingIndexedExperts,
@@ -1248,7 +1252,7 @@ def _make_humming_indexed_experts(activation: MoEActivation):
     from vllm.model_executor.layers.quantization.utils import humming as humming_utils
     from vllm.utils import humming
 
-    top_k, num_experts = 6, 12
+    top_k = 6
     hidden_size, intermediate_size = 2688, 1856
     gate_up_size = intermediate_size * 2 if activation.is_gated else intermediate_size
     num_w13_stacks = 2 if activation.is_gated else 1
@@ -1277,16 +1281,18 @@ def _make_humming_indexed_experts(activation: MoEActivation):
             stack_size=stack_size,
         )
         for tensor_name, attrs in tensor_attrs.items():
+            shape, dtype = attrs["shape"], attrs["dtype"]
+            if not random_weights:
+                value = torch.ones(shape, dtype=dtype, device="cuda")
+            elif dtype == torch.uint8:
+                value = torch.randint(0, 256, shape, dtype=dtype, device="cuda")
+            elif dtype == torch.float8_e4m3fn:
+                value = (torch.rand(shape, device="cuda") + 0.5).to(dtype)
+            else:
+                value = torch.full(shape, 0.01, dtype=dtype, device="cuda")
             layer.register_parameter(
                 f"{sublayer_name}_{tensor_name}",
-                Parameter(
-                    torch.ones(
-                        attrs["shape"],
-                        dtype=attrs["dtype"],
-                        device="cuda",
-                    ),
-                    requires_grad=False,
-                ),
+                Parameter(value, requires_grad=False),
             )
 
     humming_utils.convert_to_humming_moe_kernel_format(
@@ -1709,6 +1715,82 @@ def test_humming_gated_non_gated_shape_contract(activation: MoEActivation):
     experts.num_dispatchers = 2
     batched_metas, _ = experts.get_buffer_metas(17, top_k, activation)
     assert batched_metas["quanted_gate_up_input"]["shape"][0] == num_experts * 17 * 2
+
+
+def test_nemotron_h_humming_schedule_is_bitwise_neutral(monkeypatch):
+    """The Nemotron-H Lightning EP4 launch schedule (4 stages, narrower warps)
+    keeps every routed output bit: the trainer relies on Humming results not
+    depending on launch tiles. Lightning EP4 rank geometry, batch invariant."""
+    from vllm import envs
+    from vllm.forward_context import set_forward_context
+    from vllm.model_executor.models.nemotron_h_moe import nemotron_humming_schedule
+
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
+    activation = MoEActivation.RELU2_NO_MUL
+    set_random_seed(0)
+    experts, layer = _make_humming_indexed_experts(
+        activation, num_experts=32, random_weights=True
+    )
+    moe_config = experts.moe_config
+    top_k, hidden_size = moe_config.experts_per_token, moe_config.hidden_dim
+
+    def run(num_tokens, hidden_states, topk_weights, topk_ids):
+        workspace13_shape, workspace2_shape, _ = experts.workspace_shapes(
+            M=num_tokens,
+            N=moe_config.intermediate_size,
+            K=hidden_size,
+            topk=top_k,
+            global_num_experts=32,
+            local_num_experts=32,
+            expert_tokens_meta=None,
+            activation=activation,
+        )
+        output = torch.empty_like(hidden_states)
+        with set_forward_context(None, vllm_config, num_tokens=num_tokens):
+            experts.apply(
+                output=output,
+                hidden_states=hidden_states,
+                w1=layer.w13_weight,
+                w2=layer.w2_weight,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                activation=activation,
+                global_num_experts=32,
+                expert_map=None,
+                a1q_scale=None,
+                a2_scale=None,
+                workspace13=torch.empty(
+                    workspace13_shape, dtype=torch.bfloat16, device="cuda"
+                ),
+                workspace2=torch.empty(
+                    workspace2_shape, dtype=torch.bfloat16, device="cuda"
+                ),
+                expert_tokens_meta=None,
+                apply_router_weight_on_input=False,
+            )
+        return output
+
+    inputs = {}
+    for num_tokens in (1, 16, 64, 300, 1024, 4096):
+        hidden_states = torch.randn(
+            num_tokens, hidden_size, dtype=torch.bfloat16, device="cuda"
+        )
+        topk_ids = torch.stack(
+            [torch.randperm(32, device="cuda")[:top_k] for _ in range(num_tokens)]
+        ).to(torch.int32)
+        topk_weights = torch.rand(
+            num_tokens, top_k, dtype=torch.bfloat16, device="cuda"
+        )
+        inputs[num_tokens] = (hidden_states, topk_weights, topk_ids)
+
+    default = {m: run(m, *args) for m, args in inputs.items()}
+    tables = (experts.w13_tuning_config, experts.w2_tuning_config)
+    experts.transform_tuning_configs(nemotron_humming_schedule)
+    assert (experts.w13_tuning_config, experts.w2_tuning_config) != tables
+    for m, args in inputs.items():
+        tuned = run(m, *args)
+        assert torch.isfinite(tuned).all()
+        assert torch.equal(tuned, default[m]), m
 
 
 def test_humming_indexed_writes_supplied_output_buffer():

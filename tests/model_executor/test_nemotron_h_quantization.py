@@ -222,3 +222,89 @@ def test_nemotron_h_gated_norm_uses_shared_kernel_only_at_tp1(monkeypatch, tp_si
     norm.variance_epsilon = 1e-5
     out = nemotron_h.NemotronHGatedRMSNorm.forward(norm, torch.ones(2, 4), None)
     assert out == ("shared" if tp_size == 1 else "default")
+
+
+def _lightning_vllm_config(**changes):
+    values = dict(
+        hidden_size=2688,
+        moe_intermediate_size=1856,
+        n_routed_experts=128,
+        num_experts_per_tok=6,
+        moe_backend="humming",
+        tp=1,
+        dp=4,
+        ep=True,
+    )
+    values.update(changes)
+    return SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(
+                hidden_size=values["hidden_size"],
+                moe_intermediate_size=values["moe_intermediate_size"],
+                n_routed_experts=values["n_routed_experts"],
+                num_experts_per_tok=values["num_experts_per_tok"],
+            )
+        ),
+        kernel_config=SimpleNamespace(moe_backend=values["moe_backend"]),
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=values["tp"],
+            data_parallel_size=values["dp"],
+            enable_expert_parallel=values["ep"],
+        ),
+        additional_config={},
+    )
+
+
+@pytest.mark.parametrize(
+    "changes,applies",
+    [
+        ({}, True),
+        ({"dp": 2}, False),
+        ({"moe_intermediate_size": 2048}, False),
+        ({"num_experts_per_tok": 8}, False),
+        ({"moe_backend": "flashinfer_cutedsl"}, False),
+        ({"tp": 2, "dp": 2}, False),
+    ],
+)
+def test_nemotron_h_humming_schedule_only_for_measured_config(
+    monkeypatch, changes, applies
+):
+    """The Humming launch schedule is recorded by the config hook only for the
+    configuration it was measured on (Lightning, TP1/EP4, Humming indexed, BI)."""
+    from vllm.model_executor.models import nemotron_h_moe
+    from vllm.model_executor.models.config import NemotronHForCausalLMConfig
+
+    monkeypatch.setattr(nemotron_h_moe.envs, "VLLM_BATCH_INVARIANT", True)
+    monkeypatch.setattr(nemotron_h_moe.envs, "VLLM_HUMMING_MOE_GEMM_TYPE", "indexed")
+    vllm_config = _lightning_vllm_config(**changes)
+    NemotronHForCausalLMConfig.select_humming_schedule(vllm_config)
+    assert (nemotron_h_moe.SCHEDULE_KEY in vllm_config.additional_config) == applies
+
+
+def test_nemotron_h_humming_schedule_keeps_reduction():
+    from vllm.model_executor.models.nemotron_h_moe import nemotron_humming_schedule
+
+    def entry(lower, upper, n, stages=3, warp_n=64):
+        return [
+            lower,
+            upper,
+            {
+                "block_shape": [64, n, 32],
+                "warp_shape": [64, warp_n, 32],
+                "num_stages": stages,
+                "use_stream_k": False,
+                "mma_type": "mma",
+                "use_f16_accum": False,
+            },
+        ]
+
+    table = [entry(0, 64, 128), entry(64, 448, 256), entry(448, 8192, 256)]
+    tuned = nemotron_humming_schedule(table)
+    assert table[1][2]["num_stages"] == 3  # input untouched
+    assert [e[2]["num_stages"] for e in tuned] == [3, 4, 4]
+    assert [e[2]["warp_shape"][1] for e in tuned] == [64, 32, 64]
+    assert all(e[2]["block_shape"][2] == 32 for e in tuned)
+    bad = [entry(0, 64, 256)]
+    bad[0][2]["use_f16_accum"] = True
+    with pytest.raises(ValueError, match="reduction recipe"):
+        nemotron_humming_schedule(bad)

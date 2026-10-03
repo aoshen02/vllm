@@ -1125,6 +1125,9 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
             routing_tables=layer._expert_routing_tables(),
         )
         self.moe_kernel.fused_experts.process_weights_after_loading(layer)
+        transform = getattr(layer, "_humming_tuning_transform", None)
+        if transform is not None and self.nvfp4_backend == NvFp4MoeBackend.HUMMING:
+            self.moe_kernel.fused_experts.transform_tuning_configs(transform)
 
     def _restore_padded_moe_dims(self, layer: RoutedExperts) -> None:
         """Recover the padded ``moe_config`` dims from the exported weights."""
