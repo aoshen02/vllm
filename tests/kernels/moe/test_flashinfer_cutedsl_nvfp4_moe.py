@@ -484,3 +484,68 @@ def test_flashinfer_cutedsl_w4a16_moe(m: int, workspace_init):
             output.flatten().float(), reference.flatten().float(), dim=0
         )
         assert cosine > 0.99, f"cosine similarity {cosine:.4f} below 0.99"
+
+
+@torch.inference_mode()
+def test_flashinfer_cutedsl_w4a16_moe_batch_invariant(workspace_init):
+    """Under batch invariance a token's output is independent of its batch.
+
+    One tactic serves every token count; a token gives bitwise the same row
+    alone, at another position, among other tokens, and in a large batch.
+    """
+    pytest.importorskip("flashinfer.fused_moe.cute_dsl.tuner")
+    from flashinfer.fused_moe.cute_dsl.tuner import CuteDslFusedMoEW4A16Runner
+    from flashinfer.tllm_enums import ActivationType
+
+    from vllm.model_executor.layers.fused_moe.experts.flashinfer_cutedsl_w4a16_moe import (  # noqa: E501
+        BATCH_INVARIANT_TACTIC,
+        prepare_w4a16_scales,
+        w4a16_tactic,
+    )
+
+    assert {w4a16_tactic(m, True) for m in (1, 64, 65, 16384)} == {
+        BATCH_INVARIANT_TACTIC
+    }
+    n, k, e, topk, pool = 1856, 2688, 128, 6, 1024
+    set_random_seed(11)
+    w1_q, w1_scale, w1_global = _quantize_nvfp4_linear(
+        torch.randn((e, n, k), device="cuda", dtype=torch.bfloat16) / 15
+    )
+    w2_q, w2_scale, w2_global = _quantize_nvfp4_linear(
+        torch.randn((e, k, n), device="cuda", dtype=torch.bfloat16) / 15
+    )
+    weights = [
+        w1_q,
+        prepare_w4a16_scales(w1_scale),
+        (1.0 / w1_global).float(),
+        w2_q,
+        prepare_w4a16_scales(w2_scale),
+        (1.0 / w2_global).float(),
+    ]
+    x = torch.randn((pool, k), device="cuda", dtype=torch.bfloat16) / 10
+    ids = torch.stack([torch.randperm(e, device="cuda")[:topk] for _ in range(pool)])
+    ids = ids.to(torch.int32)
+    routes = torch.softmax(torch.randn((pool, topk), device="cuda"), -1)
+    runner = CuteDslFusedMoEW4A16Runner(
+        num_experts=e,
+        top_k=topk,
+        num_local_experts=e,
+        use_fused_finalize=False,
+        activation_type=ActivationType.Relu2.value,
+    )
+
+    def run(rows):
+        out = torch.empty((len(rows), k), device="cuda", dtype=torch.bfloat16)
+        inputs = [x[rows], ids[rows], routes[rows], *weights[:3], *weights[3:], out]
+        runner.forward(inputs, tactic=(BATCH_INVARIANT_TACTIC,) * 2)
+        return out
+
+    probe = 5
+    alone = run(torch.tensor([probe], device="cuda"))[0]
+    for m in (7, 65, pool):
+        rows = torch.randperm(pool, device="cuda")[:m]
+        rows[m // 2] = probe
+        assert torch.equal(run(rows)[m // 2], alone), m
+    full = run(torch.arange(pool, device="cuda"))
+    perm = torch.randperm(pool, device="cuda")
+    assert torch.equal(run(perm), full[perm])

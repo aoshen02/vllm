@@ -1,6 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Explicit Nemotron W4A16 routed-expert backend; not batch invariant."""
+"""Explicit Nemotron W4A16 routed-expert backend.
+
+Batch invariant with one tile tactic for every token count: each output
+element is one CTA's K_TILE=256 FP32 accumulation along the full K, with no
+split-K, and the top-k combine is a per-token FP32 sum in slot order, so a
+token's result does not depend on the batch it is in.
+"""
 
 import weakref
 
@@ -15,12 +21,20 @@ from vllm.model_executor.layers.fused_moe.experts.flashinfer_cutedsl_moe import 
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import kNvfp4Static
 
+# Under batch invariance every token count uses this tactic.
+BATCH_INVARIANT_TACTIC = ((256, 128, 256), (2, 1), True)
 
-def nemotron_w4a16_support(config, model_type, batch_invariant):
+
+def w4a16_tactic(num_tokens, batch_invariant):
+    """GEMM tactic for ``num_tokens`` routed source tokens."""
+    if batch_invariant or num_tokens > 64:
+        return BATCH_INVARIANT_TACTIC
+    return ((128, 8, 256), (1, 1), True)
+
+
+def nemotron_w4a16_support(config, model_type):
     """Limit explicit backend selection to the supported Nemotron recipe."""
     parallel = config.moe_parallel_config
-    if batch_invariant:
-        return False, "W4A16 routed backend does not support batch invariance"
     if model_type != "nemotron_h" or config.moe_backend != "flashinfer_cutedsl":
         return False, "requires explicit Nemotron flashinfer_cutedsl selection"
     if config.in_dtype != torch.bfloat16:
@@ -62,9 +76,7 @@ class FlashInferCuteDSLW4A16Experts(FlashInferCuteDSLExperts):
         current = get_current_vllm_config_or_none()
         model = current.model_config if current is not None else None
         model_type = getattr(getattr(model, "hf_config", None), "model_type", None)
-        supported, reason = nemotron_w4a16_support(
-            config, model_type, envs.VLLM_BATCH_INVARIANT
-        )
+        supported, reason = nemotron_w4a16_support(config, model_type)
         if not supported:
             return supported, reason
         try:
@@ -87,7 +99,7 @@ class FlashInferCuteDSLW4A16Experts(FlashInferCuteDSLExperts):
 
     @staticmethod
     def _supports_batch_invariance():
-        return False
+        return True
 
     def __init__(self, moe_config, quant_config):
         from flashinfer.fused_moe.cute_dsl.tuner import CuteDslFusedMoEW4A16Runner
@@ -209,9 +221,5 @@ class FlashInferCuteDSLW4A16Experts(FlashInferCuteDSLExperts):
         ]
         # Explicit screened candidates, chosen from host-known shapes before
         # launch. No autotuning or device synchronization inside Graph replay.
-        tile = (
-            ((128, 8, 256), (1, 1), True)
-            if hidden_states.shape[0] <= 64
-            else ((256, 128, 256), (2, 1), True)
-        )
+        tile = w4a16_tactic(hidden_states.shape[0], envs.VLLM_BATCH_INVARIANT)
         self.runner.forward(inputs, tactic=(tile, tile))
