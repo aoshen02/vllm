@@ -79,7 +79,9 @@ def record_metadata_for_reloading(model: torch.nn.Module):
 
 
 @torch.no_grad()
-def initialize_layerwise_reload(model: torch.nn.Module):
+def initialize_layerwise_reload(
+    model: torch.nn.Module, *, copy_immediately: bool = False
+):
     """Set up layerwise weight loading with deferred processing.
 
     Must be called after `record_metadata_for_reloading`. This function:
@@ -92,6 +94,11 @@ def initialize_layerwise_reload(model: torch.nn.Module):
     2. Load all cached weights
     3. Run quantization processing if applicable
     4. Copy processed values back to original tensor storage
+
+    With `copy_immediately`, a layer is materialized on its first load and every
+    incoming tensor is copied into it before the loader returns. No reference to
+    an incoming tensor is kept, so callers may reuse transfer buffers (e.g. IPC
+    buckets) between `load_weights` calls.
     """
     # disable torchao reloading to avoid infinite recursion
     model._original_do_torchao_reload = getattr(model, "_do_torchao_reload", False)
@@ -111,6 +118,7 @@ def initialize_layerwise_reload(model: torch.nn.Module):
 
         # Restore layer parameters/buffers onto meta device
         restore_layer_on_meta(layer, info)
+        info.copy_immediately = copy_immediately
 
         # Wrap weight loaders to buffer loading
         initialize_online_processing(layer)
@@ -180,6 +188,17 @@ def make_online_process_loader(layer: torch.nn.Module, param_name: str) -> Calla
         bound_args = loader_signature.bind(*args, **kwargs)
         bound_args.apply_defaults()
 
+        if info.copy_immediately:
+            ret = _load_immediately(
+                layer, info, param_name, original_loader, bound_args
+            )
+            if (
+                not is_deferred_attention_layer(layer)
+                and info.load_numel >= info.load_numel_total  # type: ignore[operator]
+            ):
+                _layerwise_process(layer, info)
+            return ret
+
         # Buffer loaded weights, track loading progress
         info.loaded_weights.append((param_name, bound_args))
         num_loaded, ret = get_numel_loaded(original_loader, bound_args)
@@ -220,6 +239,38 @@ def make_online_process_loader(layer: torch.nn.Module, param_name: str) -> Calla
         return ret
 
     return online_process_loader
+
+
+def _load_immediately(
+    layer: torch.nn.Module,
+    info: LayerReloadingInfo,
+    param_name: str,
+    original_loader: Callable,
+    bound_args: inspect.BoundArguments,
+):
+    """Copy one incoming tensor into the layer's checkpoint-format storage."""
+    if any(tensor.is_meta for tensor in get_layer_tensors(layer).values()):
+        if is_deferred_attention_layer(layer):
+            # Keep the live runtime buffers; only the checkpoint scale
+            # parameters are recreated for loading.
+            _place_kernel_tensors(layer, info)
+            quant_method = getattr(layer, "quant_method", None)
+            if quant_method is not None:
+                quant_method.create_weights(layer)
+        else:
+            materialize_layer(layer, info)
+        _wrap_parameters_weight_loader(layer)
+
+    bound_args.arguments["param"] = getattr(layer, param_name)
+    num_loaded, ret = get_numel_loaded(original_loader, bound_args)
+    info.load_numel += num_loaded
+
+    # Keep only the name: the incoming tensor must not outlive this call
+    for key, value in bound_args.arguments.items():
+        if isinstance(value, torch.Tensor):
+            bound_args.arguments[key] = None
+    info.loaded_weights.append((param_name, bound_args))
+    return ret
 
 
 def finalize_layerwise_processing(model: torch.nn.Module, model_config: ModelConfig):
@@ -293,6 +344,12 @@ def _finalize_attention_layer(
     if info.kernel_tensors is None:
         if info.load_numel > 0:
             _layerwise_process(layer, info)
+    elif info.load_numel > 0 and info.copy_immediately:
+        # Scales were loaded into recreated parameters next to the live buffers
+        quant_method = getattr(layer, "quant_method", None)
+        if quant_method is not None:
+            quant_method.process_weights_after_loading(layer)
+        _copy_and_restore_kernel_tensors(layer, info)
     elif info.load_numel > 0:
         # Reload with new scale weights from checkpoint
         _place_kernel_tensors(layer, info)
@@ -348,10 +405,11 @@ def _layerwise_process(layer: torch.nn.Module, info: LayerReloadingInfo):
         param.weight_loader = _get_original_loader(param)
 
     # Load all buffered weights into materialized layer (using original loaders)
-    for name, args in info.loaded_weights:
-        param = getattr(layer, name)
-        args.arguments["param"] = param
-        param.weight_loader(*args.args, **args.kwargs)
+    if not info.copy_immediately:
+        for name, args in info.loaded_weights:
+            param = getattr(layer, name)
+            args.arguments["param"] = param
+            param.weight_loader(*args.args, **args.kwargs)
 
     # Process weights (quantization, repacking, etc.)
     quant_method = getattr(layer, "quant_method", None)

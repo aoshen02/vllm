@@ -26,6 +26,10 @@ class LayerReloadingInfo:
     # used by `online_process_loader` to buffer args and tensors until ready to load
     loaded_weights: list[tuple[str, BoundArguments]] = field(default_factory=list)
 
+    # load each incoming tensor as it arrives instead of buffering its arguments;
+    # set by `initialize_layerwise_reload(copy_immediately=True)`
+    copy_immediately: bool = False
+
     # kernel formatted tensors, copied into by `_layerwise_process` when reloading
     kernel_tensors: LayerTensors | None = None
 
