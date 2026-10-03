@@ -253,6 +253,17 @@ _BATCH_INVARIANT_MATMUL_TUNED_CONFIGS: dict[
                 (2048, _MatmulMConfig(128, 128, 8, 3)),
             ),
         ),
+        # Nemotron-H (hidden 2688) qkv_proj and o_proj. One bucket: under
+        # torch.compile the bucket is picked once at trace time, so a single
+        # tile has to serve decode and prefill alike.
+        (4608, 2688): _MatmulShapeConfig(
+            block_k=64,
+            m_buckets=((2048, _MatmulMConfig(64, 256, 4, 5)),),
+        ),
+        (2688, 4096): _MatmulShapeConfig(
+            block_k=64,
+            m_buckets=((2048, _MatmulMConfig(64, 256, 4, 5)),),
+        ),
     },
     "sm120": {
         (12288, 2048): _MatmulShapeConfig(  # Qwen3-1.7B gate_up_proj

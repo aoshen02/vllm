@@ -780,6 +780,12 @@ class NvmlCudaPlatform(CudaPlatformBase):
     @with_nvml_context
     def get_device_capability(cls, device_id: int = 0) -> DeviceCapability | None:
         try:
+            if torch.cuda.is_initialized():
+                # The CUDA runtime fixed this process's visible devices when it
+                # initialized; CUDA_VISIBLE_DEVICES may have been changed since
+                # (e.g. by a co-located trainer), so ask the runtime directly.
+                major, minor = torch.cuda.get_device_capability(device_id)
+                return DeviceCapability(major=major, minor=minor)
             physical_device_id = cls.visible_device_id_to_physical_device_id(device_id)
             handle = pynvml.nvmlDeviceGetHandleByIndex(physical_device_id)
             major, minor = pynvml.nvmlDeviceGetCudaComputeCapability(handle)

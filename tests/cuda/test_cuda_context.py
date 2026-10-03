@@ -88,6 +88,7 @@ def test_get_device_capability_uses_visible_device_ordinal(monkeypatch):
         return f"handle-{index}"
 
     monkeypatch.setattr(platform_interface, "_assigned_physical_gpu_ids", [1])
+    monkeypatch.setattr(torch.cuda, "is_initialized", lambda: False)
     monkeypatch.setenv(NvmlCudaPlatform.device_control_env_var, "0,1")
     monkeypatch.setattr(
         NvmlCudaPlatform,
@@ -115,6 +116,36 @@ def test_get_device_capability_uses_visible_device_ordinal(monkeypatch):
     assert seen_indices == [1]
 
 
+@pytest.mark.parametrize("env_after_init", ["3", "3,1", "1,0,3,2"])
+def test_get_device_capability_ignores_env_changed_after_cuda_init(
+    monkeypatch, env_after_init
+):
+    """Once CUDA is initialized its visible-device list is fixed. A narrowed or
+    reordered CUDA_VISIBLE_DEVICES set afterwards (as a co-located trainer may
+    do) must not redirect the lookup to another GPU."""
+    from vllm.platforms.cuda import NvmlCudaPlatform, pynvml
+
+    runtime = {0: (10, 0), 1: (9, 0)}  # what the initialized runtime sees
+    monkeypatch.setattr(torch.cuda, "is_initialized", lambda: True)
+    monkeypatch.setattr(
+        torch.cuda, "get_device_capability", lambda index: runtime[index]
+    )
+    monkeypatch.setenv(NvmlCudaPlatform.device_control_env_var, env_after_init)
+    monkeypatch.setattr(pynvml, "nvmlInit", lambda: None)
+    monkeypatch.setattr(pynvml, "nvmlShutdown", lambda: None)
+
+    def fail(*_args):
+        raise AssertionError("NVML lookup through the device-control env var")
+
+    monkeypatch.setattr(pynvml, "nvmlDeviceGetHandleByIndex", fail)
+    NvmlCudaPlatform.get_device_capability.cache_clear()
+    try:
+        assert NvmlCudaPlatform.get_device_capability(0).to_int() == 100
+        assert NvmlCudaPlatform.get_device_capability(1).to_int() == 90
+    finally:
+        NvmlCudaPlatform.get_device_capability.cache_clear()
+
+
 def _stub_nvml(monkeypatch) -> dict[str, int]:
     """Stub NVML to report SM 9.0 and count init/shutdown pairs.
 
@@ -136,6 +167,7 @@ def _stub_nvml(monkeypatch) -> dict[str, int]:
     )
     # Pin the visible-device mapping so the test does not depend on whatever
     # CUDA_VISIBLE_DEVICES happens to be set to in the environment.
+    monkeypatch.setattr(torch.cuda, "is_initialized", lambda: False)
     monkeypatch.setenv(NvmlCudaPlatform.device_control_env_var, "0")
     monkeypatch.setattr(
         NvmlCudaPlatform,
