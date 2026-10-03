@@ -304,6 +304,7 @@ class MambaMixer2(MambaBase, PluggableLayer):
         cache_config: CacheConfig | None = None,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        norm_cls: type[Mixer2RMSNormGated] = Mixer2RMSNormGated,
     ):
         super().__init__()
 
@@ -515,7 +516,7 @@ class MambaMixer2(MambaBase, PluggableLayer):
             prefix=f"{prefix}.out_proj",
         )
 
-        self.norm = Mixer2RMSNormGated(
+        self.norm = norm_cls(
             intermediate_size, n_groups, self.use_rms_norm, eps=rms_norm_eps
         )
 

@@ -24,6 +24,7 @@ from itertools import islice
 import torch
 from torch import nn
 
+from vllm import envs
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import (
     CacheConfig,
@@ -52,7 +53,10 @@ from vllm.model_executor.layers.linear import (
     UnquantizedLinearMethod,
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
-from vllm.model_executor.layers.mamba.mamba_mixer2 import MambaMixer2
+from vllm.model_executor.layers.mamba.mamba_mixer2 import (
+    MambaMixer2,
+    Mixer2RMSNormGated,
+)
 from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateCopyFunc,
     MambaStateCopyFuncCalculator,
@@ -88,6 +92,43 @@ from vllm.model_executor.models.utils import (
 )
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.nemotron_h import NemotronHConfig
+
+
+class NemotronHRMSNorm(RMSNorm):
+    def forward(self, x, residual=None):
+        if envs.VLLM_BATCH_INVARIANT:
+            from .nemotron_h_alignment import rms_forward
+
+            return rms_forward(x, self.weight, self.variance_epsilon, residual)
+        return super().forward(x, residual)
+
+
+class NemotronHGatedRMSNorm(Mixer2RMSNormGated):
+    def forward(self, x, gate):
+        # The shared kernel normalizes whole groups on one rank; with TP the
+        # default path (batch invariant itself) reduces across ranks.
+        if envs.VLLM_BATCH_INVARIANT and self.tp_size == 1:
+            from .nemotron_h_alignment import gated_forward
+
+            if not self.use_rms_norm:
+                raise ValueError(
+                    "Shared gated normalization requires RMS normalization"
+                )
+            return gated_forward(
+                x, gate, self.weight, self.group_size, self.variance_epsilon
+            )
+        return super().forward(x, gate)
+
+
+class NemotronHGateLinear(GateLinear):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if envs.VLLM_BATCH_INVARIANT:
+            # Small-M CuTe and large-M GEMM have different reduction arithmetic.
+            # The cuBLAS bf16 -> fp32 GEMM that remains is kept batch invariant
+            # like every cuBLAS GEMM in BI mode on SM10x (no split-K via the
+            # workspace config), and it is the call the trainer replays.
+            self.allow_ll_bf16_gemm = False
 
 
 class NemotronHMLP(nn.Module):
@@ -126,6 +167,41 @@ class NemotronHMLP(nn.Module):
         )
         self.act_fn = get_act_fn(hidden_act)
 
+        if envs.VLLM_BATCH_INVARIANT and prefix.endswith(".shared_experts"):
+            self._select_shared_nvfp4_kernels()
+
+    def _select_shared_nvfp4_kernels(self) -> None:
+        from vllm.model_executor.kernels.linear.nvfp4.base import (
+            NvFp4LinearLayerConfig,
+        )
+        from vllm.model_executor.kernels.linear.nvfp4.flashinfer import (
+            NemotronSharedNvFp4LinearKernel,
+        )
+        from vllm.model_executor.layers.quantization.modelopt import (
+            ModelOptLinearMethod,
+        )
+        from vllm.model_executor.layers.quantization.utils.quant_utils import (
+            kNvfp4Static,
+        )
+
+        layers = (self.up_proj, self.down_proj)
+        if not all(
+            isinstance(layer.quant_method, ModelOptLinearMethod)
+            and layer.quant_method.spec.weight == kNvfp4Static
+            and layer.quant_method.spec.activation is None
+            for layer in layers
+        ):
+            return
+        if get_tensor_model_parallel_world_size() != 1:
+            raise ValueError("Aligned Nemotron shared W4A16 requires TP=1")
+        supported, reason = NemotronSharedNvFp4LinearKernel.is_supported()
+        if not supported:
+            raise ValueError(reason)
+        for layer in layers:
+            method = layer.quant_method
+            assert isinstance(method, ModelOptLinearMethod)
+            method.kernel = NemotronSharedNvFp4LinearKernel(NvFp4LinearLayerConfig())
+
     def forward(self, x: torch.Tensor):
         x, _ = self.up_proj(x)
         x = maybe_fused_act_quant(self.act_fn, x, self.down_proj)
@@ -157,7 +233,7 @@ class NemotronHMoE(nn.Module):
 
         self.is_sequence_parallel = parallel_config.use_sequence_parallel_moe
 
-        self.gate = GateLinear(
+        self.gate = NemotronHGateLinear(
             config.hidden_size,
             config.n_routed_experts,
             out_dtype=torch.float32,
@@ -252,6 +328,11 @@ class NemotronHMoE(nn.Module):
             apply_routed_scale_to_output=True,
             router_logits_dtype=self.gate.out_dtype,
         )
+        if envs.VLLM_BATCH_INVARIANT:
+            # CUDA graphs capture the Humming kernel's scale tensor addresses.
+            # Layerwise reload writes new values back into that storage, so
+            # keep the kernel instead of rebuilding it over fresh tensors.
+            self.experts.routed_experts._preserve_humming_reload_kernel = True
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
@@ -314,7 +395,7 @@ class NemotronHMLPDecoderLayer(nn.Module):
             prefix=f"{prefix}.mixer",
         )
 
-        self.norm = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
+        self.norm = NemotronHRMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
 
     def forward(
         self,
@@ -357,7 +438,7 @@ class NemotronHMoEDecoderLayer(nn.Module):
             prefix=f"{prefix}.mixer",
         )
 
-        self.norm = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
+        self.norm = NemotronHRMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
 
     def forward(
         self,
@@ -400,13 +481,14 @@ class NemotronHMambaDecoderLayer(nn.Module):
             head_dim=config.mamba_head_dim,
             rms_norm_eps=config.layer_norm_epsilon,
             activation=config.mamba_hidden_act,
+            norm_cls=NemotronHGatedRMSNorm,
             model_config=model_config,
             cache_config=cache_config,
             quant_config=quant_config,
             prefix=f"{prefix}.mixer",
         )
 
-        self.norm = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
+        self.norm = NemotronHRMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
 
     def forward(
         self,
@@ -478,6 +560,26 @@ class NemotronHAttention(nn.Module):
         # Get per-layer sliding window from config (for heterogeneous models)
         sliding_window = getattr(config, "sliding_window", None)
 
+        attn_backend = None
+        if envs.VLLM_BATCH_INVARIANT:
+            from vllm.model_executor.models.nemotron_h_fa4 import (
+                NemotronHFixedFA4Backend,
+                fixed_fa4_unsupported_reason,
+            )
+
+            reason = fixed_fa4_unsupported_reason(
+                self.head_dim,
+                cache_config.cache_dtype if cache_config else "auto",
+                sliding_window,
+                model_config.max_model_len if model_config else 0,
+            )
+            if reason is not None:
+                raise ValueError(
+                    f"VLLM_BATCH_INVARIANT=1 for Nemotron-H uses fixed-schedule "
+                    f"FA4 attention, which {reason}."
+                )
+            attn_backend = NemotronHFixedFA4Backend
+
         self.attn = Attention(
             self.num_heads,
             self.head_dim,
@@ -487,6 +589,7 @@ class NemotronHAttention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.attn",
             per_layer_sliding_window=sliding_window,
+            attn_backend=attn_backend,
         )
 
     def forward(
@@ -527,7 +630,7 @@ class NemotronHAttentionDecoderLayer(nn.Module):
             prefix=f"{prefix}.mixer",
         )
 
-        self.norm = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
+        self.norm = NemotronHRMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
 
     def forward(
         self,
@@ -616,7 +719,9 @@ class NemotronHModel(nn.Module, EagleModelMixin):
             ["hidden_states", "residual"], config.hidden_size
         )
 
-        self.norm_f = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
+        self.norm_f = NemotronHRMSNorm(
+            config.hidden_size, eps=config.layer_norm_epsilon
+        )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
