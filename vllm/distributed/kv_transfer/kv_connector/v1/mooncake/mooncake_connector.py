@@ -86,6 +86,7 @@ except ImportError:
     TransferEngine = None
 
 if TYPE_CHECKING:
+    from vllm.config.kv_transfer import KVTransferConfig
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
     from vllm.v1.kv_cache_interface import KVCacheConfig
     from vllm.v1.request import Request
@@ -794,10 +795,10 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
     ############################################################
     # Worker Side Methods
     ############################################################
-    @property
-    def supports_sleep_mode(self) -> bool:
+    @classmethod
+    def supports_sleep_mode(cls, kv_transfer_config: "KVTransferConfig") -> bool:
         # Only RDMA peers drop a stale remote key (the failed access refreshes it).
-        extra_config = self._kv_transfer_config.kv_connector_extra_config
+        extra_config = kv_transfer_config.kv_connector_extra_config
         return extra_config.get("mooncake_protocol", "rdma") == "rdma"
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):

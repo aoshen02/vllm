@@ -2639,7 +2639,8 @@ def test_failed_registration_is_registered_on_retry():
 def test_only_rdma_supports_sleep_mode(protocol: str):
     """Only RDMA peers refresh a stale remote key, through the failed access."""
     with mooncake_sleep_worker("kv_producer", protocol=protocol) as (connector, *_):
-        assert connector.supports_sleep_mode is (protocol == "rdma")
+        config = connector._kv_transfer_config
+        assert type(connector).supports_sleep_mode(config) is (protocol == "rdma")
 
 
 @pytest.mark.parametrize("ready", [True, False], ids=["ready_to_send", "not_ready"])
