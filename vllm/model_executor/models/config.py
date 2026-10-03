@@ -711,6 +711,12 @@ class NemotronHForCausalLMConfig(VerifyAndUpdateConfig):
         reason = nemotron_h_moe.schedule_unsupported_reason(vllm_config)
         if reason is None:
             additional[nemotron_h_moe.SCHEDULE_KEY] = "lightning_ep4"
+        elif vllm_config.kernel_config.moe_backend == "humming":
+            # Humming is selected but the tuned schedule is not: say so, since
+            # the measured gain (5-12% TPOT) silently disappears otherwise.
+            logger.warning(
+                "Nemotron-H Humming MoE keeps the default schedule: %s.", reason
+            )
         else:
             logger.info("Nemotron-H keeps Humming's default schedule: %s.", reason)
 

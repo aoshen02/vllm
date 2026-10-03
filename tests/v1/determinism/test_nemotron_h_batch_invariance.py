@@ -71,10 +71,11 @@ import torch
 from vllm.model_executor.determinism.batch_invariant import init_batch_invariance
 init_batch_invariance()
 torch.manual_seed(0)
-x = torch.randn(4096, 2688, device="cuda", dtype=torch.bfloat16)
+# Trainer micro-batches reach 8K-16K packed tokens.
+x = torch.randn(16384, 2688, device="cuda", dtype=torch.bfloat16)
 w = torch.randn(128, 2688, device="cuda", dtype=torch.bfloat16) / 50
 full = torch.mm(x, w.T, out_dtype=torch.float32)
-for m in (1, 2, 7, 16, 33, 64, 256, 1024):
+for m in (1, 2, 7, 16, 33, 64, 256, 1024, 4096, 8192):
     part = torch.mm(x[:m].contiguous(), w.T, out_dtype=torch.float32)
     assert torch.equal(part, full[:m]), m
 """

@@ -36,6 +36,7 @@ from vllm.config.parallel import ParallelConfig
 from vllm.distributed import get_ep_group, get_tensor_model_parallel_world_size
 from vllm.distributed.communication_op import tensor_model_parallel_all_gather
 from vllm.distributed.parallel_state import get_pp_group
+from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import get_act_fn
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import (
@@ -97,6 +98,8 @@ from vllm.model_executor.models.utils import (
 )
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.nemotron_h import NemotronHConfig
+
+logger = init_logger(__name__)
 
 
 class NemotronHRMSNorm(RMSNorm):
@@ -198,7 +201,14 @@ class NemotronHMLP(nn.Module):
         ):
             return
         if get_tensor_model_parallel_world_size() != 1:
-            raise ValueError("Aligned Nemotron shared W4A16 requires TP=1")
+            # Like the gated norm: with TP keep the generic BI selection
+            # (Humming W4A16), which is batch invariant but not the kernel the
+            # single-rank trainer replays.
+            logger.warning_once(
+                "Nemotron-H shared experts keep the default batch-invariant "
+                "W4A16 kernel with TP > 1; training-replay alignment needs TP=1."
+            )
+            return
         supported, reason = NemotronSharedNvFp4LinearKernel.is_supported()
         if not supported:
             raise ValueError(reason)

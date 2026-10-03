@@ -36,7 +36,10 @@ def schedule_unsupported_reason(vllm_config) -> str | None:
     if vllm_config.kernel_config.moe_backend != "humming":
         return "the MoE backend is not Humming"
     if envs.VLLM_HUMMING_MOE_GEMM_TYPE != "indexed":
-        return "the Humming GEMM type is not indexed"
+        return (
+            "the Humming GEMM type is not indexed "
+            "(set VLLM_HUMMING_MOE_GEMM_TYPE=indexed)"
+        )
     if parallel.tensor_parallel_size != 1 or not parallel.enable_expert_parallel:
         return "it needs TP1 with expert parallelism"
     ep_size = parallel.data_parallel_size

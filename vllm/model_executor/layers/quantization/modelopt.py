@@ -1125,9 +1125,18 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
             routing_tables=layer._expert_routing_tables(),
         )
         self.moe_kernel.fused_experts.process_weights_after_loading(layer)
+        self._apply_humming_tuning_transform(layer)
+
+    def _apply_humming_tuning_transform(self, layer: RoutedExperts) -> None:
+        """Apply a model's Humming launch-schedule transform, if it set one."""
         transform = getattr(layer, "_humming_tuning_transform", None)
         if transform is not None and self.nvfp4_backend == NvFp4MoeBackend.HUMMING:
-            self.moe_kernel.fused_experts.transform_tuning_configs(transform)
+            try:
+                self.moe_kernel.fused_experts.transform_tuning_configs(transform)
+            except ValueError as e:
+                # A launch-schedule tweak must not stop the engine; the default
+                # tables are equally correct.
+                logger.warning_once("Keeping Humming's default MoE schedule: %s", e)
 
     def _restore_padded_moe_dims(self, layer: RoutedExperts) -> None:
         """Recover the padded ``moe_config`` dims from the exported weights."""

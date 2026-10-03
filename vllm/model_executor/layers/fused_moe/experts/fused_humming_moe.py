@@ -183,8 +183,8 @@ class HummingExpertsBase(mk.FusedMoEExpertsModular):
         A model may tune launch geometry for its shapes; the transform must not
         change the reduction (K tile, accumulation type).
         """
-        self.w13_tuning_config = transform(self.w13_tuning_config)
-        self.w2_tuning_config = transform(self.w2_tuning_config)
+        w13, w2 = transform(self.w13_tuning_config), transform(self.w2_tuning_config)
+        self.w13_tuning_config, self.w2_tuning_config = w13, w2
         self.w13_tuning_config_str = json.dumps(self.w13_tuning_config)
         self.w2_tuning_config_str = json.dumps(self.w2_tuning_config)
 

@@ -308,3 +308,88 @@ def test_nemotron_h_humming_schedule_keeps_reduction():
     bad[0][2]["use_f16_accum"] = True
     with pytest.raises(ValueError, match="reduction recipe"):
         nemotron_humming_schedule(bad)
+
+
+@pytest.mark.parametrize("table_ok", [True, False])
+def test_humming_schedule_failure_keeps_default_tables(caplog_vllm, table_ok):
+    """A table the schedule does not recognise (e.g. after a Humming upgrade)
+    must not stop the engine: the default, equally correct, table stays."""
+    from vllm.model_executor.layers.fused_moe.experts.fused_humming_moe import (
+        HummingExpertsBase,
+    )
+    from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import NvFp4MoeBackend
+    from vllm.model_executor.layers.quantization.modelopt import (
+        ModelOptNvFp4FusedMoE,
+    )
+
+    def transform(table):
+        if not table_ok:
+            raise ValueError("Missing Nemotron Humming N256 intervals")
+        return [*table, "tuned"]
+
+    experts = SimpleNamespace(w13_tuning_config=["w13"], w2_tuning_config=["w2"])
+    experts.transform_tuning_configs = lambda fn: (
+        HummingExpertsBase.transform_tuning_configs(experts, fn)
+    )
+    method = SimpleNamespace(
+        nvfp4_backend=NvFp4MoeBackend.HUMMING,
+        moe_kernel=SimpleNamespace(fused_experts=experts),
+    )
+    layer = SimpleNamespace(_humming_tuning_transform=transform)
+    ModelOptNvFp4FusedMoE._apply_humming_tuning_transform(method, layer)
+    if table_ok:
+        assert experts.w13_tuning_config == ["w13", "tuned"]
+    else:
+        assert experts.w13_tuning_config == ["w13"]
+        assert experts.w2_tuning_config == ["w2"]
+        assert "Keeping Humming's default MoE schedule" in caplog_vllm.text
+
+
+def test_nemotron_h_humming_schedule_inactive_without_indexed_warns(
+    monkeypatch, caplog_vllm
+):
+    from vllm.model_executor.models import nemotron_h_moe
+    from vllm.model_executor.models.config import NemotronHForCausalLMConfig
+
+    monkeypatch.setattr(nemotron_h_moe.envs, "VLLM_BATCH_INVARIANT", True)
+    monkeypatch.setattr(nemotron_h_moe.envs, "VLLM_HUMMING_MOE_GEMM_TYPE", None)
+    vllm_config = _lightning_vllm_config()
+    NemotronHForCausalLMConfig.select_humming_schedule(vllm_config)
+    assert not vllm_config.additional_config
+    assert "VLLM_HUMMING_MOE_GEMM_TYPE=indexed" in caplog_vllm.text
+
+
+@pytest.mark.parametrize("tp_size", [1, 2])
+def test_nemotron_h_shared_experts_fall_back_with_tp(monkeypatch, tp_size):
+    """With TP > 1 the shared experts keep the generic BI W4A16 kernel instead
+    of failing at construction, like the gated norm."""
+    from vllm.model_executor.kernels.linear.nvfp4 import flashinfer
+    from vllm.model_executor.layers.quantization.modelopt import ModelOptLinearMethod
+    from vllm.model_executor.layers.quantization.utils.quant_utils import (
+        kNvfp4Static,
+    )
+    from vllm.model_executor.models import nemotron_h
+
+    monkeypatch.setattr(
+        nemotron_h, "get_tensor_model_parallel_world_size", lambda: tp_size
+    )
+    monkeypatch.setattr(
+        flashinfer.NemotronSharedNvFp4LinearKernel,
+        "is_supported",
+        classmethod(lambda cls, compute_capability=None: (True, None)),
+    )
+
+    def projection():
+        method = Mock(spec=ModelOptLinearMethod)
+        method.spec = SimpleNamespace(weight=kNvfp4Static, activation=None)
+        method.kernel = "default"
+        return SimpleNamespace(quant_method=method)
+
+    mlp = SimpleNamespace(up_proj=projection(), down_proj=projection())
+    nemotron_h.NemotronHMLP._select_shared_nvfp4_kernels(mlp)
+    for proj in (mlp.up_proj, mlp.down_proj):
+        kernel = proj.quant_method.kernel
+        if tp_size == 1:
+            assert isinstance(kernel, flashinfer.NemotronSharedNvFp4LinearKernel)
+        else:
+            assert kernel == "default"
