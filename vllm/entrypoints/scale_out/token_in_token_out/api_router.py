@@ -54,13 +54,17 @@ class _RenderedJSONResponse(JSONResponse):
     path. The parts are sent as consecutive ``http.response.body`` messages
     (small ones coalesced) instead of one joined body: no full-size copy,
     the server's write flow control applies, and each part is released
-    once sent.
+    once sent. Bodies up to ``COALESCE_BYTES`` go out as a single message,
+    exactly like ``JSONResponse``; larger ones are a stream of messages whose
+    last carries ``more_body=False`` (body-rewriting middleware such as
+    GZipMiddleware then sees a streaming response). Single-use: the parts are
+    consumed by the first send.
     """
 
     COALESCE_BYTES = 1 << 20
 
     def __init__(self, rendered: RenderedGenerateResponse) -> None:
-        self._parts = rendered.parts
+        self._parts: list[bytes | memoryview] | None = rendered.parts
         # Same header order as JSONResponse: content-length, content-type.
         super().__init__(
             content=None,
@@ -72,7 +76,10 @@ class _RenderedJSONResponse(JSONResponse):
         return b""
 
     def _chunks(self) -> Iterator[bytes]:
-        parts, self._parts = self._parts, []
+        if self._parts is None:
+            raise RuntimeError("A rendered generate response can only be sent once")
+        parts = self._parts
+        self._parts = None
         parts.reverse()  # pop() from the end releases parts in order
         buffer = bytearray()
         while parts:
@@ -97,9 +104,15 @@ class _RenderedJSONResponse(JSONResponse):
                 "headers": self.raw_headers,
             }
         )
-        for chunk in self._chunks():
-            await send({"type": "http.response.body", "body": chunk, "more_body": True})
-        await send({"type": "http.response.body", "body": b"", "more_body": False})
+        # Hold one chunk back so the last one carries more_body=False.
+        pending = b""
+        for index, chunk in enumerate(self._chunks()):
+            if index:
+                await send(
+                    {"type": "http.response.body", "body": pending, "more_body": True}
+                )
+            pending = chunk
+        await send({"type": "http.response.body", "body": pending, "more_body": False})
         if self.background is not None:
             await self.background()
 

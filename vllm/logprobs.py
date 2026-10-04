@@ -230,7 +230,10 @@ class _WireEncoder:
         self, token_ids: np.ndarray, logprobs: np.ndarray, ranks: np.ndarray
     ) -> bool:
         """Encode the rows, or return False if they are not representable
-        (width change, ids/ranks beyond int32)."""
+        (width change, ids/ranks beyond int32, logprobs wider than float32,
+        which the container then keeps losslessly in array mode)."""
+        if logprobs.dtype not in (_FLOAT32, np.dtype(np.float16)):
+            return False
         width = token_ids.shape[1]
         if self.slots is not None and width != self.slots:
             return False
@@ -311,6 +314,9 @@ class ArrayLogprobs(MutableSequence[LogprobsOnePosition | None]):
     _tail_fill: int = 0
     # Positions after the array rows, once irregular rows were seen.
     _legacy: list[LogprobsOnePosition] | None = None
+    # For slices: positions the source container held when it was sliced
+    # (DELTA outputs slice suffixes of the cumulative container).
+    source_positions: int | None = None
     wire_base64: InitVar[bool] = False
     _wire: _WireEncoder | None = field(default=None, init=False, repr=False)
 
@@ -326,9 +332,10 @@ class ArrayLogprobs(MutableSequence[LogprobsOnePosition | None]):
         self._wire = None
         if wire.num_rows:
             token_ids, logprobs, ranks = wire.decode()
-            self.token_id_chunks = [token_ids]
-            self.logprob_chunks = [logprobs]
-            self.rank_chunks = [ranks]
+            # Writable copies, like array-mode storage.
+            self.token_id_chunks = [token_ids.copy()]
+            self.logprob_chunks = [logprobs.copy()]
+            self.rank_chunks = [ranks.copy()]
             self._tail_fill = wire.num_rows
 
     def wire_parts(
@@ -506,6 +513,9 @@ class ArrayLogprobs(MutableSequence[LogprobsOnePosition | None]):
 
     def extend(self, values) -> None:
         if isinstance(values, ArrayLogprobs):
+            if values.source_positions is not None:
+                # Merged DELTA outputs: the newest slice's source count.
+                self.source_positions = values.source_positions
             values._unwire()
             # Snapshot first: ``values`` may be ``self``.
             blocks = values._filled_blocks()
@@ -555,7 +565,7 @@ class ArrayLogprobs(MutableSequence[LogprobsOnePosition | None]):
         start, stop, step = index.indices(self.num_positions)
         if step != 1:
             raise ValueError("ArrayLogprobs only supports contiguous slices")
-        result = ArrayLogprobs()
+        result = ArrayLogprobs(source_positions=self.num_positions)
         if stop <= start:
             return result
         array_positions = self._array_positions

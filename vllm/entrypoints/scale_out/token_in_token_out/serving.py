@@ -604,6 +604,7 @@ class ServingTokens(GenerateBaseServing):
                                 self._require_array_logprobs(out_logprobs),
                                 sampling_params.num_logprobs,
                                 expected_positions=len(delta_token_ids),
+                                expected_source_positions=num_generated_tokens[i],
                             )
                     elif sampling_params.logprobs is not None:
                         out_logprobs = output.logprobs
@@ -679,9 +680,10 @@ class ServingTokens(GenerateBaseServing):
         logprobs: ArrayLogprobs,
         num_logprobs: int | None,
         expected_positions: int | None = None,
+        expected_source_positions: int | None = None,
     ) -> CompactLogprobs:
         n, s, token_ids, values, ranks = compact_logprobs_fields(
-            logprobs, num_logprobs, expected_positions
+            logprobs, num_logprobs, expected_positions, expected_source_positions
         )
         return CompactLogprobs(
             num_positions=n,

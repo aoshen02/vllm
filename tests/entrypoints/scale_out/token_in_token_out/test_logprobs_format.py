@@ -1693,3 +1693,164 @@ async def test_compact_zero_token_abort_stream_vs_full():
     block = json.loads(response.body)["choices"][0]["compact_logprobs"]
     assert block["num_positions"] == 0 and block["num_slots"] == 4
     assert block["token_ids"] == block["logprobs"] == block["ranks"] == ""
+
+
+# ------------------------------------------------- round-3 audit regressions
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("missing_step", [1, 2])
+async def test_compact_stream_step_without_rows_is_an_error(missing_step):
+    """Claude r3 #1: a step with a token but no logprob rows must not make a
+    later chunk silently carry an earlier token's row."""
+    chunks: list[Any] = [
+        _engine_rows(0, 2, 4),
+        _engine_rows(2, 1, 4),
+        _engine_rows(3, 2, 4),
+    ]
+    ids = chunks[missing_step][0]
+    chunks[missing_step] = (ids, None, None)
+    feeder = _OutputProcessorEngine(chunks)
+    generator = await _serving(feeder).serve_tokens(
+        _request(logprobs=3, logprobs_format="compact", stream=True)
+    )
+    events = _parse_sse_chunks([chunk async for chunk in generator])
+    data = [e for e in events if isinstance(e, dict)]
+    for event, chunk in zip(data[:missing_step], chunks):
+        np.testing.assert_array_equal(
+            _decode(event["choices"][0]["compact_logprobs"])[0], chunk[0]
+        )
+    assert "error" in data[missing_step]
+    assert "generated tokens" in json.dumps(data[missing_step])
+    for event in data:
+        for choice in event.get("choices", []):
+            block = choice.get("compact_logprobs")
+            if block:
+                assert _decode(block)[0][:, 0].tolist() == choice["token_ids"]
+
+
+def test_delta_slices_record_source_positions():
+    token_ids, logprobs, ranks = _engine_rows(0, 5, 4)
+    container = ArrayLogprobs()
+    container.append_rows(token_ids, logprobs, ranks)
+    tail = container[-2:]
+    assert tail.source_positions == 5
+    merged = container[-3:-2]
+    merged.extend(tail)
+    assert merged.source_positions == 5 and len(merged) == 3
+    assert container.source_positions is None
+
+
+def _gzip_client(parts, minimum_size=500):
+    from starlette.middleware.gzip import GZipMiddleware
+
+    app = FastAPI()
+    app.state.args = Namespace(log_error_stack=False, tokens_only=False)
+    serving = MagicMock()
+
+    async def _serve(request, raw_request):
+        return RenderedGenerateResponse(list(parts))
+
+    serving.serve_tokens = _serve
+    app.state.serving_tokens = serving
+    init_exception_handler(app)
+    api_router.attach_router(app)
+    app.add_middleware(GZipMiddleware, minimum_size=minimum_size)
+    return TestClient(app)
+
+
+def test_small_rendered_body_behaves_like_json_response_under_gzip():
+    """Claude/Codex r3 #2: a body up to 1 MiB is a single message, so
+    GZipMiddleware keeps Content-Length and minimum_size like JSONResponse."""
+    parts = [b'{"choices":[', memoryview(b'{"index":0}'), b"]}"]
+    with _gzip_client(parts) as client:
+        result = client.post(
+            "/inference/v1/generate",
+            json={"token_ids": [1], "sampling_params": {}},
+            headers={"accept-encoding": "gzip"},
+        )
+    assert result.content == b"".join(parts)
+    assert "content-encoding" not in result.headers
+    assert int(result.headers["content-length"]) == len(result.content)
+
+
+def test_large_rendered_body_under_gzip_decodes():
+    big = [b'{"a":"' + b"x" * (3 << 20), b'"}']
+    with _gzip_client(big) as client:
+        result = client.post(
+            "/inference/v1/generate",
+            json={"token_ids": [1], "sampling_params": {}},
+            headers={"accept-encoding": "gzip"},
+        )
+    assert result.content == b"".join(big)
+    assert result.headers["content-encoding"] == "gzip"
+
+
+@pytest.mark.asyncio
+async def test_rendered_response_messages_and_single_use():
+    rendered = RenderedGenerateResponse([b"x" * (3 << 20), b"tail"])
+    response = api_router._RenderedJSONResponse(rendered)
+    messages: list[dict] = []
+
+    async def send(message):
+        messages.append(message)
+
+    await response({"type": "http"}, None, send)
+    bodies = [m for m in messages if m["type"] == "http.response.body"]
+    assert [m["more_body"] for m in bodies] == [True, False]
+    assert bodies[-1]["body"] == b"tail"
+    assert b"".join(m["body"] for m in bodies) == b"x" * (3 << 20) + b"tail"
+    with pytest.raises(RuntimeError, match="only be sent once"):
+        await response({"type": "http"}, None, send)
+    messages.clear()
+    small = api_router._RenderedJSONResponse(RenderedGenerateResponse([b"{", b"}"]))
+    await small({"type": "http"}, None, send)
+    assert [m.get("more_body") for m in messages[1:]] == [False]
+    messages.clear()
+    empty = api_router._RenderedJSONResponse(RenderedGenerateResponse([]))
+    await empty({"type": "http"}, None, send)
+    assert messages[1] == {
+        "type": "http.response.body",
+        "body": b"",
+        "more_body": False,
+    }
+
+
+def test_log_response_logs_whole_multipart_body(monkeypatch):
+    """Codex r3 #2: the debug response logger joins all body parts."""
+    from vllm.entrypoints.serve.middleware import log_response as log_mod
+
+    logged: list[str] = []
+    monkeypatch.setattr(
+        log_mod.logger, "info", lambda fmt, *args: logged.append(fmt % args)
+    )
+    log_mod._log_non_streaming_response([b'{"choices":[', b'{"token_ids":[1]}]}'])
+    assert logged == ['response_body={{"choices":[{"token_ids":[1]}]}}']
+
+
+def test_wire_mode_refuses_float64_and_stays_lossless():
+    """Claude r3 #4: float64 rows leave wire mode (lossless array storage);
+    decoded wire rows are writable."""
+    token_ids, logprobs, ranks = _engine_rows(0, 4, 3)
+    wire = ArrayLogprobs(wire_base64=True)
+    wire.append_rows(token_ids[:2], logprobs[:2], ranks[:2])
+    values64 = logprobs[2:].astype(np.float64)
+    values64[0, 1] = -1e-50
+    wire.append_rows(token_ids[2:], values64, ranks[2:])
+    assert wire.wire_parts() is None
+    assert wire[2][int(token_ids[2, 1])].logprob == -1e-50
+    _, values, _ = wire.arrays()
+    assert values.dtype == np.float64 and values.flags.writeable
+    first = ArrayLogprobs(wire_base64=True)
+    first.append_rows(token_ids[:1], logprobs[:1].astype(np.float64), ranks[:1])
+    assert first.wire_parts() is None
+
+
+def test_lead_table_warm_lookups_do_not_take_the_lock():
+    """Claude r3 #5: warm lookups never wait on the lock."""
+    table = logprobs_render._LeadTable(b"")
+    ids = np.array([[1, 2], [3, 4]])
+    table.lookup(ids)
+    with table.lock:
+        result = table.lookup(ids)  # would deadlock if it took the lock
+    assert result[1, 1] == b'{"token":"token_id:4","logprob":'

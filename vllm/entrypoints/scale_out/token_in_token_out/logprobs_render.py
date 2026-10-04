@@ -62,6 +62,7 @@ def _check_compact_rows(
     container: ArrayLogprobs,
     num_logprobs: int | None,
     expected_positions: int | None = None,
+    expected_source_positions: int | None = None,
 ) -> None:
     """Refuse rows the compact format cannot represent (GenerationError, 500):
     inconsistent widths, or a width other than ``k + 1`` for ``k >= 0``
@@ -70,6 +71,19 @@ def _check_compact_rows(
     if not container.is_regular:
         raise GenerationError(
             "Engine logprob rows have inconsistent widths; the compact "
+            "logprobs format cannot represent them"
+        )
+    if (
+        expected_source_positions is not None
+        and container.source_positions is not None
+        and container.source_positions != expected_source_positions
+    ):
+        # Streaming: the DELTA slice always has as many rows as new tokens,
+        # but if a step had tokens without rows, the slice holds rows of
+        # earlier tokens. Compare the cumulative counts instead.
+        raise GenerationError(
+            f"{container.source_positions} logprob positions for "
+            f"{expected_source_positions} generated tokens; the compact "
             "logprobs format cannot represent them"
         )
     if expected_positions is not None and len(container) != expected_positions:
@@ -97,13 +111,16 @@ def compact_logprobs_fields(
     container: ArrayLogprobs,
     num_logprobs: int | None,
     expected_positions: int | None = None,
+    expected_source_positions: int | None = None,
 ) -> tuple[int, int, bytes, bytes, bytes]:
     """Return ``(N, S, b64(token_ids), b64(logprobs), b64(ranks))``.
 
     Raises GenerationError (HTTP 500) when the engine rows cannot be
     represented: inconsistent row widths or ids/ranks beyond int32.
     """
-    _check_compact_rows(container, num_logprobs, expected_positions)
+    _check_compact_rows(
+        container, num_logprobs, expected_positions, expected_source_positions
+    )
     token_ids, logprobs, ranks = container.arrays()
     # Arrays are C-contiguous little-endian (ArrayLogprobs). The wire format
     # is int32/float32; engine data normally already has these dtypes.
@@ -213,21 +230,30 @@ class _LeadTable:
             column[:] = outside
             result[~inside] = column
             return result
+        values, filled = self.values, self.filled
+        if hi < len(values):
+            missing = np.unique(ids[~filled[ids]])
+            if not missing.size:
+                return values[ids]  # warm path: no lock
+        else:
+            missing = np.unique(ids)
+        # Format outside the lock (the expensive part), publish under it, so
+        # a render on the event loop never waits for another thread's
+        # formatting; the lock only covers growth and a few stores.
+        formatted = [(i, self._format(i)) for i in missing.tolist()]
         with self.lock:
             if hi >= len(self.values):
                 size = min(self.max_ids, max(hi + 1, 2 * len(self.values)))
-                values = np.empty(size, dtype=object)
-                values[: len(self.values)] = self.values
-                filled = np.zeros(size, dtype=bool)
-                filled[: len(self.filled)] = self.filled
-                self.values, self.filled = values, filled
+                grown = np.empty(size, dtype=object)
+                grown[: len(self.values)] = self.values
+                grown_filled = np.zeros(size, dtype=bool)
+                grown_filled[: len(self.filled)] = self.filled
+                self.values, self.filled = grown, grown_filled
             values, filled = self.values, self.filled
-            missing = ids[~filled[ids]]
-            if missing.size:
-                for token_id in np.unique(missing).tolist():
-                    values[token_id] = self._format(token_id)
-                filled[missing] = True
-        return values[ids]
+            for token_id, lead in formatted:
+                values[token_id] = lead
+            filled[missing] = True
+            return values[ids]
 
 
 _NEXT_LEADS = _LeadTable(_SEP_TOP_NEXT)
