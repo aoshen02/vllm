@@ -143,13 +143,13 @@ class LogprobsProcessor:
         if len(ranks) == 0:
             return
         # The engine pads rows to the batch-wide max; keep this request's
-        # k + 1 slots, like the zip truncation in the list/flat paths.
+        # k + 1 slots, like the zip truncation in the list/flat paths. Rows
+        # can also be narrower (a co-batched request's logprob_token_ids
+        # replaces the batch's tensors); they are truncated the same way and
+        # ArrayLogprobs keeps width changes as legacy entries (never raises).
         width = logprobs.shape[1]
         num_slots = width if self.num_logprobs == -1 else self.num_logprobs + 1
-        if num_slots > width:
-            raise ValueError(
-                f"Engine returned {width} logprob slots, expected {num_slots}"
-            )
+        num_slots = min(num_slots, width)
         token_ids = token_ids[:, :num_slots]
         logprobs = logprobs[:, :num_slots]
         # Same sequential float accumulation as the per-position path.

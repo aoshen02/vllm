@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import operator
 from collections.abc import Iterable, Iterator, MutableSequence
 from dataclasses import dataclass, field
 from typing import ClassVar, overload
@@ -159,22 +160,55 @@ class FlatLogprobs(MutableSequence[LogprobsOnePosition | None]):
             yield self.__getitem__(i)
 
 
+_INT32 = np.dtype("<i4")
+_INT64 = np.dtype("<i8")
+_FLOAT32 = np.dtype("<f4")
+_FLOAT64 = np.dtype("<f8")
+_INT32_INFO = np.iinfo(np.int32)
+
+
+def _storage_int_dtype(values: np.ndarray) -> np.dtype:
+    """int32 unless a value does not fit (then int64; never wraps)."""
+    if values.dtype == np.int32 or values.size == 0:
+        return _INT32
+    if int(values.min()) >= _INT32_INFO.min and int(values.max()) <= _INT32_INFO.max:
+        return _INT32
+    return _INT64
+
+
+def _storage_float_dtype(values: np.ndarray) -> np.dtype:
+    """float32 (the engine dtype; float16 widens exactly) or float64."""
+    return _FLOAT64 if values.dtype == np.float64 else _FLOAT32
+
+
 @dataclass
 class ArrayLogprobs(MutableSequence[LogprobsOnePosition | None]):
     """
     Sample logprobs of a request kept as the engine's ``LogprobsLists`` rows.
 
-    Rows are copied into preallocated numpy blocks (at least
-    ``BLOCK_ROWS`` rows each), so accumulating ``N`` positions with ``S``
-    slots creates ``O(N / BLOCK_ROWS)`` Python objects instead of
-    ``O(N * S)``, also when the engine delivers one row per step. Row ``i``
-    is exactly the engine row: slot 0 holds the sampled token, slots
-    ``1..S-1`` the top-k candidates in engine order. Candidate tokens are
-    never detokenized.
+    Row ``i`` is exactly the engine row: slot 0 holds the sampled token,
+    slots ``1..S-1`` the top-k candidates in engine order. Candidate tokens
+    are never detokenized. Rows are copied into numpy blocks whose capacity
+    grows geometrically from the first append (1, 2, 4, ... rows, or the
+    size of the incoming engine chunk if larger) up to ``BLOCK_BYTES``, so
+    a request reserves at most about twice its data (or one block), and
+    ``N`` positions create ``O(log N + N * row_bytes / BLOCK_BYTES)``
+    Python objects instead of ``O(N * S)``.
 
-    ``token_ids`` / ``ranks`` are stored as ``int32``; ``logprobs`` keep the
+    Each block has its own dtypes: ``token_ids`` / ``ranks`` are ``int32``
+    unless a value needs ``int64`` (never wrapped); ``logprobs`` keep the
     raw engine values, including non-finite ones, as ``float32`` (the engine
-    dtype) or ``float64`` if the engine produced float64.
+    dtype) or ``float64`` if the engine produced float64. :meth:`arrays`
+    promotes losslessly across blocks.
+
+    Slices are exact-sized views of the stored rows (no allocation).
+
+    Irregular engine output (a row whose width differs from the stored
+    width, e.g. when a co-batched request's ``logprob_token_ids`` replaced
+    the batch's logprob tensors) never raises: from that position on, rows
+    are kept as legacy ``dict[int, Logprob]`` entries (same truncation and
+    overwrite semantics as the list path) and :attr:`is_regular` becomes
+    False, so renderers fall back to the legacy path.
 
     Positional access (``container[i]``) materializes the same
     ``dict[int, Logprob]`` the list representation would hold (with
@@ -182,7 +216,7 @@ class ArrayLogprobs(MutableSequence[LogprobsOnePosition | None]):
     consumers use :meth:`arrays` instead.
     """
 
-    BLOCK_ROWS: ClassVar[int] = 4096
+    BLOCK_BYTES: ClassVar[int] = 8 << 20
 
     # Blocks; only the first ``_tail_fill`` rows of the last block are used.
     token_id_chunks: list[np.ndarray] = field(default_factory=list)
@@ -190,6 +224,35 @@ class ArrayLogprobs(MutableSequence[LogprobsOnePosition | None]):
     rank_chunks: list[np.ndarray] = field(default_factory=list)
     num_positions: int = 0
     _tail_fill: int = 0
+    # Positions after the array rows, once irregular rows were seen.
+    _legacy: list[LogprobsOnePosition] | None = None
+
+    @property
+    def is_regular(self) -> bool:
+        """Whether every position is stored as an array row."""
+        return self._legacy is None
+
+    @property
+    def _array_positions(self) -> int:
+        return self.num_positions - (len(self._legacy) if self._legacy else 0)
+
+    @staticmethod
+    def _row_dict(
+        token_ids: np.ndarray, logprobs: np.ndarray, rank: int
+    ) -> LogprobsOnePosition:
+        ids = token_ids.tolist()
+        ranks = itertools.chain((int(rank),), range(1, len(ids)))
+        # Same insertion/overwrite semantics as the list[dict] path.
+        return {
+            token_id: Logprob(logprob=value, rank=r)
+            for token_id, value, r in zip(ids, logprobs.tolist(), ranks)
+        }
+
+    def _append_legacy(self, positions: list[LogprobsOnePosition]) -> None:
+        if self._legacy is None:
+            self._legacy = []
+        self._legacy.extend(positions)
+        self.num_positions += len(positions)
 
     def append_rows(
         self, token_ids: np.ndarray, logprobs: np.ndarray, ranks: np.ndarray
@@ -200,22 +263,22 @@ class ArrayLogprobs(MutableSequence[LogprobsOnePosition | None]):
         if n == 0:
             return
         width = token_ids.shape[1]
-        if self.token_id_chunks and width != self.token_id_chunks[0].shape[1]:
-            raise ValueError("All positions must have the same number of slots")
+        if self._legacy is not None or (
+            self.token_id_chunks and width != self.token_id_chunks[0].shape[1]
+        ):
+            self._append_legacy(
+                [self._row_dict(token_ids[i], logprobs[i], ranks[i]) for i in range(n)]
+            )
+            return
+        dtypes = (
+            _storage_int_dtype(token_ids),
+            _storage_float_dtype(logprobs),
+            _storage_int_dtype(ranks),
+        )
         pos = 0
         while pos < n:
-            if not self.rank_chunks or self._tail_fill == len(self.rank_chunks[-1]):
-                rows = max(self.BLOCK_ROWS, n - pos)
-                if self.logprob_chunks:
-                    float_dtype = self.logprob_chunks[0].dtype
-                else:
-                    float_dtype = np.dtype(
-                        "<f8" if logprobs.dtype == np.float64 else "<f4"
-                    )
-                self.token_id_chunks.append(np.empty((rows, width), dtype="<i4"))
-                self.logprob_chunks.append(np.empty((rows, width), dtype=float_dtype))
-                self.rank_chunks.append(np.empty((rows,), dtype="<i4"))
-                self._tail_fill = 0
+            if not self._tail_can_hold(dtypes):
+                self._new_block(n - pos, width, dtypes)
             fill = self._tail_fill
             take = min(n - pos, len(self.rank_chunks[-1]) - fill)
             self.token_id_chunks[-1][fill : fill + take] = token_ids[pos : pos + take]
@@ -225,17 +288,45 @@ class ArrayLogprobs(MutableSequence[LogprobsOnePosition | None]):
             pos += take
         self.num_positions += n
 
-    def _filled(self) -> Iterator[tuple[np.ndarray, np.ndarray, np.ndarray]]:
-        """Yield the used ``(token_ids, logprobs, ranks)`` rows per block."""
-        last = len(self.rank_chunks) - 1
-        for i, (t, lp, r) in enumerate(
-            zip(self.token_id_chunks, self.logprob_chunks, self.rank_chunks)
-        ):
-            if i == last:
-                fill = self._tail_fill
-                yield t[:fill], lp[:fill], r[:fill]
-            else:
-                yield t, lp, r
+    def _tail_can_hold(self, dtypes: tuple[np.dtype, np.dtype, np.dtype]) -> bool:
+        if not self.rank_chunks or self._tail_fill == len(self.rank_chunks[-1]):
+            return False
+        blocks = (
+            self.token_id_chunks[-1],
+            self.logprob_chunks[-1],
+            self.rank_chunks[-1],
+        )
+        # Only lossless (widening) stores into the existing block.
+        return all(
+            np.can_cast(dtype, block.dtype, casting="safe")
+            for dtype, block in zip(dtypes, blocks)
+        )
+
+    def _new_block(
+        self, remaining: int, width: int, dtypes: tuple[np.dtype, np.dtype, np.dtype]
+    ) -> None:
+        tid_dtype, lp_dtype, rank_dtype = dtypes
+        row_bytes = width * (tid_dtype.itemsize + lp_dtype.itemsize)
+        row_bytes += rank_dtype.itemsize
+        max_rows = max(1, self.BLOCK_BYTES // row_bytes)
+        previous = len(self.rank_chunks[-1]) if self.rank_chunks else 0
+        rows = max(remaining, min(max_rows, max(1, 2 * previous)))
+        self.token_id_chunks.append(np.empty((rows, width), dtype=tid_dtype))
+        self.logprob_chunks.append(np.empty((rows, width), dtype=lp_dtype))
+        self.rank_chunks.append(np.empty((rows,), dtype=rank_dtype))
+        self._tail_fill = 0
+
+    def _filled_block(self, i: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """The used ``(token_ids, logprobs, ranks)`` rows of block ``i``."""
+        t, lp, r = self.token_id_chunks[i], self.logprob_chunks[i], self.rank_chunks[i]
+        if i == len(self.rank_chunks) - 1 and self._tail_fill != len(r):
+            fill = self._tail_fill
+            return t[:fill], lp[:fill], r[:fill]
+        return t, lp, r
+
+    def _filled_blocks(self) -> list[tuple[np.ndarray, np.ndarray, np.ndarray]]:
+        """Snapshot of all used rows, per block."""
+        return [self._filled_block(i) for i in range(len(self.rank_chunks))]
 
     @property
     def num_slots(self) -> int | None:
@@ -244,20 +335,33 @@ class ArrayLogprobs(MutableSequence[LogprobsOnePosition | None]):
             return None
         return self.token_id_chunks[0].shape[1]
 
+    def reserved_bytes(self) -> int:
+        """Bytes allocated by the blocks (used and unused rows)."""
+        return sum(
+            a.nbytes
+            for a in itertools.chain(
+                self.token_id_chunks, self.logprob_chunks, self.rank_chunks
+            )
+        )
+
     def arrays(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Return contiguous ``(token_ids[N, S], logprobs[N, S], ranks[N])``.
 
-        Blocks are concatenated once and kept as a single block afterwards.
-        Returns ``[0, 0]``-shaped arrays when there are no positions.
+        Blocks are concatenated once (promoting dtypes losslessly) and kept
+        as a single exact-sized block afterwards. Returns ``[0, 0]``-shaped
+        arrays when there are no positions. Raises ValueError when the
+        container is not :attr:`is_regular`.
         """
+        if self._legacy is not None:
+            raise ValueError("Logprob rows have inconsistent widths")
         if not self.token_id_chunks:
             return (
-                np.empty((0, 0), dtype="<i4"),
-                np.empty((0, 0), dtype="<f4"),
-                np.empty((0,), dtype="<i4"),
+                np.empty((0, 0), dtype=_INT32),
+                np.empty((0, 0), dtype=_FLOAT32),
+                np.empty((0,), dtype=_INT32),
             )
         if len(self.rank_chunks) > 1 or self._tail_fill != len(self.rank_chunks[0]):
-            ids, values, ranks = zip(*self._filled())
+            ids, values, ranks = zip(*self._filled_blocks())
             self.token_id_chunks = [np.concatenate(ids)]
             self.logprob_chunks = [np.concatenate(values)]
             self.rank_chunks = [np.concatenate(ranks)]
@@ -266,10 +370,16 @@ class ArrayLogprobs(MutableSequence[LogprobsOnePosition | None]):
 
     def extend(self, values) -> None:
         if isinstance(values, ArrayLogprobs):
-            for t, lp, r in values._filled():
+            # Snapshot first: ``values`` may be ``self``.
+            blocks = values._filled_blocks()
+            legacy = list(values._legacy) if values._legacy is not None else None
+            for t, lp, r in blocks:
                 self.append_rows(t, lp, r)
+            if legacy is not None:
+                self._append_legacy(legacy)
             return
-        raise TypeError("ArrayLogprobs can only be extended with ArrayLogprobs")
+        # Other position containers (list, FlatLogprobs): keep legacy dicts.
+        self._append_legacy(list(values))
 
     def __len__(self) -> int:
         """Gets number of positions stored in the container"""
@@ -283,48 +393,67 @@ class ArrayLogprobs(MutableSequence[LogprobsOnePosition | None]):
 
     def __getitem__(self, index: int | slice):
         if isinstance(index, slice):
-            start, stop, step = index.indices(self.num_positions)
-            if step != 1:
-                raise ValueError("ArrayLogprobs only supports contiguous slices")
-            pieces = []
-            # Walk blocks from the end: the output processor slices suffixes.
-            end = self.num_positions
-            for t, lp, r in reversed(list(self._filled())):
-                begin = end - len(r)
-                lo, hi = max(start, begin), min(stop, end)
-                if lo < hi:
-                    pieces.append(
-                        (
-                            t[lo - begin : hi - begin],
-                            lp[lo - begin : hi - begin],
-                            r[lo - begin : hi - begin],
-                        )
-                    )
-                end = begin
-                if end <= start:
-                    break
-            result = ArrayLogprobs()
-            for t, lp, r in reversed(pieces):
-                result.append_rows(t, lp, r)
-            return result
-        if not isinstance(index, int):
-            raise TypeError(f"Invalid index type: {type(index)}")
+            return self._slice(index)
+        try:
+            index = operator.index(index)
+        except TypeError:
+            raise TypeError(f"Invalid index type: {type(index)}") from None
         if index < 0:
             index += self.num_positions
         if not 0 <= index < self.num_positions:
             raise IndexError("ArrayLogprobs index out of range")
-        for t, lp, r in self._filled():
+        array_positions = self._array_positions
+        if index >= array_positions:
+            assert self._legacy is not None
+            return self._legacy[index - array_positions]
+        for i in range(len(self.rank_chunks)):
+            t, lp, r = self._filled_block(i)
             if index < len(r):
-                ids = t[index].tolist()
-                values = lp[index].tolist()
-                ranks = itertools.chain((int(r[index]),), range(1, len(ids)))
-                # Same insertion/overwrite semantics as the list[dict] path.
-                return {
-                    token_id: Logprob(logprob=value, rank=rank)
-                    for token_id, value, rank in zip(ids, values, ranks)
-                }
+                return self._row_dict(t[index], lp[index], r[index])
             index -= len(r)
         raise AssertionError("unreachable")
+
+    def _slice(self, index: slice) -> "ArrayLogprobs":
+        start, stop, step = index.indices(self.num_positions)
+        if step != 1:
+            raise ValueError("ArrayLogprobs only supports contiguous slices")
+        result = ArrayLogprobs()
+        if stop <= start:
+            return result
+        array_positions = self._array_positions
+        if self._legacy is not None:
+            legacy_part = self._legacy[
+                max(start - array_positions, 0) : max(stop - array_positions, 0)
+            ]
+            if legacy_part:
+                result._legacy = legacy_part
+                result.num_positions = len(legacy_part)
+            stop = min(stop, array_positions)
+            if stop <= start:
+                return result
+        pieces = []
+        # Walk blocks backward lazily: the output processor slices suffixes.
+        end = array_positions
+        for i in range(len(self.rank_chunks) - 1, -1, -1):
+            if end <= start:
+                break
+            t, lp, r = self._filled_block(i)
+            begin = end - len(r)
+            lo, hi = max(start, begin) - begin, min(stop, end) - begin
+            if lo < hi:
+                pieces.append((t[lo:hi], lp[lo:hi], r[lo:hi]))
+            end = begin
+        # Exact-sized views; the result's blocks are full, so appends to it
+        # allocate new blocks and never write into this container.
+        if not pieces:
+            return result
+        for t, lp, r in reversed(pieces):
+            result.token_id_chunks.append(t)
+            result.logprob_chunks.append(lp)
+            result.rank_chunks.append(r)
+            result.num_positions += len(r)
+        result._tail_fill = len(result.rank_chunks[-1])
+        return result
 
     def __setitem__(self, item, value) -> None:
         raise TypeError("Cannot set logprobs in ArrayLogprobs")
