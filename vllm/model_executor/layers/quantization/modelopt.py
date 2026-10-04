@@ -970,6 +970,11 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
             weight_loader=weight_loader,
         )
         layer.register_parameter("w2_input_scale", w2_input_scale)
+        if self.use_a16:
+            # Weight-only checkpoints carry no activation scales: a layerwise
+            # reload must not wait for them.
+            w13_input_scale.weight_loader_numel = 0
+            w2_input_scale.weight_loader_numel = 0
 
     def process_weights_after_loading(self, layer: RoutedExperts) -> None:
         """Convert NVFP4 MoE weights into kernel format and setup the kernel."""
@@ -2425,9 +2430,10 @@ class _DropInputScale(FormatScheme):
 
     def extra_weights(self, layer, shapes, ctx, wl) -> None:
         data = torch.full((shapes.num_partitions,), torch.nan)
-        layer.register_parameter(
-            "input_scale", PerTensorScaleParameter(data=data, weight_loader=wl)
-        )
+        scale = PerTensorScaleParameter(data=data, weight_loader=wl)
+        # Usually absent from the checkpoint: a layerwise reload must not wait.
+        scale.weight_loader_numel = 0
+        layer.register_parameter("input_scale", scale)
 
     def post_process(self, layer) -> None:
         scale = getattr(layer, "input_scale", None)
