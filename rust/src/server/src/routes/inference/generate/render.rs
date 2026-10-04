@@ -352,4 +352,107 @@ mod tests {
             assert_eq!(format_u32(value, &mut buf), value.to_string().as_bytes());
         }
     }
+
+    /// Serve one response over real HTTP/1.1 (hyper via `axum::serve`) and
+    /// return (raw header block, de-framed body).
+    async fn fetch_over_http(make: fn() -> Response) -> (String, Vec<u8>) {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = axum::Router::new().route("/", axum::routing::get(move || async move { make() }));
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stream
+            .write_all(b"GET / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut raw = Vec::new();
+        stream.read_to_end(&mut raw).await.unwrap();
+        server.abort();
+
+        let split = raw.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+        let head = String::from_utf8(raw[..split].to_vec()).unwrap().to_ascii_lowercase();
+        let mut rest = &raw[split + 4..];
+        if !head.contains("transfer-encoding: chunked") {
+            return (head, rest.to_vec());
+        }
+        let mut body = Vec::new();
+        loop {
+            let line_end = rest.windows(2).position(|w| w == b"\r\n").unwrap();
+            let size =
+                usize::from_str_radix(std::str::from_utf8(&rest[..line_end]).unwrap(), 16).unwrap();
+            rest = &rest[line_end + 2..];
+            if size == 0 {
+                break;
+            }
+            body.extend_from_slice(&rest[..size]);
+            rest = &rest[size + 2..];
+        }
+        (head, body)
+    }
+
+    fn test_envelope() -> GenerateEnvelope {
+        GenerateEnvelope {
+            request_id: "http-1".to_string(),
+            finish_reason: "abort".to_string(),
+            token_ids: vec![1, 2],
+            prompt_logprobs: None,
+            kv_transfer_params: None,
+            ec_transfer_params: None,
+        }
+    }
+
+    fn positions() -> Vec<PositionLogprobs> {
+        (0..300_u32)
+            .map(|i| PositionLogprobs {
+                entries: (0..3_u32)
+                    .map(|j| vllm_llm::TokenLogprob {
+                        token_id: i + j,
+                        logprob: -(j as f32) * 0.5,
+                        rank: j + 1,
+                    })
+                    .collect(),
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn http_framing_compact_has_length_and_openai_is_chunked() {
+        use vllm_llm::{Logprobs, LogprobsAccumulator as _};
+
+        use super::super::compact::CompactLogprobsAccumulator;
+
+        let (head, body) = fetch_over_http(|| {
+            let mut accumulator = CompactLogprobsAccumulator::new(3);
+            accumulator.extend(Logprobs {
+                positions: positions(),
+            });
+            let block = accumulator.finish().unwrap();
+            generate_response(test_envelope(), ChoiceLogprobs::Compact(Some(block)))
+        })
+        .await;
+        assert!(head.starts_with("http/1.1 200"), "{head}");
+        assert!(head.contains("content-type: application/json"), "{head}");
+        assert!(
+            head.contains(&format!("content-length: {}", body.len())),
+            "{head}"
+        );
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["choices"][0]["compact_logprobs"]["num_positions"], 300);
+
+        let (head, body) = fetch_over_http(|| {
+            generate_response(test_envelope(), ChoiceLogprobs::OpenAi(positions()))
+        })
+        .await;
+        assert!(head.starts_with("http/1.1 200"), "{head}");
+        assert!(head.contains("content-type: application/json"), "{head}");
+        assert!(head.contains("transfer-encoding: chunked"), "{head}");
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["choices"][0]["logprobs"]["content"].as_array().unwrap().len(),
+            300
+        );
+    }
 }
