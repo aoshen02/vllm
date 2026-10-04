@@ -49,12 +49,24 @@ pub struct GenerateRequest {
     pub content_parts: Option<Vec<MediaContentPart>>,
     /// Output logprobs wire format: absent / `"openai"` (default) or
     /// `"compact"` (packed base64 arrays in `choices[i].compact_logprobs`).
-    pub logprobs_format: Option<String>,
+    /// Kept as a raw value so an explicit `null` or non-string is rejected
+    /// with a 400 by validation (only an absent field means the default).
+    #[serde(default, deserialize_with = "deserialize_present")]
+    pub logprobs_format: Option<Value>,
     #[serde(flatten)]
     pub other: Map<String, Value>,
 }
 
 impl Normalizable for GenerateRequest {}
+
+/// Deserialize a present field as `Some(value)`, keeping an explicit `null`
+/// distinguishable from an absent field.
+fn deserialize_present<'de, D>(deserializer: D) -> Result<Option<Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Value::deserialize(deserializer).map(Some)
+}
 
 /// Mirrors the Python vLLM `GenerateResponseChoice` class.
 ///

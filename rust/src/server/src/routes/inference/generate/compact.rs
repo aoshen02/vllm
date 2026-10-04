@@ -32,11 +32,17 @@ pub(crate) enum LogprobsFormat {
 }
 
 impl LogprobsFormat {
-    /// Parse the request field; `None` means an unsupported value.
-    pub(crate) fn parse(value: Option<&str>) -> Option<Self> {
+    /// Parse the request field (`None` = absent); returns `None` for an
+    /// unsupported value, including an explicit `null` or a non-string
+    /// (matching the Python frontend's `Literal["openai", "compact"]`).
+    pub(crate) fn parse(value: Option<&serde_json::Value>) -> Option<Self> {
         match value {
-            None | Some("openai") => Some(Self::OpenAi),
-            Some("compact") => Some(Self::Compact),
+            None => Some(Self::OpenAi),
+            Some(serde_json::Value::String(value)) => match value.as_str() {
+                "openai" => Some(Self::OpenAi),
+                "compact" => Some(Self::Compact),
+                _ => None,
+            },
             Some(_) => None,
         }
     }
@@ -145,9 +151,11 @@ impl EncodedArray {
 /// Accumulates sample logprobs directly into the compact wire encoding.
 #[derive(Debug, Default)]
 pub(crate) struct CompactLogprobsAccumulator {
-    /// Slot count to report when no position was scored; set from the
-    /// request's `logprobs` (k + 1) when known.
-    fallback_slots: usize,
+    /// The request's row width `k + 1` (`0` when unknown, i.e. `logprobs`
+    /// absent or `-1`). Wider engine rows (padded to the batch-wide max
+    /// top-k) are truncated to it, like the Python frontend; it is also the
+    /// reported `num_slots` when no position was scored.
+    requested_slots: usize,
     num_slots: Option<usize>,
     num_positions: usize,
     /// Whether the engine attached a logprobs payload to any step.
@@ -162,9 +170,9 @@ pub(crate) struct CompactLogprobsAccumulator {
 }
 
 impl CompactLogprobsAccumulator {
-    pub(crate) fn new(fallback_slots: usize) -> Self {
+    pub(crate) fn new(requested_slots: usize) -> Self {
         Self {
-            fallback_slots,
+            requested_slots,
             ..Default::default()
         }
     }
@@ -187,7 +195,7 @@ impl CompactLogprobsAccumulator {
         }
         Ok(CompactLogprobs {
             num_positions: self.num_positions,
-            num_slots: self.num_slots.unwrap_or(self.fallback_slots),
+            num_slots: self.num_slots.unwrap_or(self.requested_slots),
             token_ids: self.token_ids.finish(),
             logprobs: self.logprobs.finish(),
             ranks: self.ranks.finish(),
@@ -201,7 +209,11 @@ impl LogprobsAccumulator for CompactLogprobsAccumulator {
         if self.error.is_some() || step.positions.is_empty() {
             return;
         }
-        let slots = *self.num_slots.get_or_insert(step.positions[0].entries.len());
+        let width = step.positions[0].entries.len();
+        let slots = *self.num_slots.get_or_insert(match self.requested_slots {
+            0 => width,
+            requested => width.min(requested),
+        });
         if slots == 0 {
             self.fail("raw generate logprobs position unexpectedly had no token candidates".into());
             return;
@@ -216,9 +228,9 @@ impl LogprobsAccumulator for CompactLogprobsAccumulator {
         self.scratch_ranks.reserve(rows * 4);
 
         for position in &step.positions {
-            if position.entries.len() != slots {
+            if position.entries.len() < slots {
                 self.fail(format!(
-                    "raw generate logprobs row width changed from {slots} to {}",
+                    "raw generate logprobs row has {} candidates, expected at least {slots}",
                     position.entries.len()
                 ));
                 return;
@@ -229,7 +241,7 @@ impl LogprobsAccumulator for CompactLogprobsAccumulator {
                 return;
             }
             self.scratch_ranks.extend_from_slice(&sampled_rank.to_le_bytes());
-            for entry in &position.entries {
+            for entry in &position.entries[..slots] {
                 if entry.token_id > i32::MAX as u32 {
                     self.fail(format!("token id {} does not fit int32", entry.token_id));
                     return;
@@ -296,9 +308,9 @@ impl From<&CompactLogprobs> for CompactLogprobsJson {
 /// Encode one step's logprobs (e.g. one streaming chunk) as a compact block.
 pub(crate) fn encode_compact(
     logprobs: Logprobs,
-    fallback_slots: usize,
+    requested_slots: usize,
 ) -> Result<CompactLogprobsJson, String> {
-    let mut accumulator = CompactLogprobsAccumulator::new(fallback_slots);
+    let mut accumulator = CompactLogprobsAccumulator::new(requested_slots);
     accumulator.extend(logprobs);
     accumulator.finish().map(|block| CompactLogprobsJson::from(&block))
 }
@@ -347,15 +359,50 @@ pub(crate) mod tests {
     fn parse_logprobs_format() {
         assert_eq!(LogprobsFormat::parse(None), Some(LogprobsFormat::OpenAi));
         assert_eq!(
-            LogprobsFormat::parse(Some("openai")),
+            LogprobsFormat::parse(Some(&serde_json::json!("openai"))),
             Some(LogprobsFormat::OpenAi)
         );
         assert_eq!(
-            LogprobsFormat::parse(Some("compact")),
+            LogprobsFormat::parse(Some(&serde_json::json!("compact"))),
             Some(LogprobsFormat::Compact)
         );
-        assert_eq!(LogprobsFormat::parse(Some("Compact")), None);
-        assert_eq!(LogprobsFormat::parse(Some("")), None);
+        assert_eq!(
+            LogprobsFormat::parse(Some(&serde_json::json!("Compact"))),
+            None
+        );
+        assert_eq!(LogprobsFormat::parse(Some(&serde_json::json!(""))), None);
+        assert_eq!(LogprobsFormat::parse(Some(&serde_json::Value::Null)), None);
+        assert_eq!(LogprobsFormat::parse(Some(&serde_json::json!(1))), None);
+    }
+
+    #[test]
+    fn compact_truncates_padded_rows_to_requested_width() {
+        // Engine rows padded to a wider batch-wide top-k (4 slots) for a
+        // request that asked for k = 1 (2 slots).
+        let mut accumulator = CompactLogprobsAccumulator::new(2);
+        accumulator.extend(Logprobs {
+            positions: vec![
+                position(&[(5, -0.5, 2), (4, -0.25, 1), (5, -0.5, 2), (6, -1.0, 3)]),
+                position(&[(7, -0.1, 1), (7, -0.1, 1), (8, -2.0, 2), (9, -3.0, 3)]),
+            ],
+        });
+        let block = CompactLogprobsJson::from(&accumulator.finish().expect("finish"));
+        let value = serde_json::to_value(&block).unwrap();
+        assert_eq!(value["num_slots"], 2);
+        let (token_ids, bits, ranks) = decode_compact(&value);
+        assert_eq!(token_ids, vec![5, 4, 7, 7]);
+        assert_eq!(
+            bits,
+            [-0.5_f32, -0.25, -0.1, -0.1].map(f32::to_bits).to_vec()
+        );
+        assert_eq!(ranks, vec![2, 1]);
+
+        // Unknown requested width (`logprobs: -1`): keep the engine width.
+        let mut accumulator = CompactLogprobsAccumulator::new(0);
+        accumulator.extend(Logprobs {
+            positions: vec![position(&[(5, -0.5, 2), (4, -0.25, 1), (5, -0.5, 2)])],
+        });
+        assert_eq!(accumulator.finish().unwrap().num_slots, 3);
     }
 
     #[test]
@@ -452,7 +499,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn compact_empty_uses_fallback_slots() {
+    fn compact_empty_uses_requested_slots() {
         let block = CompactLogprobsAccumulator::new(129).finish().expect("finish");
         let value = serde_json::to_value(CompactLogprobsJson::from(&block)).unwrap();
         assert_eq!(value["num_positions"], 0);
@@ -463,7 +510,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn compact_rejects_row_width_change() {
+    fn compact_rejects_narrower_row() {
         let mut accumulator = CompactLogprobsAccumulator::new(2);
         accumulator.extend(Logprobs {
             positions: vec![position(&[(1, -0.1, 1), (1, -0.1, 1)])],

@@ -62,7 +62,7 @@ pub(super) fn prepare_generate_request(
             .unwrap_or(false);
     let include_logprobs = request.sampling_params.inner.logprobs.is_some();
     let include_prompt_logprobs = request.sampling_params.inner.prompt_logprobs.is_some();
-    let logprobs_format = LogprobsFormat::parse(request.logprobs_format.as_deref())
+    let logprobs_format = LogprobsFormat::parse(request.logprobs_format.as_ref())
         .expect("logprobs_format validated by validate_request_compat");
     let logprobs_slots = request
         .sampling_params

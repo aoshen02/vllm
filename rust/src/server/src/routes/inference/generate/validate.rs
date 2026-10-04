@@ -24,7 +24,7 @@ pub(crate) fn validate_request_compat(
         );
     }
 
-    if LogprobsFormat::parse(request.logprobs_format.as_deref()).is_none() {
+    if LogprobsFormat::parse(request.logprobs_format.as_ref()).is_none() {
         bail_invalid_request!(
             param = "logprobs_format",
             "logprobs_format must be \"openai\" or \"compact\"."
@@ -136,12 +136,16 @@ mod tests {
     fn validate_request_compat_checks_logprobs_format() {
         let served = served(&["Qwen/Qwen1.5-0.5B-Chat"]);
         for (format, ok) in [
-            (json!(null), true),
             (json!("openai"), true),
             (json!("compact"), true),
             (json!("Compact"), false),
             (json!("numpy"), false),
             (json!(""), false),
+            // Same as the Python frontend's Literal field: an explicit null or
+            // a non-string value is rejected (only an absent field defaults).
+            (json!(null), false),
+            (json!(1), false),
+            (json!(["compact"]), false),
         ] {
             let request: GenerateRequest = serde_json::from_value(json!({
                 "token_ids": [11, 22],
@@ -155,15 +159,14 @@ mod tests {
                 "format={format}"
             );
         }
-        // A non-string value is a request parse error.
-        assert!(
-            serde_json::from_value::<GenerateRequest>(json!({
-                "token_ids": [11, 22],
-                "logprobs_format": 1,
-                "sampling_params": {}
-            }))
-            .is_err()
-        );
+        // An absent field means the default format.
+        let request: GenerateRequest = serde_json::from_value(json!({
+            "token_ids": [11, 22],
+            "sampling_params": {}
+        }))
+        .expect("parse request");
+        assert!(request.logprobs_format.is_none());
+        assert!(validate_request_compat(&request, &served).is_ok());
     }
 
     #[test]
