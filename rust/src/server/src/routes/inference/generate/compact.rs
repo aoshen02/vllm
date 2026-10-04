@@ -94,22 +94,23 @@ impl Base64Segments {
     /// length that is not a multiple of three.
     fn encode(&mut self, mut data: &[u8]) {
         while !data.is_empty() {
+            // Start a new segment when the (first segment-sized piece of the)
+            // data does not fit, so a typical engine step becomes one
+            // exactly-sized allocation instead of being spread over a
+            // growing buffer.
+            let wanted = (data.len().div_ceil(3) * 4).min(SEGMENT_TARGET_BYTES);
+            if !self.current.is_empty() && self.current.len() + wanted > SEGMENT_TARGET_BYTES {
+                self.close_segment();
+            }
             // Raw bytes (a multiple of 3) that still fit the open segment.
             let room = (SEGMENT_TARGET_BYTES - self.current.len()) / 4 * 3;
-            if room == 0 {
-                self.close_segment();
-                continue;
-            }
-            let take = data.len().min(room);
-            let (piece, rest) = data.split_at(take);
+            let (piece, rest) = data.split_at(data.len().min(room));
             let encoded = piece.len().div_ceil(3) * 4;
             if self.current.is_empty() {
-                let remaining = data.len().div_ceil(3) * 4;
-                self.current.reserve_exact(remaining.min(SEGMENT_TARGET_BYTES));
+                self.current.reserve_exact(encoded);
             } else if self.current.capacity() - self.current.len() < encoded {
-                // Grow geometrically but never past the segment size, so a
-                // full segment has no spare capacity (plain `String` growth
-                // would overshoot to 2x and then need a shrinking copy).
+                // Coalescing small steps: grow geometrically but never past
+                // the segment size (plain `String` growth would overshoot).
                 let grow =
                     encoded.max(self.current.len()).min(SEGMENT_TARGET_BYTES - self.current.len());
                 self.current.reserve_exact(grow);
