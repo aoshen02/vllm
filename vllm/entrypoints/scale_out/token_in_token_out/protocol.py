@@ -1,12 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from dataclasses import dataclass
 from typing import Any, Literal, TypeAlias
 
 from pydantic import (
     BaseModel,
     Field,
     PrivateAttr,
+    SerializationInfo,
+    SerializerFunctionWrapHandler,
     field_validator,
+    model_serializer,
     model_validator,
 )
 
@@ -121,6 +125,17 @@ class GenerateRequest(BaseModel):
 
     stream: bool | None = False
     stream_options: StreamOptions | None = None
+    logprobs_format: Literal["openai", "compact"] = Field(
+        default="openai",
+        description=(
+            "Wire format of the sample logprobs. 'openai' (default): "
+            "`choices[].logprobs` as today. 'compact': `choices[].logprobs` is "
+            "null and `choices[].compact_logprobs` carries the engine rows as "
+            "base64 of little-endian int32/float32 arrays (slot 0 = sampled "
+            "token, slots 1..k = top-k in engine order). Streaming emits one "
+            "compact block per chunk covering that chunk's positions."
+        ),
+    )
     cache_salt: str | None = Field(
         default=None,
         min_length=1,
@@ -194,6 +209,36 @@ class GenerateRequest(BaseModel):
         )
 
 
+class CompactLogprobs(BaseModel):
+    """Sample logprobs in the opt-in ``logprobs_format="compact"`` format.
+
+    Decode: ``np.frombuffer(base64.b64decode(token_ids), "<i4")
+    .reshape(num_positions, num_slots)``; ``logprobs`` likewise with
+    ``"<f4"``; ``ranks`` is ``"<i4"`` of length ``num_positions``. Values are
+    the raw engine float32 (no clamping; non-finite values preserved).
+    """
+
+    num_positions: int
+    num_slots: int
+    dtype_token_ids: Literal["int32"] = "int32"
+    dtype_logprobs: Literal["float32"] = "float32"
+    byteorder: Literal["little"] = "little"
+    token_ids: str
+    logprobs: str
+    ranks: str
+
+
+def _drop_unset_compact_logprobs(
+    model: BaseModel, handler: SerializerFunctionWrapHandler
+) -> Any:
+    # ``compact_logprobs`` is opt-in; keep the default wire format unchanged
+    # by omitting the key unless it is set.
+    data = handler(model)
+    if isinstance(data, dict) and data.get("compact_logprobs", 0) is None:
+        del data["compact_logprobs"]
+    return data
+
+
 class GenerateResponseChoice(BaseModel):
     index: int
     logprobs: ChatCompletionLogProbs | None = None
@@ -211,6 +256,8 @@ class GenerateResponseChoice(BaseModel):
     # or (b) ``enable_return_routed_experts`` is off server-side.
     routed_experts: str | None = None
     sampling_mask: list[list[int]] | None = None
+    # Only present (non-null) when the request set logprobs_format="compact".
+    compact_logprobs: CompactLogprobs | None = None
 
     @field_validator("token_ids")
     @classmethod
@@ -218,6 +265,12 @@ class GenerateResponseChoice(BaseModel):
         if v is not None and any(t < 0 for t in v):
             raise ValueError("token_ids must not contain negative values")
         return v
+
+    @model_serializer(mode="wrap")
+    def _serialize(
+        self, handler: SerializerFunctionWrapHandler, info: SerializationInfo
+    ) -> Any:
+        return _drop_unset_compact_logprobs(self, handler)
 
 
 class GenerateResponseStreamChoice(BaseModel):
@@ -227,6 +280,14 @@ class GenerateResponseStreamChoice(BaseModel):
     token_ids: list[int] | None = None
     routed_experts: str | None = None
     sampling_mask: list[list[int]] | None = None
+    # Only present (non-null) when the request set logprobs_format="compact".
+    compact_logprobs: CompactLogprobs | None = None
+
+    @model_serializer(mode="wrap")
+    def _serialize(
+        self, handler: SerializerFunctionWrapHandler, info: SerializationInfo
+    ) -> Any:
+        return _drop_unset_compact_logprobs(self, handler)
 
 
 class GenerateStreamResponse(BaseModel):
@@ -267,6 +328,18 @@ class GenerateResponse(BaseModel):
             "ECTransfer parameters used for encoder-cache disaggregated serving."
         ),
     )
+
+
+@dataclass
+class RenderedGenerateResponse:
+    """A non-streaming generate response already rendered to JSON bytes.
+
+    Returned instead of :class:`GenerateResponse` when the logprobs were
+    rendered without per-entry objects; ``body`` is the complete
+    ``application/json`` response body.
+    """
+
+    body: bytes
 
 
 class DerenderChatRequest(BaseModel):

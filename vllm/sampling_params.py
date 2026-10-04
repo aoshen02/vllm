@@ -303,6 +303,13 @@ class SamplingParams(
     NOTE: GC costs of FlatLogprobs is significantly smaller than
     list[dict[int, Logprob]]. After enabled, PromptLogprobs and
     SampleLogprobs would populated as FlatLogprobs."""
+    array_logprobs: bool = False
+    """Frontend-only: keep sample logprobs as the engine's numpy rows
+    (``vllm.logprobs.ArrayLogprobs``) instead of per-entry ``Logprob``
+    objects, and never detokenize logprob candidates. Takes precedence over
+    `flat_logprobs` for sample logprobs (prompt logprobs are unaffected).
+    Set by `/inference/v1/generate`, whose responses never contain
+    candidate text."""
     # NOTE: This parameter is only exposed at the engine level for now.
     # It is not exposed in the OpenAI API server, as the OpenAI API does
     # not support returning only a list of token IDs.

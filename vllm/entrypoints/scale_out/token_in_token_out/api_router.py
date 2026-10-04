@@ -22,6 +22,7 @@ from vllm.logger import init_logger
 from .protocol import (
     GenerateRequest,
     GenerateResponse,
+    RenderedGenerateResponse,
 )
 from .serving import ServingTokens
 
@@ -41,6 +42,17 @@ def engine_client(request: Request) -> EngineClient:
 
 
 router = APIRouter()
+
+
+class _RenderedJSONResponse(JSONResponse):
+    """``JSONResponse`` whose content is an already-rendered JSON body.
+
+    Subclassing JSONResponse keeps ``load_aware_call`` bookkeeping and the
+    ``application/json`` headers identical to the default path.
+    """
+
+    def render(self, content: bytes) -> bytes:
+        return content
 
 
 @router.post(
@@ -66,6 +78,9 @@ async def generate(request: GenerateRequest, raw_request: Request):
         return JSONResponse(
             content=generator.model_dump(), status_code=generator.error.code
         )
+
+    elif isinstance(generator, RenderedGenerateResponse):
+        return _RenderedJSONResponse(content=generator.body)
 
     elif isinstance(generator, GenerateResponse):
         return JSONResponse(content=generator.model_dump())

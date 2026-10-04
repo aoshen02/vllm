@@ -5,6 +5,8 @@ from collections.abc import Iterable, Iterator, MutableSequence
 from dataclasses import dataclass, field
 from typing import overload
 
+import numpy as np
+
 
 # We use dataclass for now because it is used for
 # openai server output, and msgspec is not serializable.
@@ -157,11 +159,156 @@ class FlatLogprobs(MutableSequence[LogprobsOnePosition | None]):
             yield self.__getitem__(i)
 
 
+@dataclass
+class ArrayLogprobs(MutableSequence[LogprobsOnePosition | None]):
+    """
+    Sample logprobs of a request kept as the engine's ``LogprobsLists`` rows.
+
+    Positions are stored as a list of numpy chunks (one per engine output),
+    so accumulating ``N`` positions with ``S`` slots creates ``O(chunks)``
+    Python objects instead of ``O(N * S)``. Row ``i`` is exactly the engine
+    row: slot 0 holds the sampled token, slots ``1..S-1`` the top-k
+    candidates in engine order. Candidate tokens are never detokenized.
+
+    ``token_ids`` / ``ranks`` chunks are ``int32`` and ``logprobs`` chunks
+    ``float32`` (the raw engine values, including non-finite ones).
+
+    Positional access (``container[i]``) materializes the same
+    ``dict[int, Logprob]`` the list representation would hold (with
+    ``decoded_token=None``), so generic consumers keep working; fast
+    consumers use :meth:`arrays` instead.
+    """
+
+    token_id_chunks: list[np.ndarray] = field(default_factory=list)
+    logprob_chunks: list[np.ndarray] = field(default_factory=list)
+    rank_chunks: list[np.ndarray] = field(default_factory=list)
+    num_positions: int = 0
+
+    def append_rows(
+        self, token_ids: np.ndarray, logprobs: np.ndarray, ranks: np.ndarray
+    ) -> None:
+        """Append ``n`` positions given as ``[n, S]``, ``[n, S]`` and ``[n]``
+        arrays. The arrays are copied, so engine buffers are not retained."""
+        n = len(ranks)
+        if n == 0:
+            return
+        if self.token_id_chunks and (
+            token_ids.shape[1] != self.token_id_chunks[0].shape[1]
+        ):
+            raise ValueError("All positions must have the same number of slots")
+        self.token_id_chunks.append(np.array(token_ids, dtype="<i4", order="C"))
+        self.logprob_chunks.append(np.array(logprobs, dtype="<f4", order="C"))
+        self.rank_chunks.append(np.array(ranks, dtype="<i4", order="C"))
+        self.num_positions += n
+
+    @property
+    def num_slots(self) -> int | None:
+        """Slots per position, or None if no position was stored yet."""
+        if not self.token_id_chunks:
+            return None
+        return self.token_id_chunks[0].shape[1]
+
+    def arrays(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Return contiguous ``(token_ids[N, S], logprobs[N, S], ranks[N])``.
+
+        Chunks are concatenated once and kept as a single chunk afterwards.
+        Returns ``[0, 0]``-shaped arrays when there are no positions.
+        """
+        if not self.token_id_chunks:
+            return (
+                np.empty((0, 0), dtype="<i4"),
+                np.empty((0, 0), dtype="<f4"),
+                np.empty((0,), dtype="<i4"),
+            )
+        if len(self.token_id_chunks) > 1:
+            self.token_id_chunks = [np.concatenate(self.token_id_chunks)]
+            self.logprob_chunks = [np.concatenate(self.logprob_chunks)]
+            self.rank_chunks = [np.concatenate(self.rank_chunks)]
+        return self.token_id_chunks[0], self.logprob_chunks[0], self.rank_chunks[0]
+
+    def extend(self, values) -> None:
+        if isinstance(values, ArrayLogprobs):
+            for t, lp, r in zip(
+                values.token_id_chunks, values.logprob_chunks, values.rank_chunks
+            ):
+                self.append_rows(t, lp, r)
+            return
+        raise TypeError("ArrayLogprobs can only be extended with ArrayLogprobs")
+
+    def __len__(self) -> int:
+        """Gets number of positions stored in the container"""
+        return self.num_positions
+
+    @overload
+    def __getitem__(self, position: int) -> LogprobsOnePosition: ...
+
+    @overload
+    def __getitem__(self, s: slice, /) -> "ArrayLogprobs": ...
+
+    def __getitem__(self, index: int | slice):
+        if isinstance(index, slice):
+            start, stop, step = index.indices(self.num_positions)
+            if step != 1:
+                raise ValueError("ArrayLogprobs only supports contiguous slices")
+            result = ArrayLogprobs()
+            if stop <= start:
+                return result
+            # Walk chunks; slices used by the output processor are suffixes.
+            offset = 0
+            for t, lp, r in zip(
+                self.token_id_chunks, self.logprob_chunks, self.rank_chunks
+            ):
+                n = len(r)
+                lo, hi = max(start - offset, 0), min(stop - offset, n)
+                if lo < hi:
+                    result.token_id_chunks.append(t[lo:hi])
+                    result.logprob_chunks.append(lp[lo:hi])
+                    result.rank_chunks.append(r[lo:hi])
+                    result.num_positions += hi - lo
+                offset += n
+                if offset >= stop:
+                    break
+            return result
+        if not isinstance(index, int):
+            raise TypeError(f"Invalid index type: {type(index)}")
+        if index < 0:
+            index += self.num_positions
+        if not 0 <= index < self.num_positions:
+            raise IndexError("ArrayLogprobs index out of range")
+        for t, lp, r in zip(
+            self.token_id_chunks, self.logprob_chunks, self.rank_chunks
+        ):
+            if index < len(r):
+                ids = t[index].tolist()
+                values = lp[index].tolist()
+                ranks = itertools.chain((int(r[index]),), range(1, len(ids)))
+                # Same insertion/overwrite semantics as the list[dict] path.
+                return {
+                    token_id: Logprob(logprob=value, rank=rank)
+                    for token_id, value, rank in zip(ids, values, ranks)
+                }
+            index -= len(r)
+        raise AssertionError("unreachable")
+
+    def __setitem__(self, item, value) -> None:
+        raise TypeError("Cannot set logprobs in ArrayLogprobs")
+
+    def __delitem__(self, item) -> None:
+        raise TypeError("Cannot delete logprobs from ArrayLogprobs")
+
+    def insert(self, index: int, value: dict[int, Logprob] | None) -> None:
+        raise TypeError("Cannot insert logprobs to ArrayLogprobs")
+
+    def __iter__(self) -> Iterator[LogprobsOnePosition]:
+        for i in range(self.num_positions):
+            yield self.__getitem__(i)
+
+
 # {token_id -> logprob} per each sequence group. None if the corresponding
 # sequence group doesn't require prompt logprob.
 PromptLogprobs = FlatLogprobs | list[LogprobsOnePosition | None]
 # {token_id -> logprob} for each sequence group.
-SampleLogprobs = FlatLogprobs | list[LogprobsOnePosition]
+SampleLogprobs = FlatLogprobs | ArrayLogprobs | list[LogprobsOnePosition]
 
 
 def create_prompt_logprobs(flat_logprobs: bool) -> PromptLogprobs:
@@ -172,8 +319,12 @@ def create_prompt_logprobs(flat_logprobs: bool) -> PromptLogprobs:
     return logprobs
 
 
-def create_sample_logprobs(flat_logprobs: bool) -> SampleLogprobs:
+def create_sample_logprobs(
+    flat_logprobs: bool, array_logprobs: bool = False
+) -> SampleLogprobs:
     """Creates a container to store decode logprobs for a request"""
+    if array_logprobs:
+        return ArrayLogprobs()
     return FlatLogprobs() if flat_logprobs else []
 
 

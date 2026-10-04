@@ -5,8 +5,11 @@ import itertools
 from collections.abc import Iterable
 from dataclasses import dataclass
 
+import numpy as np
+
 from vllm.logger import init_logger
 from vllm.logprobs import (
+    ArrayLogprobs,
     FlatLogprobs,
     PromptLogprobs,
     SampleLogprobs,
@@ -55,7 +58,9 @@ class LogprobsProcessor:
             logprobs=(
                 None
                 if num_logprobs is None
-                else create_sample_logprobs(sampling_params.flat_logprobs)
+                else create_sample_logprobs(
+                    sampling_params.flat_logprobs, sampling_params.array_logprobs
+                )
             ),
             prompt_logprobs=(
                 None
@@ -82,6 +87,12 @@ class LogprobsProcessor:
         assert self.cumulative_logprob is not None
 
         token_ids_lst, logprobs_lst, ranks_lst, _ = logprobs_lists
+
+        if isinstance(self.logprobs, ArrayLogprobs):
+            self._append_array_logprobs(
+                self.logprobs, token_ids_lst, logprobs_lst, ranks_lst
+            )
+            return
 
         for rank_np, logprobs_np, token_ids_np in zip(
             ranks_lst, logprobs_lst, token_ids_lst
@@ -117,6 +128,36 @@ class LogprobsProcessor:
                 rank,
                 self.num_logprobs,
             )
+
+    def _append_array_logprobs(
+        self,
+        container: ArrayLogprobs,
+        token_ids: np.ndarray,
+        logprobs: np.ndarray,
+        ranks: np.ndarray,
+    ) -> None:
+        """Keep the engine rows as numpy chunks; no per-entry objects and no
+        candidate detokenization."""
+        assert self.num_logprobs is not None
+        assert self.cumulative_logprob is not None
+        if len(ranks) == 0:
+            return
+        # The engine pads rows to the batch-wide max; keep this request's
+        # k + 1 slots, like the zip truncation in the list/flat paths.
+        width = logprobs.shape[1]
+        num_slots = width if self.num_logprobs == -1 else self.num_logprobs + 1
+        if num_slots > width:
+            raise ValueError(
+                f"Engine returned {width} logprob slots, expected {num_slots}"
+            )
+        token_ids = token_ids[:, :num_slots]
+        logprobs = logprobs[:, :num_slots]
+        # Same sequential float accumulation as the per-position path.
+        cumulative_logprob = self.cumulative_logprob
+        for value in logprobs[:, 0].tolist():
+            cumulative_logprob += value
+        self.cumulative_logprob = cumulative_logprob
+        container.append_rows(token_ids, logprobs, ranks)
 
     def _update_prompt_logprobs(
         self,

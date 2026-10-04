@@ -33,7 +33,7 @@ from vllm.entrypoints.serve.utils.api_utils import get_max_tokens, should_includ
 from vllm.entrypoints.serve.utils.request_logger import RequestLogger
 from vllm.inputs import EngineInput, TokensPrompt, mm_input
 from vllm.logger import init_logger
-from vllm.logprobs import Logprob
+from vllm.logprobs import ArrayLogprobs, Logprob
 from vllm.multimodal.inputs import (
     MultiModalKwargsItem,
     MultiModalKwargsItems,
@@ -45,13 +45,20 @@ from vllm.sampling_params import RequestOutputKind, SamplingParams
 from vllm.utils.collection_utils import as_list
 from vllm.utils.serial_utils import numpy2base64
 
+from .logprobs_render import (
+    compact_logprobs_fields,
+    render_compact_logprobs,
+    render_json_with_fragments,
+)
 from .mm_serde import decode_mm_kwargs_item
 from .protocol import (
+    CompactLogprobs,
     GenerateRequest,
     GenerateResponse,
     GenerateResponseChoice,
     GenerateResponseStreamChoice,
     GenerateStreamResponse,
+    RenderedGenerateResponse,
 )
 
 logger = init_logger(__name__)
@@ -104,7 +111,12 @@ class ServingTokens(GenerateBaseServing):
         self,
         request: GenerateRequest,
         raw_request: Request | None = None,
-    ) -> GenerateResponse | ErrorResponse | AsyncGenerator[str, None]:
+    ) -> (
+        GenerateResponse
+        | RenderedGenerateResponse
+        | ErrorResponse
+        | AsyncGenerator[str, None]
+    ):
         error_check_ret = await self._check_model(request)
         if error_check_ret is not None:
             logger.error("Error with model %s", error_check_ret)
@@ -231,6 +243,13 @@ class ServingTokens(GenerateBaseServing):
         sampling_params.output_kind = (
             RequestOutputKind.DELTA if request.stream else RequestOutputKind.FINAL_ONLY
         )
+        # Internal storage is decided by the request's logprobs_format, never
+        # by a client-provided sampling_params.array_logprobs.
+        sampling_params.array_logprobs = self._use_array_logprobs(request)
+        if sampling_params.array_logprobs and not sampling_params.stop:
+            # Generate responses carry no text: without stop strings the
+            # sampled-token detokenizer has no observable effect.
+            sampling_params.detokenize = False
 
         self._log_inputs(
             request_id,
@@ -275,6 +294,20 @@ class ServingTokens(GenerateBaseServing):
             request, result_generator, request_id, model_name, request_metadata
         )
 
+    @staticmethod
+    def _use_array_logprobs(request: GenerateRequest) -> bool:
+        """Whether sample logprobs are kept as engine rows (ArrayLogprobs)."""
+        return request.logprobs_format == "compact"
+
+    @staticmethod
+    def _require_array_logprobs(logprobs: object) -> ArrayLogprobs:
+        if not isinstance(logprobs, ArrayLogprobs):
+            raise TypeError(
+                "logprobs_format='compact' requires ArrayLogprobs sample "
+                f"logprobs, got {type(logprobs).__name__}"
+            )
+        return logprobs
+
     async def serve_tokens_full_generator(
         self,
         request: GenerateRequest,
@@ -282,10 +315,13 @@ class ServingTokens(GenerateBaseServing):
         request_id: str,
         model_name: str,
         request_metadata: RequestResponseMetadata,
-    ) -> ErrorResponse | GenerateResponse:
+    ) -> ErrorResponse | GenerateResponse | RenderedGenerateResponse:
         created_time = int(time.time())
         final_res: RequestOutput | None = None
         sampling_params: SamplingParams = request.sampling_params
+        compact = request.logprobs_format == "compact"
+        # choice position -> field name -> pre-rendered JSON value
+        fragments: dict[int, dict[str, bytes]] = {}
 
         try:
             async for res in result_generator:
@@ -304,15 +340,22 @@ class ServingTokens(GenerateBaseServing):
             out_logprobs = output.logprobs
 
             # This is top_logprobs in completions API
+            logprobs = None
             if sampling_params.logprobs is not None:
                 assert out_logprobs is not None, "Did not output logprobs"
-                logprobs = self._create_tokens_logprobs(
-                    token_ids=token_ids,
-                    top_logprobs=out_logprobs,
-                    num_output_top_logprobs=sampling_params.logprobs,
-                )
-            else:
-                logprobs = None
+                if compact:
+                    fragments[len(choices)] = {
+                        "compact_logprobs": render_compact_logprobs(
+                            self._require_array_logprobs(out_logprobs),
+                            sampling_params.num_logprobs,
+                        )
+                    }
+                else:
+                    logprobs = self._create_tokens_logprobs(
+                        token_ids=token_ids,
+                        top_logprobs=out_logprobs,
+                        num_output_top_logprobs=sampling_params.logprobs,
+                    )
 
             routed_experts_b64 = (
                 numpy2base64(output.routed_experts)
@@ -387,6 +430,10 @@ class ServingTokens(GenerateBaseServing):
                         delta=False,
                     )
 
+        if fragments:
+            return RenderedGenerateResponse(
+                render_json_with_fragments(response.model_dump(), fragments)
+            )
         return response
 
     async def serve_tokens_stream_generator(
@@ -402,6 +449,7 @@ class ServingTokens(GenerateBaseServing):
         first_iteration = True
         num_cached_tokens = None
         sampling_params: SamplingParams = request.sampling_params
+        compact = request.logprobs_format == "compact"
 
         include_usage, include_continuous_usage = should_include_usage(
             request.stream_options, False
@@ -429,16 +477,22 @@ class ServingTokens(GenerateBaseServing):
                     if not delta_token_ids:
                         continue
 
+                    logprobs = None
+                    compact_logprobs = None
                     if sampling_params.logprobs is not None:
                         out_logprobs = output.logprobs
                         assert out_logprobs is not None, "Did not output logprobs"
-                        logprobs = self._create_tokens_logprobs(
-                            token_ids=delta_token_ids,
-                            top_logprobs=out_logprobs,
-                            num_output_top_logprobs=sampling_params.logprobs,
-                        )
-                    else:
-                        logprobs = None
+                        if compact:
+                            compact_logprobs = self._compact_logprobs_model(
+                                self._require_array_logprobs(out_logprobs),
+                                sampling_params.num_logprobs,
+                            )
+                        else:
+                            logprobs = self._create_tokens_logprobs(
+                                token_ids=delta_token_ids,
+                                top_logprobs=out_logprobs,
+                                num_output_top_logprobs=sampling_params.logprobs,
+                            )
 
                     routed_experts_b64 = (
                         numpy2base64(output.routed_experts)
@@ -455,6 +509,7 @@ class ServingTokens(GenerateBaseServing):
                                 finish_reason=finish_reason,
                                 token_ids=as_list(delta_token_ids),
                                 routed_experts=routed_experts_b64,
+                                compact_logprobs=compact_logprobs,
                             )
                         ],
                     )
@@ -498,6 +553,19 @@ class ServingTokens(GenerateBaseServing):
             data = self.create_streaming_error_response(e)
             yield f"data: {data}\n\n"
         yield "data: [DONE]\n\n"
+
+    @staticmethod
+    def _compact_logprobs_model(
+        logprobs: ArrayLogprobs, num_logprobs: int | None
+    ) -> CompactLogprobs:
+        n, s, token_ids, values, ranks = compact_logprobs_fields(logprobs, num_logprobs)
+        return CompactLogprobs(
+            num_positions=n,
+            num_slots=s,
+            token_ids=token_ids.decode("ascii"),
+            logprobs=values.decode("ascii"),
+            ranks=ranks.decode("ascii"),
+        )
 
     def _create_tokens_logprobs(
         self,
