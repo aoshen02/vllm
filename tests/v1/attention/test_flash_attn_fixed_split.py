@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Nemotron-H fixed-schedule FA4 attention used under VLLM_BATCH_INVARIANT=1."""
+"""FA4 attention with a fixed split-KV schedule (batch invariance)."""
 
 from types import SimpleNamespace
 
@@ -28,14 +28,14 @@ def test_fixed_schedule_rejects_what_it_cannot_serve(
 ):
     """Unsupported layers get a reason, so the model can fall back explicitly
     instead of failing at construction or exceeding the schedule at runtime."""
-    from vllm.model_executor.models import nemotron_h_fa4
+    from vllm.v1.attention.backends import flash_attn_fixed_split
 
     monkeypatch.setattr(
-        nemotron_h_fa4.current_platform,
+        flash_attn_fixed_split.current_platform,
         "is_device_capability_family",
         lambda family, device_id=0: family == 100,
     )
-    actual = nemotron_h_fa4.fixed_fa4_unsupported_reason(
+    actual = flash_attn_fixed_split.fixed_split_unsupported_reason(
         head_size, kv_cache_dtype, sliding_window, max_model_len
     )
     if reason is None:
@@ -45,14 +45,16 @@ def test_fixed_schedule_rejects_what_it_cannot_serve(
 
 
 def _make_impl(monkeypatch):
-    from vllm.model_executor.models import nemotron_h_fa4
+    from vllm.v1.attention.backends import flash_attn_fixed_split
 
     config = SimpleNamespace(
-        model_config=SimpleNamespace(max_model_len=nemotron_h_fa4.MAX_SEQ_LEN),
+        model_config=SimpleNamespace(max_model_len=flash_attn_fixed_split.MAX_SEQ_LEN),
         parallel_config=SimpleNamespace(decode_context_parallel_size=1),
     )
-    monkeypatch.setattr(nemotron_h_fa4, "get_current_vllm_config", lambda: config)
-    return nemotron_h_fa4.NemotronHFixedFA4Impl(
+    monkeypatch.setattr(
+        flash_attn_fixed_split, "get_current_vllm_config", lambda: config
+    )
+    return flash_attn_fixed_split.FlashAttnFixedSplitImpl(
         NUM_HEADS, HEAD, HEAD**-0.5, NUM_KV_HEADS, None, None, "fp8_e4m3"
     )
 

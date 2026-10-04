@@ -210,6 +210,63 @@ class Mixer2RMSNormGated(CustomOp):
         return self.forward_cuda(x, gate)
 
 
+def grouped_gated_rms_norm(
+    x: torch.Tensor,
+    gate: torch.Tensor,
+    weight: torch.Tensor,
+    group_size: int,
+    eps: float,
+) -> torch.Tensor:
+    return rms_norm_gated(
+        x,
+        weight,
+        None,
+        z=gate,
+        eps=eps,
+        group_size=group_size,
+        norm_before_gate=False,
+    )
+
+
+def grouped_gated_rms_norm_fake(
+    x: torch.Tensor,
+    gate: torch.Tensor,
+    weight: torch.Tensor,
+    group_size: int,
+    eps: float,
+) -> torch.Tensor:
+    return torch.empty_like(x)
+
+
+direct_register_custom_op(
+    op_name="grouped_gated_rms_norm",
+    op_func=grouped_gated_rms_norm,
+    fake_impl=grouped_gated_rms_norm_fake,
+)
+
+
+class GroupedMixer2RMSNormGated(Mixer2RMSNormGated):
+    """Under VLLM_BATCH_INVARIANT with TP1, normalize every group in one
+    ``rms_norm_gated`` launch (a custom op, so compiled and eager callers run
+    the same kernel) that a training-side replay can call. With TP the default
+    path, batch invariant itself, reduces across ranks."""
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        gate: torch.Tensor,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if envs.VLLM_BATCH_INVARIANT and self.tp_size == 1:
+            if not self.use_rms_norm:
+                raise ValueError(
+                    "Grouped gated normalization requires RMS normalization"
+                )
+            return torch.ops.vllm.grouped_gated_rms_norm(
+                x, gate, self.weight, self.group_size, self.variance_epsilon
+            )
+        return super().forward(x, gate)
+
+
 def mamba_v2_sharded_weight_loader(
     shard_spec: list[tuple[int, int, float]],
     tp_size: int,

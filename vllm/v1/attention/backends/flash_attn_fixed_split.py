@@ -1,6 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Fixed-schedule FP8 attention for Nemotron-H batch invariance."""
+"""FA4 attention with a fixed split-KV schedule, for batch invariance.
+
+Every split covers the same keys regardless of batch composition, sequence
+length or prefill/decode phase, so a token's output does not depend on what
+else is scheduled; a training-side replay can run the same schedule.
+"""
 
 import inspect
 
@@ -17,14 +22,13 @@ from vllm.v1.attention.backends.flash_attn import (
 )
 from vllm.vllm_flash_attn.cute.interface import _flash_attn_fwd
 
-# Fixed split-KV schedule shared bit-for-bit with the training-side replay:
-# every split covers the same keys regardless of batch or sequence length.
+# Every split covers SEQLEN_K_PER_SPLIT keys, for any batch or sequence length.
 MAX_SEQ_LEN = 16384
 SEQLEN_K_PER_SPLIT = 640
 NUM_SPLITS = 32
 
 
-def fixed_fa4_unsupported_reason(
+def fixed_split_unsupported_reason(
     head_size: int,
     kv_cache_dtype: str,
     sliding_window: int | None,
@@ -47,7 +51,7 @@ def fixed_fa4_unsupported_reason(
     return None
 
 
-class NemotronHFixedFA4Impl(FlashAttentionImpl):
+class FlashAttnFixedSplitImpl(FlashAttentionImpl):
     supports_quant_query_input = True
     supports_dcp = False
 
@@ -66,7 +70,7 @@ class NemotronHFixedFA4Impl(FlashAttentionImpl):
         sinks: torch.Tensor | None = None,
     ) -> None:
         config = get_current_vllm_config()
-        reason = fixed_fa4_unsupported_reason(
+        reason = fixed_split_unsupported_reason(
             head_size,
             kv_cache_dtype,
             sliding_window,
@@ -82,7 +86,7 @@ class NemotronHFixedFA4Impl(FlashAttentionImpl):
         ):
             reason = "requires plain causal decoder attention without DCP"
         if reason is not None:
-            raise ValueError(f"Nemotron-H fixed-schedule FA4 attention {reason}")
+            raise ValueError(f"Fixed split-KV FA4 attention {reason}")
         # FlashAttentionImpl.__init__ is skipped: it picks a vllm_flash_attn
         # version and rejects FP8 KV caches, while this impl calls the CuTe FA4
         # kernel directly. Set the attributes other code reads.
@@ -113,7 +117,7 @@ class NemotronHFixedFA4Impl(FlashAttentionImpl):
         output_block_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if output_scale is not None or output_block_scale is not None:
-            raise ValueError("Nemotron-H fixed FA4 does not fuse output quantization")
+            raise ValueError("Fixed split-KV FA4 does not fuse output quantization")
         if attn_metadata is None:
             return output.fill_(0)
         if (
@@ -122,7 +126,7 @@ class NemotronHFixedFA4Impl(FlashAttentionImpl):
             or attn_metadata.max_query_len > MAX_SEQ_LEN
             or attn_metadata.max_seq_len > MAX_SEQ_LEN
         ):
-            raise ValueError("Unsupported Nemotron-H fixed FA4 metadata")
+            raise ValueError("Unsupported fixed split-KV FA4 metadata")
 
         key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_size, dim=-1)
         key_cache = canonicalize_singleton_dim_strides(key_cache).view(
@@ -157,7 +161,7 @@ class NemotronHFixedFA4Impl(FlashAttentionImpl):
         return output
 
 
-class NemotronHFixedFA4Backend(FlashAttentionBackend):
+class FlashAttnFixedSplitBackend(FlashAttentionBackend):
     @staticmethod
-    def get_impl_cls() -> type[NemotronHFixedFA4Impl]:
-        return NemotronHFixedFA4Impl
+    def get_impl_cls() -> type[FlashAttnFixedSplitImpl]:
+        return FlashAttnFixedSplitImpl

@@ -92,17 +92,22 @@ def test_nemotron_h_batch_invariant_uses_cuda_fp8_quant(
 
 
 @pytest.mark.parametrize("batch_invariant", [False, True])
-def test_nemotron_h_gate_skips_small_m_cute_gemm_under_bi(monkeypatch, batch_invariant):
-    from vllm.model_executor.models import nemotron_h
+def test_gate_skips_small_m_cute_gemm_under_bi(monkeypatch, batch_invariant):
+    """The small-M CuTe router GEMM reduces differently from the large-M path,
+    so batch invariance must not select it."""
+    from vllm.model_executor.kernels.linear.cute_dsl import ll_bf16
+    from vllm.model_executor.layers.fused_moe.router import gate_linear
 
-    def parent_init(self, *args, **kwargs):
-        torch.nn.Module.__init__(self)
-        self.allow_ll_bf16_gemm = True
-        self.allow_cublas_router_gemm = True
-
-    monkeypatch.setattr(nemotron_h.GateLinear, "__init__", parent_init)
-    monkeypatch.setattr(nemotron_h.envs, "VLLM_BATCH_INVARIANT", batch_invariant)
-    gate = nemotron_h.NemotronHGateLinear(2688, 128, out_dtype=torch.float32)
+    monkeypatch.setattr(gate_linear.envs, "VLLM_BATCH_INVARIANT", batch_invariant)
+    monkeypatch.setattr(ll_bf16, "is_available", lambda: True)
+    gate = gate_linear.GateLinear.__new__(gate_linear.GateLinear)
+    torch.nn.Module.__init__(gate)
+    gate.weight = torch.nn.Parameter(torch.empty(128, 2688, dtype=torch.bfloat16))
+    gate.allow_specialized_router_gemm = True
+    gate.allow_cublas_router_gemm = False
+    gate._router_gemm_cublas_capable = True
+    gate.out_dtype = None
+    gate.set_out_dtype(torch.float32)
     assert gate.allow_ll_bf16_gemm is not batch_invariant
     # cuBLAS bf16 -> fp32 stays: row invariance is covered by
     # tests/v1/determinism/test_nemotron_h_batch_invariance.py.
@@ -110,49 +115,50 @@ def test_nemotron_h_gate_skips_small_m_cute_gemm_under_bi(monkeypatch, batch_inv
 
 
 @pytest.mark.parametrize("batch_invariant", [False, True])
-def test_nemotron_h_norms_dispatch_to_shared_kernels_under_bi(
-    monkeypatch, batch_invariant
-):
-    from vllm.model_executor.models import nemotron_h, nemotron_h_alignment
+def test_cuda_rms_norm_dispatch_under_bi(monkeypatch, batch_invariant):
+    from vllm.model_executor.layers import layernorm
 
     calls = []
-    monkeypatch.setattr(nemotron_h.envs, "VLLM_BATCH_INVARIANT", batch_invariant)
-    monkeypatch.setattr(nemotron_h, "get_tensor_model_parallel_world_size", lambda: 1)
+
+    def shared(*args):
+        calls.append("rms")
+        return "shared"
+
+    monkeypatch.setattr(layernorm.envs, "VLLM_BATCH_INVARIANT", batch_invariant)
+    monkeypatch.setattr(layernorm, "cuda_rms_norm", shared)
     monkeypatch.setattr(
-        nemotron_h_alignment,
-        "rms_forward",
-        lambda *args: calls.append("rms") or "shared",
+        layernorm.RMSNorm, "forward", lambda self, x, residual=None: "default"
     )
-    monkeypatch.setattr(
-        nemotron_h.RMSNorm, "forward", lambda self, x, residual=None: "default"
-    )
-    norm = nemotron_h.NemotronHRMSNorm.__new__(nemotron_h.NemotronHRMSNorm)
+    norm = layernorm.CudaRMSNorm.__new__(layernorm.CudaRMSNorm)
     torch.nn.Module.__init__(norm)
     norm.weight = torch.nn.Parameter(torch.ones(4))
     norm.variance_epsilon = 1e-5
-    out = nemotron_h.NemotronHRMSNorm.forward(norm, torch.ones(2, 4))
+    out = layernorm.CudaRMSNorm.forward(norm, torch.ones(2, 4))
     assert out == ("shared" if batch_invariant else "default")
     assert calls == (["rms"] if batch_invariant else [])
 
 
 @pytest.mark.parametrize("tp_size", [1, 2])
-def test_nemotron_h_gated_norm_uses_shared_kernel_only_at_tp1(monkeypatch, tp_size):
-    """The shared gated-norm kernel normalizes whole groups on one rank; with
+def test_grouped_gated_norm_only_at_tp1(monkeypatch, tp_size):
+    """The grouped gated-norm kernel normalizes whole groups on one rank; with
     TP the default (batch-invariant, all-reducing) path is used instead of
     failing at runtime."""
-    from vllm.model_executor.models import nemotron_h, nemotron_h_alignment
+    from vllm.model_executor.layers.mamba import mamba_mixer2
 
-    monkeypatch.setattr(nemotron_h.envs, "VLLM_BATCH_INVARIANT", True)
-    monkeypatch.setattr(nemotron_h_alignment, "gated_forward", lambda *args: "shared")
+    monkeypatch.setattr(mamba_mixer2.envs, "VLLM_BATCH_INVARIANT", True)
     monkeypatch.setattr(
-        nemotron_h.Mixer2RMSNormGated, "forward", lambda self, x, gate: "default"
+        torch.ops.vllm, "grouped_gated_rms_norm", lambda *args: "grouped"
     )
-    norm = nemotron_h.NemotronHGatedRMSNorm.__new__(nemotron_h.NemotronHGatedRMSNorm)
+    monkeypatch.setattr(
+        mamba_mixer2.Mixer2RMSNormGated, "forward", lambda self, x, gate: "default"
+    )
+    cls = mamba_mixer2.GroupedMixer2RMSNormGated
+    norm = cls.__new__(cls)
     torch.nn.Module.__init__(norm)
     norm.tp_size = tp_size
     norm.use_rms_norm = True
     norm.weight = torch.nn.Parameter(torch.ones(4))
     norm.group_size = 4
     norm.variance_epsilon = 1e-5
-    out = nemotron_h.NemotronHGatedRMSNorm.forward(norm, torch.ones(2, 4), None)
-    assert out == ("shared" if tp_size == 1 else "default")
+    out = cls.forward(norm, torch.ones(2, 4), None)
+    assert out == ("grouped" if tp_size == 1 else "default")

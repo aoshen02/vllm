@@ -39,9 +39,9 @@ def _assert_rows_invariant(fn, x):
 @skip_if_not_cuda
 @torch.inference_mode()
 def test_nemotron_h_norms_are_row_invariant():
-    from vllm.model_executor.models.nemotron_h_alignment import (
-        gated_forward,
-        rms_forward,
+    from vllm.model_executor.layers.layernorm import cuda_rms_norm as rms_forward
+    from vllm.model_executor.layers.mamba.mamba_mixer2 import (
+        grouped_gated_rms_norm as gated_forward,
     )
 
     torch.manual_seed(0)

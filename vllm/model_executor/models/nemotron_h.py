@@ -45,7 +45,7 @@ from vllm.model_executor.layers.fused_moe import (
     fused_moe_make_expert_params_mapping,
 )
 from vllm.model_executor.layers.fusion.fused_act_quant import maybe_fused_act_quant
-from vllm.model_executor.layers.layernorm import RMSNorm
+from vllm.model_executor.layers.layernorm import CudaRMSNorm
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     QKVParallelLinear,
@@ -55,8 +55,8 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mamba.mamba_mixer2 import (
+    GroupedMixer2RMSNormGated,
     MambaMixer2,
-    Mixer2RMSNormGated,
 )
 from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateCopyFunc,
@@ -95,43 +95,6 @@ from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.nemotron_h import NemotronHConfig
 
 logger = init_logger(__name__)
-
-
-class NemotronHRMSNorm(RMSNorm):
-    def forward(self, x, residual=None):
-        if envs.VLLM_BATCH_INVARIANT:
-            from .nemotron_h_alignment import rms_forward
-
-            return rms_forward(x, self.weight, self.variance_epsilon, residual)
-        return super().forward(x, residual)
-
-
-class NemotronHGatedRMSNorm(Mixer2RMSNormGated):
-    def forward(self, x, gate):
-        # The shared kernel normalizes whole groups on one rank; with TP the
-        # default path (batch invariant itself) reduces across ranks.
-        if envs.VLLM_BATCH_INVARIANT and self.tp_size == 1:
-            from .nemotron_h_alignment import gated_forward
-
-            if not self.use_rms_norm:
-                raise ValueError(
-                    "Shared gated normalization requires RMS normalization"
-                )
-            return gated_forward(
-                x, gate, self.weight, self.group_size, self.variance_epsilon
-            )
-        return super().forward(x, gate)
-
-
-class NemotronHGateLinear(GateLinear):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        if envs.VLLM_BATCH_INVARIANT:
-            # Small-M CuTe and large-M GEMM have different reduction arithmetic.
-            # The cuBLAS bf16 -> fp32 GEMM that remains is kept batch invariant
-            # like every cuBLAS GEMM in BI mode on SM10x (no split-K via the
-            # workspace config), and it is the call the trainer replays.
-            self.allow_ll_bf16_gemm = False
 
 
 class NemotronHMLP(nn.Module):
@@ -243,7 +206,7 @@ class NemotronHMoE(nn.Module):
 
         self.is_sequence_parallel = parallel_config.use_sequence_parallel_moe
 
-        self.gate = NemotronHGateLinear(
+        self.gate = GateLinear(
             config.hidden_size,
             config.n_routed_experts,
             out_dtype=torch.float32,
@@ -400,7 +363,7 @@ class NemotronHMLPDecoderLayer(nn.Module):
             prefix=f"{prefix}.mixer",
         )
 
-        self.norm = NemotronHRMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
+        self.norm = CudaRMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
 
     def forward(
         self,
@@ -443,7 +406,7 @@ class NemotronHMoEDecoderLayer(nn.Module):
             prefix=f"{prefix}.mixer",
         )
 
-        self.norm = NemotronHRMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
+        self.norm = CudaRMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
 
     def forward(
         self,
@@ -486,14 +449,14 @@ class NemotronHMambaDecoderLayer(nn.Module):
             head_dim=config.mamba_head_dim,
             rms_norm_eps=config.layer_norm_epsilon,
             activation=config.mamba_hidden_act,
-            norm_cls=NemotronHGatedRMSNorm,
+            norm_cls=GroupedMixer2RMSNormGated,
             model_config=model_config,
             cache_config=cache_config,
             quant_config=quant_config,
             prefix=f"{prefix}.mixer",
         )
 
-        self.norm = NemotronHRMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
+        self.norm = CudaRMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
 
     def forward(
         self,
@@ -567,12 +530,12 @@ class NemotronHAttention(nn.Module):
 
         attn_backend = None
         if envs.VLLM_BATCH_INVARIANT:
-            from vllm.model_executor.models.nemotron_h_fa4 import (
-                NemotronHFixedFA4Backend,
-                fixed_fa4_unsupported_reason,
+            from vllm.v1.attention.backends.flash_attn_fixed_split import (
+                FlashAttnFixedSplitBackend,
+                fixed_split_unsupported_reason,
             )
 
-            reason = fixed_fa4_unsupported_reason(
+            reason = fixed_split_unsupported_reason(
                 self.head_dim,
                 cache_config.cache_dtype if cache_config else "auto",
                 sliding_window,
@@ -580,10 +543,10 @@ class NemotronHAttention(nn.Module):
             )
             if reason is not None:
                 raise ValueError(
-                    f"VLLM_BATCH_INVARIANT=1 for Nemotron-H uses fixed-schedule "
+                    f"VLLM_BATCH_INVARIANT=1 for Nemotron-H uses fixed split-KV "
                     f"FA4 attention, which {reason}."
                 )
-            attn_backend = NemotronHFixedFA4Backend
+            attn_backend = FlashAttnFixedSplitBackend
 
         self.attn = Attention(
             self.num_heads,
@@ -635,7 +598,7 @@ class NemotronHAttentionDecoderLayer(nn.Module):
             prefix=f"{prefix}.mixer",
         )
 
-        self.norm = NemotronHRMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
+        self.norm = CudaRMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
 
     def forward(
         self,
@@ -724,9 +687,7 @@ class NemotronHModel(nn.Module, EagleModelMixin):
             ["hidden_states", "residual"], config.hidden_size
         )
 
-        self.norm_f = NemotronHRMSNorm(
-            config.hidden_size, eps=config.layer_norm_epsilon
-        )
+        self.norm_f = CudaRMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
