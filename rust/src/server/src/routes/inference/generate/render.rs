@@ -7,10 +7,18 @@
 //! 100+ candidates each. Instead of building a `ChatLogProbs` tree (two heap
 //! strings and one byte vector per candidate) and serializing it into one
 //! contiguous buffer, the default (`openai`) format is written straight from
-//! the engine logprobs in bounded chunks as the HTTP body is polled, and the
-//! compact format hands its pre-encoded base64 segments to the body without
-//! copying. The produced bytes are identical to serializing the previous
-//! `GenerateResponse` value with `serde_json`.
+//! the engine logprobs in bounded chunks by a task on the runtime that built
+//! the response (the request runtime for the offloaded generate route) into a
+//! bounded channel that the HTTP body drains, and the compact format hands its
+//! pre-encoded base64 segments to the body without copying. The produced bytes
+//! are identical to serializing the previous `GenerateResponse` value with
+//! `serde_json`.
+//!
+//! Observability: the handler returns once headers are ready, so
+//! `http_request_duration_seconds` and the `TraceLayer` latency stop before
+//! the OpenAI-format body is rendered (previously they included the eager
+//! serialization). The render task runs in the request span and logs
+//! `generate response body rendered` (`render_wall_s`, `bytes`) at debug level.
 
 use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
@@ -24,6 +32,8 @@ use bytes::Bytes;
 use http_body::{Frame, SizeHint};
 use serde::Serialize;
 use serde_json::Value;
+use tracing::{debug, trace};
+use tracing_futures::Instrument as _;
 use vllm_llm::PositionLogprobs;
 
 use super::compact::{BYTEORDER, CompactLogprobs, DTYPE_LOGPROBS, DTYPE_TOKEN_IDS, EncodedArray};
@@ -52,8 +62,8 @@ pub(super) enum ChoiceLogprobs {
     Compact(Option<CompactLogprobs>),
 }
 
-/// Positions rendered per body chunk in the OpenAI format (~14 KB each at
-/// top-128).
+/// Positions rendered per body chunk in the OpenAI format. At top-128 one
+/// position is ~13.9 KB, so a chunk is ~0.89 MB.
 const OPENAI_POSITIONS_PER_CHUNK: usize = 64;
 
 /// Builds the response body as a list of byte parts.
@@ -168,11 +178,12 @@ pub(super) fn generate_response(envelope: GenerateEnvelope, logprobs: ChoiceLogp
             tail.raw(b"]}");
             write_choice_fields(&mut tail, &envelope);
             write_tail(&mut tail, &envelope);
-            Body::new(OpenAiLogprobsBody::new(
-                head.finish(),
-                positions,
-                tail.finish(),
-            ))
+            let (tx, rx) = tokio::sync::mpsc::channel(OPENAI_BODY_CHANNEL_CHUNKS);
+            tokio::spawn(
+                produce_openai_body(head.finish(), positions, tail.finish(), tx)
+                    .instrument(tracing::Span::current()),
+            );
+            Body::new(ChannelBody { rx })
         }
     };
 
@@ -227,25 +238,25 @@ impl http_body::Body for PartsBody {
     }
 }
 
-/// Lazily renders OpenAI-format output logprobs in bounded chunks as the body
-/// is polled, releasing each position after it is written.
-pub(super) struct OpenAiLogprobsBody {
-    head: VecDeque<Bytes>,
+/// Renders OpenAI-format output logprobs in bounded chunks, releasing each
+/// position after it is written.
+struct OpenAiRenderer {
     positions: std::vec::IntoIter<PositionLogprobs>,
     first: bool,
-    tail: VecDeque<Bytes>,
     capacity_hint: usize,
 }
 
-impl OpenAiLogprobsBody {
-    fn new(head: Vec<Bytes>, positions: Vec<PositionLogprobs>, tail: Vec<Bytes>) -> Self {
+impl OpenAiRenderer {
+    fn new(positions: Vec<PositionLogprobs>) -> Self {
         Self {
-            head: head.into(),
             positions: positions.into_iter(),
             first: true,
-            tail: tail.into(),
             capacity_hint: 0,
         }
+    }
+
+    fn next_chunk(&mut self) -> Option<Bytes> {
+        (self.positions.len() > 0).then(|| self.render_chunk())
     }
 
     fn render_chunk(&mut self) -> Bytes {
@@ -255,32 +266,75 @@ impl OpenAiLogprobsBody {
                 out.push(b',');
             }
             write_openai_position(&mut out, &position);
+            #[cfg(test)]
+            tests::RENDERED_ON_THREAD.with(|count| count.set(count.get() + 1));
         }
         self.capacity_hint = out.len() + out.len() / 8;
         Bytes::from(out)
     }
 }
 
-impl http_body::Body for OpenAiLogprobsBody {
+/// Render one OpenAI-format body (head, positions, tail) into `tx`.
+///
+/// Runs as a task on the runtime that built the response, which for the
+/// offloaded generate route is the request runtime, so the HTTP runtime only
+/// moves ready chunks. `send` waits while the channel is full (backpressure
+/// from the client); a dropped body closes the channel and stops rendering.
+async fn produce_openai_body(
+    head: Vec<Bytes>,
+    positions: Vec<PositionLogprobs>,
+    tail: Vec<Bytes>,
+    tx: tokio::sync::mpsc::Sender<Bytes>,
+) {
+    let started = std::time::Instant::now();
+    let mut bytes = 0_usize;
+    let mut renderer = OpenAiRenderer::new(positions);
+    for part in head {
+        bytes += part.len();
+        if tx.send(part).await.is_err() {
+            return;
+        }
+    }
+    while let Some(chunk) = renderer.next_chunk() {
+        bytes += chunk.len();
+        if tx.send(chunk).await.is_err() {
+            trace!(bytes, "generate response body dropped before completion");
+            return;
+        }
+        // Keep the request runtime fair when the client drains faster than
+        // we render (sends then never wait).
+        tokio::task::yield_now().await;
+    }
+    for part in tail {
+        bytes += part.len();
+        if tx.send(part).await.is_err() {
+            return;
+        }
+    }
+    debug!(
+        render_wall_s = started.elapsed().as_secs_f64(),
+        bytes, "generate response body rendered"
+    );
+}
+
+/// Chunks rendered for an in-flight OpenAI-format body, at most this many
+/// buffered ahead of the socket (~0.9 MB each at top-128).
+const OPENAI_BODY_CHANNEL_CHUNKS: usize = 2;
+
+/// HTTP body fed by [`produce_openai_body`]; size unknown (chunked).
+struct ChannelBody {
+    rx: tokio::sync::mpsc::Receiver<Bytes>,
+}
+
+impl http_body::Body for ChannelBody {
     type Data = Bytes;
     type Error = Infallible;
 
     fn poll_frame(
         mut self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
+        cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Bytes>, Infallible>>> {
-        let this = &mut *self;
-        if let Some(part) = this.head.pop_front() {
-            return Poll::Ready(Some(Ok(Frame::data(part))));
-        }
-        if this.positions.len() > 0 {
-            return Poll::Ready(Some(Ok(Frame::data(this.render_chunk()))));
-        }
-        Poll::Ready(this.tail.pop_front().map(|part| Ok(Frame::data(part))))
-    }
-
-    fn is_end_stream(&self) -> bool {
-        self.head.is_empty() && self.positions.len() == 0 && self.tail.is_empty()
+        self.rx.poll_recv(cx).map(|chunk| chunk.map(|chunk| Ok(Frame::data(chunk))))
     }
 }
 
@@ -344,6 +398,69 @@ fn write_f32(out: &mut Vec<u8>, value: f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    thread_local! {
+        /// OpenAI positions rendered on the current thread.
+        pub(super) static RENDERED_ON_THREAD: std::cell::Cell<usize> =
+            const { std::cell::Cell::new(0) };
+    }
+
+    #[tokio::test]
+    async fn openai_producer_stops_when_body_is_dropped_and_is_bounded() {
+        let many: Vec<PositionLogprobs> = positions().into_iter().cycle().take(64 * 50).collect();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(OPENAI_BODY_CHANNEL_CHUNKS);
+        let producer = tokio::spawn(produce_openai_body(
+            vec![Bytes::from_static(b"[")],
+            many,
+            vec![Bytes::from_static(b"]")],
+            tx,
+        ));
+        // Head + one rendered chunk, then let the producer fill the channel.
+        assert_eq!(rx.recv().await.unwrap(), Bytes::from_static(b"["));
+        rx.recv().await.unwrap();
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        // Backpressure: at most the channel capacity is rendered ahead.
+        assert!(rx.len() <= OPENAI_BODY_CHANNEL_CHUNKS);
+        assert!(!producer.is_finished());
+        drop(rx);
+        tokio::time::timeout(std::time::Duration::from_secs(5), producer)
+            .await
+            .expect("producer stops after the body is dropped")
+            .unwrap();
+    }
+
+    #[test]
+    fn openai_render_runs_on_request_runtime_not_body_poller() {
+        // `generate_response` runs inside the handler on the request runtime;
+        // the HTTP runtime only polls the body. Rendering must stay on the
+        // former so control routes on the HTTP runtime are not starved.
+        let request_runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let response = request_runtime.block_on(async {
+            generate_response(test_envelope(), ChoiceLogprobs::OpenAi(positions()))
+        });
+        let http_runtime =
+            tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        RENDERED_ON_THREAD.with(|count| count.set(0));
+        let body = http_runtime
+            .block_on(axum::body::to_bytes(response.into_body(), usize::MAX))
+            .unwrap();
+        assert_eq!(
+            RENDERED_ON_THREAD.with(|count| count.get()),
+            0,
+            "positions were rendered on the body-polling thread"
+        );
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["choices"][0]["logprobs"]["content"].as_array().unwrap().len(),
+            300
+        );
+    }
 
     #[test]
     fn format_u32_matches_display() {

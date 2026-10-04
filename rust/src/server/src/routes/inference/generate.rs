@@ -151,7 +151,8 @@ pub async fn generate(
     };
 
     match result {
-        Ok((envelope, logprobs)) => generate_response(envelope, logprobs),
+        // In the request span so the body render task inherits it.
+        Ok((envelope, logprobs)) => request_span.in_scope(|| generate_response(envelope, logprobs)),
         Err(error) => error.into_response(),
     }
 }
