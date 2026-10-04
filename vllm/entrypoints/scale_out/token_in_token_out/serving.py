@@ -6,6 +6,7 @@ import asyncio
 import time
 from collections.abc import AsyncGenerator
 from collections.abc import Sequence as GenericSequence
+from concurrent.futures import ThreadPoolExecutor
 
 import msgspec
 from fastapi import Request
@@ -67,6 +68,9 @@ logger = init_logger(__name__)
 # ArrayLogprobs entries (positions x slots) from which the final
 # non-streaming response is built in a worker thread (~0.03 s inline).
 OFFLOAD_MIN_LOGPROB_ENTRIES = 1 << 20
+_RESPONSE_BUILDER = ThreadPoolExecutor(
+    max_workers=1, thread_name_prefix="generate-response"
+)
 
 
 class ServingTokens(GenerateBaseServing):
@@ -350,8 +354,11 @@ class ServingTokens(GenerateBaseServing):
         if self._num_logprob_entries(request, final_res) >= OFFLOAD_MIN_LOGPROB_ENTRIES:
             # Large bodies (e.g. ~6.5 s for 245k positions x top-128) would
             # block the event loop; build them in a worker thread so other
-            # requests (pause, health, sends) keep being served.
-            return await asyncio.to_thread(
+            # requests (pause, health, sends) keep being served. One thread
+            # per process: builds stay sequential (first bodies finish and
+            # can be sent early; peak memory as with inline builds).
+            return await asyncio.get_running_loop().run_in_executor(
+                _RESPONSE_BUILDER,
                 self._build_full_response,
                 request,
                 final_res,
