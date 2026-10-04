@@ -14,6 +14,12 @@ import pytest
 import torch
 
 from tests.kernels.mamba.utils import carve_paged_states, single_shot_scan
+from vllm.model_executor.layers.mamba.ops import (
+    ssd_bmm,
+    ssd_chunk_scan,
+    ssd_chunk_state,
+    ssd_state_passing,
+)
 from vllm.model_executor.layers.mamba.ops.ssd_emit import (
     _bmm_chunk_workspace_range_fwd,
     _chunk_scan_workspace_range_fwd,
@@ -28,6 +34,37 @@ pytestmark = pytest.mark.skipif(
     not current_platform.is_cuda_alike(),
     reason="Mamba2 SSD Triton kernels require a CUDA-alike device.",
 )
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _reference_on_batch_invariant_tiles():
+    """The emit kernels always run the batch-invariant tiles, while the reference
+    scan autotunes unless VLLM_BATCH_INVARIANT is set at import. The cumsum head
+    tile changes the bits, so pin the reference to the same tiles."""
+    pinned = [
+        (ssd_bmm._bmm_chunk_fwd_kernel, ssd_bmm._BATCH_INVARIANT_CONFIG),
+        (
+            ssd_chunk_state._chunk_cumsum_fwd_kernel,
+            ssd_chunk_state._CUMSUM_BATCH_INVARIANT_CONFIG,
+        ),
+        (
+            ssd_chunk_state._chunk_state_fwd_kernel,
+            ssd_chunk_state._CHUNK_STATE_BATCH_INVARIANT_CONFIG,
+        ),
+        (ssd_chunk_scan._chunk_scan_fwd_kernel, ssd_chunk_scan._BATCH_INVARIANT_CONFIG),
+        (
+            ssd_state_passing._state_passing_fwd_kernel,
+            ssd_state_passing._BATCH_INVARIANT_CONFIG,
+        ),
+    ]
+    saved = [(kernel, kernel.configs) for kernel, _ in pinned]
+    for kernel, config in pinned:
+        kernel.configs = [config]
+        kernel.cache.clear()
+    yield
+    for kernel, configs in saved:
+        kernel.configs = configs
+        kernel.cache.clear()
 
 
 def _paged(num_slots, shape, dtype, device):
