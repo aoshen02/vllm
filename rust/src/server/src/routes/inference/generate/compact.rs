@@ -106,6 +106,13 @@ impl Base64Segments {
             if self.current.is_empty() {
                 let remaining = data.len().div_ceil(3) * 4;
                 self.current.reserve_exact(remaining.min(SEGMENT_TARGET_BYTES));
+            } else if self.current.capacity() - self.current.len() < encoded {
+                // Grow geometrically but never past the segment size, so a
+                // full segment has no spare capacity (plain `String` growth
+                // would overshoot to 2x and then need a shrinking copy).
+                let grow =
+                    encoded.max(self.current.len()).min(SEGMENT_TARGET_BYTES - self.current.len());
+                self.current.reserve_exact(grow);
             }
             STANDARD.encode_string(piece, &mut self.current);
             self.encoded_len += encoded;
@@ -523,6 +530,12 @@ pub(crate) mod tests {
             accumulator.scratch_capacity() <= 2 * SCRATCH_TARGET_BYTES,
             "scratch capacity {}",
             accumulator.scratch_capacity()
+        );
+        // Full segments carry no spare capacity.
+        assert!(
+            accumulator.token_ids.current.capacity() <= SEGMENT_TARGET_BYTES,
+            "open segment capacity {}",
+            accumulator.token_ids.current.capacity()
         );
         let block = accumulator.finish().unwrap();
         for array in [&block.token_ids, &block.logprobs, &block.ranks] {
