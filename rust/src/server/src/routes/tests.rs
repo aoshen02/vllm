@@ -7111,3 +7111,157 @@ async fn raw_generate_http_framing_through_build_router() {
     server.abort();
     engine_task.await.expect("mock engine task");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn raw_generate_compact_huge_logprobs_rejected_before_engine() {
+    // requested k + 1 never reaches the compact accumulator unbounded: the
+    // shared lowering rejects logprobs above max_logprobs with a 400 before
+    // the engine sees the request.
+    let mut app = test_app().await;
+    let response = app
+        .call(
+            Request::builder()
+                .method("POST")
+                .uri("/inference/v1/generate")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "Qwen/Qwen1.5-0.5B-Chat",
+                        "token_ids": [11, 22],
+                        "logprobs_format": "compact",
+                        "sampling_params": {"logprobs": 2147483647}
+                    })
+                    .to_string(),
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("call app");
+    let status = response.status();
+    let body = to_bytes(response.into_body(), usize::MAX).await.expect("read body");
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn non_stream_raw_generate_compact_logprob_token_ids_without_logprobs() {
+    use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD;
+
+    let ipc = IpcNamespace::new().expect("create ipc namespace");
+    let handshake_address = ipc.handshake_endpoint();
+    let engine_id = b"engine-raw-generate-compact-token-ids".to_vec();
+
+    let engine_task = MockEngineTask::new(spawn_mock_engine_task(
+        handshake_address.clone(),
+        engine_id.clone(),
+        |dealer, push| {
+            boxed_test_future(async move {
+                let add = recv_engine_message(dealer).await;
+                let request: EngineCoreRequest =
+                    rmp_serde::from_slice(&add[1]).expect("decode request");
+                // Rows [sampled, ids...] padded to a wider batch max (-inf).
+                let row = |sampled: u32| PositionLogprobs {
+                    entries: vec![
+                        TokenLogprob {
+                            token_id: sampled,
+                            logprob: -0.1,
+                            rank: 3,
+                        },
+                        TokenLogprob {
+                            token_id: 5,
+                            logprob: -1.5,
+                            rank: 1,
+                        },
+                        TokenLogprob {
+                            token_id: 6,
+                            logprob: -2.5,
+                            rank: 2,
+                        },
+                        TokenLogprob {
+                            token_id: 0,
+                            logprob: f32::NEG_INFINITY,
+                            rank: 3,
+                        },
+                    ],
+                };
+                send_outputs(
+                    push,
+                    RequestBatchOutputs {
+                        outputs: vec![request_output_with_logprobs(
+                            &request.request_id,
+                            vec![33, 44],
+                            Some(EngineCoreFinishReason::Length),
+                            None,
+                            Some(Logprobs {
+                                positions: vec![row(33), row(44)],
+                            }),
+                            None,
+                        )],
+                        ..Default::default()
+                    }
+                    .into(),
+                )
+                .await;
+            })
+        },
+    ));
+
+    let client = EngineCoreClient::connect(
+        EngineCoreClientConfig::new_single(handshake_address)
+            .with_model_name("test-model")
+            .with_local_input_output_addresses(
+                Some(ipc.input_endpoint()),
+                Some(ipc.output_endpoint()),
+            ),
+    )
+    .await
+    .expect("connect client");
+    let chat = ChatLlm::from_shared_backend(Llm::new(client), Arc::new(FakeChatBackend::new()));
+    let mut app = build_router(Arc::new(AppState::new(
+        vec!["Qwen/Qwen1.5-0.5B-Chat".to_string()],
+        chat,
+    )));
+
+    let response = app
+        .call(
+            Request::builder()
+                .method("POST")
+                .uri("/inference/v1/generate")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "Qwen/Qwen1.5-0.5B-Chat",
+                        "token_ids": [11, 22],
+                        "logprobs_format": "compact",
+                        "sampling_params": {"max_tokens": 2, "logprob_token_ids": [5, 6]}
+                    })
+                    .to_string(),
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("call app");
+    let status = response.status();
+    let body = to_bytes(response.into_body(), usize::MAX).await.expect("read body");
+    engine_task.await.expect("mock engine task");
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("decode json");
+    let block = &json["choices"][0]["compact_logprobs"];
+    // Emitted although `logprobs` is unset; S = len(logprob_token_ids) + 1.
+    assert_eq!(block["num_positions"], 2);
+    assert_eq!(block["num_slots"], 3);
+    let ids: Vec<i32> = STANDARD
+        .decode(block["token_ids"].as_str().unwrap())
+        .unwrap()
+        .chunks_exact(4)
+        .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    assert_eq!(ids, vec![33, 5, 6, 44, 5, 6]);
+}

@@ -24,10 +24,20 @@ pub(crate) fn validate_request_compat(
         );
     }
 
-    if LogprobsFormat::parse(request.logprobs_format.as_ref()).is_none() {
+    let Some(logprobs_format) = LogprobsFormat::parse(request.logprobs_format.as_ref()) else {
         bail_invalid_request!(
             param = "logprobs_format",
             "logprobs_format must be \"openai\" or \"compact\"."
+        );
+    };
+
+    // The full-vocabulary payload (`logprobs: -1`) has no compact encoding.
+    if logprobs_format == LogprobsFormat::Compact
+        && request.sampling_params.inner.logprobs.is_some_and(|k| k < 0)
+    {
+        bail_invalid_request!(
+            param = "logprobs",
+            "logprobs=-1 is not supported with logprobs_format \"compact\"."
         );
     }
 
@@ -130,6 +140,29 @@ mod tests {
         }))
         .expect("parse request");
         assert!(validate_request_compat(&request, &served(&["Qwen/Qwen1.5-0.5B-Chat"])).is_ok());
+    }
+
+    #[test]
+    fn validate_request_compat_rejects_compact_full_vocab_logprobs() {
+        let served = served(&["Qwen/Qwen1.5-0.5B-Chat"]);
+        let request = |format: &str, logprobs: i32| -> GenerateRequest {
+            serde_json::from_value(json!({
+                "token_ids": [11, 22],
+                "logprobs_format": format,
+                "sampling_params": {"logprobs": logprobs}
+            }))
+            .expect("parse request")
+        };
+        let error = validate_request_compat(&request("compact", -1), &served)
+            .expect_err("compact with logprobs=-1 is not supported");
+        assert_eq!(
+            error.to_error_response().error.param.as_deref(),
+            Some("logprobs")
+        );
+        assert!(validate_request_compat(&request("compact", 0), &served).is_ok());
+        assert!(validate_request_compat(&request("compact", 128), &served).is_ok());
+        // The default format keeps accepting -1 (unchanged from base).
+        assert!(validate_request_compat(&request("openai", -1), &served).is_ok());
     }
 
     #[test]
