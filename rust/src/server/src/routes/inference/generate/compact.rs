@@ -19,7 +19,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use bytes::Bytes;
 use serde::Serialize;
-use vllm_llm::{Logprobs, LogprobsAccumulator};
+use vllm_llm::{Logprobs, LogprobsAccumulator, PositionLogprobs};
 
 /// Wire value of the request `logprobs_format` field.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -48,9 +48,12 @@ impl LogprobsFormat {
     }
 }
 
-/// Encoded segments are closed once they reach roughly this many bytes. Large
-/// engine steps produce one exactly-sized segment each.
+/// Maximum size of one encoded segment (a multiple of 4). Steps are split
+/// across segments (keeping the base64 carry), so no segment exceeds it.
 const SEGMENT_TARGET_BYTES: usize = 1 << 20;
+
+/// Upper bound on the bytes packed per scratch batch (per array).
+const SCRATCH_TARGET_BYTES: usize = 1 << 20;
 
 /// Incremental padded base64 encoder whose output is kept as immutable
 /// segments that can be handed to the HTTP body without copying.
@@ -86,21 +89,28 @@ impl Base64Segments {
         self.carry_len = rest.len();
     }
 
-    /// Encode `data` and append it. Only the final call (from `finish`) may
-    /// pass a length that is not a multiple of three.
-    fn encode(&mut self, data: &[u8]) {
-        if data.is_empty() {
-            return;
+    /// Encode `data` and append it, splitting it so that no segment exceeds
+    /// `SEGMENT_TARGET_BYTES`. Only the final call (from `finish`) may pass a
+    /// length that is not a multiple of three.
+    fn encode(&mut self, mut data: &[u8]) {
+        while !data.is_empty() {
+            // Raw bytes (a multiple of 3) that still fit the open segment.
+            let room = (SEGMENT_TARGET_BYTES - self.current.len()) / 4 * 3;
+            if room == 0 {
+                self.close_segment();
+                continue;
+            }
+            let take = data.len().min(room);
+            let (piece, rest) = data.split_at(take);
+            let encoded = piece.len().div_ceil(3) * 4;
+            if self.current.is_empty() {
+                let remaining = data.len().div_ceil(3) * 4;
+                self.current.reserve_exact(remaining.min(SEGMENT_TARGET_BYTES));
+            }
+            STANDARD.encode_string(piece, &mut self.current);
+            self.encoded_len += encoded;
+            data = rest;
         }
-        let encoded = data.len().div_ceil(3) * 4;
-        if !self.current.is_empty() && self.current.len() + encoded > SEGMENT_TARGET_BYTES {
-            self.close_segment();
-        }
-        if self.current.is_empty() {
-            self.current.reserve_exact(encoded);
-        }
-        STANDARD.encode_string(data, &mut self.current);
-        self.encoded_len += encoded;
     }
 
     fn close_segment(&mut self) {
@@ -177,6 +187,15 @@ impl CompactLogprobsAccumulator {
         }
     }
 
+    /// Retained capacity of the packing scratch buffers.
+    #[cfg(test)]
+    fn scratch_capacity(&self) -> usize {
+        self.scratch_token_ids
+            .capacity()
+            .max(self.scratch_logprobs.capacity())
+            .max(self.scratch_ranks.capacity())
+    }
+
     /// Whether any step carried a logprobs payload.
     pub(crate) fn saw_payload(&self) -> bool {
         self.saw_payload
@@ -221,7 +240,26 @@ impl LogprobsAccumulator for CompactLogprobsAccumulator {
             return;
         }
 
-        let rows = step.positions.len();
+        // Pack in bounded batches so the retained scratch capacity stays at
+        // about SCRATCH_TARGET_BYTES per array regardless of step size.
+        let rows_per_batch = (SCRATCH_TARGET_BYTES / (slots * 4)).max(1);
+        for batch in step.positions.chunks(rows_per_batch) {
+            if !self.pack_batch(batch, slots) {
+                return;
+            }
+        }
+    }
+
+    fn num_positions(&self) -> usize {
+        self.num_positions
+    }
+}
+
+impl CompactLogprobsAccumulator {
+    /// Pack and encode one batch of rows; returns `false` after recording an
+    /// error.
+    fn pack_batch(&mut self, batch: &[PositionLogprobs], slots: usize) -> bool {
+        let rows = batch.len();
         self.scratch_token_ids.clear();
         self.scratch_logprobs.clear();
         self.scratch_ranks.clear();
@@ -229,24 +267,24 @@ impl LogprobsAccumulator for CompactLogprobsAccumulator {
         self.scratch_logprobs.reserve(rows * slots * 4);
         self.scratch_ranks.reserve(rows * 4);
 
-        for position in &step.positions {
+        for position in batch {
             if position.entries.len() < slots {
                 self.fail(format!(
                     "raw generate logprobs row has {} candidates, expected at least {slots}",
                     position.entries.len()
                 ));
-                return;
+                return false;
             }
             let sampled_rank = position.entries[0].rank;
             if sampled_rank > i32::MAX as u32 {
                 self.fail(format!("sampled rank {sampled_rank} does not fit int32"));
-                return;
+                return false;
             }
             self.scratch_ranks.extend_from_slice(&sampled_rank.to_le_bytes());
             for entry in &position.entries[..slots] {
                 if entry.token_id > i32::MAX as u32 {
                     self.fail(format!("token id {} does not fit int32", entry.token_id));
-                    return;
+                    return false;
                 }
                 self.scratch_token_ids.extend_from_slice(&entry.token_id.to_le_bytes());
                 self.scratch_logprobs.extend_from_slice(&entry.logprob.to_bits().to_le_bytes());
@@ -257,10 +295,7 @@ impl LogprobsAccumulator for CompactLogprobsAccumulator {
         self.logprobs.push(&self.scratch_logprobs);
         self.ranks.push(&self.scratch_ranks);
         self.num_positions += rows;
-    }
-
-    fn num_positions(&self) -> usize {
-        self.num_positions
+        true
     }
 }
 
@@ -431,27 +466,80 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn steps_coalesce_into_bounded_exact_segments() {
-        // 300 KB raw -> 400 KB encoded: two steps fit one 1 MiB segment.
-        let step = vec![7_u8; 3 * 100_000];
-        let mut segments = Base64Segments::default();
-        for _ in 0..4 {
-            segments.push(&step);
+    fn segments_never_exceed_target_and_match_one_shot() {
+        let data: Vec<u8> = (0..7_000_003_u32).map(|i| (i * 31 + 7) as u8).collect();
+        // Mixed push sizes: tiny (carry across segment boundaries), steps
+        // smaller than a segment, and steps several segments long.
+        for sizes in [
+            vec![1_usize, 2, 300_000, 5, 3_000_001, 700_000, 1],
+            vec![3_500_000],
+            vec![1_048_575, 1, 1_048_576 / 4 * 3, 2],
+        ] {
+            let mut segments = Base64Segments::default();
+            let mut offset = 0;
+            for size in sizes.iter().cycle() {
+                if offset >= data.len() {
+                    break;
+                }
+                let end = (offset + size).min(data.len());
+                segments.push(&data[offset..end]);
+                offset = end;
+            }
+            let encoded = segments.finish();
+            assert!(
+                encoded
+                    .segments
+                    .iter()
+                    .all(|s| !s.is_empty() && s.len() <= SEGMENT_TARGET_BYTES),
+                "segment lens {:?}",
+                encoded.segments.iter().map(|s| s.len()).collect::<Vec<_>>()
+            );
+            let expected = STANDARD.encode(&data);
+            assert_eq!(encoded.len, expected.len());
+            assert_eq!(encoded.to_base64_string(), expected);
         }
-        let encoded = segments.finish();
-        assert_eq!(encoded.segments.len(), 2);
-        assert!(encoded.segments.iter().all(|s| s.len() == 800_000));
-        assert_eq!(encoded.len, 1_600_000);
+    }
 
-        // A step larger than the target becomes its own segment.
-        let big = vec![7_u8; 3 * 300_000];
-        let mut segments = Base64Segments::default();
-        segments.push(&step);
-        segments.push(&big);
-        segments.push(&big);
-        let encoded = segments.finish();
-        let lens: Vec<_> = encoded.segments.iter().map(|s| s.len()).collect();
-        assert_eq!(lens, [400_000, 1_200_000, 1_200_000]);
+    #[test]
+    fn wide_steps_keep_scratch_and_segments_bounded() {
+        // 256 positions x 4097 slots: 4 MiB per packed array in one step.
+        let slots = 4097_u32;
+        let positions: Vec<_> = (0..256_u32)
+            .map(|row| PositionLogprobs {
+                entries: (0..slots)
+                    .map(|slot| TokenLogprob {
+                        token_id: row * 7 + slot,
+                        logprob: -(slot as f32) * 1e-3,
+                        rank: slot.max(1),
+                    })
+                    .collect(),
+            })
+            .collect();
+        let mut accumulator = CompactLogprobsAccumulator::new(slots as usize);
+        accumulator.extend(Logprobs {
+            positions: positions.clone(),
+        });
+        assert!(
+            accumulator.scratch_capacity() <= 2 * SCRATCH_TARGET_BYTES,
+            "scratch capacity {}",
+            accumulator.scratch_capacity()
+        );
+        let block = accumulator.finish().unwrap();
+        for array in [&block.token_ids, &block.logprobs, &block.ranks] {
+            assert!(array.segments.iter().all(|s| s.len() <= SEGMENT_TARGET_BYTES));
+        }
+        let value = serde_json::to_value(CompactLogprobsJson::from(&block)).unwrap();
+        let (token_ids, bits, _) = decode_compact(&value);
+        let expected_ids: Vec<i32> = positions
+            .iter()
+            .flat_map(|p| p.entries.iter().map(|e| e.token_id as i32))
+            .collect();
+        let expected_bits: Vec<u32> = positions
+            .iter()
+            .flat_map(|p| p.entries.iter().map(|e| e.logprob.to_bits()))
+            .collect();
+        assert_eq!(token_ids, expected_ids);
+        assert_eq!(bits, expected_bits);
     }
 
     #[test]
