@@ -6985,3 +6985,129 @@ async fn non_stream_raw_generate_compact_zero_token_abort_returns_empty_block() 
     assert_eq!(block["num_slots"], 6);
     assert_eq!(block["token_ids"], "");
 }
+
+/// Send one raw HTTP/1.1 POST and return (lower-cased header block, de-framed body).
+async fn raw_http_post(addr: std::net::SocketAddr, path: &str, body: &str) -> (String, Vec<u8>) {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    let request = format!(
+        "POST {path} HTTP/1.1\r\nHost: t\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(request.as_bytes()).await.expect("write");
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).await.expect("read");
+
+    let split = raw.windows(4).position(|w| w == b"\r\n\r\n").expect("header end");
+    let head = String::from_utf8(raw[..split].to_vec()).unwrap().to_ascii_lowercase();
+    let mut rest = &raw[split + 4..];
+    if !head.contains("transfer-encoding: chunked") {
+        return (head, rest.to_vec());
+    }
+    let mut body = Vec::new();
+    loop {
+        let line_end = rest.windows(2).position(|w| w == b"\r\n").unwrap();
+        let size =
+            usize::from_str_radix(std::str::from_utf8(&rest[..line_end]).unwrap(), 16).unwrap();
+        rest = &rest[line_end + 2..];
+        if size == 0 {
+            break;
+        }
+        body.extend_from_slice(&rest[..size]);
+        rest = &rest[size + 2..];
+    }
+    (head, body)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn raw_generate_http_framing_through_build_router() {
+    let ipc = IpcNamespace::new().expect("create ipc namespace");
+    let handshake_address = ipc.handshake_endpoint();
+    let engine_id = b"engine-raw-generate-framing".to_vec();
+
+    let engine_task = MockEngineTask::new(spawn_mock_engine_task(
+        handshake_address.clone(),
+        engine_id.clone(),
+        |dealer, push| {
+            boxed_test_future(async move {
+                for _ in 0..2 {
+                    let add = recv_engine_message(dealer).await;
+                    let request: EngineCoreRequest =
+                        rmp_serde::from_slice(&add[1]).expect("decode request");
+                    send_outputs(
+                        push,
+                        RequestBatchOutputs {
+                            outputs: vec![request_output_with_logprobs(
+                                &request.request_id,
+                                vec![33, 44],
+                                Some(EngineCoreFinishReason::Stop),
+                                None,
+                                Some(sample_logprobs_for_tokens(&[33, 44])),
+                                None,
+                            )],
+                            ..Default::default()
+                        }
+                        .into(),
+                    )
+                    .await;
+                }
+            })
+        },
+    ));
+
+    let client = EngineCoreClient::connect(
+        EngineCoreClientConfig::new_single(handshake_address)
+            .with_model_name("test-model")
+            .with_local_input_output_addresses(
+                Some(ipc.input_endpoint()),
+                Some(ipc.output_endpoint()),
+            ),
+    )
+    .await
+    .expect("connect client");
+    let chat = ChatLlm::from_shared_backend(Llm::new(client), Arc::new(FakeChatBackend::new()));
+    let app = build_router(Arc::new(AppState::new(
+        vec!["Qwen/Qwen1.5-0.5B-Chat".to_string()],
+        chat,
+    )));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("local addr");
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.expect("serve") });
+
+    let request = |format: &str| {
+        json!({
+            "model": "Qwen/Qwen1.5-0.5B-Chat",
+            "token_ids": [11, 22],
+            "logprobs_format": format,
+            "sampling_params": {"max_tokens": 2, "logprobs": 1}
+        })
+        .to_string()
+    };
+
+    // Compact: exact Content-Length through all router layers.
+    let (head, body) = raw_http_post(addr, "/inference/v1/generate", &request("compact")).await;
+    assert!(head.starts_with("http/1.1 200"), "{head}");
+    assert!(head.contains("content-type: application/json"), "{head}");
+    assert!(
+        head.contains(&format!("content-length: {}", body.len())),
+        "{head}"
+    );
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("compact json");
+    assert_eq!(json["choices"][0]["compact_logprobs"]["num_positions"], 2);
+
+    // Default format: chunked, rendered on the request runtime.
+    let (head, body) = raw_http_post(addr, "/inference/v1/generate", &request("openai")).await;
+    assert!(head.starts_with("http/1.1 200"), "{head}");
+    assert!(head.contains("content-type: application/json"), "{head}");
+    assert!(head.contains("transfer-encoding: chunked"), "{head}");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("openai json");
+    assert_eq!(
+        json["choices"][0]["logprobs"]["content"][1]["token"],
+        "token_id:44"
+    );
+
+    server.abort();
+    engine_task.await.expect("mock engine task");
+}
