@@ -18,6 +18,7 @@ JSON of the remaining (small) response fields.
 
 import json
 import secrets
+import threading
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -125,6 +126,56 @@ _SEP_TOP_FIRST = b',"bytes":null,"top_logprobs":['
 _SEP_TOP_NEXT = b',"bytes":null},'
 _END_WITH_TOP = b',"bytes":null}]}'
 _END_NO_TOP = b',"bytes":null,"top_logprobs":[]}'
+
+
+class _LeadTable:
+    """token id -> ``sep + {"token":"token_id:<id>","logprob":`` as a numpy
+    object array, so a block of ids maps to leads with one fancy index.
+
+    Covers ids below ``max_ids`` (~100 bytes per id actually seen, plus an
+    8-byte slot per id up to the largest seen); other ids are formatted
+    per call.
+    """
+
+    max_ids = 1 << 18
+
+    def __init__(self, sep: bytes):
+        self.sep = sep
+        self.values = np.empty(0, dtype=object)
+        self.filled = np.zeros(0, dtype=bool)
+        # Renders may run on the event loop and in the worker thread.
+        self.lock = threading.Lock()
+
+    def _format(self, token_id: int) -> bytes:
+        return self.sep + f'{{"token":"token_id:{token_id}","logprob":'.encode()
+
+    def lookup(self, ids: np.ndarray) -> np.ndarray:
+        if ids.size == 0:
+            return np.empty(ids.shape, dtype=object)
+        lo, hi = int(ids.min()), int(ids.max())
+        if lo < 0 or hi >= self.max_ids:
+            flat = [self._format(i) for i in ids.ravel().tolist()]
+            result = np.empty(len(flat), dtype=object)
+            result[:] = flat
+            return result.reshape(ids.shape)
+        with self.lock:
+            if hi >= len(self.values):
+                size = min(self.max_ids, max(hi + 1, 2 * len(self.values)))
+                values = np.empty(size, dtype=object)
+                values[: len(self.values)] = self.values
+                filled = np.zeros(size, dtype=bool)
+                filled[: len(self.filled)] = self.filled
+                self.values, self.filled = values, filled
+            values, filled = self.values, self.filled
+            missing = ids[~filled[ids]]
+            if missing.size:
+                for token_id in np.unique(missing).tolist():
+                    values[token_id] = self._format(token_id)
+                filled[missing] = True
+        return values[ids]
+
+
+_NEXT_LEADS = _LeadTable(_SEP_TOP_NEXT)
 
 
 def format_float_reprs(values: np.ndarray, exact_float32: bool) -> list[bytes]:
@@ -285,33 +336,29 @@ def render_openai_logprobs_parts(
     exact_float32 = logprobs.dtype == np.float32
     width = limit + 1
     item = _ITEM_PREFIX.__getitem__
-    concat = bytes.__add__
-    end = _END_WITH_TOP if limit else _END_NO_TOP
+    row_end = _END_WITH_TOP if limit else _END_NO_TOP
+    row_sep = row_end + b","
+    # Each value is preceded by one "lead" piece: the separator closing the
+    # previous entry plus this entry's ``{"token":...,"logprob":`` prefix.
+    # Leads of top entries 2..k come from a per-id table, so a block is a
+    # single join of alternating leads and float texts.
     parts: list[bytes] = [b'{"content":[']
     for start in range(0, n, _RENDER_BLOCK_ROWS):
         stop = min(start + _RENDER_BLOCK_ROWS, n)
-        entries = list(
-            map(
-                concat,
-                map(item, id_cols[start:stop].ravel().tolist()),
-                format_float_reprs(values[start:stop].ravel(), exact_float32),
-            )
-        )
-        block = []
-        for offset in range(0, len(entries), width):
-            if limit:
-                block.append(
-                    entries[offset]
-                    + _SEP_TOP_FIRST
-                    + _SEP_TOP_NEXT.join(entries[offset + 1 : offset + width])
-                    + end
-                )
-            else:
-                block.append(entries[offset] + end)
-        if start:
-            parts.append(b",")
-        parts.append(b",".join(block))
-    parts.append(b"]}")
+        block_ids = id_cols[start:stop]
+        out: list[bytes] = [b""] * (2 * (stop - start) * width)
+        if limit > 1:
+            out[0::2] = _NEXT_LEADS.lookup(block_ids).ravel().tolist()
+        out[0 :: 2 * width] = [row_sep + item(i) for i in block_ids[:, 0].tolist()]
+        if start == 0:
+            out[0] = item(int(block_ids[0, 0]))
+        if limit:
+            out[2 :: 2 * width] = [
+                _SEP_TOP_FIRST + item(i) for i in block_ids[:, 1].tolist()
+            ]
+        out[1::2] = format_float_reprs(values[start:stop].ravel(), exact_float32)
+        parts.append(b"".join(out))
+    parts.append(row_end + b"]}")
     return parts
 
 
