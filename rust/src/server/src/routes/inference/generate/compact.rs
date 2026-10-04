@@ -269,11 +269,12 @@ impl LogprobsAccumulator for CompactLogprobsAccumulator {
         let candidate_bytes = rows.saturating_mul(slots).saturating_mul(4);
         let wanted = candidate_bytes.min(SCRATCH_TARGET_BYTES);
         self.scratch_token_ids
-            .reserve(wanted.saturating_sub(self.scratch_token_ids.len()));
+            .reserve_exact(wanted.saturating_sub(self.scratch_token_ids.len()));
         self.scratch_logprobs
-            .reserve(wanted.saturating_sub(self.scratch_logprobs.len()));
-        self.scratch_ranks
-            .reserve((rows * 4).min(SCRATCH_TARGET_BYTES).saturating_sub(self.scratch_ranks.len()));
+            .reserve_exact(wanted.saturating_sub(self.scratch_logprobs.len()));
+        self.scratch_ranks.reserve_exact(
+            (rows * 4).min(SCRATCH_TARGET_BYTES).saturating_sub(self.scratch_ranks.len()),
+        );
 
         for position in &step.positions {
             let sampled_rank = position.entries[0].rank;
@@ -660,6 +661,37 @@ pub(crate) mod tests {
             (0..slots).map(|s| (-(s as f32)).to_bits()).collect::<Vec<_>>()
         );
         assert_eq!(ranks, vec![1]);
+    }
+
+    #[test]
+    fn growing_steps_keep_retained_scratch_within_target() {
+        // Same S across steps of increasing row counts: capped reservations
+        // must not double the previous capacity past the target.
+        let slots = 200_001_u32;
+        let mut accumulator = CompactLogprobsAccumulator::new(slots as usize);
+        for rows in [1, 2, 3, 5] {
+            accumulator.extend(Logprobs {
+                positions: vec![wide_row(slots); rows],
+            });
+            assert!(
+                accumulator.scratch_capacity() <= SCRATCH_TARGET_BYTES,
+                "after {rows} rows: scratch capacity {}",
+                accumulator.scratch_capacity()
+            );
+        }
+        // Ranks scratch too: many narrow rows, then more.
+        let mut accumulator = CompactLogprobsAccumulator::new(1);
+        for rows in [100_000, 200_000, 300_000] {
+            accumulator.extend(Logprobs {
+                positions: vec![wide_row(1); rows],
+            });
+            assert!(
+                accumulator.scratch_capacity() <= SCRATCH_TARGET_BYTES,
+                "after {rows} narrow rows: scratch capacity {}",
+                accumulator.scratch_capacity()
+            );
+        }
+        assert_eq!(accumulator.finish().unwrap().num_positions, 600_000);
     }
 
     #[test]
