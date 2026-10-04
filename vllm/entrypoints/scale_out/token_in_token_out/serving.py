@@ -49,6 +49,7 @@ from .logprobs_render import (
     compact_logprobs_fields,
     render_compact_logprobs,
     render_json_with_fragments,
+    render_openai_logprobs,
 )
 from .mm_serde import decode_mm_kwargs_item
 from .protocol import (
@@ -296,8 +297,14 @@ class ServingTokens(GenerateBaseServing):
 
     @staticmethod
     def _use_array_logprobs(request: GenerateRequest) -> bool:
-        """Whether sample logprobs are kept as engine rows (ArrayLogprobs)."""
-        return request.logprobs_format == "compact"
+        """Whether sample logprobs are kept as engine rows (ArrayLogprobs).
+
+        Always for compact. For the default format only without streaming:
+        the full response is rendered from the rows by
+        ``render_openai_logprobs`` (byte-identical to the legacy path), while
+        streaming deltas keep the legacy containers.
+        """
+        return request.logprobs_format == "compact" or not request.stream
 
     @staticmethod
     def _require_array_logprobs(logprobs: object) -> ArrayLogprobs:
@@ -350,7 +357,18 @@ class ServingTokens(GenerateBaseServing):
                             sampling_params.num_logprobs,
                         )
                     }
+                elif (
+                    isinstance(out_logprobs, ArrayLogprobs)
+                    and (
+                        rendered := render_openai_logprobs(
+                            token_ids, out_logprobs, sampling_params.logprobs
+                        )
+                    )
+                    is not None
+                ):
+                    fragments[len(choices)] = {"logprobs": rendered}
                 else:
+                    # Legacy containers or irregular rows.
                     logprobs = self._create_tokens_logprobs(
                         token_ids=token_ids,
                         top_logprobs=out_logprobs,

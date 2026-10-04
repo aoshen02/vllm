@@ -3,8 +3,9 @@
 """Tests for the ``logprobs_format`` option of ``/inference/v1/generate``."""
 
 import json
+import time
 from argparse import Namespace
-from typing import Any
+from typing import Any, cast
 from unittest.mock import MagicMock
 
 import numpy as np
@@ -19,6 +20,7 @@ from vllm.entrypoints.scale_out.token_in_token_out import api_router
 from vllm.entrypoints.scale_out.token_in_token_out.logprobs_render import (
     render_compact_logprobs,
     render_json_with_fragments,
+    render_openai_logprobs,
 )
 from vllm.entrypoints.scale_out.token_in_token_out.protocol import (
     CompactLogprobs,
@@ -29,6 +31,7 @@ from vllm.entrypoints.scale_out.token_in_token_out.protocol import (
     GenerateStreamResponse,
     RenderedGenerateResponse,
 )
+from vllm.entrypoints.scale_out.token_in_token_out.serving import ServingTokens
 from vllm.entrypoints.serve.exception_handling.register import init_exception_handler
 from vllm.logprobs import ArrayLogprobs, append_logprobs_for_next_position
 from vllm.sampling_params import SamplingParams
@@ -392,21 +395,153 @@ async def test_compact_without_logprobs_has_no_block():
 
 
 @pytest.mark.asyncio
-async def test_default_format_ignores_client_array_flag():
+async def test_default_stream_ignores_client_array_flag():
     chunks = [_engine_rows(0, 3, 4)]
     feeder = _OutputProcessorEngine(chunks, finish=FinishReason.LENGTH)
-    response = await _serving(feeder).serve_tokens(
-        _request(sampling={"array_logprobs": True})
+    generator = await _serving(feeder).serve_tokens(
+        _request(stream=True, sampling={"array_logprobs": True})
     )
+    events = _parse_sse_chunks([chunk async for chunk in generator])
     assert feeder.sampling_params.array_logprobs is False
     assert feeder.sampling_params.detokenize is True
-    assert isinstance(response, GenerateResponse)
-    dump = response.model_dump()
-    assert "compact_logprobs" not in dump["choices"][0]
-    content = dump["choices"][0]["logprobs"]["content"]
+    content = events[0]["choices"][0]["logprobs"]["content"]
     assert [c["token"] for c in content] == [
         f"token_id:{t}" for t in chunks[0][0][:, 0].tolist()
     ]
+
+
+async def _full_body(monkeypatch, chunks, request, array: bool) -> bytes:
+    """Full non-streaming body through the router's rendering rules."""
+    monkeypatch.setattr(time, "time", lambda: 1700000000.0)
+    if not array:
+        monkeypatch.setattr(
+            ServingTokens, "_use_array_logprobs", staticmethod(lambda r: False)
+        )
+    feeder = _OutputProcessorEngine(chunks)
+    response = await _serving(feeder).serve_tokens(request.model_copy(deep=True))
+    monkeypatch.undo()
+    assert feeder.sampling_params.array_logprobs is array
+    if array:
+        assert isinstance(response, RenderedGenerateResponse)
+        return response.body
+    assert isinstance(response, GenerateResponse)
+    return JSONResponse(content=response.model_dump()).body
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("logprobs", [0, 1, 3])
+async def test_default_full_response_is_byte_identical(monkeypatch, logprobs):
+    chunks = [_engine_rows(0, 5, 6), _engine_rows(5, 4, 6)]
+    chunks[0][1][2, 0] = np.float32(-np.inf)  # clamped to -9999.0
+    chunks[1][1][1, 2] = np.float32(-1e30)
+    chunks[1][1][3, 1] = np.float32(-0.0)
+    request = _request(logprobs=logprobs, request_id="fixed-id")
+    fast = await _full_body(monkeypatch, chunks, request, array=True)
+    legacy = await _full_body(monkeypatch, chunks, request, array=False)
+    assert fast == legacy
+
+
+def _legacy_logprobs_bytes(token_ids, legacy, k) -> bytes:
+    model = ServingTokens._create_tokens_logprobs(
+        cast(Any, None),
+        token_ids=token_ids,
+        top_logprobs=legacy,
+        num_output_top_logprobs=k,
+    )
+    return JSONResponse(content=model.model_dump()).body
+
+
+def _containers(token_ids, logprobs, ranks, num_logprobs):
+    container = ArrayLogprobs()
+    width = token_ids.shape[1]
+    slots = width if num_logprobs == -1 else num_logprobs + 1
+    container.append_rows(token_ids[:, :slots], logprobs[:, :slots], ranks)
+    legacy: list = []
+    for i in range(len(ranks)):
+        append_logprobs_for_next_position(
+            legacy,
+            token_ids[i].tolist(),
+            logprobs[i].tolist(),
+            [None] * width,
+            int(ranks[i]),
+            num_logprobs,
+        )
+    return container, legacy
+
+
+@pytest.mark.parametrize("num_logprobs", [0, 1, 2, 5, -1])
+@pytest.mark.parametrize("seed", [0, 1, 2])
+def test_openai_renderer_matches_legacy(num_logprobs, seed):
+    width = 6
+    token_ids, logprobs, ranks = _engine_rows(seed * 100, 40, width, seed=seed)
+    special = np.array(
+        [-np.inf, -1e30, -9999.0, -9999.5, -0.0, -1.2e-7, -5e-45, -1e-5, -123.456],
+        dtype=np.float32,
+    )
+    rng = np.random.default_rng(seed)
+    logprobs.flat[rng.choice(logprobs.size, len(special), replace=False)] = special
+    container, legacy = _containers(token_ids, logprobs, ranks, num_logprobs)
+    sampled = token_ids[:, 0].tolist()
+    fast = render_openai_logprobs(sampled, container, num_logprobs)
+    assert fast == _legacy_logprobs_bytes(sampled, legacy, num_logprobs)
+    # Also exactly what the full legacy response embeds.
+    assert render_openai_logprobs([], ArrayLogprobs(), num_logprobs) == (
+        _legacy_logprobs_bytes([], [], num_logprobs)
+    )
+
+
+def test_openai_renderer_without_top_k_count():
+    token_ids, logprobs, ranks = _engine_rows(0, 4, 3)
+    container, legacy = _containers(token_ids, logprobs, ranks, 2)
+    sampled = token_ids[:, 0].tolist()
+    fast = render_openai_logprobs(sampled, container, None)
+    assert fast == _legacy_logprobs_bytes(sampled, legacy, None)
+
+
+@pytest.mark.parametrize("value", [np.nan, np.inf])
+def test_openai_renderer_nonfinite_raises_like_legacy(value):
+    token_ids, logprobs, ranks = _engine_rows(0, 3, 4)
+    logprobs[1, 1] = np.float32(value)
+    container, legacy = _containers(token_ids, logprobs, ranks, 3)
+    sampled = token_ids[:, 0].tolist()
+    with pytest.raises(ValueError, match="Out of range float values"):
+        render_openai_logprobs(sampled, container, 3)
+    with pytest.raises(ValueError, match="Out of range float values"):
+        _legacy_logprobs_bytes(sampled, legacy, 3)
+
+
+@pytest.mark.parametrize("case", ["dup_top", "sampled_mismatch", "length"])
+def test_openai_renderer_defers_irregular_rows(case):
+    token_ids, logprobs, ranks = _engine_rows(0, 4, 5)
+    sampled = token_ids[:, 0].tolist()
+    if case == "dup_top":
+        token_ids[2, 3] = token_ids[2, 4]
+    elif case == "sampled_mismatch":
+        sampled[1] += 1
+    else:
+        sampled = sampled[:-1]
+    container, legacy = _containers(token_ids, logprobs, ranks, 4)
+    assert render_openai_logprobs(sampled, container, 4) is None
+    if case == "dup_top":
+        # The legacy fallback through ArrayLogprobs positional access still
+        # yields the legacy bytes.
+        assert _legacy_logprobs_bytes(sampled, container, 4) == _legacy_logprobs_bytes(
+            sampled, legacy, 4
+        )
+
+
+@pytest.mark.asyncio
+async def test_default_full_response_irregular_rows_fall_back(monkeypatch):
+    chunks = [_engine_rows(0, 4, 5)]
+    chunks[0][0][1, 2] = chunks[0][0][1, 3]
+    request = _request(logprobs=4, request_id="fixed-id")
+    monkeypatch.setattr(time, "time", lambda: 1700000000.0)
+    feeder = _OutputProcessorEngine(chunks)
+    response = await _serving(feeder).serve_tokens(request.model_copy(deep=True))
+    monkeypatch.undo()
+    assert isinstance(response, GenerateResponse)
+    legacy = await _full_body(monkeypatch, chunks, request, array=False)
+    assert JSONResponse(content=response.model_dump()).body == legacy
 
 
 @pytest.mark.asyncio
