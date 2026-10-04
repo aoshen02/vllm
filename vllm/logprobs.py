@@ -170,8 +170,9 @@ class ArrayLogprobs(MutableSequence[LogprobsOnePosition | None]):
     row: slot 0 holds the sampled token, slots ``1..S-1`` the top-k
     candidates in engine order. Candidate tokens are never detokenized.
 
-    ``token_ids`` / ``ranks`` chunks are ``int32`` and ``logprobs`` chunks
-    ``float32`` (the raw engine values, including non-finite ones).
+    ``token_ids`` / ``ranks`` chunks are ``int32``; ``logprobs`` chunks keep
+    the raw engine values, including non-finite ones, as ``float32`` (the
+    engine dtype) or ``float64`` if the engine produced float64.
 
     Positional access (``container[i]``) materializes the same
     ``dict[int, Logprob]`` the list representation would hold (with
@@ -197,7 +198,8 @@ class ArrayLogprobs(MutableSequence[LogprobsOnePosition | None]):
         ):
             raise ValueError("All positions must have the same number of slots")
         self.token_id_chunks.append(np.array(token_ids, dtype="<i4", order="C"))
-        self.logprob_chunks.append(np.array(logprobs, dtype="<f4", order="C"))
+        float_dtype = "<f8" if logprobs.dtype == np.float64 else "<f4"
+        self.logprob_chunks.append(np.array(logprobs, dtype=float_dtype, order="C"))
         self.rank_chunks.append(np.array(ranks, dtype="<i4", order="C"))
         self.num_positions += n
 

@@ -18,9 +18,12 @@ from pydantic import ValidationError
 
 from vllm.entrypoints.scale_out.token_in_token_out import api_router
 from vllm.entrypoints.scale_out.token_in_token_out.logprobs_render import (
+    format_float_reprs,
     render_compact_logprobs,
+    render_compact_logprobs_parts,
     render_json_with_fragments,
     render_openai_logprobs,
+    render_openai_logprobs_parts,
 )
 from vllm.entrypoints.scale_out.token_in_token_out.protocol import (
     CompactLogprobs,
@@ -609,3 +612,52 @@ def test_router_renders_body_and_releases_load_counter():
     assert result.headers["content-type"] == "application/json"
     assert int(result.headers["content-length"]) == len(result.content)
     assert app.state.server_load_metrics == 0
+
+
+def test_float_reprs_match_python_repr():
+    """Sampled check; scripts/claude-genopt-py-float-exhaustive.py checked all
+    finite float32 values."""
+    rng = np.random.default_rng(0)
+    bits = rng.integers(0, 2**32, size=200_000, dtype=np.uint64).astype(np.uint32)
+    values = bits.view(np.float32)
+    edges = []
+    for edge in (1e-4, 1e16, 9999.0, 1.0):
+        e = np.float32(edge)
+        edges += [e, np.nextafter(e, np.float32(0)), np.nextafter(e, np.float32(1e30))]
+    special = np.array(
+        edges + [0.0, 1e-45, 3.4028235e38, 1.2e-7, 0.1, 5e-5, 123.456],
+        dtype=np.float32,
+    )
+    values = np.concatenate([values[np.isfinite(values)], special, -special])
+    as_double = values.astype(np.float64)
+    expected = [repr(v).encode() for v in as_double.tolist()]
+    assert format_float_reprs(as_double, True) == expected
+    doubles = rng.standard_normal(2000) * np.logspace(-8, 8, 2000)
+    assert format_float_reprs(doubles, False) == [
+        repr(v).encode() for v in doubles.tolist()
+    ]
+    assert format_float_reprs(np.empty(0), True) == []
+
+
+def test_openai_renderer_float64_engine_values_match_legacy():
+    token_ids, logprobs, ranks = _engine_rows(0, 6, 4)
+    values = logprobs.astype(np.float64) + 1e-9  # not float32-representable
+    container, legacy = _containers(token_ids, values, ranks, 3)
+    assert container.arrays()[1].dtype == np.float64
+    sampled = token_ids[:, 0].tolist()
+    assert render_openai_logprobs(sampled, container, 3) == (
+        _legacy_logprobs_bytes(sampled, legacy, 3)
+    )
+
+
+def test_parts_renderers_join_to_bytes():
+    container = ArrayLogprobs()
+    token_ids, logprobs, ranks = _engine_rows(0, 3, 4)
+    container.append_rows(token_ids, logprobs, ranks)
+    sampled = token_ids[:, 0].tolist()
+    assert b"".join(render_compact_logprobs_parts(container, 3)) == (
+        render_compact_logprobs(container, 3)
+    )
+    parts = render_openai_logprobs_parts(sampled, container, 3)
+    assert parts is not None
+    assert b"".join(parts) == render_openai_logprobs(sampled, container, 3)

@@ -47,9 +47,9 @@ from vllm.utils.serial_utils import numpy2base64
 
 from .logprobs_render import (
     compact_logprobs_fields,
-    render_compact_logprobs,
+    render_compact_logprobs_parts,
     render_json_with_fragments,
-    render_openai_logprobs,
+    render_openai_logprobs_parts,
 )
 from .mm_serde import decode_mm_kwargs_item
 from .protocol import (
@@ -301,7 +301,7 @@ class ServingTokens(GenerateBaseServing):
 
         Always for compact. For the default format only without streaming:
         the full response is rendered from the rows by
-        ``render_openai_logprobs`` (byte-identical to the legacy path), while
+        ``render_openai_logprobs_parts`` (byte-identical to the legacy path), while
         streaming deltas keep the legacy containers.
         """
         return request.logprobs_format == "compact" or not request.stream
@@ -328,7 +328,7 @@ class ServingTokens(GenerateBaseServing):
         sampling_params: SamplingParams = request.sampling_params
         compact = request.logprobs_format == "compact"
         # choice position -> field name -> pre-rendered JSON value
-        fragments: dict[int, dict[str, bytes]] = {}
+        fragments: dict[int, dict[str, bytes | list[bytes]]] = {}
 
         try:
             async for res in result_generator:
@@ -352,7 +352,7 @@ class ServingTokens(GenerateBaseServing):
                 assert out_logprobs is not None, "Did not output logprobs"
                 if compact:
                     fragments[len(choices)] = {
-                        "compact_logprobs": render_compact_logprobs(
+                        "compact_logprobs": render_compact_logprobs_parts(
                             self._require_array_logprobs(out_logprobs),
                             sampling_params.num_logprobs,
                         )
@@ -360,7 +360,7 @@ class ServingTokens(GenerateBaseServing):
                 elif (
                     isinstance(out_logprobs, ArrayLogprobs)
                     and (
-                        rendered := render_openai_logprobs(
+                        rendered := render_openai_logprobs_parts(
                             token_ids, out_logprobs, sampling_params.logprobs
                         )
                     )
