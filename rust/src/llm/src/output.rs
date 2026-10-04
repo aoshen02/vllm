@@ -325,6 +325,33 @@ impl Drop for GenerateOutputStream {
     }
 }
 
+/// Destination for the per-step sample logprobs consumed by
+/// [`GenerateOutputStreamExt::collect_output_into`].
+///
+/// The default accumulator (`Option<Logprobs>`) keeps the decoded per-position
+/// form. Callers that only need a different final representation (for example
+/// a packed array encoding) can implement this to convert each step as it
+/// arrives instead of retaining every [`Logprobs`] position until the end.
+pub trait LogprobsAccumulator: Send {
+    /// Consume one engine step's sample logprobs.
+    fn extend(&mut self, step: Logprobs);
+    /// Number of scored positions accumulated so far.
+    fn num_positions(&self) -> usize;
+}
+
+impl LogprobsAccumulator for Option<Logprobs> {
+    fn extend(&mut self, step: Logprobs) {
+        match self {
+            Some(collected) => collected.positions.extend(step.positions),
+            None => *self = Some(step),
+        }
+    }
+
+    fn num_positions(&self) -> usize {
+        self.as_ref().map_or(0, Logprobs::len)
+    }
+}
+
 #[allow(clippy::manual_async_fn, reason = "specify `Send` bound")]
 #[easy_ext::ext(GenerateOutputStreamExt)]
 impl<T: Stream<Item = Result<GenerateOutput>> + Send> T {
@@ -332,8 +359,25 @@ impl<T: Stream<Item = Result<GenerateOutput>> + Send> T {
     /// output.
     pub fn collect_output(self) -> impl Future<Output = Result<CollectedGenerateOutput>> + Send {
         async move {
+            let (mut collected, logprobs) = self.collect_output_into(None::<Logprobs>).await?;
+            collected.logprobs = logprobs;
+            Ok(collected)
+        }
+    }
+
+    /// Collect the raw generate stream to completion, handing every step's
+    /// sample logprobs to `logprobs` instead of retaining them.
+    ///
+    /// The returned [`CollectedGenerateOutput::logprobs`] is always `None`; the
+    /// accumulated logprobs live in the returned accumulator.
+    pub fn collect_output_into<A: LogprobsAccumulator>(
+        self,
+        logprobs: A,
+    ) -> impl Future<Output = Result<(CollectedGenerateOutput, A)>> + Send {
+        async move {
             let stream = self;
             pin_mut!(stream);
+            let mut logprobs = logprobs;
             let mut prompt_token_ids = None;
             let mut prompt_logprobs = None;
             let mut cached_token_count = 0;
@@ -350,22 +394,19 @@ impl<T: Stream<Item = Result<GenerateOutput>> + Send> T {
                     }
                 }
 
+                if let Some(step_logprobs) = output.logprobs {
+                    logprobs.extend(step_logprobs);
+                }
+
                 if let Some(existing) = collected.as_mut() {
                     existing.token_ids.extend(output.token_ids);
-                    if let Some(step_logprobs) = output.logprobs {
-                        if let Some(collected_logprobs) = existing.logprobs.as_mut() {
-                            collected_logprobs.positions.extend(step_logprobs.positions);
-                        } else {
-                            existing.logprobs = Some(step_logprobs);
-                        }
-                    }
                 } else {
                     collected = Some(CollectedGenerateOutput {
                         request_id: output.request_id,
                         prompt_token_ids: prompt_token_ids.take().unwrap_or_default(),
                         prompt_logprobs: prompt_logprobs.take(),
                         token_ids: output.token_ids,
-                        logprobs: output.logprobs,
+                        logprobs: None,
                         finish_reason: FinishReason::Error,
                         usage: TokenUsage {
                             prompt_token_count: prompt_token_ids.as_ref().map_or(0, Vec::len),
@@ -387,7 +428,7 @@ impl<T: Stream<Item = Result<GenerateOutput>> + Send> T {
                     };
                     collected.kv_transfer_params = output.kv_transfer_params;
                     collected.ec_transfer_params = output.ec_transfer_params;
-                    return Ok(collected);
+                    return Ok((collected, logprobs));
                 }
             }
 
