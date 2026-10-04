@@ -4,6 +4,7 @@
 use vllm_engine_core_client::protocol::multimodal::MmFeatures;
 use vllm_text::{Prompt, TextDecodeOptions, TextRequest};
 
+use super::compact::LogprobsFormat;
 use super::types::GenerateRequest;
 use super::validate;
 use crate::error::ApiError;
@@ -30,6 +31,11 @@ pub(super) struct ResponseOptions {
     pub include_logprobs: bool,
     /// Whether the caller requested top-level prompt logprobs.
     pub include_prompt_logprobs: bool,
+    /// Wire format for output logprobs.
+    pub logprobs_format: LogprobsFormat,
+    /// Requested engine row width (`logprobs + 1`), used as `num_slots` for a
+    /// compact block with no scored positions; `0` when unknown (`-1`).
+    pub logprobs_slots: usize,
 }
 
 /// Validate and lower one raw generate request into the internal
@@ -56,6 +62,14 @@ pub(super) fn prepare_generate_request(
             .unwrap_or(false);
     let include_logprobs = request.sampling_params.inner.logprobs.is_some();
     let include_prompt_logprobs = request.sampling_params.inner.prompt_logprobs.is_some();
+    let logprobs_format = LogprobsFormat::parse(request.logprobs_format.as_deref())
+        .expect("logprobs_format validated by validate_request_compat");
+    let logprobs_slots = request
+        .sampling_params
+        .inner
+        .logprobs
+        .and_then(|k| usize::try_from(k).ok())
+        .map_or(0, |k| k + 1);
     let mut sampling_params = request.sampling_params.inner;
     sampling_params.vllm_xargs = merge_kv_transfer_params(
         sampling_params.vllm_xargs,
@@ -92,6 +106,8 @@ pub(super) fn prepare_generate_request(
             include_continuous_usage,
             include_logprobs,
             include_prompt_logprobs,
+            logprobs_format,
+            logprobs_slots,
         },
     })
 }

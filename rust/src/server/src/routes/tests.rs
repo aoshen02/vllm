@@ -6729,3 +6729,170 @@ async fn profile_routes_are_hidden_when_profiling_is_disabled() {
 
     engine_task.abort_and_join().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn raw_generate_rejects_unknown_logprobs_format() {
+    let mut app = test_app().await;
+
+    for stream in [false, true] {
+        let response = app
+            .call(
+                Request::builder()
+                    .method("POST")
+                    .uri("/inference/v1/generate")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "model": "Qwen/Qwen1.5-0.5B-Chat",
+                            "token_ids": [11, 22],
+                            "stream": stream,
+                            "logprobs_format": "numpy",
+                            "sampling_params": {"logprobs": 1}
+                        })
+                        .to_string(),
+                    ))
+                    .expect("build request"),
+            )
+            .await
+            .expect("call app");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX).await.expect("read body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("decode json");
+        assert_eq!(json["error"]["param"], "logprobs_format");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn non_stream_raw_generate_returns_compact_logprobs() {
+    use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD;
+
+    let ipc = IpcNamespace::new().expect("create ipc namespace");
+    let handshake_address = ipc.handshake_endpoint();
+    let engine_id = b"engine-raw-generate-compact".to_vec();
+
+    let engine_task = MockEngineTask::new(spawn_mock_engine_task(
+        handshake_address.clone(),
+        engine_id.clone(),
+        |dealer, push| {
+            boxed_test_future(async move {
+                let add = recv_engine_message(dealer).await;
+                let request: EngineCoreRequest =
+                    rmp_serde::from_slice(&add[1]).expect("decode request");
+
+                send_outputs(
+                    push,
+                    RequestBatchOutputs {
+                        outputs: vec![
+                            request_output_with_logprobs(
+                                &request.request_id,
+                                vec![33],
+                                None,
+                                None,
+                                Some(sample_logprobs_for_token(33, 34)),
+                                Some(prompt_logprobs_for_tokens(&[11, 22])),
+                            ),
+                            request_output_with_logprobs(
+                                &request.request_id,
+                                vec![44],
+                                Some(EngineCoreFinishReason::Abort),
+                                None,
+                                Some(sample_logprobs_for_token(44, 45)),
+                                None,
+                            ),
+                        ],
+                        ..Default::default()
+                    }
+                    .into(),
+                )
+                .await;
+            })
+        },
+    ));
+
+    let client = EngineCoreClient::connect(
+        EngineCoreClientConfig::new_single(handshake_address)
+            .with_model_name("test-model")
+            .with_local_input_output_addresses(
+                Some(ipc.input_endpoint()),
+                Some(ipc.output_endpoint()),
+            ),
+    )
+    .await
+    .expect("connect client");
+    let chat = ChatLlm::from_shared_backend(Llm::new(client), Arc::new(FakeChatBackend::new()));
+    let mut app = build_router(Arc::new(AppState::new(
+        vec!["Qwen/Qwen1.5-0.5B-Chat".to_string()],
+        chat,
+    )));
+
+    let response = app
+        .call(
+            Request::builder()
+                .method("POST")
+                .uri("/inference/v1/generate")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "request_id": "raw-compact",
+                        "model": "Qwen/Qwen1.5-0.5B-Chat",
+                        "token_ids": [11, 22],
+                        "stream": false,
+                        "logprobs_format": "compact",
+                        "sampling_params": {
+                            "max_tokens": 2,
+                            "logprobs": 1,
+                            "prompt_logprobs": 1
+                        }
+                    })
+                    .to_string(),
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("call app");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get("content-type").and_then(|value| value.to_str().ok()),
+        Some("application/json")
+    );
+    let body = to_bytes(response.into_body(), usize::MAX).await.expect("read body");
+    engine_task.await.expect("mock engine task");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("decode json");
+
+    let choice = &json["choices"][0];
+    assert_eq!(json["request_id"], "raw-compact");
+    assert_eq!(choice["token_ids"], json!([33, 44]));
+    assert_eq!(choice["finish_reason"], "abort");
+    assert!(choice["logprobs"].is_null());
+    // Prompt logprobs keep their usual map shape.
+    assert_eq!(
+        json["prompt_logprobs"][1]["22"]["decoded_token"],
+        "token_id:22"
+    );
+
+    let block = &choice["compact_logprobs"];
+    assert_eq!(block["num_positions"], 2);
+    assert_eq!(block["num_slots"], 2);
+    assert_eq!(block["dtype_token_ids"], "int32");
+    assert_eq!(block["dtype_logprobs"], "float32");
+    assert_eq!(block["byteorder"], "little");
+    let decode = |key: &str| STANDARD.decode(block[key].as_str().expect(key)).expect(key);
+    let ints = |bytes: Vec<u8>| -> Vec<i32> {
+        bytes
+            .chunks_exact(4)
+            .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
+            .collect()
+    };
+    let floats: Vec<f32> = decode("logprobs")
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    assert_eq!(ints(decode("token_ids")), vec![33, 34, 44, 45]);
+    assert_eq!(floats, vec![-0.1, -0.2, -0.1, -0.2]);
+    assert_eq!(ints(decode("ranks")), vec![1, 1]);
+}

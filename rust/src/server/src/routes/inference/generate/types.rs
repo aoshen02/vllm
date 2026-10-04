@@ -9,6 +9,7 @@ use serde_json::{Map, Value};
 use validator::Validate;
 use vllm_text::SamplingParams;
 
+use super::compact::CompactLogprobsJson;
 use crate::routes::openai::utils::types::{ChatLogProbs, Normalizable, StreamOptions, Usage};
 
 /// Sampling parameters for the token-in/token-out generate API.
@@ -46,6 +47,9 @@ pub struct GenerateRequest {
     pub ec_transfer_params: Option<HashMap<String, Value>>,
     /// Raw multimodal input; server resolves media. Mutually exclusive with `features`.
     pub content_parts: Option<Vec<MediaContentPart>>,
+    /// Output logprobs wire format: absent / `"openai"` (default) or
+    /// `"compact"` (packed base64 arrays in `choices[i].compact_logprobs`).
+    pub logprobs_format: Option<String>,
     #[serde(flatten)]
     pub other: Map<String, Value>,
 }
@@ -56,6 +60,10 @@ impl Normalizable for GenerateRequest {}
 ///
 /// Do not skip serializing `None` fields here: non-streaming response types
 /// should serialize `None` as explicit `null`.
+///
+/// Production responses are rendered directly by `render.rs`; this type is the
+/// serde reference those bytes are tested against.
+#[cfg(test)]
 #[derive(Debug, Clone, Serialize)]
 pub(super) struct GenerateResponseChoice {
     pub index: u32,
@@ -72,6 +80,8 @@ pub(super) struct GenerateResponseStreamChoice {
     pub logprobs: Option<ChatLogProbs>,
     pub finish_reason: Option<String>,
     pub token_ids: Vec<u32>,
+    /// Present only for `logprobs_format: "compact"`.
+    pub compact_logprobs: Option<CompactLogprobsJson>,
 }
 
 /// Mirrors the Python vLLM `GenerateStreamResponse` class.
@@ -83,7 +93,9 @@ pub(super) struct GenerateStreamResponse {
     pub usage: Option<Usage>,
 }
 
-/// Mirrors the Python vLLM `GenerateResponse` class.
+/// Mirrors the Python vLLM `GenerateResponse` class (serde reference for the
+/// direct renderer in `render.rs`).
+#[cfg(test)]
 #[derive(Debug, Clone, Serialize)]
 pub(super) struct GenerateResponse {
     pub request_id: String,

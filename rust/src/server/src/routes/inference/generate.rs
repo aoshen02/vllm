@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+mod compact;
 mod convert;
+mod render;
 mod types;
 mod validate;
 
@@ -11,7 +13,6 @@ use std::result::Result;
 use std::sync::Arc;
 
 use asynk_strim_attr::{TryYielder, try_stream};
-use axum::Json;
 use axum::extract::State;
 use axum::http::HeaderMap;
 use axum::response::sse::{Event, Sse};
@@ -25,11 +26,10 @@ use vllm_llm::{
     CollectedGenerateOutput, FinishReason, GenerateOutput, GenerateOutputStreamExt as _, TokenUsage,
 };
 
+use self::compact::{CompactLogprobsAccumulator, LogprobsFormat, encode_compact};
 use self::convert::{ResponseOptions, prepare_generate_request};
-use self::types::{
-    GenerateLogprob, GenerateResponse, GenerateResponseChoice, GenerateResponseStreamChoice,
-    GenerateStreamResponse,
-};
+use self::render::{ChoiceLogprobs, GenerateEnvelope, generate_response};
+use self::types::{GenerateLogprob, GenerateResponseStreamChoice, GenerateStreamResponse};
 pub(crate) use self::types::{GenerateRequest, GenerateSamplingParams};
 pub(crate) use self::validate::validate_request_compat;
 use crate::config::ApiServerOptions;
@@ -104,28 +104,96 @@ pub async fn generate(
         return Sse::new(sse_stream).into_response();
     }
 
-    let collected = match raw_stream.collect_output().instrument(request_span.clone()).await {
-        Ok(collected) => collected,
-        Err(error) => {
-            return server_error!(
-                "failed to collect raw generate response: {}",
-                error.to_report_string()
-            )
-            .into_response();
+    let options = prepared.options;
+    let collect_error = |error: vllm_llm::Error| {
+        server_error!(
+            "failed to collect raw generate response: {}",
+            error.to_report_string()
+        )
+        .into_response()
+    };
+
+    let result = match options.logprobs_format {
+        LogprobsFormat::OpenAi => {
+            let mut collected =
+                match raw_stream.collect_output().instrument(request_span.clone()).await {
+                    Ok(collected) => collected,
+                    Err(error) => return collect_error(error),
+                };
+            let logprobs = collected.logprobs.take();
+            openai_choice_logprobs(logprobs, options.include_logprobs).and_then(|logprobs| {
+                let envelope =
+                    collect_generate(collected, prepared.request_id, api_server_options, options)?;
+                Ok((envelope, logprobs))
+            })
+        }
+        LogprobsFormat::Compact => {
+            let accumulator = CompactLogprobsAccumulator::new(options.logprobs_slots);
+            let (collected, accumulator) = match raw_stream
+                .collect_output_into(accumulator)
+                .instrument(request_span.clone())
+                .await
+            {
+                Ok(collected) => collected,
+                Err(error) => return collect_error(error),
+            };
+            compact_choice_logprobs(accumulator, options.include_logprobs).and_then(|logprobs| {
+                let envelope =
+                    collect_generate(collected, prepared.request_id, api_server_options, options)?;
+                Ok((envelope, logprobs))
+            })
         }
     };
 
-    let response = match collect_generate(
-        collected,
-        prepared.request_id,
-        api_server_options,
-        prepared.options,
-    ) {
-        Ok(response) => response,
-        Err(error) => return error.into_response(),
-    };
+    match result {
+        Ok((envelope, logprobs)) => generate_response(envelope, logprobs),
+        Err(error) => error.into_response(),
+    }
+}
 
-    Json(response).into_response()
+/// Validate collected output logprobs for the default OpenAI rendering.
+fn openai_choice_logprobs(
+    logprobs: Option<Logprobs>,
+    include_logprobs: bool,
+) -> Result<ChoiceLogprobs, ApiError> {
+    if !include_logprobs {
+        return Ok(ChoiceLogprobs::None);
+    }
+    let logprobs = logprobs.ok_or_else(|| {
+        ApiError::server_error(
+            "raw generate response requested logprobs but generation returned none".to_string(),
+        )
+    })?;
+    // Rendering is streamed after the status line, so reject malformed rows
+    // up front exactly like the eager conversion did.
+    if logprobs.positions.iter().any(|position| position.entries.is_empty()) {
+        return Err(empty_position_error());
+    }
+    Ok(ChoiceLogprobs::OpenAi(logprobs.positions))
+}
+
+fn compact_choice_logprobs(
+    accumulator: CompactLogprobsAccumulator,
+    include_logprobs: bool,
+) -> Result<ChoiceLogprobs, ApiError> {
+    if !include_logprobs {
+        return Ok(ChoiceLogprobs::Compact(None));
+    }
+    if !accumulator.saw_payload() {
+        return Err(ApiError::server_error(
+            "raw generate response requested logprobs but generation returned none".to_string(),
+        ));
+    }
+    accumulator
+        .finish()
+        .map(|block| ChoiceLogprobs::Compact(Some(block)))
+        .map_err(ApiError::server_error)
+}
+
+fn empty_position_error() -> ApiError {
+    ApiError::server_error(
+        "raw generate logprobs position unexpectedly had no token candidates".to_string(),
+    )
 }
 
 #[try_stream]
@@ -143,6 +211,8 @@ async fn generate_chunk_stream(
         include_logprobs,
         // Ignored: raw generate streaming has no prompt-logprobs wire shape.
         include_prompt_logprobs: _,
+        logprobs_format,
+        logprobs_slots,
     }: ResponseOptions,
     mut y: TryYielder<GenerateStreamResponse, ApiError>,
 ) -> Result<(), ApiError> {
@@ -184,15 +254,27 @@ async fn generate_chunk_stream(
                     continue;
                 }
 
-                let logprobs = if include_logprobs && !token_ids.is_empty() {
-                    let logprobs = output.logprobs.as_ref().ok_or_else(|| {
+                let (logprobs, compact_logprobs) = if include_logprobs && !token_ids.is_empty() {
+                    let logprobs = output.logprobs.ok_or_else(|| {
                         server_error!(
                             "raw generate stream requested logprobs but generation returned none"
                         )
                     })?;
-                    Some(raw_logprobs_to_openai_chat(logprobs)?)
+                    match logprobs_format {
+                        LogprobsFormat::OpenAi => {
+                            (Some(raw_logprobs_to_openai_chat(&logprobs)?), None)
+                        }
+                        // Per-chunk compact block covering this chunk's positions.
+                        LogprobsFormat::Compact => (
+                            None,
+                            Some(
+                                encode_compact(logprobs, logprobs_slots)
+                                    .map_err(ApiError::server_error)?,
+                            ),
+                        ),
+                    }
                 } else {
-                    None
+                    (None, None)
                 };
 
                 y.yield_ok(GenerateStreamResponse {
@@ -202,6 +284,7 @@ async fn generate_chunk_stream(
                         logprobs,
                         finish_reason: finish_reason.map(|reason| reason.as_str().to_string()),
                         token_ids,
+                        compact_logprobs,
                     }],
                     usage: include_continuous_usage
                         .then(|| Usage::from_token_usage(usage, enable_prompt_tokens_details)),
@@ -230,6 +313,8 @@ async fn generate_chunk_stream(
     Ok(())
 }
 
+/// Build everything in the non-streaming response except the output logprobs
+/// (which the caller takes out of `collected` beforehand).
 fn collect_generate(
     collected: CollectedGenerateOutput,
     request_id: String,
@@ -238,24 +323,10 @@ fn collect_generate(
         ..
     }: ApiServerOptions,
     ResponseOptions {
-        // Ignored: non-streaming raw generate responses do not include usage.
-        include_usage: _,
-        // Ignored: continuous usage is a streaming-only option.
-        include_continuous_usage: _,
-        include_logprobs,
         include_prompt_logprobs,
+        ..
     }: ResponseOptions,
-) -> Result<GenerateResponse, ApiError> {
-    let logprobs = if include_logprobs {
-        let logprobs = collected.logprobs.as_ref().ok_or_else(|| {
-            ApiError::server_error(
-                "raw generate response requested logprobs but generation returned none".to_string(),
-            )
-        })?;
-        Some(raw_logprobs_to_openai_chat(logprobs)?)
-    } else {
-        None
-    };
+) -> Result<GenerateEnvelope, ApiError> {
     let prompt_logprobs = if include_prompt_logprobs {
         match collected.prompt_logprobs.as_ref() {
             Some(prompt_logprobs) => Some(raw_prompt_logprobs_to_maps(prompt_logprobs)),
@@ -283,14 +354,10 @@ fn collect_generate(
         );
     }
 
-    Ok(GenerateResponse {
+    Ok(GenerateEnvelope {
         request_id,
-        choices: vec![GenerateResponseChoice {
-            index: 0,
-            logprobs,
-            finish_reason: Some(finish_reason),
-            token_ids: collected.token_ids,
-        }],
+        finish_reason,
+        token_ids: collected.token_ids,
         prompt_logprobs,
         kv_transfer_params: collected.kv_transfer_params,
         ec_transfer_params: collected.ec_transfer_params,
@@ -325,11 +392,7 @@ fn raw_prompt_logprobs_to_maps(
 fn position_to_chat_logprobs_content(
     position: &PositionLogprobs,
 ) -> Result<ChatLogProbsContent, ApiError> {
-    let chosen = position.entries.first().ok_or_else(|| {
-        ApiError::server_error(
-            "raw generate logprobs position unexpectedly had no token candidates".to_string(),
-        )
-    })?;
+    let chosen = position.entries.first().ok_or_else(empty_position_error)?;
     let token = format_token_id(chosen.token_id);
 
     Ok(ChatLogProbsContent {
@@ -495,6 +558,366 @@ mod tests {
                 .map(|details| details.cached_tokens),
             Some(2)
         );
+    }
+
+    use axum::body::to_bytes;
+    use serde_json::json;
+    use vllm_engine_core_client::protocol::logprobs::TokenLogprob;
+
+    use super::compact::tests::{decode_compact, position};
+    use super::types::{GenerateResponse, GenerateResponseChoice};
+
+    fn tricky_positions() -> Vec<PositionLogprobs> {
+        vec![
+            position(&[(0, -0.0, 1), (0, -0.0, 1), (9, -1e-7, 2)]),
+            position(&[
+                (151_935, f32::NEG_INFINITY, 77),
+                (3, f32::NAN, 1),
+                (i32::MAX as u32, -1e30, 2),
+            ]),
+            position(&[
+                (42, f32::INFINITY, 2),
+                (7, -12.345_678, 1),
+                (42, f32::INFINITY, 2),
+            ]),
+            position(&[
+                (1, f32::MIN_POSITIVE / 8.0, 1),
+                (100, -9999.0, 1),
+                (1000, -10000.5, 2),
+            ]),
+        ]
+    }
+
+    fn collected_output(
+        logprobs: Option<Vec<PositionLogprobs>>,
+        kv: Option<serde_json::Value>,
+    ) -> CollectedGenerateOutput {
+        let token_ids = logprobs
+            .as_ref()
+            .map(|positions| positions.iter().map(|p| p.entries[0].token_id).collect())
+            .unwrap_or_else(|| vec![5, 6]);
+        CollectedGenerateOutput {
+            request_id: "raw-1".to_string(),
+            prompt_logprobs: Some(Logprobs {
+                positions: vec![position(&[(22, -0.5, 1)])],
+            }),
+            token_ids,
+            logprobs: logprobs.map(|positions| Logprobs { positions }),
+            finish_reason: FinishReason::Abort,
+            usage: vllm_llm::TokenUsage::default(),
+            kv_transfer_params: kv,
+            ec_transfer_params: None,
+            prompt_token_ids: vec![11, 22],
+        }
+    }
+
+    /// Reference bytes: the pre-optimization eager conversion + serde_json.
+    fn reference_bytes(collected: &CollectedGenerateOutput, request_id: &str) -> Vec<u8> {
+        let response = GenerateResponse {
+            request_id: request_id.to_string(),
+            choices: vec![GenerateResponseChoice {
+                index: 0,
+                logprobs: collected
+                    .logprobs
+                    .as_ref()
+                    .map(|logprobs| raw_logprobs_to_openai_chat(logprobs).expect("convert")),
+                finish_reason: Some(collected.finish_reason.as_str().to_string()),
+                token_ids: collected.token_ids.clone(),
+            }],
+            prompt_logprobs: collected.prompt_logprobs.as_ref().map(raw_prompt_logprobs_to_maps),
+            kv_transfer_params: collected.kv_transfer_params.clone(),
+            ec_transfer_params: collected.ec_transfer_params.clone(),
+        };
+        serde_json::to_vec(&response).expect("serialize reference")
+    }
+
+    async fn render_openai(mut collected: CollectedGenerateOutput, request_id: &str) -> Vec<u8> {
+        let include_logprobs = collected.logprobs.is_some();
+        let logprobs = openai_choice_logprobs(collected.logprobs.take(), include_logprobs)
+            .unwrap_or_else(|_| panic!("valid logprobs"));
+        let envelope = collect_generate(
+            collected,
+            request_id.to_string(),
+            ApiServerOptions::default(),
+            ResponseOptions {
+                include_logprobs,
+                include_prompt_logprobs: true,
+                ..Default::default()
+            },
+        )
+        .expect("envelope");
+        let response = generate_response(envelope, logprobs);
+        assert_eq!(
+            response.headers().get("content-type").unwrap(),
+            "application/json"
+        );
+        to_bytes(response.into_body(), usize::MAX).await.expect("body").to_vec()
+    }
+
+    #[tokio::test]
+    async fn direct_openai_render_is_byte_identical_to_serde_reference() {
+        let many: Vec<PositionLogprobs> = (0..1000_u32)
+            .map(|i| PositionLogprobs {
+                entries: (0..9_u32)
+                    .map(|j| TokenLogprob {
+                        token_id: i * 131 + j * 7919,
+                        logprob: -(i as f32) * 0.037 - j as f32 * 1.25e-3,
+                        rank: j.max(1),
+                    })
+                    .collect(),
+            })
+            .collect();
+        let mut with_max_id = tricky_positions();
+        with_max_id.push(position(&[(u32::MAX, -2.5, 1), (u32::MAX, -2.5, 1)]));
+        let cases = [
+            (collected_output(Some(tricky_positions()), None), "raw-1"),
+            (collected_output(Some(with_max_id), None), "max-id"),
+            (
+                collected_output(
+                    Some(tricky_positions()),
+                    Some(json!({"a": [1, "x"], "b": null})),
+                ),
+                "quote\"back\\slash\u{1}\u{e9}",
+            ),
+            (collected_output(Some(many), None), "many"),
+            (collected_output(Some(Vec::new()), None), "empty-positions"),
+            (collected_output(None, None), "no-logprobs"),
+        ];
+        for (collected, request_id) in cases {
+            let expected = reference_bytes(&collected, request_id);
+            let actual = render_openai(collected, request_id).await;
+            assert_eq!(
+                String::from_utf8(actual).unwrap(),
+                String::from_utf8(expected).unwrap(),
+                "request_id={request_id}"
+            );
+        }
+    }
+
+    #[test]
+    fn openai_choice_logprobs_rejects_empty_position() {
+        let logprobs = Logprobs {
+            positions: vec![
+                position(&[(1, -0.1, 1)]),
+                PositionLogprobs { entries: vec![] },
+            ],
+        };
+        assert!(openai_choice_logprobs(Some(logprobs), true).is_err());
+        assert!(openai_choice_logprobs(None, true).is_err());
+        assert!(matches!(
+            openai_choice_logprobs(None, false),
+            Ok(ChoiceLogprobs::None)
+        ));
+    }
+
+    fn step(
+        token_ids: Vec<u32>,
+        positions: Option<Vec<PositionLogprobs>>,
+        finish_reason: Option<FinishReason>,
+    ) -> vllm_llm::Result<GenerateOutput> {
+        Ok(GenerateOutput {
+            request_id: "engine-1".to_string(),
+            prompt_info: None,
+            token_ids,
+            logprobs: positions.map(|positions| Logprobs { positions }),
+            finish_reason,
+            cached_token_count: 0,
+            kv_transfer_params: None,
+            ec_transfer_params: None,
+        })
+    }
+
+    async fn compact_response_json(
+        steps: Vec<vllm_llm::Result<GenerateOutput>>,
+        include_logprobs: bool,
+    ) -> Result<serde_json::Value, ApiError> {
+        let (collected, accumulator) = stream::iter(steps)
+            .collect_output_into(CompactLogprobsAccumulator::new(3))
+            .await
+            .expect("collect");
+        assert!(collected.logprobs.is_none());
+        let logprobs = compact_choice_logprobs(accumulator, include_logprobs)?;
+        let envelope = collect_generate(
+            collected,
+            "compact-1".to_string(),
+            ApiServerOptions::default(),
+            ResponseOptions::default(),
+        )?;
+        let response = generate_response(envelope, logprobs);
+        let length = response
+            .headers()
+            .get("content-length")
+            .map(|value| value.to_str().unwrap().parse::<usize>().unwrap());
+        let body = to_bytes(response.into_body(), usize::MAX).await.expect("body");
+        if let Some(length) = length {
+            assert_eq!(length, body.len());
+        }
+        Ok(serde_json::from_slice(&body).expect("valid json"))
+    }
+
+    #[tokio::test]
+    async fn compact_abort_with_partial_output_decodes_engine_rows() {
+        let rows = tricky_positions()
+            .into_iter()
+            .map(|mut p| {
+                p.entries.truncate(3);
+                p
+            })
+            .collect::<Vec<_>>();
+        let json = compact_response_json(
+            vec![
+                step(vec![0, 151_935], Some(rows[..2].to_vec()), None),
+                step(vec![42], Some(rows[2..3].to_vec()), None),
+                // Abort: terminal output with no new tokens or logprobs.
+                step(vec![], None, Some(FinishReason::Abort)),
+            ],
+            true,
+        )
+        .await
+        .expect("compact response");
+
+        let choice = &json["choices"][0];
+        assert_eq!(json["request_id"], "compact-1");
+        assert_eq!(choice["finish_reason"], "abort");
+        assert_eq!(choice["token_ids"], json!([0, 151_935, 42]));
+        assert!(choice["logprobs"].is_null());
+        assert!(json["prompt_logprobs"].is_null());
+        let block = &choice["compact_logprobs"];
+        assert_eq!(block["num_positions"], 3);
+        assert_eq!(block["num_slots"], 3);
+        let (token_ids, bits, ranks) = decode_compact(block);
+        let expected_rows = &rows[..3];
+        assert_eq!(
+            token_ids,
+            expected_rows
+                .iter()
+                .flat_map(|p| p.entries.iter().map(|e| e.token_id as i32))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            bits,
+            expected_rows
+                .iter()
+                .flat_map(|p| p.entries.iter().map(|e| e.logprob.to_bits()))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(ranks, vec![1, 77, 2]);
+        // Sampled slot of each row equals the sampled token id.
+        assert_eq!(token_ids[3], 151_935);
+        // Raw, unclamped non-finite logprobs survive.
+        assert_eq!(f32::from_bits(bits[3]), f32::NEG_INFINITY);
+        assert!(f32::from_bits(bits[4]).is_nan());
+        assert_eq!(f32::from_bits(bits[6]), f32::INFINITY);
+    }
+
+    #[tokio::test]
+    async fn compact_without_requested_logprobs_renders_null_block() {
+        let json = compact_response_json(
+            vec![step(vec![1, 2], None, Some(FinishReason::Length))],
+            false,
+        )
+        .await
+        .expect("compact response");
+        assert!(json["choices"][0]["logprobs"].is_null());
+        assert!(json["choices"][0]["compact_logprobs"].is_null());
+        assert_eq!(
+            json["choices"][0].as_object().unwrap().keys().collect::<Vec<_>>(),
+            [
+                "index",
+                "logprobs",
+                "finish_reason",
+                "token_ids",
+                "compact_logprobs"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_abort_before_any_position_uses_requested_width() {
+        // The engine attached an empty logprobs payload to the abort output.
+        let json = compact_response_json(
+            vec![step(vec![], Some(Vec::new()), Some(FinishReason::Abort))],
+            true,
+        )
+        .await
+        .expect("compact response");
+        let block = &json["choices"][0]["compact_logprobs"];
+        assert_eq!(block["num_positions"], 0);
+        assert_eq!(block["num_slots"], 3);
+        assert_eq!(block["token_ids"], "");
+    }
+
+    #[tokio::test]
+    async fn compact_missing_logprobs_payload_is_server_error() {
+        let error =
+            compact_response_json(vec![step(vec![1], None, Some(FinishReason::Length))], true)
+                .await
+                .expect_err("missing payload");
+        assert!(format!("{error:?}").contains("returned none"), "{error:?}");
+    }
+
+    #[tokio::test]
+    async fn stream_compact_emits_per_chunk_blocks() {
+        let rows = tricky_positions();
+        let chunks: Vec<_> = generate_chunk_stream(
+            stream::iter(vec![
+                step(vec![0], Some(rows[..1].to_vec()), None),
+                step(
+                    vec![151_935],
+                    Some(rows[1..2].to_vec()),
+                    Some(FinishReason::Abort),
+                ),
+            ]),
+            "raw-stream".to_string(),
+            ApiServerOptions::default(),
+            ResponseOptions {
+                include_logprobs: true,
+                logprobs_format: LogprobsFormat::Compact,
+                logprobs_slots: 3,
+                ..Default::default()
+            },
+        )
+        .try_collect()
+        .await
+        .expect("collect chunks");
+        assert_eq!(chunks.len(), 2);
+        for (chunk, row) in chunks.iter().zip(&rows) {
+            let json = serde_json::to_value(chunk).unwrap();
+            let choice = &json["choices"][0];
+            assert!(choice.get("logprobs").is_none());
+            let block = &choice["compact_logprobs"];
+            assert_eq!(block["num_positions"], 1);
+            let (token_ids, bits, _) = decode_compact(block);
+            assert_eq!(
+                token_ids,
+                row.entries.iter().map(|e| e.token_id as i32).collect::<Vec<_>>()
+            );
+            assert_eq!(
+                bits,
+                row.entries.iter().map(|e| e.logprob.to_bits()).collect::<Vec<_>>()
+            );
+        }
+
+        // The default stream format carries no compact block.
+        let chunks: Vec<_> = generate_chunk_stream(
+            stream::iter(vec![step(
+                vec![0],
+                Some(rows[..1].to_vec()),
+                Some(FinishReason::Length),
+            )]),
+            "raw-stream".to_string(),
+            ApiServerOptions::default(),
+            ResponseOptions {
+                include_logprobs: true,
+                ..Default::default()
+            },
+        )
+        .try_collect()
+        .await
+        .expect("collect chunks");
+        let json = serde_json::to_value(&chunks[0]).unwrap();
+        assert!(json["choices"][0].get("compact_logprobs").is_none());
+        assert!(json["choices"][0]["logprobs"]["content"].is_array());
     }
 
     #[test]
