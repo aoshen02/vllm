@@ -264,14 +264,17 @@ impl OpenAiRenderer {
 
     fn render_chunk(&mut self) -> Bytes {
         let mut out = Vec::with_capacity(self.capacity_hint);
-        for position in self.positions.by_ref().take(OPENAI_POSITIONS_PER_CHUNK) {
-            if !std::mem::replace(&mut self.first, false) {
-                out.push(b',');
+        TOKEN_FRAGMENTS.with(|fragments| {
+            let mut fragments = fragments.borrow_mut();
+            for position in self.positions.by_ref().take(OPENAI_POSITIONS_PER_CHUNK) {
+                if !std::mem::replace(&mut self.first, false) {
+                    out.push(b',');
+                }
+                write_openai_position_cached(&mut out, &position, &mut fragments);
+                #[cfg(test)]
+                tests::RENDERED_ON_THREAD.with(|count| count.set(count.get() + 1));
             }
-            write_openai_position(&mut out, &position);
-            #[cfg(test)]
-            tests::RENDERED_ON_THREAD.with(|count| count.set(count.get() + 1));
-        }
+        });
         self.capacity_hint = out.len() + out.len() / 8;
         Bytes::from(out)
     }
@@ -375,6 +378,7 @@ impl http_body::Body for ChannelBody {
 /// Write one `ChatLogProbsContent` object for a raw generate position, byte-
 /// identical to `serde_json` serialization of the value previously built by
 /// `position_to_chat_logprobs_content`. `position.entries` must be non-empty.
+#[cfg(test)]
 pub(super) fn write_openai_position(out: &mut Vec<u8>, position: &PositionLogprobs) {
     let chosen = &position.entries[0];
     write_candidate_fields(out, chosen.token_id, chosen.logprob);
@@ -398,7 +402,11 @@ fn write_candidate_fields(out: &mut Vec<u8>, token_id: u32, logprob: f32) {
     out.extend_from_slice(digits);
     out.extend_from_slice(b"\",\"logprob\":");
     write_f32(out, clamp_logprob(logprob));
-    // UTF-8 bytes of "token_id:" followed by the ASCII digits.
+    write_bytes_suffix(out, digits);
+}
+
+/// `,"bytes":[...]`: the UTF-8 bytes of "token_id:" followed by the digits.
+fn write_bytes_suffix(out: &mut Vec<u8>, digits: &[u8]) {
     out.extend_from_slice(b",\"bytes\":[116,111,107,101,110,95,105,100,58");
     for &digit in digits {
         out.extend_from_slice(DIGIT_BYTE_LITERALS[(digit - b'0') as usize]);
@@ -425,8 +433,109 @@ fn format_u32(mut value: u32, buf: &mut [u8; 10]) -> &[u8] {
 }
 
 /// `serde_json`'s `f32` encoding (shortest round-trip, non-finite as `null`).
+/// Calling its formatter crate directly measured no faster, so the encoding
+/// stays byte-identical by construction.
 fn write_f32(out: &mut Vec<u8>, value: f32) {
     serde_json::to_writer(&mut *out, &value).expect("f32 serializes");
+}
+
+/// Token ids at or above this are rendered without the fragment cache (the
+/// dense index is bounded at 8 B per id, i.e. 8 MiB per thread).
+const MAX_CACHED_TOKEN_ID: u32 = 1 << 20;
+
+thread_local! {
+    /// Per-thread cache of the id-dependent JSON around each candidate's
+    /// logprob. Render tasks run on the request runtime's few threads, so the
+    /// cache is shared by all requests rendered there and needs no locking.
+    static TOKEN_FRAGMENTS: std::cell::RefCell<TokenFragments> =
+        std::cell::RefCell::new(TokenFragments::default());
+}
+
+/// Location of one token id's fragments in [`TokenFragments::arena`].
+#[derive(Clone, Copy, Default)]
+struct FragmentSlot {
+    offset: u32,
+    prefix_len: u8,
+    /// `0` means not rendered yet (a real entry is never empty).
+    total_len: u8,
+}
+
+/// Pre-rendered `{"token":"token_id:N","logprob":` (prefix) and
+/// `,"bytes":[116,...,digits]` (suffix) per token id: these are pure
+/// functions of the id, so a candidate only formats its `f32`.
+#[derive(Default)]
+pub(super) struct TokenFragments {
+    slots: Vec<FragmentSlot>,
+    arena: Vec<u8>,
+}
+
+impl TokenFragments {
+    /// The (prefix, suffix) fragments for `token_id`, rendering them on first
+    /// use; `None` for ids beyond the cache bound.
+    fn get(&mut self, token_id: u32) -> Option<(&[u8], &[u8])> {
+        if token_id >= MAX_CACHED_TOKEN_ID {
+            return None;
+        }
+        let index = token_id as usize;
+        if index >= self.slots.len() {
+            self.slots.resize(index + 1, FragmentSlot::default());
+        }
+        if self.slots[index].total_len == 0 {
+            let offset = self.arena.len();
+            let mut digits_buf = [0_u8; 10];
+            let digits = format_u32(token_id, &mut digits_buf);
+            self.arena.extend_from_slice(b"{\"token\":\"token_id:");
+            self.arena.extend_from_slice(digits);
+            self.arena.extend_from_slice(b"\",\"logprob\":");
+            let prefix_len = self.arena.len() - offset;
+            write_bytes_suffix(&mut self.arena, digits);
+            let total_len = self.arena.len() - offset;
+            self.slots[index] = FragmentSlot {
+                offset: u32::try_from(offset).expect("fragment arena below 4 GiB"),
+                prefix_len: prefix_len as u8,
+                total_len: total_len as u8,
+            };
+        }
+        let slot = self.slots[index];
+        let start = slot.offset as usize;
+        let entry = &self.arena[start..start + slot.total_len as usize];
+        Some(entry.split_at(slot.prefix_len as usize))
+    }
+}
+
+/// [`write_openai_position`] using the per-thread fragment cache.
+pub(super) fn write_openai_position_cached(
+    out: &mut Vec<u8>,
+    position: &PositionLogprobs,
+    fragments: &mut TokenFragments,
+) {
+    let chosen = &position.entries[0];
+    write_candidate_cached(out, fragments, chosen.token_id, chosen.logprob);
+    out.extend_from_slice(b",\"top_logprobs\":[");
+    for (index, entry) in position.entries.iter().enumerate() {
+        if index > 0 {
+            out.push(b',');
+        }
+        write_candidate_cached(out, fragments, entry.token_id, entry.logprob);
+        out.push(b'}');
+    }
+    out.extend_from_slice(b"]}");
+}
+
+fn write_candidate_cached(
+    out: &mut Vec<u8>,
+    fragments: &mut TokenFragments,
+    token_id: u32,
+    logprob: f32,
+) {
+    match fragments.get(token_id) {
+        Some((prefix, suffix)) => {
+            out.extend_from_slice(prefix);
+            write_f32(out, clamp_logprob(logprob));
+            out.extend_from_slice(suffix);
+        }
+        None => write_candidate_fields(out, token_id, logprob),
+    }
 }
 
 #[cfg(test)]
@@ -450,6 +559,77 @@ mod tests {
         let response = generate_response(test_envelope(), ChoiceLogprobs::OpenAi(rows));
         let result = axum::body::to_bytes(response.into_body(), usize::MAX).await;
         assert!(result.is_err(), "truncated body completed cleanly");
+    }
+
+    /// Deterministic xorshift for test data.
+    fn next(state: &mut u64) -> u64 {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        *state
+    }
+
+    #[test]
+    fn cached_fragments_match_serde_reference() {
+        let specials = [
+            0.0_f32,
+            -0.0,
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            -9999.0,
+            -9999.5,
+            f32::MIN_POSITIVE,
+            f32::MIN_POSITIVE / 3.0,
+            f32::MAX,
+            f32::MIN,
+            -1e-7,
+            -0.1,
+        ];
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut fragments = TokenFragments::default();
+        // Two passes over overlapping id sets exercise cache fill and reuse.
+        for pass in 0..2 {
+            for row in 0..3000 {
+                let width = 1 + (next(&mut state) % 8) as usize;
+                let entries = (0..width)
+                    .map(|_| {
+                        let token_id = match next(&mut state) % 6 {
+                            0 => (next(&mut state) % 10) as u32,
+                            1 => MAX_CACHED_TOKEN_ID - 1 - (next(&mut state) % 3) as u32,
+                            2 => MAX_CACHED_TOKEN_ID + (next(&mut state) % 1000) as u32,
+                            3 => u32::MAX - (next(&mut state) % 2) as u32,
+                            _ => (next(&mut state) % 200_000) as u32,
+                        };
+                        let logprob = if next(&mut state).is_multiple_of(4) {
+                            specials[(next(&mut state) % specials.len() as u64) as usize]
+                        } else {
+                            f32::from_bits(next(&mut state) as u32)
+                        };
+                        vllm_llm::TokenLogprob {
+                            token_id,
+                            logprob,
+                            rank: 1,
+                        }
+                    })
+                    .collect();
+                let position = PositionLogprobs { entries };
+                let expected = serde_json::to_vec(
+                    &super::super::position_to_chat_logprobs_content(&position).unwrap(),
+                )
+                .unwrap();
+                let mut cached = Vec::new();
+                write_openai_position_cached(&mut cached, &position, &mut fragments);
+                let mut uncached = Vec::new();
+                write_openai_position(&mut uncached, &position);
+                assert_eq!(
+                    String::from_utf8_lossy(&cached),
+                    String::from_utf8_lossy(&expected),
+                    "pass {pass} row {row}"
+                );
+                assert_eq!(uncached, expected, "pass {pass} row {row}");
+            }
+        }
     }
 
     #[tokio::test]
