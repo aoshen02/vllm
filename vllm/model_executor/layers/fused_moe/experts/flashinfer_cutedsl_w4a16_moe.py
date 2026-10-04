@@ -140,6 +140,10 @@ class FlashInferCuteDSLW4A16Experts(FlashInferCuteDSLExperts):
             if not torch.equal(layer.expert_map, expected):
                 raise ValueError("Non-contiguous expert maps are unsupported")
         self._layer_ref = weakref.ref(layer)
+        # Scales are read through the layer; a layerwise reload would otherwise
+        # keep its processed copies alive here.
+        for desc in (self.quant_config._w1, self.quant_config._w2):
+            desc.scale = desc.alpha_or_gscale = None
 
     def _registered_scale(self, name, initial):
         ref = getattr(self, "_layer_ref", None)
