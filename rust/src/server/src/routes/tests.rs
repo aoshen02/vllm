@@ -7022,7 +7022,7 @@ async fn raw_http_post(addr: std::net::SocketAddr, path: &str, body: &str) -> (S
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
-async fn raw_generate_http_framing_through_build_router() {
+async fn raw_generate_http_framing_through_production_serve_loop() {
     let ipc = IpcNamespace::new().expect("create ipc namespace");
     let handshake_address = ipc.handshake_endpoint();
     let engine_id = b"engine-raw-generate-framing".to_vec();
@@ -7074,7 +7074,18 @@ async fn raw_generate_http_framing_through_build_router() {
     )));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("local addr");
-    let server = tokio::spawn(async move { axum::serve(listener, app).await.expect("serve") });
+    // The production connection loop (hyper http1 + graceful drain), not
+    // `axum::serve`.
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let server = tokio::spawn(crate::serve_connections(
+        listener,
+        app,
+        shutdown.clone().cancelled_owned(),
+        crate::ConnectionTimeouts {
+            header_read: std::time::Duration::from_secs(30),
+            keep_alive_enabled: true,
+        },
+    ));
 
     let request = |format: &str| {
         json!({
@@ -7108,7 +7119,8 @@ async fn raw_generate_http_framing_through_build_router() {
         "token_id:44"
     );
 
-    server.abort();
+    shutdown.cancel();
+    server.await.expect("serve task").expect("serve_connections");
     engine_task.await.expect("mock engine task");
 }
 
