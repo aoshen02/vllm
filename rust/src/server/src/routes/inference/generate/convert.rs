@@ -33,6 +33,9 @@ pub(super) struct ResponseOptions {
     pub include_prompt_logprobs: bool,
     /// Wire format for output logprobs.
     pub logprobs_format: LogprobsFormat,
+    /// Whether compact output carries a block: `logprobs` or a non-empty
+    /// `logprob_token_ids` was requested (the engine returns rows for both).
+    pub include_compact_logprobs: bool,
     /// Requested engine row width (`logprobs + 1`), used as `num_slots` for a
     /// compact block with no scored positions; `0` when unknown (`-1`).
     pub logprobs_slots: usize,
@@ -64,12 +67,20 @@ pub(super) fn prepare_generate_request(
     let include_prompt_logprobs = request.sampling_params.inner.prompt_logprobs.is_some();
     let logprobs_format = LogprobsFormat::parse(request.logprobs_format.as_ref())
         .expect("logprobs_format validated by validate_request_compat");
-    let logprobs_slots = request
+    // Compact follows the engine / Python `num_logprobs`: `logprobs` when
+    // set, else `len(logprob_token_ids)` (lowering rejects both set with
+    // different counts). The default format keeps gating on `logprobs` only.
+    let logprob_token_ids = request
         .sampling_params
         .inner
-        .logprobs
-        .and_then(|k| usize::try_from(k).ok())
-        .map_or(0, |k| k + 1);
+        .logprob_token_ids
+        .as_deref()
+        .filter(|ids| !ids.is_empty());
+    let include_compact_logprobs = include_logprobs || logprob_token_ids.is_some();
+    let logprobs_slots = match request.sampling_params.inner.logprobs {
+        Some(k) => usize::try_from(k).map_or(0, |k| k + 1),
+        None => logprob_token_ids.map_or(0, |ids| ids.len() + 1),
+    };
     let mut sampling_params = request.sampling_params.inner;
     sampling_params.vllm_xargs = merge_kv_transfer_params(
         sampling_params.vllm_xargs,
@@ -107,6 +118,7 @@ pub(super) fn prepare_generate_request(
             include_logprobs,
             include_prompt_logprobs,
             logprobs_format,
+            include_compact_logprobs,
             logprobs_slots,
         },
     })
@@ -205,6 +217,31 @@ mod tests {
             prepared.text_request.sampling_params.thinking_token_budget,
             Some(64)
         );
+    }
+
+    #[test]
+    fn prepare_generate_request_compact_counts_logprob_token_ids() {
+        // `logprob_token_ids` without `logprobs`: the engine returns rows of
+        // [sampled, ids...] (padded to the batch max with -inf), and Python's
+        // `num_logprobs` is len(ids), so compact renders S = len(ids) + 1.
+        let request: GenerateRequest = serde_json::from_value(json!({
+            "model": "Qwen/Qwen1.5-0.5B-Chat",
+            "token_ids": [11, 22],
+            "logprobs_format": "compact",
+            "sampling_params": {"logprob_token_ids": [5, 6, 7]}
+        }))
+        .expect("parse request");
+        let prepared = prepare_generate_request(
+            request,
+            &served(&["Qwen/Qwen1.5-0.5B-Chat"]),
+            ResolvedRequestContext::default(),
+            None,
+        )
+        .expect("prepare");
+        assert_eq!(prepared.options.logprobs_slots, 4);
+        assert!(prepared.options.include_compact_logprobs);
+        // The default (openai) gate is unchanged: `logprobs` only.
+        assert!(!prepared.options.include_logprobs);
     }
 
     #[test]

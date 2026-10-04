@@ -48,7 +48,7 @@ pub(super) enum ChoiceLogprobs {
     None,
     /// OpenAI chat-style `{"content": [...]}`. Positions must be non-empty.
     OpenAi(Vec<PositionLogprobs>),
-    /// `"logprobs": null` plus `"compact_logprobs"` (`None` renders `null`).
+    /// `"logprobs": null` plus `"compact_logprobs"` (`None` omits the key).
     Compact(Option<CompactLogprobs>),
 }
 
@@ -152,10 +152,10 @@ pub(super) fn generate_response(envelope: GenerateEnvelope, logprobs: ChoiceLogp
             write_head(&mut out, &envelope);
             out.raw(b"null");
             write_choice_fields(&mut out, &envelope);
-            out.raw(b",\"compact_logprobs\":");
-            match block.as_ref() {
-                Some(block) => write_compact(&mut out, block),
-                None => out.raw(b"null"),
+            // Omitted (not null) when logprobs were not requested, like Python.
+            if let Some(block) = block.as_ref() {
+                out.raw(b",\"compact_logprobs\":");
+                write_compact(&mut out, block);
             }
             write_tail(&mut out, &envelope);
             Body::new(PartsBody::new(out.finish()))

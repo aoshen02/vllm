@@ -139,7 +139,7 @@ pub async fn generate(
             };
             compact_choice_logprobs(
                 accumulator,
-                options.include_logprobs,
+                options.include_compact_logprobs,
                 collected.token_ids.len(),
             )
             .and_then(|logprobs| {
@@ -222,6 +222,7 @@ async fn generate_chunk_stream(
         // Ignored: raw generate streaming has no prompt-logprobs wire shape.
         include_prompt_logprobs: _,
         logprobs_format,
+        include_compact_logprobs,
         logprobs_slots,
     }: ResponseOptions,
     mut y: TryYielder<GenerateStreamResponse, ApiError>,
@@ -264,7 +265,11 @@ async fn generate_chunk_stream(
                     continue;
                 }
 
-                let (logprobs, compact_logprobs) = if include_logprobs && !token_ids.is_empty() {
+                let wants_logprobs = match logprobs_format {
+                    LogprobsFormat::OpenAi => include_logprobs,
+                    LogprobsFormat::Compact => include_compact_logprobs,
+                };
+                let (logprobs, compact_logprobs) = if wants_logprobs && !token_ids.is_empty() {
                     let logprobs = output.logprobs.ok_or_else(|| {
                         server_error!(
                             "raw generate stream requested logprobs but generation returned none"
@@ -822,7 +827,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn compact_without_requested_logprobs_renders_null_block() {
+    async fn compact_without_requested_logprobs_omits_block() {
         let json = compact_response_json(
             vec![step(vec![1, 2], None, Some(FinishReason::Length))],
             false,
@@ -830,16 +835,10 @@ mod tests {
         .await
         .expect("compact response");
         assert!(json["choices"][0]["logprobs"].is_null());
-        assert!(json["choices"][0]["compact_logprobs"].is_null());
+        // Same as the Python frontend: the key is omitted, not null.
         assert_eq!(
             json["choices"][0].as_object().unwrap().keys().collect::<Vec<_>>(),
-            [
-                "index",
-                "logprobs",
-                "finish_reason",
-                "token_ids",
-                "compact_logprobs"
-            ]
+            ["index", "logprobs", "finish_reason", "token_ids"]
         );
     }
 
@@ -901,7 +900,7 @@ mod tests {
             "raw-stream".to_string(),
             ApiServerOptions::default(),
             ResponseOptions {
-                include_logprobs: true,
+                include_compact_logprobs: true,
                 logprobs_format: LogprobsFormat::Compact,
                 logprobs_slots: 3,
                 ..Default::default()
