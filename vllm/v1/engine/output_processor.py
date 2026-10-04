@@ -590,9 +590,12 @@ class OutputProcessor:
         the params object may be shared (e.g. with a parent request).
         """
         params = request.sampling_params
-        if params is not None and params.array_logprobs:
+        if params is not None and (
+            params.array_logprobs or params.array_logprobs_base64
+        ):
             params = copy.copy(params)
             params.array_logprobs = False
+            params.array_logprobs_base64 = False
             request.sampling_params = params
 
     def _update_streaming_request_state(

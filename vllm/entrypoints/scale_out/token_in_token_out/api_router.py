@@ -4,7 +4,9 @@
 
 import asyncio
 import json
+from collections.abc import Iterator
 from http import HTTPStatus
+from typing import Any
 
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -45,14 +47,61 @@ router = APIRouter()
 
 
 class _RenderedJSONResponse(JSONResponse):
-    """``JSONResponse`` whose content is an already-rendered JSON body.
+    """``JSONResponse`` for an already-rendered body given as parts.
 
     Subclassing JSONResponse keeps ``load_aware_call`` bookkeeping and the
-    ``application/json`` headers identical to the default path.
+    headers (``content-type``, ``content-length``) identical to the default
+    path. The parts are sent as consecutive ``http.response.body`` messages
+    (small ones coalesced) instead of one joined body: no full-size copy,
+    the server's write flow control applies, and each part is released
+    once sent.
     """
 
-    def render(self, content: bytes) -> bytes:
-        return content
+    COALESCE_BYTES = 1 << 20
+
+    def __init__(self, rendered: RenderedGenerateResponse) -> None:
+        self._parts = rendered.parts
+        # Same header order as JSONResponse: content-length, content-type.
+        super().__init__(
+            content=None,
+            headers={"content-length": str(rendered.content_length)},
+        )
+
+    def render(self, content: Any) -> bytes:
+        # The body is sent from ``self._parts`` in ``__call__``.
+        return b""
+
+    def _chunks(self) -> Iterator[bytes]:
+        parts, self._parts = self._parts, []
+        parts.reverse()  # pop() from the end releases parts in order
+        buffer = bytearray()
+        while parts:
+            part = parts.pop()
+            if len(part) < self.COALESCE_BYTES:
+                buffer += part
+                if len(buffer) < self.COALESCE_BYTES:
+                    continue
+                part, buffer = buffer, bytearray()
+            elif buffer:
+                yield bytes(buffer)
+                buffer = bytearray()
+            yield part if isinstance(part, bytes) else bytes(part)
+        if buffer:
+            yield bytes(buffer)
+
+    async def __call__(self, scope, receive, send) -> None:
+        await send(
+            {
+                "type": "http.response.start",
+                "status": self.status_code,
+                "headers": self.raw_headers,
+            }
+        )
+        for chunk in self._chunks():
+            await send({"type": "http.response.body", "body": chunk, "more_body": True})
+        await send({"type": "http.response.body", "body": b"", "more_body": False})
+        if self.background is not None:
+            await self.background()
 
 
 @router.post(
@@ -80,7 +129,7 @@ async def generate(request: GenerateRequest, raw_request: Request):
         )
 
     elif isinstance(generator, RenderedGenerateResponse):
-        return _RenderedJSONResponse(content=generator.body)
+        return _RenderedJSONResponse(generator)
 
     elif isinstance(generator, GenerateResponse):
         return JSONResponse(content=generator.model_dump())

@@ -343,14 +343,29 @@ class GenerateResponse(BaseModel):
 
 @dataclass
 class RenderedGenerateResponse:
-    """A non-streaming generate response already rendered to JSON bytes.
+    """A non-streaming generate response already rendered to JSON.
 
     Returned instead of :class:`GenerateResponse` when the logprobs were
-    rendered without per-entry objects; ``body`` is the complete
-    ``application/json`` response body.
+    rendered without per-entry objects. ``parts`` concatenate to the
+    complete ``application/json`` body; the router sends them one by one
+    (with a Content-Length) instead of joining them. Passing ``bytes``
+    makes a single part.
     """
 
-    body: bytes
+    parts: list[bytes | memoryview]
+
+    def __post_init__(self) -> None:
+        if isinstance(self.parts, (bytes, bytearray, memoryview)):
+            self.parts = [bytes(self.parts)]
+
+    @property
+    def body(self) -> bytes:
+        """The joined body (copies; for tests and small responses)."""
+        return b"".join(self.parts)
+
+    @property
+    def content_length(self) -> int:
+        return sum(len(part) for part in self.parts)
 
 
 class DerenderChatRequest(BaseModel):

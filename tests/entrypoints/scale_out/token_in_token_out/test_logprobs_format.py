@@ -913,7 +913,7 @@ def test_array_logprobs_self_extend_doubles(consolidate):
 def test_array_logprobs_flag_stays_off_engine_wire():
     """Audit #6: array_logprobs is frontend-only; the request sent to
     EngineCore after add_request does not carry it."""
-    params = SamplingParams(logprobs=2, array_logprobs=True)
+    params = SamplingParams(logprobs=2, array_logprobs=True, array_logprobs_base64=True)
     request = EngineCoreRequest(
         request_id="r-int",
         external_req_id="r",
@@ -930,10 +930,13 @@ def test_array_logprobs_flag_stays_off_engine_wire():
     processor.add_request(request, None, queue=None)
     state = processor.request_states["r-int"]
     assert isinstance(state.logprobs_processor.logprobs, ArrayLogprobs)
+    assert state.logprobs_processor.logprobs.wire_parts() is not None
     assert b"array_logprobs" not in MsgpackEncoder().encode(request)[0]
     assert request.sampling_params.array_logprobs is False
+    assert request.sampling_params.array_logprobs_base64 is False
     # The caller's (possibly shared) params object is not mutated.
     assert params.array_logprobs is True
+    assert params.array_logprobs_base64 is True
 
 
 def test_float_fast_path_guard(monkeypatch):
@@ -1191,3 +1194,201 @@ async def test_sampled_text_detokenizer_only_for_stop_strings(
     if prompt_logprobs is not None:
         prompt = json.loads(response.body)["prompt_logprobs"]
         assert prompt[1]["2"]["decoded_token"] == gpt2_tokenizer.decode([2])
+
+
+# ------------------------------------------------------- round 3: wire mode
+
+
+def _wire_container(chunks) -> ArrayLogprobs:
+    container = ArrayLogprobs(wire_base64=True)
+    for token_ids, logprobs, ranks in chunks:
+        container.append_rows(token_ids, logprobs, ranks)
+    return container
+
+
+@pytest.mark.parametrize("flush", [3, 7, 64, 1 << 20])
+@pytest.mark.parametrize("step", [1, 3, 1024])
+def test_wire_mode_matches_one_shot_compact(monkeypatch, flush, step):
+    """Incremental base64 at append time == one-shot encoding of the arrays,
+    for any engine step size and segment size (carry handling)."""
+    from vllm import logprobs as logprobs_mod
+
+    monkeypatch.setattr(logprobs_mod._Base64Stream, "FLUSH_BYTES", flush)
+    token_ids, logprobs, ranks = _engine_rows(0, 50, 5)
+    logprobs[3, 2] = np.array([0x7FC00123], dtype=np.uint32).view(np.float32)[0]
+    logprobs[7, 0] = np.float32(-np.inf)
+    chunks = [
+        (token_ids[i : i + step], logprobs[i : i + step], ranks[i : i + step])
+        for i in range(0, 50, step)
+    ]
+    wire = _wire_container(chunks)
+    plain = ArrayLogprobs()
+    for chunk in chunks:
+        plain.append_rows(*chunk)
+    assert len(wire) == 50
+    assert wire.num_slots == 5
+    assert wire.reserved_bytes() == 0  # no array storage in wire mode
+    assert wire.wire_parts() is not None
+    fast = b"".join(render_compact_logprobs_parts(wire, 4))
+    assert fast == render_compact_logprobs(plain, 4)
+    block = json.loads(fast)
+    ids, lps, rk = _decode(block)
+    np.testing.assert_array_equal(ids, token_ids)
+    assert lps.tobytes() == logprobs.tobytes()
+    np.testing.assert_array_equal(rk, ranks)
+    # Rendering does not consume: render twice, append more, render again.
+    assert b"".join(render_compact_logprobs_parts(wire, 4)) == fast
+    wire.append_rows(token_ids[:2], logprobs[:2], ranks[:2])
+    plain.append_rows(token_ids[:2], logprobs[:2], ranks[:2])
+    assert b"".join(render_compact_logprobs_parts(wire, 4)) == (
+        render_compact_logprobs(plain, 4)
+    )
+
+
+def test_wire_mode_positional_access_decodes():
+    token_ids, logprobs, ranks = _engine_rows(0, 6, 4)
+    wire = _wire_container([(token_ids, logprobs, ranks)])
+    container, legacy = _containers(token_ids, logprobs, ranks, 3)
+    assert wire[2] == legacy[2]  # leaves wire mode, decodes rows
+    assert wire.wire_parts() is None
+    assert list(wire) == legacy
+    assert list(wire[-3:]) == legacy[-3:]
+    assert render_compact_logprobs(wire, 3) == render_compact_logprobs(container, 3)
+
+
+@pytest.mark.parametrize("case", ["width", "int64"])
+def test_wire_mode_unrepresentable_rows_fall_back(case):
+    """Rows the wire cannot carry leave wire mode; compact then fails the
+    request (500) exactly as without wire mode, and positions stay exact."""
+    token_ids, logprobs, ranks = _engine_rows(0, 4, 4)
+    wire = _wire_container([(token_ids[:2], logprobs[:2], ranks[:2])])
+    if case == "width":
+        wire.append_rows(token_ids[2:, :3], logprobs[2:, :3], ranks[2:])
+        assert not wire.is_regular
+    else:
+        big = token_ids[2:].astype(np.int64)
+        big[0, 1] = 2**31 + 7
+        wire.append_rows(big, logprobs[2:], ranks[2:])
+        assert wire[2][2**31 + 7].logprob == float(logprobs[2, 1])
+    assert len(wire) == 4
+    assert wire.wire_parts() is None
+    with pytest.raises(GenerationError):
+        render_compact_logprobs_parts(wire, 3)
+
+
+@pytest.mark.asyncio
+async def test_compact_full_response_uses_wire_mode_and_same_bytes(monkeypatch):
+    chunks = [_engine_rows(0, 5, 6), _engine_rows(5, 3, 6)]
+    request = _request(logprobs=4, logprobs_format="compact", request_id="fixed")
+    monkeypatch.setattr(time, "time", lambda: 1700000000.0)
+    feeder = _OutputProcessorEngine(chunks)
+    wire_body = (
+        await _serving(feeder).serve_tokens(request.model_copy(deep=True))
+    ).body
+    assert feeder.sampling_params.array_logprobs_base64 is True
+    original = ServingTokens._configure_logprobs.__func__
+
+    def no_wire(cls, req, params):
+        original(cls, req, params)
+        params.array_logprobs_base64 = False
+
+    monkeypatch.setattr(ServingTokens, "_configure_logprobs", classmethod(no_wire))
+    feeder = _OutputProcessorEngine(chunks)
+    plain_body = (
+        await _serving(feeder).serve_tokens(request.model_copy(deep=True))
+    ).body
+    assert feeder.sampling_params.array_logprobs_base64 is False
+    assert wire_body == plain_body
+
+
+@pytest.mark.asyncio
+async def test_compact_stream_does_not_use_wire_mode():
+    feeder = _OutputProcessorEngine([_engine_rows(0, 3, 4)])
+    generator = await _serving(feeder).serve_tokens(
+        _request(logprobs=3, logprobs_format="compact", stream=True)
+    )
+    _ = [chunk async for chunk in generator]
+    assert feeder.sampling_params.array_logprobs_base64 is False
+
+
+def test_router_sends_parts_with_content_length():
+    """The rendered body is sent as several body messages (no joined copy)
+    with the same bytes and headers as a joined body."""
+    big = [b"x" * (3 << 20), memoryview(b'","y":'), b"z" * 10, b"w" * (2 << 20)]
+    expected = b"".join(big)
+    app = FastAPI()
+    app.state.args = Namespace(log_error_stack=False, tokens_only=False)
+    app.state.enable_server_load_tracking = True
+    app.state.server_load_metrics = 0
+    serving = MagicMock()
+
+    async def _serve(request, raw_request):
+        return RenderedGenerateResponse(list(big))
+
+    serving.serve_tokens = _serve
+    app.state.serving_tokens = serving
+    init_exception_handler(app)
+    api_router.attach_router(app)
+    messages: list[dict] = []
+    inner = app.build_middleware_stack()
+
+    async def recording_app(scope, receive, send):
+        async def _send(message):
+            messages.append(message)
+            await send(message)
+
+        await inner(scope, receive, _send)
+
+    app.build_middleware_stack = lambda: recording_app  # type: ignore[method-assign]
+    with TestClient(app) as client:
+        result = client.post(
+            "/inference/v1/generate",
+            json={"token_ids": [1], "sampling_params": {}},
+        )
+    assert result.status_code == 200
+    assert result.content == expected
+    assert int(result.headers["content-length"]) == len(expected)
+    assert result.headers["content-type"] == "application/json"
+    bodies = [m for m in messages if m["type"] == "http.response.body"]
+    assert len(bodies) >= 3
+    assert b"".join(m["body"] for m in bodies) == expected
+    assert bodies[-1]["more_body"] is False
+    assert app.state.server_load_metrics == 0
+
+
+def test_rendered_response_accepts_bytes():
+    rendered = RenderedGenerateResponse(b"{}")
+    assert rendered.parts == [b"{}"] and rendered.body == b"{}"
+    assert rendered.content_length == 2
+
+
+def test_lead_table_large_ids_and_growth(monkeypatch):
+    """Leads for ids beyond the table bound are formatted directly; the
+    table grows on demand; bytes stay identical to the legacy path."""
+    table = logprobs_render._LeadTable(b"|")
+    monkeypatch.setattr(logprobs_render._LeadTable, "max_ids", 64)
+    small = np.array([[3, 9], [63, 3]])
+    assert table.lookup(small).tolist() == [
+        [b'|{"token":"token_id:3","logprob":', b'|{"token":"token_id:9","logprob":'],
+        [b'|{"token":"token_id:63","logprob":', b'|{"token":"token_id:3","logprob":'],
+    ]
+    assert len(table.values) == 64
+    big = np.array([[64, 2**31 + 1]])
+    assert table.lookup(big).tolist() == [
+        [
+            b'|{"token":"token_id:64","logprob":',
+            b'|{"token":"token_id:2147483649","logprob":',
+        ],
+    ]
+    monkeypatch.setattr(
+        logprobs_render,
+        "_NEXT_LEADS",
+        logprobs_render._LeadTable(logprobs_render._SEP_TOP_NEXT),
+    )
+    monkeypatch.setattr(logprobs_render._LeadTable, "max_ids", 1000)
+    token_ids, logprobs, ranks = _engine_rows(0, 5, 6)
+    container, legacy = _containers(token_ids, logprobs, ranks, 5)
+    sampled = token_ids[:, 0].tolist()
+    assert render_openai_logprobs(sampled, container, 5) == _legacy_logprobs_bytes(
+        sampled, legacy, 5
+    )

@@ -12,8 +12,9 @@ produce JSON bytes directly, without per-entry Python/pydantic objects:
   ``JSONResponse.render``) produces for the same rows, or returns ``None`` when
   the rows are irregular and the caller must use the legacy path.
 
-:func:`render_json_with_fragments` splices pre-rendered fragments into the
-JSON of the remaining (small) response fields.
+:func:`render_json_with_fragments_parts` splices pre-rendered fragments into
+the JSON of the remaining (small) response fields and returns the body as a
+list of parts, which the router sends without joining them.
 """
 
 import json
@@ -91,14 +92,40 @@ def render_compact_logprobs_parts(
 ) -> list[bytes]:
     """The ``compact_logprobs`` JSON object (see the generate SPEC) as parts
     whose concatenation is the JSON; avoids copying the large payloads."""
-    n, s, token_ids, logprobs, ranks = compact_logprobs_fields(container, num_logprobs)
+    token_ids: bytes | list[bytes]
+    logprobs: bytes | list[bytes]
+    ranks: bytes | list[bytes]
+    wire = container.wire_parts() if container.is_regular else None
+    if wire is not None:
+        # Encoded while the rows arrived (ArrayLogprobs wire mode).
+        n, stored_slots, token_ids, logprobs, ranks = wire
+        s = (
+            stored_slots
+            if stored_slots is not None
+            else compact_num_slots(container, num_logprobs)
+        )
+    else:
+        n, s, token_ids, logprobs, ranks = compact_logprobs_fields(
+            container, num_logprobs
+        )
     head = (
         f'{{"num_positions":{n},"num_slots":{s},'
         f'"dtype_token_ids":"{COMPACT_DTYPE_TOKEN_IDS}",'
         f'"dtype_logprobs":"{COMPACT_DTYPE_LOGPROBS}",'
         f'"byteorder":"{COMPACT_BYTEORDER}","token_ids":"'
     ).encode("ascii")
-    return [head, token_ids, b'","logprobs":"', logprobs, b'","ranks":"', ranks, b'"}']
+    parts = [head]
+    for piece, tail in (
+        (token_ids, b'","logprobs":"'),
+        (logprobs, b'","ranks":"'),
+        (ranks, b'"}'),
+    ):
+        if isinstance(piece, bytes):
+            parts.append(piece)
+        else:
+            parts.extend(piece)
+        parts.append(tail)
+    return parts
 
 
 def render_compact_logprobs(
@@ -377,6 +404,14 @@ def render_json_with_fragments(
     content: dict[str, Any],
     choice_fragments: Mapping[int, Mapping[str, bytes | list[bytes]]],
 ) -> bytes:
+    """Joined :func:`render_json_with_fragments_parts`."""
+    return b"".join(render_json_with_fragments_parts(content, choice_fragments))
+
+
+def render_json_with_fragments_parts(
+    content: dict[str, Any],
+    choice_fragments: Mapping[int, Mapping[str, bytes | list[bytes]]],
+) -> list[bytes | memoryview]:
     """Render ``content`` like ``JSONResponse`` with pre-rendered values.
 
     ``choice_fragments[i][key]`` is the JSON (bytes, or a list of parts to
@@ -385,7 +420,7 @@ def render_json_with_fragments(
     trailing optional fields). ``content`` is modified in place.
     """
     if not choice_fragments:
-        return _dumps(content)
+        return [_dumps(content)]
     token = secrets.token_hex(16)
     fragments: list[bytes | list[bytes]] = []
     choices = content["choices"]
@@ -407,4 +442,4 @@ def render_json_with_fragments(
         else:
             out.extend(fragment)
         out.append(memoryview(piece)[len(marker) :])
-    return b"".join(out)
+    return out

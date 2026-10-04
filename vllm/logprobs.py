@@ -3,10 +3,11 @@
 import itertools
 import operator
 from collections.abc import Iterable, Iterator, MutableSequence
-from dataclasses import dataclass, field
+from dataclasses import InitVar, dataclass, field
 from typing import ClassVar, overload
 
 import numpy as np
+import pybase64
 
 
 # We use dataclass for now because it is used for
@@ -181,6 +182,81 @@ def _storage_float_dtype(values: np.ndarray) -> np.dtype:
     return _FLOAT64 if values.dtype == np.float64 else _FLOAT32
 
 
+class _Base64Stream:
+    """Incremental base64 of a byte stream, as standalone segments.
+
+    Bytes are buffered and encoded in pieces whose length is a multiple of
+    3, so the concatenation of :meth:`parts` equals ``b64encode`` of the
+    whole stream (only the last part can carry ``=`` padding). The pending
+    buffer stays below ``FLUSH_BYTES`` + one write.
+    """
+
+    FLUSH_BYTES: ClassVar[int] = 3 << 18  # 768 KiB of input per segment
+
+    def __init__(self) -> None:
+        self.segments: list[bytes] = []
+        self.pending = bytearray()
+
+    def write(self, data: np.ndarray) -> None:
+        self.pending += memoryview(data).cast("B")
+        if len(self.pending) >= self.FLUSH_BYTES:
+            cut = len(self.pending) - len(self.pending) % 3
+            self.segments.append(pybase64.b64encode(self.pending[:cut]))
+            del self.pending[:cut]
+
+    def parts(self) -> list[bytes]:
+        """Base64 text of everything written so far (does not consume)."""
+        if not self.pending:
+            return list(self.segments)
+        return [*self.segments, pybase64.b64encode(bytes(self.pending))]
+
+    def decode(self) -> bytes:
+        return pybase64.b64decode(b"".join(self.parts()))
+
+
+class _WireEncoder:
+    """Rows encoded at append time in the compact wire format: base64 of
+    little-endian ``int32`` token ids, ``float32`` logprobs, ``int32``
+    ranks."""
+
+    def __init__(self) -> None:
+        self.slots: int | None = None
+        self.num_rows = 0
+        self.token_ids = _Base64Stream()
+        self.logprobs = _Base64Stream()
+        self.ranks = _Base64Stream()
+
+    def try_write(
+        self, token_ids: np.ndarray, logprobs: np.ndarray, ranks: np.ndarray
+    ) -> bool:
+        """Encode the rows, or return False if they are not representable
+        (width change, ids/ranks beyond int32)."""
+        width = token_ids.shape[1]
+        if self.slots is not None and width != self.slots:
+            return False
+        if _storage_int_dtype(token_ids) != _INT32 or (
+            _storage_int_dtype(ranks) != _INT32
+        ):
+            return False
+        self.slots = width
+        self.token_ids.write(np.ascontiguousarray(token_ids, dtype=_INT32))
+        self.logprobs.write(np.ascontiguousarray(logprobs, dtype=_FLOAT32))
+        self.ranks.write(np.ascontiguousarray(ranks, dtype=_INT32))
+        self.num_rows += len(ranks)
+        return True
+
+    def decode(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        slots = self.slots or 0
+        token_ids = np.frombuffer(self.token_ids.decode(), dtype=_INT32)
+        logprobs = np.frombuffer(self.logprobs.decode(), dtype=_FLOAT32)
+        ranks = np.frombuffer(self.ranks.decode(), dtype=_INT32)
+        return (
+            token_ids.reshape(self.num_rows, slots),
+            logprobs.reshape(self.num_rows, slots),
+            ranks,
+        )
+
+
 @dataclass
 class ArrayLogprobs(MutableSequence[LogprobsOnePosition | None]):
     """
@@ -214,6 +290,15 @@ class ArrayLogprobs(MutableSequence[LogprobsOnePosition | None]):
     ``dict[int, Logprob]`` the list representation would hold (with
     ``decoded_token=None``), so generic consumers keep working; fast
     consumers use :meth:`arrays` instead.
+
+    With ``wire_base64=True`` (non-streaming compact responses) rows are
+    not stored as arrays: they are encoded immediately into the compact
+    wire format (base64 of ``<i4``/``<f4``/``<i4``), about 1.33x the raw
+    int32/float32 size, so building the response only stitches the
+    segments together (:meth:`wire_parts`). Any other access first decodes
+    the rows back into an array block (values as on the wire, i.e.
+    float32), and rows the wire cannot represent switch the container
+    back to array storage.
     """
 
     BLOCK_BYTES: ClassVar[int] = 8 << 20
@@ -226,6 +311,41 @@ class ArrayLogprobs(MutableSequence[LogprobsOnePosition | None]):
     _tail_fill: int = 0
     # Positions after the array rows, once irregular rows were seen.
     _legacy: list[LogprobsOnePosition] | None = None
+    wire_base64: InitVar[bool] = False
+    _wire: _WireEncoder | None = field(default=None, init=False, repr=False)
+
+    def __post_init__(self, wire_base64: bool) -> None:
+        if wire_base64:
+            self._wire = _WireEncoder()
+
+    def _unwire(self) -> None:
+        """Leave wire mode: decode the encoded rows into an array block."""
+        wire = self._wire
+        if wire is None:
+            return
+        self._wire = None
+        if wire.num_rows:
+            token_ids, logprobs, ranks = wire.decode()
+            self.token_id_chunks = [token_ids]
+            self.logprob_chunks = [logprobs]
+            self.rank_chunks = [ranks]
+            self._tail_fill = wire.num_rows
+
+    def wire_parts(
+        self,
+    ) -> tuple[int, int | None, list[bytes], list[bytes], list[bytes]] | None:
+        """``(N, S, token_ids, logprobs, ranks)`` base64 parts, or None if the
+        container is not (or no longer) in wire mode."""
+        wire = self._wire
+        if wire is None:
+            return None
+        return (
+            wire.num_rows,
+            wire.slots,
+            wire.token_ids.parts(),
+            wire.logprobs.parts(),
+            wire.ranks.parts(),
+        )
 
     @property
     def is_regular(self) -> bool:
@@ -262,6 +382,11 @@ class ArrayLogprobs(MutableSequence[LogprobsOnePosition | None]):
         n = len(ranks)
         if n == 0:
             return
+        if self._wire is not None:
+            if self._wire.try_write(token_ids, logprobs, ranks):
+                self.num_positions += n
+                return
+            self._unwire()
         width = token_ids.shape[1]
         if self._legacy is not None or (
             self.token_id_chunks and width != self.token_id_chunks[0].shape[1]
@@ -331,6 +456,8 @@ class ArrayLogprobs(MutableSequence[LogprobsOnePosition | None]):
     @property
     def num_slots(self) -> int | None:
         """Slots per position, or None if no position was stored yet."""
+        if self._wire is not None:
+            return self._wire.slots
         if not self.token_id_chunks:
             return None
         return self.token_id_chunks[0].shape[1]
@@ -352,6 +479,7 @@ class ArrayLogprobs(MutableSequence[LogprobsOnePosition | None]):
         arrays when there are no positions. Raises ValueError when the
         container is not :attr:`is_regular`.
         """
+        self._unwire()
         if self._legacy is not None:
             raise ValueError("Logprob rows have inconsistent widths")
         if not self.token_id_chunks:
@@ -370,6 +498,7 @@ class ArrayLogprobs(MutableSequence[LogprobsOnePosition | None]):
 
     def extend(self, values) -> None:
         if isinstance(values, ArrayLogprobs):
+            values._unwire()
             # Snapshot first: ``values`` may be ``self``.
             blocks = values._filled_blocks()
             legacy = list(values._legacy) if values._legacy is not None else None
@@ -392,6 +521,7 @@ class ArrayLogprobs(MutableSequence[LogprobsOnePosition | None]):
     def __getitem__(self, s: slice, /) -> "ArrayLogprobs": ...
 
     def __getitem__(self, index: int | slice):
+        self._unwire()
         if isinstance(index, slice):
             return self._slice(index)
         try:
@@ -485,11 +615,11 @@ def create_prompt_logprobs(flat_logprobs: bool) -> PromptLogprobs:
 
 
 def create_sample_logprobs(
-    flat_logprobs: bool, array_logprobs: bool = False
+    flat_logprobs: bool, array_logprobs: bool = False, wire_base64: bool = False
 ) -> SampleLogprobs:
     """Creates a container to store decode logprobs for a request"""
     if array_logprobs:
-        return ArrayLogprobs()
+        return ArrayLogprobs(wire_base64=wire_base64)
     return FlatLogprobs() if flat_logprobs else []
 
 

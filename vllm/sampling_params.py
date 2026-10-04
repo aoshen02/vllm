@@ -313,6 +313,11 @@ class SamplingParams(
     Set by `/inference/v1/generate`, whose responses contain no text.
     Never sent to EngineCore: `OutputProcessor.add_request` resets it on
     the request after creating the request state."""
+    array_logprobs_base64: bool = False
+    """Frontend-only, with `array_logprobs`: encode sample logprob rows
+    into the compact wire format (base64) as they arrive instead of keeping
+    arrays (non-streaming `logprobs_format="compact"`). Never sent to
+    EngineCore."""
     # NOTE: This parameter is only exposed at the engine level for now.
     # It is not exposed in the OpenAI API server, as the OpenAI API does
     # not support returning only a list of token IDs.

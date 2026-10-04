@@ -59,7 +59,9 @@ class LogprobsProcessor:
                 None
                 if num_logprobs is None
                 else create_sample_logprobs(
-                    sampling_params.flat_logprobs, sampling_params.array_logprobs
+                    sampling_params.flat_logprobs,
+                    sampling_params.array_logprobs,
+                    sampling_params.array_logprobs_base64,
                 )
             ),
             prompt_logprobs=(

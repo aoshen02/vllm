@@ -49,7 +49,7 @@ from vllm.utils.serial_utils import numpy2base64
 from .logprobs_render import (
     compact_logprobs_fields,
     render_compact_logprobs_parts,
-    render_json_with_fragments,
+    render_json_with_fragments_parts,
     render_openai_logprobs_parts,
 )
 from .mm_serde import decode_mm_kwargs_item
@@ -322,6 +322,11 @@ class ServingTokens(GenerateBaseServing):
         keep their decoded tokens.
         """
         sampling_params.array_logprobs = cls._use_array_logprobs(request)
+        # Non-streaming compact: encode rows to the wire format while they
+        # arrive, so the post-abort response build only stitches segments.
+        sampling_params.array_logprobs_base64 = (
+            request.logprobs_format == "compact" and not request.stream
+        )
 
     @staticmethod
     def _require_array_logprobs(logprobs: object) -> ArrayLogprobs:
@@ -511,7 +516,7 @@ class ServingTokens(GenerateBaseServing):
 
         if fragments:
             return RenderedGenerateResponse(
-                render_json_with_fragments(response.model_dump(), fragments)
+                render_json_with_fragments_parts(response.model_dump(), fragments)
             )
         return response
 
