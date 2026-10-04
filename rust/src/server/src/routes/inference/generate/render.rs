@@ -183,7 +183,10 @@ pub(super) fn generate_response(envelope: GenerateEnvelope, logprobs: ChoiceLogp
                 produce_openai_body(head.finish(), positions, tail.finish(), tx)
                     .instrument(tracing::Span::current()),
             );
-            Body::new(ChannelBody { rx })
+            Body::new(ChannelBody {
+                rx,
+                complete: false,
+            })
         }
     };
 
@@ -284,20 +287,20 @@ async fn produce_openai_body(
     head: Vec<Bytes>,
     positions: Vec<PositionLogprobs>,
     tail: Vec<Bytes>,
-    tx: tokio::sync::mpsc::Sender<Bytes>,
+    tx: tokio::sync::mpsc::Sender<BodyChunk>,
 ) {
     let started = std::time::Instant::now();
     let mut bytes = 0_usize;
     let mut renderer = OpenAiRenderer::new(positions);
     for part in head {
         bytes += part.len();
-        if tx.send(part).await.is_err() {
+        if tx.send(BodyChunk::Data(part)).await.is_err() {
             return;
         }
     }
     while let Some(chunk) = renderer.next_chunk() {
         bytes += chunk.len();
-        if tx.send(chunk).await.is_err() {
+        if tx.send(BodyChunk::Data(chunk)).await.is_err() {
             trace!(bytes, "generate response body dropped before completion");
             return;
         }
@@ -307,14 +310,24 @@ async fn produce_openai_body(
     }
     for part in tail {
         bytes += part.len();
-        if tx.send(part).await.is_err() {
+        if tx.send(BodyChunk::Data(part)).await.is_err() {
             return;
         }
     }
+    // Explicit completion marker: a channel that closes without it (render
+    // task panicked) fails the body instead of ending it cleanly.
+    let _ = tx.send(BodyChunk::End).await;
     debug!(
         render_wall_s = started.elapsed().as_secs_f64(),
         bytes, "generate response body rendered"
     );
+}
+
+/// One message from [`produce_openai_body`] to [`ChannelBody`].
+enum BodyChunk {
+    Data(Bytes),
+    /// The whole body was produced.
+    End,
 }
 
 /// Chunks rendered for an in-flight OpenAI-format body, at most this many
@@ -322,19 +335,40 @@ async fn produce_openai_body(
 const OPENAI_BODY_CHANNEL_CHUNKS: usize = 2;
 
 /// HTTP body fed by [`produce_openai_body`]; size unknown (chunked).
+///
+/// If the producer stops without its completion marker, the body yields an
+/// error so hyper aborts the connection instead of writing the final chunk
+/// terminator after truncated JSON.
 struct ChannelBody {
-    rx: tokio::sync::mpsc::Receiver<Bytes>,
+    rx: tokio::sync::mpsc::Receiver<BodyChunk>,
+    complete: bool,
 }
 
 impl http_body::Body for ChannelBody {
     type Data = Bytes;
-    type Error = Infallible;
+    type Error = std::io::Error;
 
     fn poll_frame(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Frame<Bytes>, Infallible>>> {
-        self.rx.poll_recv(cx).map(|chunk| chunk.map(|chunk| Ok(Frame::data(chunk))))
+    ) -> Poll<Option<Result<Frame<Bytes>, std::io::Error>>> {
+        if self.complete {
+            return Poll::Ready(None);
+        }
+        self.rx.poll_recv(cx).map(|message| match message {
+            Some(BodyChunk::Data(chunk)) => Some(Ok(Frame::data(chunk))),
+            Some(BodyChunk::End) => {
+                self.complete = true;
+                None
+            }
+            None => Some(Err(std::io::Error::other(
+                "generate response body render task ended before completion",
+            ))),
+        })
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.complete
     }
 }
 
@@ -405,6 +439,19 @@ mod tests {
             const { std::cell::Cell::new(0) };
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn openai_render_task_failure_errors_the_body_instead_of_ending_it() {
+        // An invariant violation (an empty row slipping past validation)
+        // panics the render task midway. The body must fail, so hyper aborts
+        // the connection rather than writing a clean chunked terminator after
+        // truncated JSON.
+        let mut rows = positions();
+        rows[200].entries.clear();
+        let response = generate_response(test_envelope(), ChoiceLogprobs::OpenAi(rows));
+        let result = axum::body::to_bytes(response.into_body(), usize::MAX).await;
+        assert!(result.is_err(), "truncated body completed cleanly");
+    }
+
     #[tokio::test]
     async fn openai_producer_stops_when_body_is_dropped_and_is_bounded() {
         let many: Vec<PositionLogprobs> = positions().into_iter().cycle().take(64 * 50).collect();
@@ -416,7 +463,9 @@ mod tests {
             tx,
         ));
         // Head + one rendered chunk, then let the producer fill the channel.
-        assert_eq!(rx.recv().await.unwrap(), Bytes::from_static(b"["));
+        assert!(
+            matches!(rx.recv().await, Some(BodyChunk::Data(head)) if head == Bytes::from_static(b"["))
+        );
         rx.recv().await.unwrap();
         for _ in 0..10 {
             tokio::task::yield_now().await;
