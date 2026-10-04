@@ -137,7 +137,12 @@ pub async fn generate(
                 Ok(collected) => collected,
                 Err(error) => return collect_error(error),
             };
-            compact_choice_logprobs(accumulator, options.include_logprobs).and_then(|logprobs| {
+            compact_choice_logprobs(
+                accumulator,
+                options.include_logprobs,
+                collected.token_ids.len(),
+            )
+            .and_then(|logprobs| {
                 let envelope =
                     collect_generate(collected, prepared.request_id, api_server_options, options)?;
                 Ok((envelope, logprobs))
@@ -175,11 +180,16 @@ fn openai_choice_logprobs(
 fn compact_choice_logprobs(
     accumulator: CompactLogprobsAccumulator,
     include_logprobs: bool,
+    output_tokens: usize,
 ) -> Result<ChoiceLogprobs, ApiError> {
     if !include_logprobs {
         return Ok(ChoiceLogprobs::Compact(None));
     }
-    if !accumulator.saw_payload() {
+    // A request that produced no tokens (e.g. aborted while waiting: the
+    // engine / client abort output has no tokens and no logprobs payload)
+    // gets an empty block with the requested width. Missing logprobs for
+    // produced tokens are still an engine failure.
+    if !accumulator.saw_payload() && output_tokens > 0 {
         return Err(ApiError::server_error(
             "raw generate response requested logprobs but generation returned none".to_string(),
         ));
@@ -736,7 +746,8 @@ mod tests {
             .await
             .expect("collect");
         assert!(collected.logprobs.is_none());
-        let logprobs = compact_choice_logprobs(accumulator, include_logprobs)?;
+        let logprobs =
+            compact_choice_logprobs(accumulator, include_logprobs, collected.token_ids.len())?;
         let envelope = collect_generate(
             collected,
             "compact-1".to_string(),
@@ -845,6 +856,25 @@ mod tests {
         assert_eq!(block["num_positions"], 0);
         assert_eq!(block["num_slots"], 3);
         assert_eq!(block["token_ids"], "");
+    }
+
+    #[tokio::test]
+    async fn compact_zero_token_abort_without_payload_returns_empty_block() {
+        // The real shape: the client-synthesized abort output (and the engine's
+        // abort of a waiting request) carries no tokens and `logprobs: None`.
+        let json = compact_response_json(vec![step(vec![], None, Some(FinishReason::Abort))], true)
+            .await
+            .expect("zero-token abort is a 200 with an empty block");
+        let choice = &json["choices"][0];
+        assert_eq!(choice["finish_reason"], "abort");
+        assert_eq!(choice["token_ids"], json!([]));
+        assert!(choice["logprobs"].is_null());
+        let block = &choice["compact_logprobs"];
+        assert_eq!(block["num_positions"], 0);
+        assert_eq!(block["num_slots"], 3);
+        assert_eq!(block["token_ids"], "");
+        assert_eq!(block["logprobs"], "");
+        assert_eq!(block["ranks"], "");
     }
 
     #[tokio::test]

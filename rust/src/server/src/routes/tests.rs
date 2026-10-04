@@ -6896,3 +6896,92 @@ async fn non_stream_raw_generate_returns_compact_logprobs() {
     assert_eq!(floats, vec![-0.1, -0.2, -0.1, -0.2]);
     assert_eq!(ints(decode("ranks")), vec![1, 1]);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn non_stream_raw_generate_compact_zero_token_abort_returns_empty_block() {
+    let ipc = IpcNamespace::new().expect("create ipc namespace");
+    let handshake_address = ipc.handshake_endpoint();
+    let engine_id = b"engine-raw-generate-compact-abort".to_vec();
+
+    let engine_task = MockEngineTask::new(spawn_mock_engine_task(
+        handshake_address.clone(),
+        engine_id.clone(),
+        |dealer, push| {
+            boxed_test_future(async move {
+                let add = recv_engine_message(dealer).await;
+                let request: EngineCoreRequest =
+                    rmp_serde::from_slice(&add[1]).expect("decode request");
+
+                // Engine abort of a request that produced no output yet:
+                // no tokens and no logprobs (vllm/v1/engine/core.py).
+                send_outputs(
+                    push,
+                    RequestBatchOutputs {
+                        outputs: vec![request_output_with_logprobs(
+                            &request.request_id,
+                            vec![],
+                            Some(EngineCoreFinishReason::Abort),
+                            None,
+                            None,
+                            None,
+                        )],
+                        ..Default::default()
+                    }
+                    .into(),
+                )
+                .await;
+            })
+        },
+    ));
+
+    let client = EngineCoreClient::connect(
+        EngineCoreClientConfig::new_single(handshake_address)
+            .with_model_name("test-model")
+            .with_local_input_output_addresses(
+                Some(ipc.input_endpoint()),
+                Some(ipc.output_endpoint()),
+            ),
+    )
+    .await
+    .expect("connect client");
+    let chat = ChatLlm::from_shared_backend(Llm::new(client), Arc::new(FakeChatBackend::new()));
+    let mut app = build_router(Arc::new(AppState::new(
+        vec!["Qwen/Qwen1.5-0.5B-Chat".to_string()],
+        chat,
+    )));
+
+    let response = app
+        .call(
+            Request::builder()
+                .method("POST")
+                .uri("/inference/v1/generate")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "request_id": "raw-compact-abort",
+                        "model": "Qwen/Qwen1.5-0.5B-Chat",
+                        "token_ids": [11, 22],
+                        "logprobs_format": "compact",
+                        "sampling_params": {"max_tokens": 4, "logprobs": 5}
+                    })
+                    .to_string(),
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("call app");
+
+    let status = response.status();
+    let body = to_bytes(response.into_body(), usize::MAX).await.expect("read body");
+    engine_task.await.expect("mock engine task");
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("decode json");
+    let choice = &json["choices"][0];
+    assert_eq!(choice["finish_reason"], "abort");
+    assert_eq!(choice["token_ids"], json!([]));
+    let block = &choice["compact_logprobs"];
+    assert_eq!(block["num_positions"], 0);
+    assert_eq!(block["num_slots"], 6);
+    assert_eq!(block["token_ids"], "");
+}
