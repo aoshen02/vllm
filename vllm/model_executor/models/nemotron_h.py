@@ -532,20 +532,8 @@ class NemotronHAttention(nn.Module):
         if envs.VLLM_BATCH_INVARIANT:
             from vllm.v1.attention.backends.flash_attn_fixed_split import (
                 FlashAttnFixedSplitBackend,
-                fixed_split_unsupported_reason,
             )
 
-            reason = fixed_split_unsupported_reason(
-                self.head_dim,
-                cache_config.cache_dtype if cache_config else "auto",
-                sliding_window,
-                model_config.max_model_len if model_config else 0,
-            )
-            if reason is not None:
-                raise ValueError(
-                    f"VLLM_BATCH_INVARIANT=1 for Nemotron-H uses fixed split-KV "
-                    f"FA4 attention, which {reason}."
-                )
             attn_backend = FlashAttnFixedSplitBackend
 
         self.attn = Attention(

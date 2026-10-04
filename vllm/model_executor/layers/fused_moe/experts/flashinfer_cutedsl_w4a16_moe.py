@@ -205,12 +205,8 @@ class FlashInferCuteDSLW4A16Experts(FlashInferCuteDSLExperts):
         expert_tokens_meta,
         apply_router_weight_on_input,
     ):
-        if hidden_states.dtype != torch.bfloat16 or a1q_scale is not None:
-            raise ValueError("Expected unquantized BF16 activations")
-        if apply_router_weight_on_input or activation != MoEActivation.RELU2_NO_MUL:
-            raise ValueError("Unsupported W4A16 routing/activation contract")
-        if global_num_experts != self.global_num_experts:
-            raise ValueError("Global expert count changed")
+        if a1q_scale is not None or apply_router_weight_on_input:
+            raise ValueError("Expected unquantized activations, routing on output")
         inputs = [
             hidden_states,
             topk_ids.to(torch.int32),
