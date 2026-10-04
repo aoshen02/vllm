@@ -263,18 +263,34 @@ impl OpenAiRenderer {
     }
 
     fn render_chunk(&mut self) -> Bytes {
+        let chunk: Vec<PositionLogprobs> =
+            self.positions.by_ref().take(OPENAI_POSITIONS_PER_CHUNK).collect();
+        // Fill missing fragments under the write lock only when needed, then
+        // render under the shared read lock (render threads run in parallel).
+        let missing = {
+            let fragments = TOKEN_FRAGMENTS.read().unwrap_or_else(|e| e.into_inner());
+            chunk
+                .iter()
+                .flat_map(|position| &position.entries)
+                .any(|entry| fragments.missing(entry.token_id))
+        };
+        if missing {
+            TOKEN_FRAGMENTS
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .ensure_positions(&chunk);
+        }
+        let fragments = TOKEN_FRAGMENTS.read().unwrap_or_else(|e| e.into_inner());
         let mut out = Vec::with_capacity(self.capacity_hint);
-        TOKEN_FRAGMENTS.with(|fragments| {
-            let mut fragments = fragments.borrow_mut();
-            for position in self.positions.by_ref().take(OPENAI_POSITIONS_PER_CHUNK) {
-                if !std::mem::replace(&mut self.first, false) {
-                    out.push(b',');
-                }
-                write_openai_position_cached(&mut out, &position, &mut fragments);
-                #[cfg(test)]
-                tests::RENDERED_ON_THREAD.with(|count| count.set(count.get() + 1));
+        for position in &chunk {
+            if !std::mem::replace(&mut self.first, false) {
+                out.push(b',');
             }
-        });
+            write_openai_position_cached(&mut out, position, &fragments);
+            #[cfg(test)]
+            tests::RENDERED_ON_THREAD.with(|count| count.set(count.get() + 1));
+        }
+        drop(fragments);
         self.capacity_hint = out.len() + out.len() / 8;
         Bytes::from(out)
     }
@@ -439,22 +455,26 @@ fn write_f32(out: &mut Vec<u8>, value: f32) {
     serde_json::to_writer(&mut *out, &value).expect("f32 serializes");
 }
 
-/// Token ids at or above this are rendered without the fragment cache (the
-/// dense index is bounded at 8 B per id, i.e. 8 MiB per thread).
+/// Token ids at or above this are rendered without the fragment cache, which
+/// bounds the dense index at 8 B per id (8 MiB) process-wide.
 const MAX_CACHED_TOKEN_ID: u32 = 1 << 20;
 
-thread_local! {
-    /// Per-thread cache of the id-dependent JSON around each candidate's
-    /// logprob. Render tasks run on the request runtime's few threads, so the
-    /// cache is shared by all requests rendered there and needs no locking.
-    static TOKEN_FRAGMENTS: std::cell::RefCell<TokenFragments> =
-        std::cell::RefCell::new(TokenFragments::default());
-}
+/// Fragments are stored in fixed blocks that are allocated once at exactly
+/// this capacity and never reallocated.
+const FRAGMENT_BLOCK_BYTES: usize = 64 << 10;
 
-/// Location of one token id's fragments in [`TokenFragments::arena`].
+/// Process-wide, append-only cache of the id-dependent JSON around each
+/// candidate's logprob. One table serves every render thread: retained
+/// memory is about 8 B per id up to the largest id seen plus ~95 B per
+/// distinct id (≈15 MiB for a 151,936-token vocabulary), not per thread.
+static TOKEN_FRAGMENTS: std::sync::LazyLock<std::sync::RwLock<TokenFragments>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Location of one token id's fragments in [`TokenFragments::blocks`].
 #[derive(Clone, Copy, Default)]
 struct FragmentSlot {
-    offset: u32,
+    block: u32,
+    offset: u16,
     prefix_len: u8,
     /// `0` means not rendered yet (a real entry is never empty).
     total_len: u8,
@@ -466,48 +486,86 @@ struct FragmentSlot {
 #[derive(Default)]
 pub(super) struct TokenFragments {
     slots: Vec<FragmentSlot>,
-    arena: Vec<u8>,
+    blocks: Vec<Vec<u8>>,
 }
 
 impl TokenFragments {
-    /// The (prefix, suffix) fragments for `token_id`, rendering them on first
-    /// use; `None` for ids beyond the cache bound.
-    fn get(&mut self, token_id: u32) -> Option<(&[u8], &[u8])> {
-        if token_id >= MAX_CACHED_TOKEN_ID {
-            return None;
+    /// Whether `token_id` is cacheable but not rendered yet.
+    fn missing(&self, token_id: u32) -> bool {
+        token_id < MAX_CACHED_TOKEN_ID
+            && self.slots.get(token_id as usize).is_none_or(|slot| slot.total_len == 0)
+    }
+
+    /// Render the fragments of every cacheable id in `positions` that is not
+    /// cached yet.
+    pub(super) fn ensure_positions(&mut self, positions: &[PositionLogprobs]) {
+        for entry in positions.iter().flat_map(|position| &position.entries) {
+            if self.missing(entry.token_id) {
+                self.insert(entry.token_id);
+            }
         }
+    }
+
+    fn insert(&mut self, token_id: u32) {
         let index = token_id as usize;
         if index >= self.slots.len() {
+            // Exact growth: the index is sized by the largest id seen.
+            self.slots.reserve_exact(index + 1 - self.slots.len());
             self.slots.resize(index + 1, FragmentSlot::default());
         }
-        if self.slots[index].total_len == 0 {
-            let offset = self.arena.len();
-            let mut digits_buf = [0_u8; 10];
-            let digits = format_u32(token_id, &mut digits_buf);
-            self.arena.extend_from_slice(b"{\"token\":\"token_id:");
-            self.arena.extend_from_slice(digits);
-            self.arena.extend_from_slice(b"\",\"logprob\":");
-            let prefix_len = self.arena.len() - offset;
-            write_bytes_suffix(&mut self.arena, digits);
-            let total_len = self.arena.len() - offset;
-            self.slots[index] = FragmentSlot {
-                offset: u32::try_from(offset).expect("fragment arena below 4 GiB"),
-                prefix_len: prefix_len as u8,
-                total_len: total_len as u8,
-            };
+        let mut digits_buf = [0_u8; 10];
+        let digits = format_u32(token_id, &mut digits_buf);
+        let mut entry = Vec::with_capacity(128);
+        entry.extend_from_slice(b"{\"token\":\"token_id:");
+        entry.extend_from_slice(digits);
+        entry.extend_from_slice(b"\",\"logprob\":");
+        let prefix_len = entry.len();
+        write_bytes_suffix(&mut entry, digits);
+        if self
+            .blocks
+            .last()
+            .is_none_or(|block| block.len() + entry.len() > FRAGMENT_BLOCK_BYTES)
+        {
+            self.blocks.push(Vec::with_capacity(FRAGMENT_BLOCK_BYTES));
         }
-        let slot = self.slots[index];
+        let block_index = self.blocks.len() - 1;
+        let block = &mut self.blocks[block_index];
+        let offset = block.len();
+        block.extend_from_slice(&entry);
+        self.slots[index] = FragmentSlot {
+            block: u32::try_from(block_index).expect("fewer than 2^32 fragment blocks"),
+            offset: u16::try_from(offset).expect("offset within a 64 KiB block"),
+            prefix_len: prefix_len as u8,
+            total_len: entry.len() as u8,
+        };
+    }
+
+    /// The (prefix, suffix) fragments for a cached `token_id`; `None` for ids
+    /// beyond the cache bound or not yet ensured.
+    fn get(&self, token_id: u32) -> Option<(&[u8], &[u8])> {
+        let slot = *self.slots.get(token_id as usize)?;
+        if slot.total_len == 0 {
+            return None;
+        }
         let start = slot.offset as usize;
-        let entry = &self.arena[start..start + slot.total_len as usize];
+        let entry = &self.blocks[slot.block as usize][start..start + slot.total_len as usize];
         Some(entry.split_at(slot.prefix_len as usize))
+    }
+
+    /// Bytes retained by the table (index and fragment blocks).
+    #[cfg(test)]
+    fn retained_bytes(&self) -> usize {
+        self.slots.capacity() * std::mem::size_of::<FragmentSlot>()
+            + self.blocks.iter().map(Vec::capacity).sum::<usize>()
     }
 }
 
-/// [`write_openai_position`] using the per-thread fragment cache.
+/// [`write_openai_position`] using the fragment cache (ids missing from it
+/// fall back to the uncached writer, so the output never depends on it).
 pub(super) fn write_openai_position_cached(
     out: &mut Vec<u8>,
     position: &PositionLogprobs,
-    fragments: &mut TokenFragments,
+    fragments: &TokenFragments,
 ) {
     let chosen = &position.entries[0];
     write_candidate_cached(out, fragments, chosen.token_id, chosen.logprob);
@@ -524,7 +582,7 @@ pub(super) fn write_openai_position_cached(
 
 fn write_candidate_cached(
     out: &mut Vec<u8>,
-    fragments: &mut TokenFragments,
+    fragments: &TokenFragments,
     token_id: u32,
     logprob: f32,
 ) {
@@ -546,6 +604,99 @@ mod tests {
         /// OpenAI positions rendered on the current thread.
         pub(super) static RENDERED_ON_THREAD: std::cell::Cell<usize> =
             const { std::cell::Cell::new(0) };
+    }
+
+    fn rss_kib() -> u64 {
+        std::fs::read_to_string("/proc/self/status")
+            .unwrap_or_default()
+            .lines()
+            .find_map(|l| l.strip_prefix("VmRSS:"))
+            .and_then(|v| v.trim().trim_end_matches("kB").trim().parse().ok())
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn fragment_table_retains_about_one_entry_per_distinct_id() {
+        let vocab = 151_936_u32;
+        let mut fragments = TokenFragments::default();
+        let positions: Vec<_> = (0..vocab)
+            .step_by(129)
+            .map(|start| PositionLogprobs {
+                entries: (start..(start + 129).min(vocab))
+                    .map(|token_id| vllm_llm::TokenLogprob {
+                        token_id,
+                        logprob: -1.0,
+                        rank: 1,
+                    })
+                    .collect(),
+            })
+            .collect();
+        fragments.ensure_positions(&positions);
+        let retained = fragments.retained_bytes();
+        // 8 B index per id + ~95 B of fragments per id, in 64 KiB blocks.
+        assert!(retained < 16 << 20, "retained {retained} B");
+        // Ids that were never ensured fall back to the uncached writer.
+        let unseen = PositionLogprobs {
+            entries: vec![vllm_llm::TokenLogprob {
+                token_id: vocab + 7,
+                logprob: -0.5,
+                rank: 1,
+            }],
+        };
+        let mut cached = Vec::new();
+        write_openai_position_cached(&mut cached, &unseen, &fragments);
+        let mut uncached = Vec::new();
+        write_openai_position(&mut uncached, &unseen);
+        assert_eq!(cached, uncached);
+    }
+
+    #[test]
+    fn fragment_cache_memory_is_shared_across_render_threads() {
+        // Four render threads each touch every id of a 151,936 vocab. A
+        // per-thread cache would retain ~4x the table; a shared one ~1x.
+        let vocab = 151_936_u32;
+        let threads = 4;
+        let rendered = std::sync::Arc::new(std::sync::Barrier::new(threads + 1));
+        let release = std::sync::Arc::new(std::sync::Barrier::new(threads + 1));
+        let before = rss_kib();
+        let handles: Vec<_> = (0..threads)
+            .map(|_| {
+                let rendered = rendered.clone();
+                let release = release.clone();
+                std::thread::spawn(move || {
+                    let positions: Vec<PositionLogprobs> = (0..vocab)
+                        .step_by(128)
+                        .map(|start| PositionLogprobs {
+                            entries: (start..(start + 128).min(vocab))
+                                .map(|token_id| vllm_llm::TokenLogprob {
+                                    token_id,
+                                    logprob: -1.5,
+                                    rank: 1,
+                                })
+                                .collect(),
+                        })
+                        .collect();
+                    let mut renderer = OpenAiRenderer::new(positions);
+                    while let Some(chunk) = renderer.next_chunk() {
+                        std::hint::black_box(chunk);
+                    }
+                    rendered.wait();
+                    release.wait();
+                })
+            })
+            .collect();
+        rendered.wait();
+        let grown_mib = rss_kib().saturating_sub(before) / 1024;
+        // One table for all threads (RSS is printed for information only:
+        // allocator arenas and concurrently running tests make it noisy).
+        let table = TOKEN_FRAGMENTS.read().unwrap().retained_bytes();
+        println!("render threads: RSS +{grown_mib} MiB, shared table {table} B");
+        release.wait();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        // Shared table for 151,936 ids: ~1.2 MiB index + ~14 MiB fragments.
+        assert!(table < 16 << 20, "shared table retained {table} B");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -619,7 +770,8 @@ mod tests {
                 )
                 .unwrap();
                 let mut cached = Vec::new();
-                write_openai_position_cached(&mut cached, &position, &mut fragments);
+                fragments.ensure_positions(std::slice::from_ref(&position));
+                write_openai_position_cached(&mut cached, &position, &fragments);
                 let mut uncached = Vec::new();
                 write_openai_position(&mut uncached, &position);
                 assert_eq!(
