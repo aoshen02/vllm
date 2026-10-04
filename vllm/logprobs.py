@@ -168,11 +168,29 @@ _FLOAT64 = np.dtype("<f8")
 _INT32_INFO = np.iinfo(np.int32)
 
 
+_NARROW_INTS = frozenset(
+    np.dtype(t) for t in (np.int8, np.int16, np.int32, np.uint8, np.uint16)
+)
+_MIN_REDUCE = np.minimum.reduce
+_MAX_REDUCE = np.maximum.reduce
+
+
 def _storage_int_dtype(values: np.ndarray) -> np.dtype:
-    """int32 unless a value does not fit (then int64; never wraps)."""
-    if values.dtype == np.int32 or values.size == 0:
+    """int32 unless a value does not fit (then int64; never wraps).
+
+    Called per engine step: the engine's int32 ids need no scan, and tiny
+    arrays (e.g. one rank per step) are checked in Python, which is several
+    times cheaper than numpy reductions at that size.
+    """
+    if values.dtype in _NARROW_INTS or values.size == 0:
         return _INT32
-    if int(values.min()) >= _INT32_INFO.min and int(values.max()) <= _INT32_INFO.max:
+    flat = values.reshape(-1)
+    if flat.size <= 8:
+        items = flat.tolist()
+        lo, hi = min(items), max(items)
+    else:
+        lo, hi = int(_MIN_REDUCE(flat)), int(_MAX_REDUCE(flat))
+    if lo >= _INT32_INFO.min and hi <= _INT32_INFO.max:
         return _INT32
     return _INT64
 
@@ -318,6 +336,11 @@ class ArrayLogprobs(MutableSequence[LogprobsOnePosition | None]):
     # (DELTA outputs slice suffixes of the cumulative container).
     source_positions: int | None = None
     wire_base64: InitVar[bool] = False
+    # Fast path for appends into the tail block (see _tail_can_hold).
+    _tail_block: np.ndarray | None = field(default=None, init=False, repr=False)
+    _tail_dtypes: tuple[np.dtype, np.dtype, np.dtype] | None = field(
+        default=None, init=False, repr=False
+    )
     _wire: _WireEncoder | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self, wire_base64: bool) -> None:
@@ -423,6 +446,8 @@ class ArrayLogprobs(MutableSequence[LogprobsOnePosition | None]):
     def _tail_can_hold(self, dtypes: tuple[np.dtype, np.dtype, np.dtype]) -> bool:
         if not self.rank_chunks or self._tail_fill == len(self.rank_chunks[-1]):
             return False
+        if self.rank_chunks[-1] is self._tail_block and dtypes == self._tail_dtypes:
+            return True  # same dtypes as the block was created with
         blocks = (
             self.token_id_chunks[-1],
             self.logprob_chunks[-1],
@@ -455,6 +480,8 @@ class ArrayLogprobs(MutableSequence[LogprobsOnePosition | None]):
         self.logprob_chunks.append(np.empty((rows, width), dtype=lp_dtype))
         self.rank_chunks.append(np.empty((rows,), dtype=rank_dtype))
         self._tail_fill = 0
+        self._tail_block = self.rank_chunks[-1]
+        self._tail_dtypes = dtypes
 
     def _filled_block(self, i: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """The used ``(token_ids, logprobs, ranks)`` rows of block ``i``."""

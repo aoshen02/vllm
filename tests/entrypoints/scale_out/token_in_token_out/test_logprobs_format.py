@@ -1854,3 +1854,34 @@ def test_lead_table_warm_lookups_do_not_take_the_lock():
     with table.lock:
         result = table.lookup(ids)  # would deadlock if it took the lock
     assert result[1, 1] == b'{"token":"token_id:4","logprob":'
+
+
+@pytest.mark.parametrize("size", [1, 8, 9, 129])
+def test_storage_int_dtype_fast_paths(size):
+    from vllm import logprobs as logprobs_mod
+
+    check = logprobs_mod._storage_int_dtype
+    for dtype in (np.int8, np.int16, np.int32, np.uint8, np.uint16):
+        assert check(np.ones(size, dtype=dtype)) == np.dtype("<i4")
+    values = np.zeros(size, dtype=np.int64)
+    assert check(values) == np.dtype("<i4")
+    values[-1] = 2**31
+    assert check(values) == np.dtype("<i8")
+    values[-1] = -(2**31) - 1
+    assert check(values) == np.dtype("<i8")
+    values[-1] = -(2**31)
+    assert check(values) == np.dtype("<i4")
+    assert check(np.full(size, 2**31 - 1, dtype=np.uint32)) == np.dtype("<i4")
+    assert check(np.full(size, 2**31, dtype=np.uint32)) == np.dtype("<i8")
+
+
+def test_tail_fast_path_still_widens(monkeypatch):
+    token_ids, logprobs, ranks = _engine_rows(0, 3, 4)
+    container = ArrayLogprobs()
+    container.append_rows(token_ids[:1].astype(np.int32), logprobs[:1], ranks[:1])
+    container.append_rows(token_ids[1:2].astype(np.int32), logprobs[1:2], ranks[1:2])
+    wide = token_ids[2:3].copy()
+    wide[0, 1] = 2**33
+    container.append_rows(wide, logprobs[2:3], ranks[2:3])
+    assert container[2][2**33].logprob == float(logprobs[2, 1])
+    assert container.arrays()[0].dtype == np.int64
