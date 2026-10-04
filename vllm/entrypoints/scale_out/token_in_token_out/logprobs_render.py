@@ -58,6 +58,30 @@ def _as_wire_int32(values: np.ndarray, what: str) -> np.ndarray:
     return values.astype("<i4")
 
 
+def _check_compact_rows(container: ArrayLogprobs, num_logprobs: int | None) -> None:
+    """Refuse rows the compact format cannot represent (GenerationError, 500):
+    inconsistent widths, or a width other than ``k + 1`` for ``k >= 0``
+    (e.g. narrower rows when a co-batched request's ``logprob_token_ids``
+    replaced the batch's logprob tensors)."""
+    if not container.is_regular:
+        raise GenerationError(
+            "Engine logprob rows have inconsistent widths; the compact "
+            "logprobs format cannot represent them"
+        )
+    stored = container.num_slots
+    if (
+        stored is not None
+        and num_logprobs is not None
+        and num_logprobs >= 0
+        and stored != num_logprobs + 1
+    ):
+        raise GenerationError(
+            f"Engine logprob rows have {stored} slots, expected "
+            f"{num_logprobs + 1}; the compact logprobs format cannot "
+            "represent them"
+        )
+
+
 def compact_logprobs_fields(
     container: ArrayLogprobs, num_logprobs: int | None
 ) -> tuple[int, int, bytes, bytes, bytes]:
@@ -66,11 +90,7 @@ def compact_logprobs_fields(
     Raises GenerationError (HTTP 500) when the engine rows cannot be
     represented: inconsistent row widths or ids/ranks beyond int32.
     """
-    if not container.is_regular:
-        raise GenerationError(
-            "Engine logprob rows have inconsistent widths; the compact "
-            "logprobs format cannot represent them"
-        )
+    _check_compact_rows(container, num_logprobs)
     token_ids, logprobs, ranks = container.arrays()
     # Arrays are C-contiguous little-endian (ArrayLogprobs). The wire format
     # is int32/float32; engine data normally already has these dtypes.
@@ -95,7 +115,8 @@ def render_compact_logprobs_parts(
     token_ids: bytes | list[bytes]
     logprobs: bytes | list[bytes]
     ranks: bytes | list[bytes]
-    wire = container.wire_parts() if container.is_regular else None
+    _check_compact_rows(container, num_logprobs)
+    wire = container.wire_parts()
     if wire is not None:
         # Encoded while the rows arrived (ArrayLogprobs wire mode).
         n, stored_slots, token_ids, logprobs, ranks = wire
@@ -135,20 +156,6 @@ def render_compact_logprobs(
     return b"".join(render_compact_logprobs_parts(container, num_logprobs))
 
 
-class _ItemPrefixCache(dict[int, bytes]):
-    """token id -> ``{"token":"token_id:<id>","logprob":`` (bounded)."""
-
-    # ~13 MB at most per process; ids beyond the bound are not cached.
-    max_size = 1 << 17
-
-    def __missing__(self, token_id: int) -> bytes:
-        value = f'{{"token":"token_id:{token_id}","logprob":'.encode("ascii")
-        if len(self) < self.max_size:
-            self[token_id] = value
-        return value
-
-
-_ITEM_PREFIX = _ItemPrefixCache()
 _SEP_TOP_FIRST = b',"bytes":null,"top_logprobs":['
 _SEP_TOP_NEXT = b',"bytes":null},'
 _END_WITH_TOP = b',"bytes":null}]}'
@@ -181,10 +188,16 @@ class _LeadTable:
             return np.empty(ids.shape, dtype=object)
         lo, hi = int(ids.min()), int(ids.max())
         if lo < 0 or hi >= self.max_ids:
-            flat = [self._format(i) for i in ids.ravel().tolist()]
-            result = np.empty(len(flat), dtype=object)
-            result[:] = flat
-            return result.reshape(ids.shape)
+            # Ids outside the table are formatted directly, the rest cached.
+            inside = (ids >= 0) & (ids < self.max_ids)
+            result = np.empty(ids.shape, dtype=object)
+            if inside.any():
+                result[inside] = self.lookup(ids[inside])
+            outside = [self._format(i) for i in ids[~inside].tolist()]
+            column = np.empty(len(outside), dtype=object)
+            column[:] = outside
+            result[~inside] = column
+            return result
         with self.lock:
             if hi >= len(self.values):
                 size = min(self.max_ids, max(hi + 1, 2 * len(self.values)))
@@ -203,6 +216,7 @@ class _LeadTable:
 
 
 _NEXT_LEADS = _LeadTable(_SEP_TOP_NEXT)
+_PLAIN_LEADS = _LeadTable(b"")
 
 
 def format_float_reprs(values: np.ndarray, exact_float32: bool) -> list[bytes]:
@@ -362,7 +376,6 @@ def render_openai_logprobs_parts(
 
     exact_float32 = logprobs.dtype == np.float32
     width = limit + 1
-    item = _ITEM_PREFIX.__getitem__
     row_end = _END_WITH_TOP if limit else _END_NO_TOP
     row_sep = row_end + b","
     # Each value is preceded by one "lead" piece: the separator closing the
@@ -376,13 +389,12 @@ def render_openai_logprobs_parts(
         out: list[bytes] = [b""] * (2 * (stop - start) * width)
         if limit > 1:
             out[0::2] = _NEXT_LEADS.lookup(block_ids).ravel().tolist()
-        out[0 :: 2 * width] = [row_sep + item(i) for i in block_ids[:, 0].tolist()]
+        plain = _PLAIN_LEADS.lookup(block_ids[:, : min(width, 2)]).tolist()
+        out[0 :: 2 * width] = [row_sep + lead[0] for lead in plain]
         if start == 0:
-            out[0] = item(int(block_ids[0, 0]))
+            out[0] = plain[0][0]
         if limit:
-            out[2 :: 2 * width] = [
-                _SEP_TOP_FIRST + item(i) for i in block_ids[:, 1].tolist()
-            ]
+            out[2 :: 2 * width] = [_SEP_TOP_FIRST + lead[1] for lead in plain]
         out[1::2] = format_float_reprs(values[start:stop].ravel(), exact_float32)
         parts.append(b"".join(out))
     parts.append(row_end + b"]}")

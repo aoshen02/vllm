@@ -3,6 +3,8 @@
 
 
 import asyncio
+import contextvars
+import functools
 import time
 from collections.abc import AsyncGenerator
 from collections.abc import Sequence as GenericSequence
@@ -362,19 +364,54 @@ class ServingTokens(GenerateBaseServing):
             # requests (pause, health, sends) keep being served. One thread
             # per process: builds stay sequential (first bodies finish and
             # can be sent early; peak memory as with inline builds).
-            return await asyncio.get_running_loop().run_in_executor(
+            # The context copy keeps contextvars (tracing, logging) visible.
+            context = contextvars.copy_context()
+            built = await asyncio.get_running_loop().run_in_executor(
                 _RESPONSE_BUILDER,
-                self._build_full_response,
-                request,
-                final_res,
-                request_id,
-                model_name,
-                request_metadata,
-                created_time,
+                functools.partial(
+                    context.run,
+                    self._build_full_response,
+                    request,
+                    final_res,
+                    request_id,
+                    model_name,
+                    created_time,
+                ),
             )
-        return self._build_full_response(
-            request, final_res, request_id, model_name, request_metadata, created_time
-        )
+        else:
+            built = self._build_full_response(
+                request, final_res, request_id, model_name, created_time
+            )
+        # Shared-state side effects stay on the event loop.
+        response, usage, choice_meta = built
+        request_metadata.final_usage_info = usage
+        self._log_full_response(request_id, final_res, choice_meta)
+        return response
+
+    def _log_full_response(
+        self,
+        request_id: str,
+        final_res: RequestOutput,
+        choice_meta: list[tuple[int, str | None]],
+    ) -> None:
+        # Log complete response if output logging is enabled
+        if self.enable_log_outputs and self.request_logger:
+            for index, finish_reason in choice_meta:
+                # Get the corresponding output token IDs
+                output_token_ids = None
+                if index < len(final_res.outputs):
+                    output_token_ids = final_res.outputs[index].token_ids
+
+                if output_token_ids:
+                    # Log token_ids only.
+                    self.request_logger.log_outputs(
+                        request_id=request_id,
+                        outputs="",
+                        output_token_ids=output_token_ids,
+                        finish_reason=finish_reason,
+                        is_streaming=False,
+                        delta=False,
+                    )
 
     @staticmethod
     def _num_logprob_entries(request: GenerateRequest, final_res: RequestOutput) -> int:
@@ -395,10 +432,15 @@ class ServingTokens(GenerateBaseServing):
         final_res: RequestOutput,
         request_id: str,
         model_name: str,
-        request_metadata: RequestResponseMetadata,
         created_time: int,
-    ) -> GenerateResponse | RenderedGenerateResponse:
-        """Build the final response (CPU only; may run in a worker thread)."""
+    ) -> tuple[
+        GenerateResponse | RenderedGenerateResponse,
+        UsageInfo,
+        list[tuple[int, str | None]],
+    ]:
+        """Build the final response, its usage and (index, finish_reason) per
+        choice. CPU only, no shared-state side effects: may run in a worker
+        thread."""
         sampling_params: SamplingParams = request.sampling_params
         compact = request.logprobs_format == "compact"
         # choice position -> field name -> pre-rendered JSON value
@@ -414,16 +456,20 @@ class ServingTokens(GenerateBaseServing):
 
             # This is top_logprobs in completions API
             logprobs = None
-            if sampling_params.logprobs is not None:
-                assert out_logprobs is not None, "Did not output logprobs"
-                if compact:
+            if compact:
+                # Compact carries whatever sample logprobs the engine returns
+                # (``logprobs`` and/or ``logprob_token_ids``).
+                if sampling_params.num_logprobs is not None:
+                    assert out_logprobs is not None, "Did not output logprobs"
                     fragments[len(choices)] = {
                         "compact_logprobs": render_compact_logprobs_parts(
                             self._require_array_logprobs(out_logprobs),
                             sampling_params.num_logprobs,
                         )
                     }
-                elif (
+            elif sampling_params.logprobs is not None:
+                assert out_logprobs is not None, "Did not output logprobs"
+                if (
                     isinstance(out_logprobs, ArrayLogprobs)
                     and (
                         rendered := render_openai_logprobs_parts(
@@ -434,10 +480,15 @@ class ServingTokens(GenerateBaseServing):
                 ):
                     fragments[len(choices)] = {"logprobs": rendered}
                 else:
-                    # Legacy containers or irregular rows.
+                    # Legacy containers or irregular rows (materialized in
+                    # one pass, not by per-position indexing).
                     logprobs = self._create_tokens_logprobs(
                         token_ids=token_ids,
-                        top_logprobs=out_logprobs,
+                        top_logprobs=(
+                            list(out_logprobs)
+                            if isinstance(out_logprobs, ArrayLogprobs)
+                            else out_logprobs
+                        ),
                         num_output_top_logprobs=sampling_params.logprobs,
                     )
 
@@ -482,8 +533,6 @@ class ServingTokens(GenerateBaseServing):
                 cached_tokens=final_res.num_cached_tokens
             )
 
-        request_metadata.final_usage_info = usage
-
         response = GenerateResponse(
             request_id=request_id,
             created=created_time,
@@ -495,30 +544,13 @@ class ServingTokens(GenerateBaseServing):
             ec_transfer_params=final_res.ec_transfer_params,
         )
 
-        # Log complete response if output logging is enabled
-        if self.enable_log_outputs and self.request_logger:
-            for choice in choices:
-                # Get the corresponding output token IDs
-                output_token_ids = None
-                if choice.index < len(final_res.outputs):
-                    output_token_ids = final_res.outputs[choice.index].token_ids
-
-                if output_token_ids:
-                    # Log token_ids only.
-                    self.request_logger.log_outputs(
-                        request_id=request_id,
-                        outputs="",
-                        output_token_ids=output_token_ids,
-                        finish_reason=choice.finish_reason,
-                        is_streaming=False,
-                        delta=False,
-                    )
-
+        choice_meta = [(choice.index, choice.finish_reason) for choice in choices]
         if fragments:
-            return RenderedGenerateResponse(
+            rendered_response = RenderedGenerateResponse(
                 render_json_with_fragments_parts(response.model_dump(), fragments)
             )
-        return response
+            return rendered_response, usage, choice_meta
+        return response, usage, choice_meta
 
     async def serve_tokens_stream_generator(
         self,
@@ -563,20 +595,22 @@ class ServingTokens(GenerateBaseServing):
 
                     logprobs = None
                     compact_logprobs = None
-                    if sampling_params.logprobs is not None:
-                        out_logprobs = output.logprobs
-                        assert out_logprobs is not None, "Did not output logprobs"
-                        if compact:
+                    if compact:
+                        if sampling_params.num_logprobs is not None:
+                            out_logprobs = output.logprobs
+                            assert out_logprobs is not None, "Did not output logprobs"
                             compact_logprobs = self._compact_logprobs_model(
                                 self._require_array_logprobs(out_logprobs),
                                 sampling_params.num_logprobs,
                             )
-                        else:
-                            logprobs = self._create_tokens_logprobs(
-                                token_ids=delta_token_ids,
-                                top_logprobs=out_logprobs,
-                                num_output_top_logprobs=sampling_params.logprobs,
-                            )
+                    elif sampling_params.logprobs is not None:
+                        out_logprobs = output.logprobs
+                        assert out_logprobs is not None, "Did not output logprobs"
+                        logprobs = self._create_tokens_logprobs(
+                            token_ids=delta_token_ids,
+                            top_logprobs=out_logprobs,
+                            num_output_top_logprobs=sampling_params.logprobs,
+                        )
 
                     routed_experts_b64 = (
                         numpy2base64(output.routed_experts)

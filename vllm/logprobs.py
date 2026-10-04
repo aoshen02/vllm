@@ -431,6 +431,14 @@ class ArrayLogprobs(MutableSequence[LogprobsOnePosition | None]):
         self, remaining: int, width: int, dtypes: tuple[np.dtype, np.dtype, np.dtype]
     ) -> None:
         tid_dtype, lp_dtype, rank_dtype = dtypes
+        if self.rank_chunks and self._tail_fill != len(self.rank_chunks[-1]):
+            # The tail block is only partly initialized (e.g. a dtype
+            # widening starts a new block early): shrink it to its used rows,
+            # since every block but the last is treated as fully used.
+            fill = self._tail_fill
+            self.token_id_chunks[-1] = self.token_id_chunks[-1][:fill].copy()
+            self.logprob_chunks[-1] = self.logprob_chunks[-1][:fill].copy()
+            self.rank_chunks[-1] = self.rank_chunks[-1][:fill].copy()
         row_bytes = width * (tid_dtype.itemsize + lp_dtype.itemsize)
         row_bytes += rank_dtype.itemsize
         max_rows = max(1, self.BLOCK_BYTES // row_bytes)
@@ -595,8 +603,14 @@ class ArrayLogprobs(MutableSequence[LogprobsOnePosition | None]):
         raise TypeError("Cannot insert logprobs to ArrayLogprobs")
 
     def __iter__(self) -> Iterator[LogprobsOnePosition]:
-        for i in range(self.num_positions):
-            yield self.__getitem__(i)
+        """Positions in order, in one pass over the blocks."""
+        self._unwire()
+        for i in range(len(self.rank_chunks)):
+            t, lp, r = self._filled_block(i)
+            for j in range(len(r)):
+                yield self._row_dict(t[j], lp[j], r[j])
+        if self._legacy is not None:
+            yield from list(self._legacy)
 
 
 # {token_id -> logprob} per each sequence group. None if the corresponding

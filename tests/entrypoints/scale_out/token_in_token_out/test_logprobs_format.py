@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Tests for the ``logprobs_format`` option of ``/inference/v1/generate``."""
 
+import contextvars
 import hashlib
 import json
 import threading
@@ -1095,17 +1096,25 @@ def test_generate_request_omits_default_logprobs_format():
     assert restored.logprobs_format == "compact"
 
 
-def test_item_prefix_cache_is_bounded(monkeypatch):
-    cache = logprobs_render._ItemPrefixCache()
-    monkeypatch.setattr(logprobs_render._ItemPrefixCache, "max_size", 8)
-    monkeypatch.setattr(logprobs_render, "_ITEM_PREFIX", cache)
+def test_plain_leads_cover_large_vocab(monkeypatch):
+    """Claude r2 #5: entry prefixes are cached for every id below the table
+    bound (no 131k cap); larger ids are formatted directly."""
+    table = logprobs_render._LeadTable(b"")
+    monkeypatch.setattr(logprobs_render, "_PLAIN_LEADS", table)
     token_ids, logprobs, ranks = _engine_rows(0, 20, 4)
+    # Sampled ids (plain-lead column) beyond the old 131,072-entry cap; keep
+    # the sampled-in-top-k duplicates consistent.
+    duplicate = token_ids[:, 1:] == token_ids[:, :1]
+    token_ids[:, 0] += 200_000
+    token_ids[:, 1:][duplicate] += 200_000
+    token_ids[3, 0] = 2**20 + 3  # beyond the table bound
     container, legacy = _containers(token_ids, logprobs, ranks, 3)
     sampled = token_ids[:, 0].tolist()
     assert render_openai_logprobs(sampled, container, 3) == _legacy_logprobs_bytes(
         sampled, legacy, 3
     )
-    assert len(cache) == 8
+    assert table.filled[int(token_ids[1, 0])]
+    assert len(table.filled) <= logprobs_render._LeadTable.max_ids
 
 
 # sha256 of the bodies the pre-change implementation (456c93187a, i.e. base
@@ -1392,3 +1401,192 @@ def test_lead_table_large_ids_and_growth(monkeypatch):
     assert render_openai_logprobs(sampled, container, 5) == _legacy_logprobs_bytes(
         sampled, legacy, 5
     )
+
+
+# --------------------------------------------- round-2 audit regressions
+
+
+def _single_row_appends(container, token_ids, logprobs, ranks, count):
+    for i in range(count):
+        container.append_rows(
+            token_ids[i : i + 1], logprobs[i : i + 1], ranks[i : i + 1]
+        )
+
+
+@pytest.mark.parametrize("widen", ["float64", "int64_id", "int64_rank"])
+def test_dtype_widening_mid_block_keeps_only_initialized_rows(widen):
+    """Codex/Claude r2 #1: 4 single-row appends leave the third block (cap 4)
+    with 1 initialized row; a widening append must not expose the rest."""
+    token_ids, logprobs32, ranks = _engine_rows(0, 5, 4)
+    token_ids = token_ids.astype(np.int64)
+    ranks = ranks.astype(np.int64)
+    logprobs: np.ndarray = logprobs32
+    if widen == "float64":
+        logprobs = logprobs32.astype(np.float64)
+        logprobs[4, 0] = -1.000000001
+    elif widen == "int64_id":
+        token_ids[4, 2] = 2**31 + 11
+    else:
+        ranks[4] = 2**31 + 13
+    container = ArrayLogprobs()
+    _single_row_appends(container, token_ids, logprobs32, ranks, 4)
+    assert [len(r) for r in container.rank_chunks] == [1, 2, 4]
+    container.append_rows(token_ids[4:], logprobs[4:], ranks[4:])
+    legacy: list = []
+    for i in range(5):
+        values = (logprobs if i == 4 else logprobs32)[i].tolist()
+        append_logprobs_for_next_position(
+            legacy, token_ids[i].tolist(), values, [None] * 4, int(ranks[i]), 3
+        )
+    assert len(container) == 5
+    assert container[4] == legacy[4]
+    assert list(container) == legacy
+    assert [list(container[i:]) for i in range(5)] == [legacy[i:] for i in range(5)]
+    for _ in range(2):
+        ids, values, rk = container.arrays()
+        assert ids.shape == (5, 4) and values.shape == (5, 4) and rk.shape == (5,)
+    sampled = token_ids[:, 0].tolist()
+    assert render_openai_logprobs(sampled, container, 3) == _legacy_logprobs_bytes(
+        sampled, legacy, 3
+    )
+    if widen == "float64":
+        block = json.loads(render_compact_logprobs(container, 3))
+        assert block["num_positions"] == 5
+        np.testing.assert_array_equal(_decode(block)[0], token_ids)
+    else:
+        with pytest.raises(GenerationError, match="int32"):
+            render_compact_logprobs(container, 3)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+async def test_compact_uniformly_narrow_rows_are_a_request_error(stream):
+    """Codex/Claude r2 #2: every row narrower than k+1 (co-batched
+    logprob_token_ids) is not representable: 500, not a num_slots=2 block."""
+    chunks = [_engine_rows(0, 3, 2), _engine_rows(3, 2, 2)]
+    feeder = _OutputProcessorEngine(chunks)
+    request = _request(logprobs=5, logprobs_format="compact", stream=stream)
+    if not stream:
+        with pytest.raises(GenerationError, match="2 slots, expected 6"):
+            await _serving(feeder).serve_tokens(request)
+        return
+    generator = await _serving(feeder).serve_tokens(request)
+    events = _parse_sse_chunks([chunk async for chunk in generator])
+    assert events[-1] == "[DONE]"
+    data = [e for e in events[:-1] if isinstance(e, dict)]
+    assert "error" in data[0]  # already the first chunk
+    assert not any("compact_logprobs" in str(e) for e in data)
+
+
+@pytest.mark.asyncio
+async def test_compact_logprob_token_ids_without_logprobs():
+    """Rust parity: logprob_token_ids alone gives a compact block with
+    S = len(ids) + 1 (num_logprobs); the default format stays as before."""
+    chunks = [_engine_rows(0, 3, 3)]
+    feeder = _OutputProcessorEngine(chunks)
+    response = await _serving(feeder).serve_tokens(
+        _request(
+            logprobs=None,
+            logprobs_format="compact",
+            sampling={"logprob_token_ids": [5, 9]},
+        )
+    )
+    choice = json.loads(response.body)["choices"][0]
+    assert choice["logprobs"] is None
+    assert choice["compact_logprobs"]["num_slots"] == 3
+    np.testing.assert_array_equal(_decode(choice["compact_logprobs"])[0], chunks[0][0])
+    feeder = _OutputProcessorEngine(chunks)
+    response = await _serving(feeder).serve_tokens(
+        _request(logprobs=None, sampling={"logprob_token_ids": [5, 9]})
+    )
+    dump = response.model_dump()["choices"][0]
+    assert dump["logprobs"] is None and "compact_logprobs" not in dump
+
+
+def test_irregular_fallback_is_linear(monkeypatch):
+    """Codex r2 #3: legacy materialization visits each block once."""
+    monkeypatch.setattr(ArrayLogprobs, "BLOCK_BYTES", 2 * (3 * 8 + 4))
+    token_ids, logprobs, ranks = _engine_rows(0, 64, 3)
+    container = ArrayLogprobs()
+    _single_row_appends(container, token_ids, logprobs, ranks, 64)
+    container.append_rows(token_ids[:1, :2], logprobs[:1, :2], ranks[:1])
+    assert not container.is_regular
+    visits: list[int] = []
+    original = ArrayLogprobs._filled_block
+
+    def counting(self, i):
+        visits.append(i)
+        return original(self, i)
+
+    monkeypatch.setattr(ArrayLogprobs, "_filled_block", counting)
+    positions = list(container)
+    assert len(positions) == 65
+    assert len(visits) == len(container.rank_chunks)
+
+
+@pytest.mark.asyncio
+async def test_offloaded_build_side_effects_on_loop_thread(monkeypatch):
+    """Kimi r2: usage metadata and output logging happen on the event loop
+    thread; contextvars are visible in the worker (Claude r2 #6)."""
+    from vllm.entrypoints.scale_out.token_in_token_out import serving as serving_mod
+
+    monkeypatch.setattr(serving_mod, "OFFLOAD_MIN_LOGPROB_ENTRIES", 0)
+    marker: contextvars.ContextVar[str] = contextvars.ContextVar("m", default="-")
+    marker.set("caller")
+    seen: dict[str, Any] = {}
+    original = ServingTokens._build_full_response
+
+    def recording(self, *args, **kwargs):
+        seen["builder_thread"] = threading.get_ident()
+        seen["builder_ctx"] = marker.get()
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(ServingTokens, "_build_full_response", recording)
+    feeder = _OutputProcessorEngine([_engine_rows(0, 3, 4)])
+    serving = _serving(feeder)
+    logger = MagicMock()
+    logger.log_outputs.side_effect = lambda **kw: seen.setdefault(
+        "log_thread", threading.get_ident()
+    )
+    serving.request_logger = logger
+    serving.enable_log_outputs = True
+    metadata_threads: list[int] = []
+
+    class Metadata:
+        def __setattr__(self, name, value):
+            metadata_threads.append(threading.get_ident())
+            object.__setattr__(self, name, value)
+
+    metadata = Metadata()
+    request = _request(logprobs=3)
+    ServingTokens._configure_logprobs(request, request.sampling_params)
+    response = await serving.serve_tokens_full_generator(
+        request,
+        feeder.generate(None, request.sampling_params, "r"),
+        "r",
+        "m",
+        metadata,  # type: ignore[arg-type]
+    )
+    assert isinstance(response, RenderedGenerateResponse)
+    loop_thread = threading.get_ident()
+    assert seen["builder_thread"] != loop_thread
+    assert seen["builder_ctx"] == "caller"
+    assert seen["log_thread"] == loop_thread
+    assert metadata_threads == [loop_thread]
+    assert metadata.final_usage_info.completion_tokens == 3  # type: ignore[attr-defined]
+
+
+def test_generate_request_schema_keeps_all_fields():
+    """Claude r2 #3: excluding the default logprobs_format must not empty the
+    serialization schema (it is the render endpoints' response model)."""
+    for mode in ("serialization", "validation"):
+        props = GenerateRequest.model_json_schema(mode=mode)["properties"]
+        assert set(GenerateRequest.model_fields) <= set(props) | {
+            name
+            for name, f in GenerateRequest.model_fields.items()
+            if f.alias and f.alias in props
+        }
+        assert "logprobs_format" in props
+    for model in (GenerateResponseChoice, GenerateResponseStreamChoice):
+        props = model.model_json_schema(mode="serialization")["properties"]
+        assert "compact_logprobs" in props and "token_ids" in props

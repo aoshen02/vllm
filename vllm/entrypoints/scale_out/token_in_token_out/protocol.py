@@ -7,10 +7,7 @@ from pydantic import (
     BaseModel,
     Field,
     PrivateAttr,
-    SerializationInfo,
-    SerializerFunctionWrapHandler,
     field_validator,
-    model_serializer,
     model_validator,
 )
 
@@ -127,6 +124,9 @@ class GenerateRequest(BaseModel):
     stream_options: StreamOptions | None = None
     logprobs_format: Literal["openai", "compact"] = Field(
         default="openai",
+        # Opt-in: omitted when default, so serialized requests (e.g. the render
+        # endpoints' responses) are unchanged; the schema keeps the field.
+        exclude_if=lambda value: value == "openai",
         description=(
             "Wire format of the sample logprobs. 'openai' (default): "
             "`choices[].logprobs` as today. 'compact': `choices[].logprobs` is "
@@ -190,17 +190,6 @@ class GenerateRequest(BaseModel):
         instance._sampling_params_provided_keys = provided
         return instance
 
-    @model_serializer(mode="wrap")
-    def _serialize(
-        self, handler: SerializerFunctionWrapHandler, info: SerializationInfo
-    ) -> Any:
-        # logprobs_format is opt-in: omit the default so serialized requests
-        # (e.g. the render endpoints' responses) are unchanged.
-        data = handler(self)
-        if isinstance(data, dict) and data.get("logprobs_format") == "openai":
-            del data["logprobs_format"]
-        return data
-
     def is_sampling_param_provided(self, name: str) -> bool:
         """Whether the caller explicitly set ``sampling_params.<name>``.
 
@@ -239,17 +228,6 @@ class CompactLogprobs(BaseModel):
     ranks: str
 
 
-def _drop_unset_compact_logprobs(
-    model: BaseModel, handler: SerializerFunctionWrapHandler
-) -> Any:
-    # ``compact_logprobs`` is opt-in; keep the default wire format unchanged
-    # by omitting the key unless it is set.
-    data = handler(model)
-    if isinstance(data, dict) and data.get("compact_logprobs", 0) is None:
-        del data["compact_logprobs"]
-    return data
-
-
 class GenerateResponseChoice(BaseModel):
     index: int
     logprobs: ChatCompletionLogProbs | None = None
@@ -267,8 +245,11 @@ class GenerateResponseChoice(BaseModel):
     # or (b) ``enable_return_routed_experts`` is off server-side.
     routed_experts: str | None = None
     sampling_mask: list[list[int]] | None = None
-    # Only present (non-null) when the request set logprobs_format="compact".
-    compact_logprobs: CompactLogprobs | None = None
+    # Only present (non-null) when the request set logprobs_format="compact";
+    # the key is omitted otherwise, keeping the default wire format unchanged.
+    compact_logprobs: CompactLogprobs | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
     @field_validator("token_ids")
     @classmethod
@@ -276,12 +257,6 @@ class GenerateResponseChoice(BaseModel):
         if v is not None and any(t < 0 for t in v):
             raise ValueError("token_ids must not contain negative values")
         return v
-
-    @model_serializer(mode="wrap")
-    def _serialize(
-        self, handler: SerializerFunctionWrapHandler, info: SerializationInfo
-    ) -> Any:
-        return _drop_unset_compact_logprobs(self, handler)
 
 
 class GenerateResponseStreamChoice(BaseModel):
@@ -291,14 +266,11 @@ class GenerateResponseStreamChoice(BaseModel):
     token_ids: list[int] | None = None
     routed_experts: str | None = None
     sampling_mask: list[list[int]] | None = None
-    # Only present (non-null) when the request set logprobs_format="compact".
-    compact_logprobs: CompactLogprobs | None = None
-
-    @model_serializer(mode="wrap")
-    def _serialize(
-        self, handler: SerializerFunctionWrapHandler, info: SerializationInfo
-    ) -> Any:
-        return _drop_unset_compact_logprobs(self, handler)
+    # Only present (non-null) when the request set logprobs_format="compact";
+    # the key is omitted otherwise, keeping the default wire format unchanged.
+    compact_logprobs: CompactLogprobs | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
 
 class GenerateStreamResponse(BaseModel):
