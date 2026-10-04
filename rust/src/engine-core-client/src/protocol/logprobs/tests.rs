@@ -373,3 +373,354 @@ fn rejects_zero_column_logprobs_with_rows() {
         "new_logprobs: zero-column logprobs payload with 2 rows"
     );
 }
+
+/// The decoder before the round-4 rewrite (Cursor element reads, aux frame
+/// copied, intermediate vectors, per-row assembly), reproduced as the
+/// reference for the randomized equivalence test below.
+mod reference {
+    use std::io::Cursor;
+
+    use byteorder::{BigEndian, LittleEndian, NativeEndian, ReadBytesExt};
+
+    use crate::error::{Error, Result, bail_ext_value_decode, ext_value_decode};
+    use crate::protocol::logprobs::{Logprobs, PositionLogprobs, TokenLogprob};
+    use crate::protocol::tensor::{ShapeExt as _, WireArrayData, WireNdArray};
+
+    fn err(field: &str, reason: &str) -> Error {
+        ext_value_decode!("{field}: {reason}")
+    }
+
+    #[derive(Clone, Copy, PartialEq, Debug)]
+    enum Scalar {
+        I32,
+        I64,
+        F32,
+    }
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum Endian {
+        Little,
+        Big,
+        Native,
+    }
+
+    fn dtype(dtype: &str, field: &str) -> Result<(Scalar, Endian)> {
+        let (endian, body) = match dtype.as_bytes().first().copied() {
+            Some(b'<') => (Endian::Little, &dtype[1..]),
+            Some(b'>') => (Endian::Big, &dtype[1..]),
+            Some(b'=') | Some(b'|') => (Endian::Native, &dtype[1..]),
+            _ => (Endian::Native, dtype),
+        };
+        let scalar = match body {
+            "i4" | "int32" => Scalar::I32,
+            "i8" | "int64" => Scalar::I64,
+            "f4" | "float32" => Scalar::F32,
+            _ => return Err(err(field, &format!("unsupported dtype string {dtype:?}"))),
+        };
+        Ok((scalar, endian))
+    }
+
+    fn metadata<F: AsRef<[u8]>>(
+        value: WireNdArray,
+        field: &str,
+        frames: &[F],
+        expected: &[Scalar],
+    ) -> Result<(Vec<usize>, Vec<u8>, Scalar, Endian)> {
+        let WireNdArray {
+            dtype: name,
+            shape,
+            data,
+        } = value;
+        let (scalar, endian) = dtype(&name, field)?;
+        if !expected.contains(&scalar) {
+            return Err(err(
+                field,
+                &format!("expected dtype in {expected:?}, got {name}"),
+            ));
+        }
+        let bytes = match data {
+            WireArrayData::RawView(bytes) => bytes.to_vec(),
+            WireArrayData::AuxIndex(index) => frames
+                .get(index)
+                .ok_or_else(|| {
+                    err(
+                        field,
+                        &format!(
+                            "aux frame index {index} out of range for {} frames",
+                            frames.len()
+                        ),
+                    )
+                })?
+                .as_ref()
+                .to_vec(),
+        };
+        let count = shape
+            .checked_numel()
+            .ok_or_else(|| err(field, "shape element count overflowed usize"))?;
+        let size = if scalar == Scalar::I64 { 8 } else { 4 };
+        let expected_len = count
+            .checked_mul(size)
+            .ok_or_else(|| err(field, "byte length overflowed usize"))?;
+        if expected_len != bytes.len() {
+            return Err(err(
+                field,
+                &format!(
+                    "byte length mismatch: expected {expected_len}, got {}",
+                    bytes.len()
+                ),
+            ));
+        }
+        Ok((shape, bytes, scalar, endian))
+    }
+
+    fn ints(bytes: &[u8], scalar: Scalar, endian: Endian, field: &str) -> Result<Vec<u32>> {
+        let mut cursor = Cursor::new(bytes);
+        let mut out = Vec::new();
+        while (cursor.position() as usize) < bytes.len() {
+            let value: i64 = match (scalar, endian) {
+                (Scalar::I32, Endian::Little) => cursor.read_i32::<LittleEndian>().unwrap() as i64,
+                (Scalar::I32, Endian::Big) => cursor.read_i32::<BigEndian>().unwrap() as i64,
+                (Scalar::I32, Endian::Native) => cursor.read_i32::<NativeEndian>().unwrap() as i64,
+                (_, Endian::Little) => cursor.read_i64::<LittleEndian>().unwrap(),
+                (_, Endian::Big) => cursor.read_i64::<BigEndian>().unwrap(),
+                (_, Endian::Native) => cursor.read_i64::<NativeEndian>().unwrap(),
+            };
+            out.push(u32::try_from(value).map_err(|_| {
+                err(
+                    field,
+                    &format!("expected non-negative token id/rank that fits in u32, got {value}"),
+                )
+            })?);
+        }
+        Ok(out)
+    }
+
+    fn floats(bytes: &[u8], endian: Endian) -> Vec<f32> {
+        let mut cursor = Cursor::new(bytes);
+        let mut out = Vec::new();
+        while (cursor.position() as usize) < bytes.len() {
+            out.push(match endian {
+                Endian::Little => cursor.read_f32::<LittleEndian>().unwrap(),
+                Endian::Big => cursor.read_f32::<BigEndian>().unwrap(),
+                Endian::Native => cursor.read_f32::<NativeEndian>().unwrap(),
+            });
+        }
+        out
+    }
+
+    pub(super) fn resolve<F: AsRef<[u8]>>(
+        ids: WireNdArray,
+        lps: WireNdArray,
+        ranks: WireNdArray,
+        frames: &[F],
+        prefix: &str,
+    ) -> Result<Logprobs> {
+        let f_ids = format!("{prefix}.logprob_token_ids");
+        let (shape, bytes, scalar, endian) =
+            metadata(ids, &f_ids, frames, &[Scalar::I32, Scalar::I64])?;
+        if shape.len() != 2 {
+            return Err(err(
+                &f_ids,
+                &format!("expected rank-2 array, got rank {}", shape.len()),
+            ));
+        }
+        let (rows, cols) = (shape[0], shape[1]);
+        let id_values = ints(&bytes, scalar, endian, &f_ids)?;
+        let f_lps = format!("{prefix}.logprobs");
+        let (lshape, lbytes, _, lendian) = metadata(lps, &f_lps, frames, &[Scalar::F32])?;
+        if lshape.len() != 2 {
+            return Err(err(
+                &f_lps,
+                &format!("expected rank-2 array, got rank {}", lshape.len()),
+            ));
+        }
+        let lp_values = floats(&lbytes, lendian);
+        let f_ranks = format!("{prefix}.token_ranks");
+        let (rshape, rbytes, rscalar, rendian) =
+            metadata(ranks, &f_ranks, frames, &[Scalar::I32, Scalar::I64])?;
+        if rshape.len() != 1 {
+            return Err(err(
+                &f_ranks,
+                &format!("expected rank-1 array, got rank {}", rshape.len()),
+            ));
+        }
+        let rank_values = ints(&rbytes, rscalar, rendian, &f_ranks)?;
+        if rows != lshape[0] || cols != lshape[1] {
+            bail_ext_value_decode!(
+                "{prefix}: row shape mismatch between token ids ({}, {}) and logprobs ({}, {})",
+                rows,
+                cols,
+                lshape[0],
+                lshape[1]
+            );
+        }
+        if rows != rank_values.len() {
+            bail_ext_value_decode!(
+                "{prefix}: token_ranks length {} does not match row count {}",
+                rank_values.len(),
+                rows
+            );
+        }
+        if rows == 0 {
+            return Ok(Logprobs {
+                positions: Vec::new(),
+            });
+        }
+        if cols == 0 {
+            bail_ext_value_decode!("{prefix}: zero-column logprobs payload with {} rows", rows);
+        }
+        let mut positions = Vec::new();
+        for ((id_row, lp_row), sampled_rank) in
+            id_values.chunks(cols).zip(lp_values.chunks(cols)).zip(rank_values)
+        {
+            if sampled_rank == 0 {
+                bail_ext_value_decode!("token_ranks must be >= 1 for decoded engine-core logprobs");
+            }
+            positions.push(PositionLogprobs {
+                entries: id_row
+                    .iter()
+                    .zip(lp_row)
+                    .enumerate()
+                    .map(|(index, (&token_id, &logprob))| TokenLogprob {
+                        token_id,
+                        logprob,
+                        rank: if index == 0 {
+                            sampled_rank
+                        } else {
+                            index as u32
+                        },
+                    })
+                    .collect(),
+            });
+        }
+        Ok(Logprobs { positions })
+    }
+}
+
+#[test]
+fn rewritten_decoder_matches_reference_on_random_payloads() {
+    use super::WireLogprobs;
+    use crate::protocol::tensor::{WireArrayData, WireNdArray};
+
+    let state = std::cell::Cell::new(0x2545_f491_4f6c_dd1d_u64);
+    let next = || {
+        let mut s = state.get();
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        state.set(s);
+        s
+    };
+    let int_dtypes = [
+        "<i8", ">i8", "=i8", "i8", "int64", "<i4", ">i4", "|i4", "int32", "<f4", "<u8",
+    ];
+    let float_dtypes = ["<f4", ">f4", "=f4", "float32", "<i4"];
+    let mut outcomes = (0, 0);
+    for case in 0..20_000 {
+        let rows = (next() % 5) as usize;
+        let cols = (next() % 6) as usize;
+        let id_dtype = int_dtypes[(next() % int_dtypes.len() as u64) as usize];
+        let lp_dtype = float_dtypes[(next() % float_dtypes.len() as u64) as usize];
+        let rank_dtype = int_dtypes[(next() % 7) as usize];
+        let mut frames: Vec<Bytes> = vec![Bytes::from_static(b"header")];
+        let mut array = |dtype: &str, shape: Vec<usize>, count: usize, size: usize, ids: bool| {
+            // Occasionally corrupt the byte length.
+            let count = if next() % 40 == 0 { count + 1 } else { count };
+            let mut raw = Vec::with_capacity(count * size);
+            for _ in 0..count {
+                let value = next();
+                let word: u64 = if ids {
+                    // ids/ranks: mostly valid, sometimes negative, > u32 or 0.
+                    match value % 25 {
+                        0 => u64::MAX - (value >> 40),
+                        1 => (u32::MAX as u64) + 1 + (value >> 50),
+                        2 => 0,
+                        _ => (value >> 20) % 200_000 + 1,
+                    }
+                } else {
+                    value
+                };
+                raw.extend_from_slice(&word.to_le_bytes()[..size]);
+            }
+            let data = if next() % 2 == 0 {
+                WireArrayData::RawView(Bytes::from(raw))
+            } else {
+                frames.push(Bytes::from(raw));
+                // Occasionally point past the last frame.
+                let skew = if next() % 30 == 0 { 9 } else { 0 };
+                WireArrayData::AuxIndex(frames.len() - 1 + skew)
+            };
+            WireNdArray {
+                dtype: dtype.to_string(),
+                shape,
+                data,
+            }
+        };
+        let size_of = |dtype: &str| {
+            if dtype.ends_with('8') || dtype == "int64" {
+                8
+            } else {
+                4
+            }
+        };
+        let id_shape = if next() % 30 == 0 {
+            vec![rows * cols]
+        } else {
+            vec![rows, cols]
+        };
+        let lp_rows = if next() % 30 == 0 { rows + 1 } else { rows };
+        let rank_len = if next() % 30 == 0 { rows + 1 } else { rows };
+        let ids = array(id_dtype, id_shape, rows * cols, size_of(id_dtype), true);
+        let lps = array(lp_dtype, vec![lp_rows, cols], lp_rows * cols, 4, false);
+        let ranks = array(
+            rank_dtype,
+            vec![rank_len],
+            rank_len,
+            size_of(rank_dtype),
+            true,
+        );
+
+        let expected = reference::resolve(
+            ids.clone(),
+            lps.clone(),
+            ranks.clone(),
+            &frames,
+            "new_logprobs",
+        );
+        let actual = WireLogprobs {
+            logprob_token_ids: ids,
+            logprobs: lps,
+            token_ranks: ranks,
+            cu_num_generated_tokens: None,
+            cu_num_generated_tokens_tensor: None,
+        }
+        .resolve(&frames, "new_logprobs");
+        match (&expected, &actual) {
+            (Ok(expected), Ok(actual)) => {
+                outcomes.0 += 1;
+                assert_eq!(
+                    expected.positions.len(),
+                    actual.positions.len(),
+                    "case {case}"
+                );
+                for (e, a) in expected.positions.iter().zip(&actual.positions) {
+                    assert_eq!(e.entries.len(), a.entries.len(), "case {case}");
+                    for (e, a) in e.entries.iter().zip(&a.entries) {
+                        assert_eq!(
+                            (e.token_id, e.logprob.to_bits(), e.rank),
+                            (a.token_id, a.logprob.to_bits(), a.rank),
+                            "case {case}"
+                        );
+                    }
+                }
+            }
+            (Err(expected), Err(actual)) => {
+                outcomes.1 += 1;
+                assert_eq!(expected.to_string(), actual.to_string(), "case {case}");
+            }
+            _ => panic!("case {case}: reference {expected:?} vs rewritten {actual:?}"),
+        }
+    }
+    // Both successes and every kind of error are exercised substantially.
+    assert!(outcomes.0 > 3000 && outcomes.1 > 3000, "{outcomes:?}");
+}

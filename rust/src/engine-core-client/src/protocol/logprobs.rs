@@ -39,39 +39,6 @@ pub struct PositionLogprobs {
     pub entries: Vec<TokenLogprob>,
 }
 
-impl PositionLogprobs {
-    /// Convert one decoded logprobs row into this per-position form by grouping
-    /// each token/logprob pair together with the sampled/selected token's
-    /// actual vocab rank.
-    fn from_decoded_row(token_ids: &[u32], logprobs: &[f32], sampled_rank: u32) -> Result<Self> {
-        if token_ids.len() != logprobs.len() {
-            bail_ext_value_decode!(
-                "logprobs row length mismatch: token_ids={}, logprobs={}",
-                token_ids.len(),
-                logprobs.len()
-            );
-        }
-        if sampled_rank == 0 {
-            bail_ext_value_decode!("token_ranks must be >= 1 for decoded engine-core logprobs");
-        }
-
-        let mut entries = Vec::with_capacity(token_ids.len());
-        for (index, (&token_id, &logprob)) in token_ids.iter().zip(logprobs.iter()).enumerate() {
-            let rank = if index == 0 {
-                sampled_rank
-            } else {
-                index as u32
-            };
-            entries.push(TokenLogprob {
-                token_id,
-                logprob,
-                rank,
-            });
-        }
-        Ok(Self { entries })
-    }
-}
-
 /// Decoded per-request logprobs payload for one engine-core output.
 ///
 /// Unlike the Python wire payload, this public Rust type is already fully
@@ -249,16 +216,35 @@ impl WireLogprobs {
             );
         }
 
-        let token_ids = array::decode_array2_u32(
-            self.logprob_token_ids,
-            &format!("{field_prefix}.logprob_token_ids"),
+        let ids_field = array::FieldName {
+            prefix: field_prefix,
+            name: "logprob_token_ids",
+        };
+        // Validated views borrow the raw bytes (inline or aux frame); ids are
+        // range-checked up front so errors are reported in the same order as
+        // the former decode-everything-first implementation.
+        let token_ids = array::view_array2(
+            &self.logprob_token_ids,
+            &ids_field,
             frames,
+            &[array::ScalarType::I32, array::ScalarType::I64],
         )?;
-        let logprobs =
-            array::decode_array2_f32(self.logprobs, &format!("{field_prefix}.logprobs"), frames)?;
+        array::validate_u32_words(&token_ids, &ids_field)?;
+        let logprobs = array::view_array2(
+            &self.logprobs,
+            &array::FieldName {
+                prefix: field_prefix,
+                name: "logprobs",
+            },
+            frames,
+            &[array::ScalarType::F32],
+        )?;
         let token_ranks = array::decode_array1_u32(
             self.token_ranks,
-            &format!("{field_prefix}.token_ranks"),
+            &array::FieldName {
+                prefix: field_prefix,
+                name: "token_ranks",
+            },
             frames,
         )?;
 
@@ -291,19 +277,38 @@ impl WireLogprobs {
                 token_ids.rows
             );
         }
+        if token_ranks.contains(&0) {
+            bail_ext_value_decode!("token_ranks must be >= 1 for decoded engine-core logprobs");
+        }
 
+        // Build each row's entries straight from the wire bytes (no
+        // intermediate id/logprob vectors).
+        let cols = token_ids.cols;
         let mut positions = Vec::with_capacity(token_ids.rows);
-        for ((token_ids_row, logprobs_row), sampled_rank) in token_ids
-            .data
-            .chunks(token_ids.cols)
-            .zip(logprobs.data.chunks(logprobs.cols))
-            .zip(token_ranks)
-        {
-            positions.push(PositionLogprobs::from_decoded_row(
-                token_ids_row,
-                logprobs_row,
-                sampled_rank,
-            )?);
+        for (row, &sampled_rank) in token_ranks.iter().enumerate() {
+            let mut entries = Vec::with_capacity(cols);
+            array::push_token_ids(
+                token_ids.row(row),
+                token_ids.scalar,
+                token_ids.endianness,
+                |token_id| {
+                    entries.push(TokenLogprob {
+                        token_id,
+                        logprob: 0.0,
+                        rank: 0,
+                    })
+                },
+            );
+            array::for_each_f32(logprobs.row(row), logprobs.endianness, |index, logprob| {
+                let entry = &mut entries[index];
+                entry.logprob = logprob;
+                entry.rank = if index == 0 {
+                    sampled_rank
+                } else {
+                    index as u32
+                };
+            });
+            positions.push(PositionLogprobs { entries });
         }
 
         Ok(Logprobs { positions })
