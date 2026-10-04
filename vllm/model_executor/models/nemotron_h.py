@@ -30,7 +30,6 @@ from vllm.config import (
     CacheConfig,
     ModelConfig,
     VllmConfig,
-    get_current_vllm_config,
 )
 from vllm.config.parallel import ParallelConfig
 from vllm.distributed import get_ep_group, get_tensor_model_parallel_world_size
@@ -83,10 +82,6 @@ from vllm.model_executor.models.interfaces import (
     SupportsPP,
     SupportsQuant,
     SupportsReplaySSM,
-)
-from vllm.model_executor.models.nemotron_h_moe import (
-    SCHEDULE_KEY,
-    nemotron_humming_schedule,
 )
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
@@ -343,17 +338,6 @@ class NemotronHMoE(nn.Module):
             apply_routed_scale_to_output=True,
             router_logits_dtype=self.gate.out_dtype,
         )
-        if envs.VLLM_BATCH_INVARIANT:
-            # CUDA graphs capture the Humming kernel's scale tensor addresses.
-            # Layerwise reload writes new values back into that storage, so
-            # keep the kernel instead of rebuilding it over fresh tensors.
-            self.experts.routed_experts._preserve_humming_reload_kernel = True
-            additional = get_current_vllm_config().additional_config
-            if isinstance(additional, dict) and additional.get(SCHEDULE_KEY):
-                # See nemotron_h_moe: launch geometry only, bitwise neutral.
-                self.experts.routed_experts._humming_tuning_transform = (
-                    nemotron_humming_schedule
-                )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape

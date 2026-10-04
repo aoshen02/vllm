@@ -1017,20 +1017,6 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
             use_a16=self.use_a16,
         )
 
-        # Decided before any parameter is replaced, so a refusal leaves the
-        # layer as it was.
-        keep_kernel = self._preserve_humming_reload_kernel(
-            layer,
-            {
-                "w13_weight": w13,
-                "w13_weight_scale": w13_scale,
-                "w13_weight_scale_2": w13_scale_2,
-                "w2_weight": w2,
-                "w2_weight_scale": w2_scale,
-                "w2_weight_scale_2": w2_scale_2,
-            },
-        )
-
         replace_parameter(layer, "w13_weight", w13)
         replace_parameter(layer, "w13_weight_scale", w13_scale)
         replace_parameter(layer, "w13_weight_scale_2", w13_scale_2)
@@ -1040,78 +1026,7 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
         replace_parameter(layer, "w2_weight_scale_2", w2_scale_2)
         replace_parameter(layer, "w2_input_scale", a2_scale)
 
-        if not keep_kernel:
-            self._build_moe_kernel(layer)
-
-    def _preserve_humming_reload_kernel(
-        self, layer: RoutedExperts, converted: dict[str, torch.Tensor]
-    ) -> bool:
-        """Keep the existing Humming kernel during a layerwise reload.
-
-        CUDA graphs capture the addresses of the kernel's scale tensors, and
-        layerwise reload copies the processed weights back into that original
-        storage. The existing kernel therefore already sees the new weights,
-        while a rebuilt one would run eager steps on fresh tensors that the
-        captured graphs never read. Only for W4A16 layers that opt in; others
-        rebuild as before.
-        """
-        if not (
-            getattr(layer, "_preserve_humming_reload_kernel", False)
-            and self.nvfp4_backend == NvFp4MoeBackend.HUMMING
-            and self.use_a16
-        ):
-            return False
-
-        from vllm.model_executor.model_loader.reload.layerwise import LAYERWISE_INFO
-
-        info = LAYERWISE_INFO.get(layer)
-        if info is None or info.kernel_tensors is None:
-            # First load: there is no kernel to keep yet.
-            return False
-
-        def fail(reason: str) -> RuntimeError:
-            return RuntimeError(f"Cannot keep the Humming kernel on reload: {reason}")
-
-        kernel = getattr(self, "moe_kernel", None)
-        if kernel is None:
-            raise fail("there is no kernel from the first load")
-        experts = kernel.fused_experts
-        config = experts.quant_config
-        original, _ = info.kernel_tensors
-        for prefix, weight_config in (("w13", config._w1), ("w2", config._w2)):
-            # The kernel must read the storage that reload restores into.
-            for suffix, used in (
-                ("weight_scale", weight_config.scale),
-                ("weight_scale_2", weight_config.alpha_or_gscale),
-            ):
-                saved = original.get(f"{prefix}_{suffix}")
-                if (
-                    saved is None
-                    or used is None
-                    or used.data_ptr() != saved.data_ptr()
-                    or used.shape != saved.shape
-                    or used.stride() != saved.stride()
-                    or used.dtype != saved.dtype
-                ):
-                    raise fail(f"{prefix}_{suffix} is not the restored storage")
-            # The reprocessed weights must fit that storage unchanged.
-            for suffix in ("weight", "weight_scale", "weight_scale_2"):
-                name = f"{prefix}_{suffix}"
-                saved, current = original.get(name), converted.get(name)
-                if (
-                    saved is None
-                    or current is None
-                    or current.shape != saved.shape
-                    or current.stride() != saved.stride()
-                    or current.dtype != saved.dtype
-                ):
-                    raise fail(f"{name} layout changed")
-            if (
-                experts.humming_configs[prefix].to_str()
-                != layer.humming_configs[prefix].to_str()
-            ):
-                raise fail(f"{prefix} Humming recipe changed")
-        return True
+        self._build_moe_kernel(layer)
 
     def _build_moe_kernel(self, layer: RoutedExperts) -> None:
         """Build the modular MoE kernel from the (already in-format) weights."""
@@ -1125,18 +1040,6 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
             routing_tables=layer._expert_routing_tables(),
         )
         self.moe_kernel.fused_experts.process_weights_after_loading(layer)
-        self._apply_humming_tuning_transform(layer)
-
-    def _apply_humming_tuning_transform(self, layer: RoutedExperts) -> None:
-        """Apply a model's Humming launch-schedule transform, if it set one."""
-        transform = getattr(layer, "_humming_tuning_transform", None)
-        if transform is not None and self.nvfp4_backend == NvFp4MoeBackend.HUMMING:
-            try:
-                self.moe_kernel.fused_experts.transform_tuning_configs(transform)
-            except ValueError as e:
-                # A launch-schedule tweak must not stop the engine; the default
-                # tables are equally correct.
-                logger.warning_once("Keeping Humming's default MoE schedule: %s", e)
 
     def _restore_padded_moe_dims(self, layer: RoutedExperts) -> None:
         """Recover the padded ``moe_config`` dims from the exported weights."""

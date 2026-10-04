@@ -695,30 +695,6 @@ class NemotronHForCausalLMConfig(VerifyAndUpdateConfig):
         )
         if envs.VLLM_BATCH_INVARIANT:
             cls.use_cuda_fp8_quant(vllm_config)
-            cls.select_humming_schedule(vllm_config)
-
-    @staticmethod
-    def select_humming_schedule(vllm_config: "VllmConfig") -> None:
-        """Record whether the measured Lightning EP4 Humming schedule applies."""
-        from vllm.model_executor.models import nemotron_h_moe
-
-        additional = vllm_config.additional_config
-        if (
-            not isinstance(additional, dict)
-            or nemotron_h_moe.SCHEDULE_KEY in additional
-        ):
-            return
-        reason = nemotron_h_moe.schedule_unsupported_reason(vllm_config)
-        if reason is None:
-            additional[nemotron_h_moe.SCHEDULE_KEY] = "lightning_ep4"
-        elif vllm_config.kernel_config.moe_backend == "humming":
-            # Humming is selected but the tuned schedule is not: say so, since
-            # the measured gain (5-12% TPOT) silently disappears otherwise.
-            logger.warning(
-                "Nemotron-H Humming MoE keeps the default schedule: %s.", reason
-            )
-        else:
-            logger.info("Nemotron-H keeps Humming's default schedule: %s.", reason)
 
     @staticmethod
     def use_cuda_fp8_quant(vllm_config: "VllmConfig") -> None:
