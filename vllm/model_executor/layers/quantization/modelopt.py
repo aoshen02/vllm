@@ -159,6 +159,15 @@ class ModelOptKVCacheMethod(BaseKVCacheMethod):
         super().__init__(quant_config)
 
 
+# W4A16 layers drop a deprecated checkpoint's input_scale after processing, so
+# a copy arriving later (e.g. in a later layerwise-reload bucket) is ignored.
+# Formats that keep their input_scale still load (and wait for) it.
+_W4A16_IGNORE_UNEXPECTED_SUFFIXES = (
+    *QuantizationConfig._ignore_unexpected_suffixes,
+    ".input_scale",
+)
+
+
 class ModelOptQuantConfigBase(QuantizationConfig):
     # ModelOpt quant-algo string, set by each subclass. Fed to resolve() to
     # build the QuantSpec for the generic ModelOptLinearMethod. The mixed
@@ -742,6 +751,8 @@ class ModelOptNvFp4Config(ModelOptQuantConfigBase):
                 f"Unsupported ModelOpt NVFP4 quant_algo: {quant_method}. "
                 f"Supported: {' / '.join(supported)}."
             )
+        if quant_method == "W4A16_NVFP4":
+            self._ignore_unexpected_suffixes = _W4A16_IGNORE_UNEXPECTED_SUFFIXES
 
     def get_name(self) -> QuantizationMethods:
         return "modelopt_fp4"
@@ -1529,6 +1540,11 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
         self.nvfp4_config = nvfp4_config
         self.w4a16_nvfp4_config = w4a16_nvfp4_config
         self.mxfp8_config = mxfp8_config
+        if any(
+            info.get("quant_algo", "").upper() == "W4A16_NVFP4"
+            for info in quantized_layers.values()
+        ):
+            self._ignore_unexpected_suffixes = _W4A16_IGNORE_UNEXPECTED_SUFFIXES
 
         block_sizes = {
             int(layer_info.get("group_size", 128))
