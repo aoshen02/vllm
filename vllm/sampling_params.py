@@ -309,7 +309,8 @@ class SamplingParams(
     objects, and never detokenize logprob candidates. Takes precedence over
     `flat_logprobs` for sample logprobs (prompt logprobs are unaffected).
     Set by `/inference/v1/generate`, whose responses never contain
-    candidate text."""
+    candidate text. Never sent to EngineCore: `OutputProcessor.add_request`
+    resets it on the request after creating the request state."""
     # NOTE: This parameter is only exposed at the engine level for now.
     # It is not exposed in the OpenAI API server, as the OpenAI API does
     # not support returning only a list of token IDs.

@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import asyncio
+import copy
 from collections import defaultdict, deque
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -552,6 +553,7 @@ class OutputProcessor:
         req_state = self.request_states.get(request_id)
         if req_state is not None:
             self._update_streaming_request_state(req_state, request, prompt)
+            self._strip_frontend_only_params(request)
             return
 
         req_state = RequestState.from_new_request(
@@ -570,6 +572,22 @@ class OutputProcessor:
 
         # Track the external_req_id -> [internal_req_id, ...] mapping
         self.external_req_ids[req_state.external_req_id].append(request_id)
+        self._strip_frontend_only_params(request)
+
+    @staticmethod
+    def _strip_frontend_only_params(request: EngineCoreRequest) -> None:
+        """Keep frontend-only sampling flags off the EngineCore wire.
+
+        ``array_logprobs`` only selects this process's logprobs container
+        (already consumed by ``RequestState``); callers send ``request`` to
+        EngineCore right after ``add_request``. A shallow copy is used because
+        the params object may be shared (e.g. with a parent request).
+        """
+        params = request.sampling_params
+        if params is not None and params.array_logprobs:
+            params = copy.copy(params)
+            params.array_logprobs = False
+            request.sampling_params = params
 
     def _update_streaming_request_state(
         self, req_state: RequestState, request: EngineCoreRequest, prompt: str | None
