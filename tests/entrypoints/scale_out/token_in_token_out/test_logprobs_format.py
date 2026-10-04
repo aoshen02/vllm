@@ -2,21 +2,28 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Tests for the ``logprobs_format`` option of ``/inference/v1/generate``."""
 
+import hashlib
 import json
 import time
 from argparse import Namespace
 from typing import Any, cast
 from unittest.mock import MagicMock
 
+import msgspec
 import numpy as np
 import pybase64 as base64
 import pytest
+import torch
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
-from vllm.entrypoints.scale_out.token_in_token_out import api_router
+from vllm.entrypoints.openai.engine.protocol import GenerationError
+from vllm.entrypoints.scale_out.token_in_token_out import (
+    api_router,
+    logprobs_render,
+)
 from vllm.entrypoints.scale_out.token_in_token_out.logprobs_render import (
     format_float_reprs,
     render_compact_logprobs,
@@ -37,13 +44,16 @@ from vllm.entrypoints.scale_out.token_in_token_out.protocol import (
 from vllm.entrypoints.scale_out.token_in_token_out.serving import ServingTokens
 from vllm.entrypoints.serve.exception_handling.register import init_exception_handler
 from vllm.logprobs import ArrayLogprobs, append_logprobs_for_next_position
-from vllm.sampling_params import SamplingParams
+from vllm.sampling_params import RequestOutputKind, SamplingParams
+from vllm.tokenizers import get_tokenizer
 from vllm.v1.engine import EngineCoreOutput, EngineCoreRequest, FinishReason
 from vllm.v1.engine.logprobs import LogprobsProcessor
 from vllm.v1.engine.output_processor import OutputProcessor, RequestOutputCollector
-from vllm.v1.outputs import LogprobsLists
+from vllm.v1.outputs import LogprobsLists, LogprobsTensors
+from vllm.v1.serial_utils import MsgpackEncoder
 
 from .test_generate_stream import (
+    MODEL_NAME,
     _build_serving_tokens,
     _mock_engine,
     _parse_sse_chunks,
@@ -74,16 +84,23 @@ def _engine_rows(start: int, count: int, width: int, seed: int = 0):
 class _OutputProcessorEngine:
     """Feeds engine rows through the real OutputProcessor."""
 
-    def __init__(self, chunks, finish: FinishReason | None = FinishReason.ABORT):
+    def __init__(
+        self,
+        chunks,
+        finish: FinishReason | None = FinishReason.ABORT,
+        tokenizer=None,
+    ):
         self.chunks = chunks
         self.finish = finish
+        self.tokenizer = tokenizer
         self.sampling_params: Any = None
+        self.engine_request: Any = None
 
     def generate(self, engine_input, sampling_params, request_id, **kwargs):
         self.sampling_params = sampling_params
 
         async def _gen():
-            processor = OutputProcessor(tokenizer=None, log_stats=False)
+            processor = OutputProcessor(tokenizer=self.tokenizer, log_stats=False)
             request = EngineCoreRequest(
                 request_id=request_id + "-int",
                 external_req_id=request_id,
@@ -98,7 +115,9 @@ class _OutputProcessorEngine:
             )
             queue = RequestOutputCollector(sampling_params.output_kind, request_id)
             processor.add_request(request, None, queue=queue)
-            for token_ids, logprobs, ranks in self.chunks:
+            self.engine_request = request
+            prompt_k = sampling_params.prompt_logprobs
+            for i, (token_ids, logprobs, ranks) in enumerate(self.chunks):
                 processor.process_outputs(
                     [
                         EngineCoreOutput(
@@ -108,6 +127,11 @@ class _OutputProcessorEngine:
                                 None
                                 if sampling_params.num_logprobs is None
                                 else LogprobsLists(token_ids, logprobs, ranks)
+                            ),
+                            new_prompt_logprobs_tensors=(
+                                _prompt_logprobs_tensors(prompt_k)
+                                if i == 0 and prompt_k is not None
+                                else None
                             ),
                         )
                     ]
@@ -130,6 +154,18 @@ class _OutputProcessorEngine:
                 yield out
 
         return _gen()
+
+
+def _prompt_logprobs_tensors(k: int) -> LogprobsTensors:
+    """Prompt logprobs for prompt [1, 2, 3] (positions 1 and 2)."""
+    ids = torch.tensor([[2, 1000 + k, 3000][: k + 1], [3, 5000, 7000][: k + 1]])
+    values = torch.tensor([[-0.5, -1.5, -2.5][: k + 1], [-0.25, -3.0, -4.0][: k + 1]])
+    return LogprobsTensors(ids, values, torch.tensor([4, 1]))
+
+
+@pytest.fixture(scope="module")
+def gpt2_tokenizer():
+    return get_tokenizer(MODEL_NAME)
 
 
 def _serving(feeder: _OutputProcessorEngine):
@@ -413,19 +449,21 @@ async def test_default_stream_ignores_client_array_flag():
     ]
 
 
-async def _full_body(monkeypatch, chunks, request, array: bool) -> bytes:
+async def _full_body(
+    monkeypatch, chunks, request, array: bool, tokenizer=None
+) -> bytes:
     """Full non-streaming body through the router's rendering rules."""
     monkeypatch.setattr(time, "time", lambda: 1700000000.0)
     if not array:
         monkeypatch.setattr(
             ServingTokens, "_use_array_logprobs", staticmethod(lambda r: False)
         )
-    feeder = _OutputProcessorEngine(chunks)
+    feeder = _OutputProcessorEngine(chunks, tokenizer=tokenizer)
     response = await _serving(feeder).serve_tokens(request.model_copy(deep=True))
     monkeypatch.undo()
     assert feeder.sampling_params.array_logprobs is array
-    if array:
-        assert isinstance(response, RenderedGenerateResponse)
+    if isinstance(response, RenderedGenerateResponse):
+        assert array
         return response.body
     assert isinstance(response, GenerateResponse)
     return JSONResponse(content=response.model_dump()).body
@@ -507,10 +545,12 @@ def test_openai_renderer_nonfinite_raises_like_legacy(value):
     logprobs[1, 1] = np.float32(value)
     container, legacy = _containers(token_ids, logprobs, ranks, 3)
     sampled = token_ids[:, 0].tolist()
-    with pytest.raises(ValueError, match="Out of range float values"):
+    with pytest.raises(ValueError, match="Out of range float values") as fast:
         render_openai_logprobs(sampled, container, 3)
-    with pytest.raises(ValueError, match="Out of range float values"):
+    with pytest.raises(ValueError, match="Out of range float values") as slow:
         _legacy_logprobs_bytes(sampled, legacy, 3)
+    # Same message (incl. ": nan" / ": inf"), so the 400 body is unchanged.
+    assert str(fast.value) == str(slow.value)
 
 
 @pytest.mark.parametrize("case", ["dup_top", "sampled_mismatch", "length"])
@@ -666,8 +706,9 @@ def test_parts_renderers_join_to_bytes():
 def test_array_logprobs_coalesces_single_row_steps(monkeypatch):
     """One row per engine step (the common decode case) must not create one
     numpy array per row, and suffix slices must stay correct."""
-    monkeypatch.setattr(ArrayLogprobs, "BLOCK_ROWS", 4)
     token_ids, logprobs, ranks = _engine_rows(0, 11, 3)
+    row_bytes = 3 * 8 + 4
+    monkeypatch.setattr(ArrayLogprobs, "BLOCK_BYTES", 4 * row_bytes)
     container = ArrayLogprobs()
     for i in range(11):
         container.append_rows(
@@ -676,7 +717,8 @@ def test_array_logprobs_coalesces_single_row_steps(monkeypatch):
         tail = container[-1:]
         np.testing.assert_array_equal(tail.arrays()[0], token_ids[i : i + 1])
     assert len(container) == 11
-    assert len(container.rank_chunks) == 3
+    # Geometric 1, 2, 4 then capped at 4 rows: 1 + 2 + 4 + 4 = 11.
+    assert [len(r) for r in container.rank_chunks] == [1, 2, 4, 4]
     middle = container[2:9]
     np.testing.assert_array_equal(middle.arrays()[0], token_ids[2:9])
     assert middle.arrays()[1].tobytes() == logprobs[2:9].tobytes()
@@ -689,3 +731,398 @@ def test_array_logprobs_coalesces_single_row_steps(monkeypatch):
     container.append_rows(token_ids[:2], logprobs[:2], ranks[:2])
     assert len(container) == 13
     np.testing.assert_array_equal(container.arrays()[0][11:], token_ids[:2])
+
+
+# ------------------------------------------------- round-2 audit regressions
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("logprobs", [None, 2])
+@pytest.mark.parametrize("prompt_logprobs", [0, 2])
+async def test_default_prompt_logprobs_keep_decoded_tokens(
+    monkeypatch, gpt2_tokenizer, logprobs, prompt_logprobs
+):
+    """Audit #1: a default request with prompt logprobs and no stop strings
+    must keep detokenization (decoded_token text), byte-identical to legacy."""
+    chunks = [_engine_rows(0, 3, 3), _engine_rows(3, 2, 3)]
+    request = _request(
+        logprobs=logprobs,
+        request_id="fixed-id",
+        sampling={"prompt_logprobs": prompt_logprobs},
+    )
+    fast = await _full_body(monkeypatch, chunks, request, True, gpt2_tokenizer)
+    legacy = await _full_body(monkeypatch, chunks, request, False, gpt2_tokenizer)
+    assert fast == legacy
+    prompt = json.loads(fast)["prompt_logprobs"]
+    assert prompt[0] is None
+    decoded = [entry["decoded_token"] for entry in prompt[1].values()]
+    assert decoded[0] == gpt2_tokenizer.decode([2])
+    assert all(isinstance(text, str) for text in decoded)
+
+
+@pytest.mark.asyncio
+async def test_default_keeps_requested_detokenize(gpt2_tokenizer):
+    feeder = _OutputProcessorEngine([_engine_rows(0, 2, 3)], tokenizer=gpt2_tokenizer)
+    await _serving(feeder).serve_tokens(_request(logprobs=2))
+    assert feeder.sampling_params.array_logprobs is True
+    assert feeder.sampling_params.detokenize is True
+
+
+@pytest.mark.asyncio
+async def test_compact_with_prompt_logprobs_keeps_decoded_tokens(gpt2_tokenizer):
+    feeder = _OutputProcessorEngine([_engine_rows(0, 2, 3)], tokenizer=gpt2_tokenizer)
+    response = await _serving(feeder).serve_tokens(
+        _request(logprobs=2, logprobs_format="compact", sampling={"prompt_logprobs": 1})
+    )
+    assert feeder.sampling_params.detokenize is True
+    prompt = json.loads(response.body)["prompt_logprobs"]
+    assert prompt[1]["2"]["decoded_token"] == gpt2_tokenizer.decode([2])
+
+
+def test_array_logprobs_short_wide_request_reserves_little():
+    """Audit #2: a 1-row wide request must not reserve thousands of rows."""
+    width = 1024
+    token_ids, logprobs, ranks = _engine_rows(0, 1, width)
+    container = ArrayLogprobs()
+    container.append_rows(token_ids, logprobs, ranks)
+    row_bytes = width * 8 + 4
+    assert container.reserved_bytes() == row_bytes
+    for i in range(1, 40):
+        container.append_rows(token_ids, logprobs, ranks)
+        used = (i + 1) * row_bytes
+        assert container.reserved_bytes() <= 2 * used
+    big = ArrayLogprobs()
+    big.append_rows(*_engine_rows(0, 3000, 8))
+    assert big.reserved_bytes() == 3000 * (8 * 8 + 4)
+
+
+def test_array_logprobs_block_bytes_cap(monkeypatch):
+    monkeypatch.setattr(ArrayLogprobs, "BLOCK_BYTES", 10 * (4 * 8 + 4))
+    container = ArrayLogprobs()
+    rows = _engine_rows(0, 1, 4)
+    for _ in range(100):
+        container.append_rows(*rows)
+    assert max(len(r) for r in container.rank_chunks) == 10
+
+
+def test_array_logprobs_single_token_delta_slice_allocates_nothing():
+    """Audit #2: DELTA ``[-1:]`` slices are exact-sized views."""
+    token_ids, logprobs, ranks = _engine_rows(0, 300, 129)
+    container = ArrayLogprobs()
+    for i in range(300):
+        container.append_rows(
+            token_ids[i : i + 1], logprobs[i : i + 1], ranks[i : i + 1]
+        )
+        tail = container[-1:]
+        assert tail.reserved_bytes() == 129 * 8 + 4
+        assert np.shares_memory(tail.token_id_chunks[0], container.token_id_chunks[-1])
+    tail.append_rows(token_ids[:1], logprobs[:1], ranks[:1])
+    # Appending to a slice never writes into the source container.
+    np.testing.assert_array_equal(container.arrays()[0], token_ids)
+    np.testing.assert_array_equal(tail.arrays()[0], token_ids[[299, 0]])
+
+
+def test_array_logprobs_suffix_slice_visits_only_needed_blocks(monkeypatch):
+    """Audit #3: a last-row slice touches only its own block."""
+    monkeypatch.setattr(ArrayLogprobs, "BLOCK_BYTES", 2 * (3 * 8 + 4))
+    token_ids, logprobs, ranks = _engine_rows(0, 20, 3)
+    container = ArrayLogprobs()
+    for i in range(20):
+        container.append_rows(
+            token_ids[i : i + 1], logprobs[i : i + 1], ranks[i : i + 1]
+        )
+    assert len(container.rank_chunks) >= 10
+    visited: list[int] = []
+    original = ArrayLogprobs._filled_block
+
+    def counting(self, i):
+        visited.append(i)
+        return original(self, i)
+
+    monkeypatch.setattr(ArrayLogprobs, "_filled_block", counting)
+    tail = container[-1:]
+    assert visited == [len(container.rank_chunks) - 1]
+    np.testing.assert_array_equal(tail.arrays()[0], token_ids[-1:])
+    visited.clear()
+    suffix = container[-5:]
+    # 5 rows in blocks of at most 2 rows: at most 4 blocks are touched.
+    assert len(visited) <= 4
+    np.testing.assert_array_equal(suffix.arrays()[0], token_ids[-5:])
+
+
+@pytest.mark.parametrize("first_rows", [1, 3])
+def test_array_logprobs_mixed_float_dtypes_are_lossless(first_rows):
+    """Audit #4: float64 rows after float32 rows keep full precision, both
+    inside a block with free capacity and across a block boundary."""
+    token_ids, logprobs32, ranks = _engine_rows(0, first_rows + 2, 4)
+    container = ArrayLogprobs()
+    container.append_rows(
+        token_ids[:first_rows], logprobs32[:first_rows], ranks[:first_rows]
+    )
+    values64 = logprobs32[first_rows:].astype(np.float64)
+    values64[0, 0] = -1.000000001
+    values64[1, 2] = -2.000000003
+    container.append_rows(token_ids[first_rows:], values64, ranks[first_rows:])
+    assert container[first_rows][int(token_ids[first_rows, 0])].logprob == (
+        -1.000000001
+    )
+    legacy: list = []
+    expected = np.concatenate([logprobs32[:first_rows].astype(np.float64), values64])
+    for i in range(first_rows + 2):
+        append_logprobs_for_next_position(
+            legacy,
+            token_ids[i].tolist(),
+            expected[i].tolist(),
+            [None] * 4,
+            int(ranks[i]),
+            3,
+        )
+    assert list(container) == legacy
+    sampled = token_ids[:, 0].tolist()
+    assert render_openai_logprobs(sampled, container, 3) == _legacy_logprobs_bytes(
+        sampled, legacy, 3
+    )
+    assert container.arrays()[1].dtype == np.float64
+
+
+@pytest.mark.parametrize("consolidate", [False, True])
+def test_array_logprobs_self_extend_doubles(consolidate):
+    """Audit #5: ``c.extend(c)`` terminates and doubles, like a list."""
+    token_ids, logprobs, ranks = _engine_rows(0, 7, 3)
+    container = ArrayLogprobs()
+    for i in range(7):
+        container.append_rows(
+            token_ids[i : i + 1], logprobs[i : i + 1], ranks[i : i + 1]
+        )
+    if consolidate:
+        container.arrays()
+    container.extend(container)
+    assert len(container) == 14
+    np.testing.assert_array_equal(
+        container.arrays()[0], np.concatenate([token_ids, token_ids])
+    )
+
+
+def test_array_logprobs_flag_stays_off_engine_wire():
+    """Audit #6: array_logprobs is frontend-only; the request sent to
+    EngineCore after add_request does not carry it."""
+    params = SamplingParams(logprobs=2, array_logprobs=True)
+    request = EngineCoreRequest(
+        request_id="r-int",
+        external_req_id="r",
+        prompt_token_ids=[1, 2, 3],
+        mm_features=None,
+        arrival_time=0,
+        lora_request=None,
+        cache_salt=None,
+        data_parallel_rank=None,
+        sampling_params=params,
+        pooling_params=None,
+    )
+    processor = OutputProcessor(tokenizer=None, log_stats=False)
+    processor.add_request(request, None, queue=None)
+    state = processor.request_states["r-int"]
+    assert isinstance(state.logprobs_processor.logprobs, ArrayLogprobs)
+    assert b"array_logprobs" not in MsgpackEncoder().encode(request)[0]
+    assert request.sampling_params.array_logprobs is False
+    # The caller's (possibly shared) params object is not mutated.
+    assert params.array_logprobs is True
+
+
+def test_float_fast_path_guard(monkeypatch):
+    """Kimi #7a: the msgspec fast path is probed against repr at import and
+    is not used when the probe fails."""
+    assert logprobs_render._MSGSPEC_FLOATS_MATCH_REPR is True
+    assert logprobs_render._msgspec_floats_match_repr() is True
+    values = np.array([-1e-5, -0.5, -1e16, -0.037000000476837158])
+    expected = [repr(v).encode() for v in values.tolist()]
+    real_encode = msgspec.json.encode
+    monkeypatch.setattr(
+        logprobs_render.msgspec.json,
+        "encode",
+        lambda obj: real_encode(obj).replace(b"0.5", b"5e-1"),
+    )
+    assert logprobs_render._msgspec_floats_match_repr() is False
+    monkeypatch.setattr(logprobs_render, "_MSGSPEC_FLOATS_MATCH_REPR", False)
+    assert format_float_reprs(values, True) == expected
+
+
+def test_out_of_int32_ids_never_wrap():
+    """Kimi #7b: ids/ranks beyond int32 are stored exactly (default path) and
+    rejected by the int32 compact wire format instead of wrapping."""
+    token_ids, logprobs, ranks = _engine_rows(0, 3, 4)
+    token_ids = token_ids.astype(np.int64)
+    token_ids[1, 2] = 2**31 + 5
+    ranks = ranks.astype(np.int64)
+    container, legacy = _containers(token_ids, logprobs, ranks, 3)
+    assert list(container) == legacy
+    sampled = token_ids[:, 0].tolist()
+    assert render_openai_logprobs(sampled, container, 3) == _legacy_logprobs_bytes(
+        sampled, legacy, 3
+    )
+    with pytest.raises(GenerationError, match="int32"):
+        render_compact_logprobs(container, 3)
+    rank_container = ArrayLogprobs()
+    big_ranks = np.full(3, 2**31, dtype=np.int64)
+    rank_container.append_rows(token_ids[:, :1] * 0, logprobs[:, :1], big_ranks)
+    assert rank_container[0][0].rank == 2**31
+    with pytest.raises(GenerationError, match="int32"):
+        render_compact_logprobs(rank_container, 0)
+
+
+def _narrow_steps(k: int, widths: list[int]):
+    """Engine rows whose width changes between steps (e.g. a co-batched
+    request's logprob_token_ids replaced the batch's logprob tensors)."""
+    chunks = []
+    for step, width in enumerate(widths):
+        ids = np.array([[7 + step] + list(range(100, 100 + width - 1))])
+        lps = np.full((1, width), -np.inf, dtype=np.float32)
+        lps[0, 0] = -1.0 - step
+        lps[0, 1:] = -2.0 - np.arange(width - 1, dtype=np.float32)
+        chunks.append((ids, lps, np.array([1 + step])))
+    return chunks
+
+
+def _process(k: int, chunks, array: bool, kind=RequestOutputKind.FINAL_ONLY):
+    params = SamplingParams(
+        max_tokens=10, logprobs=k, detokenize=False, array_logprobs=array
+    )
+    params.output_kind = kind
+    processor = OutputProcessor(tokenizer=None, log_stats=False)
+    request = EngineCoreRequest(
+        request_id="r",
+        external_req_id="r",
+        prompt_token_ids=[1, 2],
+        mm_features=None,
+        arrival_time=0,
+        lora_request=None,
+        cache_salt=None,
+        data_parallel_rank=None,
+        sampling_params=params,
+        pooling_params=None,
+    )
+    queue = RequestOutputCollector(kind, "r")
+    processor.add_request(request, None, queue=queue)
+    for ids, lps, ranks in chunks:
+        processor.process_outputs(
+            [
+                EngineCoreOutput(
+                    request_id="r",
+                    new_token_ids=ids[:, 0].tolist(),
+                    new_logprobs=LogprobsLists(ids, lps, ranks),
+                )
+            ]
+        )
+    processor.abort_requests(["r"], internal=True)
+    out = queue.get_nowait()
+    assert out is not None
+    return out.outputs[0].logprobs
+
+
+@pytest.mark.parametrize(
+    "k,widths",
+    [(5, [6, 2]), (5, [2, 6, 3]), (-1, [7, 3]), (-1, [3, 7]), (2, [6, 6])],
+)
+@pytest.mark.parametrize(
+    "kind", [RequestOutputKind.FINAL_ONLY, RequestOutputKind.DELTA]
+)
+def test_irregular_row_widths_never_raise(k, widths, kind):
+    """Claude audit A: narrow or varying engine rows must not raise inside
+    OutputProcessor (that kills AsyncLLM's output handler); the stored
+    positions equal the legacy list path's."""
+    chunks = _narrow_steps(k, widths)
+    array = _process(k, chunks, True, kind)
+    legacy = _process(k, chunks, False, kind)
+    assert isinstance(array, ArrayLogprobs)
+    assert list(array) == list(legacy)
+    assert array.is_regular == (len(set(widths)) == 1 or (k >= 0 and min(widths) > k))
+
+
+@pytest.mark.asyncio
+async def test_irregular_rows_default_body_matches_legacy(monkeypatch):
+    chunks = [_engine_rows(0, 3, 6), _engine_rows(3, 2, 2), _engine_rows(5, 1, 6)]
+    request = _request(logprobs=5, request_id="fixed-id")
+    fast = await _full_body(monkeypatch, chunks, request, array=True)
+    legacy = await _full_body(monkeypatch, chunks, request, array=False)
+    assert fast == legacy
+
+
+@pytest.mark.asyncio
+async def test_irregular_rows_compact_is_a_request_error():
+    chunks = [_engine_rows(0, 3, 6), _engine_rows(3, 2, 2)]
+    feeder = _OutputProcessorEngine(chunks)
+    with pytest.raises(GenerationError, match="inconsistent widths"):
+        await _serving(feeder).serve_tokens(
+            _request(logprobs=5, logprobs_format="compact")
+        )
+    feeder = _OutputProcessorEngine(chunks)
+    generator = await _serving(feeder).serve_tokens(
+        _request(logprobs=5, logprobs_format="compact", stream=True)
+    )
+    events = _parse_sse_chunks([chunk async for chunk in generator])
+    assert events[-1] == "[DONE]"
+    assert any("error" in e for e in events[:-1] if isinstance(e, dict))
+
+
+def test_array_logprobs_accepts_numpy_integer_index():
+    token_ids, logprobs, ranks = _engine_rows(0, 3, 4)
+    container, legacy = _containers(token_ids, logprobs, ranks, 3)
+    assert container[np.int64(1)] == legacy[1]
+    assert container[np.int32(-1)] == legacy[-1]
+    with pytest.raises(TypeError):
+        container[1.0]  # type: ignore[index]
+
+
+def test_generate_request_omits_default_logprobs_format():
+    """Claude audit C: render endpoints serialize GenerateRequest; the
+    opt-in field must not appear unless set."""
+    request = _request()
+    assert "logprobs_format" not in request.model_dump()
+    assert "logprobs_format" not in json.loads(request.model_dump_json())
+    compact = _request(logprobs_format="compact")
+    assert compact.model_dump()["logprobs_format"] == "compact"
+    restored = GenerateRequest.model_validate_json(compact.model_dump_json())
+    assert restored.logprobs_format == "compact"
+
+
+def test_item_prefix_cache_is_bounded(monkeypatch):
+    cache = logprobs_render._ItemPrefixCache()
+    monkeypatch.setattr(logprobs_render._ItemPrefixCache, "max_size", 8)
+    monkeypatch.setattr(logprobs_render, "_ITEM_PREFIX", cache)
+    token_ids, logprobs, ranks = _engine_rows(0, 20, 4)
+    container, legacy = _containers(token_ids, logprobs, ranks, 3)
+    sampled = token_ids[:, 0].tolist()
+    assert render_openai_logprobs(sampled, container, 3) == _legacy_logprobs_bytes(
+        sampled, legacy, 3
+    )
+    assert len(cache) == 8
+
+
+# sha256 of the bodies the pre-change implementation (456c93187a, i.e. base
+# 0fd2e8d503 + listener patch) returns for golden_generate_scenarios.py,
+# produced with agent_run/scripts/claude-genopt-py-golden.py (real gpt2
+# tokenizer, prompt logprobs, sampled-in-top-k rows, -inf, narrow rows).
+GOLDEN_SHA256 = {
+    "lp2_plp2_length": (
+        "45d9a05e207128846a472d7397f795f0030a52ee77757fb3eb6381b98deefe18"
+    ),
+    "lpNone_plp1_abort": (
+        "3c0cb3e93edca68e3f551a703bf9c0ac295e240b4cc41f8ded9535c65175cf4b"
+    ),
+    "lp0_abort": "cf982779105509e6f147eef4405361db959b3c0a4e629fb7227fc63794862d82",
+    "lp5_narrow_rows": (
+        "f4f2ff4bde6d73f2dc7eed672018c64c4a3025eb9c0250e795652a5ff251590a"
+    ),
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("name", sorted(GOLDEN_SHA256))
+async def test_default_body_matches_pre_change_golden(name):
+    """Claude audit E: compare with the old implementation's bytes, not with
+    this tree's legacy branch."""
+    from .golden_generate_scenarios import SCENARIOS, render_body
+
+    assert set(SCENARIOS) == set(GOLDEN_SHA256)
+    body = await render_body(name)
+    assert hashlib.sha256(body).hexdigest() == GOLDEN_SHA256[name]

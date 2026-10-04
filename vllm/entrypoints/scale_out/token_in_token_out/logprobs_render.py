@@ -25,6 +25,7 @@ import msgspec
 import numpy as np
 import pybase64
 
+from vllm.entrypoints.openai.engine.protocol import GenerationError
 from vllm.logprobs import ArrayLogprobs
 
 COMPACT_DTYPE_TOKEN_IDS = "int32"
@@ -45,13 +46,34 @@ def compact_num_slots(container: ArrayLogprobs, num_logprobs: int | None) -> int
     return num_logprobs + 1
 
 
+def _as_wire_int32(values: np.ndarray, what: str) -> np.ndarray:
+    """Cast to little-endian int32, refusing (never wrapping) wider values."""
+    if values.dtype == np.dtype("<i4"):
+        return values
+    info = np.iinfo(np.int32)
+    if values.size and (int(values.min()) < info.min or int(values.max()) > info.max):
+        raise GenerationError(f"A {what} does not fit the compact int32 wire format")
+    return values.astype("<i4")
+
+
 def compact_logprobs_fields(
     container: ArrayLogprobs, num_logprobs: int | None
 ) -> tuple[int, int, bytes, bytes, bytes]:
-    """Return ``(N, S, b64(token_ids), b64(logprobs), b64(ranks))``."""
+    """Return ``(N, S, b64(token_ids), b64(logprobs), b64(ranks))``.
+
+    Raises GenerationError (HTTP 500) when the engine rows cannot be
+    represented: inconsistent row widths or ids/ranks beyond int32.
+    """
+    if not container.is_regular:
+        raise GenerationError(
+            "Engine logprob rows have inconsistent widths; the compact "
+            "logprobs format cannot represent them"
+        )
     token_ids, logprobs, ranks = container.arrays()
-    # Arrays are C-contiguous little-endian (ArrayLogprobs); the wire format
-    # is float32 (engine logprobs are float32, so this is normally a no-op).
+    # Arrays are C-contiguous little-endian (ArrayLogprobs). The wire format
+    # is int32/float32; engine data normally already has these dtypes.
+    token_ids = _as_wire_int32(token_ids, "token id")
+    ranks = _as_wire_int32(ranks, "rank")
     if logprobs.dtype != np.dtype("<f4"):
         logprobs = logprobs.astype("<f4")
     return (
@@ -88,13 +110,13 @@ def render_compact_logprobs(
 class _ItemPrefixCache(dict[int, bytes]):
     """token id -> ``{"token":"token_id:<id>","logprob":`` (bounded)."""
 
-    max_size = 1 << 20
+    # ~13 MB at most per process; ids beyond the bound are not cached.
+    max_size = 1 << 17
 
     def __missing__(self, token_id: int) -> bytes:
-        if len(self) >= self.max_size:
-            self.clear()
         value = f'{{"token":"token_id:{token_id}","logprob":'.encode("ascii")
-        self[token_id] = value
+        if len(self) < self.max_size:
+            self[token_id] = value
         return value
 
 
@@ -114,13 +136,49 @@ def format_float_reprs(values: np.ndarray, exact_float32: bool) -> list[bytes]:
     both use the same digits in fixed notation (verified exhaustively over
     all float32 values, see tests); other magnitudes, where the exponent
     notation differs (``1e-05`` vs ``0.00001``), use ``repr``.
-    Values must be finite.
+    Values must be finite. The fast path is disabled if an import-time
+    probe finds msgspec formatting that differs from ``repr``.
     """
     floats = values.tolist()
     if not floats:
         return []
-    if not exact_float32:
+    if not (exact_float32 and _MSGSPEC_FLOATS_MATCH_REPR):
         return [repr(v).encode("ascii") for v in floats]
+    return _format_fast(values)
+
+
+def _msgspec_floats_match_repr() -> bool:
+    """Probe the msgspec fast path against ``repr`` once at import.
+
+    The fast path was verified exhaustively for msgspec 0.21.1; this probe
+    (float32 boundaries of the fast range, powers of ten, extremes and a
+    fixed pseudo-random sample) disables it if another msgspec version
+    formats any of them differently.
+    """
+    probe: list[float] = [0.0, -0.0, 0.1, 0.5, 1.0, 9999.0, 123.456, -1.2e-7]
+    for edge in (1e-4, 1e16, 1.0, 1e-3, 1e6, 1e15, 3.4028235e38, 1e-45):
+        e = np.float32(edge)
+        probe += [
+            float(e),
+            float(np.nextafter(e, np.float32(0))),
+            float(np.nextafter(e, np.float32(3.4028235e38))),
+        ]
+    probe += [float(np.float32(10.0**p)) for p in range(-45, 39)]
+    bits = np.random.default_rng(1234).integers(0, 2**32, 4096, dtype=np.uint64)
+    sample = bits.astype(np.uint32).view(np.float32)
+    probe += sample[np.isfinite(sample)].astype(np.float64).tolist()
+    probe += [-v for v in probe]
+    values = np.array(probe, dtype=np.float64)
+    values = values[np.isfinite(values)]
+    probe = values.tolist()
+    try:
+        return _format_fast(values) == [repr(v).encode("ascii") for v in probe]
+    except Exception:
+        return False
+
+
+def _format_fast(values: np.ndarray) -> list[bytes]:
+    floats = values.tolist()
     out = msgspec.json.encode(floats)[1:-1].split(b",")
     magnitude = np.abs(values)
     for i in np.flatnonzero(
@@ -128,6 +186,9 @@ def format_float_reprs(values: np.ndarray, exact_float32: bool) -> list[bytes]:
     ).tolist():
         out[i] = repr(floats[i]).encode("ascii")
     return out
+
+
+_MSGSPEC_FLOATS_MATCH_REPR = _msgspec_floats_match_repr()
 
 
 def _rows_have_unique_slots(token_ids: np.ndarray) -> bool:
@@ -172,6 +233,8 @@ def render_openai_logprobs_parts(
     Raises ValueError for values JSON cannot represent (NaN/+inf after the
     clamp), like ``json.dumps(..., allow_nan=False)`` does on the legacy path.
     """
+    if not container.is_regular:
+        return None
     token_ids, logprobs, _ = container.arrays()
     n = len(sampled_token_ids)
     if n != len(token_ids):
@@ -210,8 +273,14 @@ def render_openai_logprobs_parts(
     values = np.maximum(
         np.take_along_axis(logprobs, value_src, axis=1).astype(np.float64), -9999.0
     )
-    if not np.isfinite(values).all():
-        raise ValueError("Out of range float values are not JSON compliant")
+    finite = np.isfinite(values)
+    if not finite.all():
+        # Same message as json.dumps(..., allow_nan=False) for the first
+        # offending value in document order (row-major here).
+        bad = values.ravel()[int(np.flatnonzero(~finite.ravel())[0])]
+        raise ValueError(
+            f"Out of range float values are not JSON compliant: {float(bad)!r}"
+        )
 
     exact_float32 = logprobs.dtype == np.float32
     width = limit + 1

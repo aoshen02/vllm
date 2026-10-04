@@ -190,6 +190,17 @@ class GenerateRequest(BaseModel):
         instance._sampling_params_provided_keys = provided
         return instance
 
+    @model_serializer(mode="wrap")
+    def _serialize(
+        self, handler: SerializerFunctionWrapHandler, info: SerializationInfo
+    ) -> Any:
+        # logprobs_format is opt-in: omit the default so serialized requests
+        # (e.g. the render endpoints' responses) are unchanged.
+        data = handler(self)
+        if isinstance(data, dict) and data.get("logprobs_format") == "openai":
+            del data["logprobs_format"]
+        return data
+
     def is_sampling_param_provided(self, name: str) -> bool:
         """Whether the caller explicitly set ``sampling_params.<name>``.
 
