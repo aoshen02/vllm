@@ -159,9 +159,8 @@ class ModelOptKVCacheMethod(BaseKVCacheMethod):
         super().__init__(quant_config)
 
 
-# W4A16 layers drop a deprecated checkpoint's input_scale after processing, so
-# a copy arriving later (e.g. in a later layerwise-reload bucket) is ignored.
-# Formats that keep their input_scale still load (and wait for) it.
+# W4A16 checkpoints carry no (or a deprecated) input_scale: a layerwise reload
+# neither waits for it (weight_loader_numel = 0) nor rejects a late copy.
 _W4A16_IGNORE_UNEXPECTED_SUFFIXES = (
     *QuantizationConfig._ignore_unexpected_suffixes,
     ".input_scale",
@@ -982,8 +981,6 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
         )
         layer.register_parameter("w2_input_scale", w2_input_scale)
         if self.use_a16:
-            # Weight-only checkpoints carry no activation scales: a layerwise
-            # reload must not wait for them.
             w13_input_scale.weight_loader_numel = 0
             w2_input_scale.weight_loader_numel = 0
 
@@ -2447,7 +2444,6 @@ class _DropInputScale(FormatScheme):
     def extra_weights(self, layer, shapes, ctx, wl) -> None:
         data = torch.full((shapes.num_partitions,), torch.nan)
         scale = PerTensorScaleParameter(data=data, weight_loader=wl)
-        # Usually absent from the checkpoint: a layerwise reload must not wait.
         scale.weight_loader_numel = 0
         layer.register_parameter("input_scale", scale)
 

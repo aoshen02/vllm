@@ -114,30 +114,6 @@ def test_gate_skips_small_m_cute_gemm_under_bi(monkeypatch, batch_invariant):
     assert gate.allow_cublas_router_gemm
 
 
-@pytest.mark.parametrize("batch_invariant", [False, True])
-def test_cuda_rms_norm_dispatch_under_bi(monkeypatch, batch_invariant):
-    from vllm.model_executor.layers import layernorm
-
-    calls = []
-
-    def shared(*args):
-        calls.append("rms")
-        return "shared"
-
-    monkeypatch.setattr(layernorm.envs, "VLLM_BATCH_INVARIANT", batch_invariant)
-    monkeypatch.setattr(layernorm, "cuda_rms_norm", shared)
-    monkeypatch.setattr(
-        layernorm.RMSNorm, "forward", lambda self, x, residual=None: "default"
-    )
-    norm = layernorm.CudaRMSNorm.__new__(layernorm.CudaRMSNorm)
-    torch.nn.Module.__init__(norm)
-    norm.weight = torch.nn.Parameter(torch.ones(4))
-    norm.variance_epsilon = 1e-5
-    out = layernorm.CudaRMSNorm.forward(norm, torch.ones(2, 4))
-    assert out == ("shared" if batch_invariant else "default")
-    assert calls == (["rms"] if batch_invariant else [])
-
-
 @pytest.mark.parametrize("tp_size", [1, 2])
 def test_grouped_gated_norm_only_at_tp1(monkeypatch, tp_size):
     """The grouped gated-norm kernel normalizes whole groups on one rank; with

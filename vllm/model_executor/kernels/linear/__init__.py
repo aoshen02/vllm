@@ -1089,8 +1089,6 @@ def init_nvfp4_linear_kernel(use_a16: bool = False) -> NvFp4LinearKernel:
     quantization = "nvfp4_w4a16" if use_a16 else "nvfp4_w4a4"
     linear_backend = _get_linear_backend(quantization=quantization)
     if envs.VLLM_BATCH_INVARIANT and use_a16:
-        # CUTLASS and emulation quantize activations; Humming keeps W4A16
-        # activations in BF16 and takes batch invariance into its compute config.
         if linear_backend not in ("auto", "humming"):
             logger.warning_once(
                 "VLLM_BATCH_INVARIANT overrides --linear-backend=%s; using the "

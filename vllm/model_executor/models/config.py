@@ -698,12 +698,8 @@ class NemotronHForCausalLMConfig(VerifyAndUpdateConfig):
 
     @staticmethod
     def use_cuda_fp8_quant(vllm_config: "VllmConfig") -> None:
-        """Quantize FP8 activations with the CUDA kernel and no fusions.
-
-        Training-side replay of the FP8 layers calls the same standalone kernel.
-        Enabling the custom op would otherwise turn on the norm/activation +
-        quant fusion passes, whose fused kernels round differently.
-        """
+        """Quantize FP8 activations with the standalone CUDA kernel; the
+        norm/activation + quant fusions round differently."""
         compilation_config = vllm_config.compilation_config
         pass_config = compilation_config.pass_config
         if pass_config.fuse_norm_quant is None:
