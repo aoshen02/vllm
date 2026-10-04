@@ -661,3 +661,31 @@ def test_parts_renderers_join_to_bytes():
     parts = render_openai_logprobs_parts(sampled, container, 3)
     assert parts is not None
     assert b"".join(parts) == render_openai_logprobs(sampled, container, 3)
+
+
+def test_array_logprobs_coalesces_single_row_steps(monkeypatch):
+    """One row per engine step (the common decode case) must not create one
+    numpy array per row, and suffix slices must stay correct."""
+    monkeypatch.setattr(ArrayLogprobs, "BLOCK_ROWS", 4)
+    token_ids, logprobs, ranks = _engine_rows(0, 11, 3)
+    container = ArrayLogprobs()
+    for i in range(11):
+        container.append_rows(
+            token_ids[i : i + 1], logprobs[i : i + 1], ranks[i : i + 1]
+        )
+        tail = container[-1:]
+        np.testing.assert_array_equal(tail.arrays()[0], token_ids[i : i + 1])
+    assert len(container) == 11
+    assert len(container.rank_chunks) == 3
+    middle = container[2:9]
+    np.testing.assert_array_equal(middle.arrays()[0], token_ids[2:9])
+    assert middle.arrays()[1].tobytes() == logprobs[2:9].tobytes()
+    ids, values, rk = container.arrays()
+    np.testing.assert_array_equal(ids, token_ids)
+    assert values.tobytes() == logprobs.tobytes()
+    np.testing.assert_array_equal(rk, ranks)
+    assert len(container.rank_chunks) == 1
+    # Appending after consolidation keeps working.
+    container.append_rows(token_ids[:2], logprobs[:2], ranks[:2])
+    assert len(container) == 13
+    np.testing.assert_array_equal(container.arrays()[0][11:], token_ids[:2])
