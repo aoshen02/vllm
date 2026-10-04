@@ -430,12 +430,16 @@ def render_openai_logprobs_parts(
         out: list[bytes] = [b""] * (2 * (stop - start) * width)
         if limit > 1:
             out[0::2] = _NEXT_LEADS.lookup(block_ids).ravel().tolist()
-        plain = _PLAIN_LEADS.lookup(block_ids[:, : min(width, 2)]).tolist()
-        out[0 :: 2 * width] = [row_sep + lead[0] for lead in plain]
+        # Flat (1-D) lookups: nested lists would allocate one GC-tracked list
+        # per row and trigger frequent garbage collections, whose full passes
+        # hold the GIL while large responses are alive.
+        firsts = _PLAIN_LEADS.lookup(block_ids[:, 0]).tolist()
+        out[0 :: 2 * width] = [row_sep + lead for lead in firsts]
         if start == 0:
-            out[0] = plain[0][0]
+            out[0] = firsts[0]
         if limit:
-            out[2 :: 2 * width] = [_SEP_TOP_FIRST + lead[1] for lead in plain]
+            seconds = _PLAIN_LEADS.lookup(block_ids[:, 1]).tolist()
+            out[2 :: 2 * width] = [_SEP_TOP_FIRST + lead for lead in seconds]
         out[1::2] = format_float_reprs(values[start:stop].ravel(), exact_float32)
         parts.append(b"".join(out))
     parts.append(row_end + b"]}")

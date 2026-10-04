@@ -1885,3 +1885,28 @@ def test_tail_fast_path_still_widens(monkeypatch):
     container.append_rows(wide, logprobs[2:3], ranks[2:3])
     assert container[2][2**33].logprob == float(logprobs[2, 1])
     assert container.arrays()[0].dtype == np.int64
+
+
+def test_openai_render_allocates_few_gc_tracked_objects():
+    """Round 4 A: rendering must not allocate per-row GC-tracked containers
+    (nested lists triggered hundreds of collections per request; their
+    pauses hold the GIL and showed up as ~0.16-0.2 s event-loop stalls)."""
+    import gc
+
+    token_ids, logprobs, ranks = _engine_rows(0, 16384, 9)
+    container, _ = _containers(token_ids, logprobs, ranks, 8)
+    sampled = token_ids[:, 0].tolist()
+    render_openai_logprobs(sampled, container, 8)  # warm the lead tables
+    collections: list[int] = []
+
+    def callback(phase, info):
+        if phase == "start":
+            collections.append(info["generation"])
+
+    gc.collect()
+    gc.callbacks.append(callback)
+    try:
+        render_openai_logprobs(sampled, container, 8)
+    finally:
+        gc.callbacks.remove(callback)
+    assert len(collections) <= 2, collections
