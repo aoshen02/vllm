@@ -106,8 +106,6 @@ class FlashInferCuteDSLW4A16Experts(FlashInferCuteDSLExperts):
         from flashinfer.tllm_enums import ActivationType
 
         mk.FusedMoEExpertsModular.__init__(self, moe_config, quant_config)
-        if quant_config.quant_dtype is not None:
-            raise ValueError("W4A16 must not quantize activations")
         # The parent's per-token NVFP4 activation mode does not apply here.
         self.per_token_activation = False
         self.hidden_dim = moe_config.hidden_dim
@@ -127,8 +125,6 @@ class FlashInferCuteDSLW4A16Experts(FlashInferCuteDSLExperts):
         )
 
     def process_weights_after_loading(self, layer):
-        if layer.activation != MoEActivation.RELU2_NO_MUL:
-            raise ValueError("Only non-gated ReLU2 is covered")
         if getattr(layer, "w13_input_scale", None) is not None:
             raise ValueError("Unexpected activation scale after W4A16 conversion")
         if layer.expert_map is not None:
@@ -219,7 +215,6 @@ class FlashInferCuteDSLW4A16Experts(FlashInferCuteDSLExperts):
             self.g2_alphas.reshape(-1),
             output,
         ]
-        # Explicit screened candidates, chosen from host-known shapes before
-        # launch. No autotuning or device synchronization inside Graph replay.
+        # Screened tiles chosen from host shapes: no autotuning in graph replay.
         tile = w4a16_tactic(hidden_states.shape[0], envs.VLLM_BATCH_INVARIANT)
         self.runner.forward(inputs, tactic=(tile, tile))
