@@ -705,14 +705,13 @@ class NemotronHForCausalLMConfig(VerifyAndUpdateConfig):
         quant fusion passes, whose fused kernels round differently.
         """
         compilation_config = vllm_config.compilation_config
-        if "-quant_fp8" in compilation_config.custom_ops:
-            return
-        compilation_config.custom_ops.append("+quant_fp8")
         pass_config = compilation_config.pass_config
         if pass_config.fuse_norm_quant is None:
             pass_config.fuse_norm_quant = False
         if pass_config.fuse_act_quant is None:
             pass_config.fuse_act_quant = False
+        if "-quant_fp8" not in compilation_config.custom_ops:
+            compilation_config.custom_ops.append("+quant_fp8")
 
 
 class NemotronHNanoVLV2Config(VerifyAndUpdateConfig):
