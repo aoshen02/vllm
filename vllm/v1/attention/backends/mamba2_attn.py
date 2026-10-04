@@ -126,11 +126,6 @@ class Mamba2AttentionBackend(AttentionBackend):
         prefix = "VLLM_BATCH_INVARIANT=1 with Mamba2 layers"
         if cache_config.use_replayssm:
             raise ValueError(f"{prefix} is not supported together with --use-replayssm")
-        if cache_config.mamba_cache_mode != "none":
-            raise ValueError(
-                f"{prefix} does not support prefix caching yet; pass "
-                "--no-enable-prefix-caching"
-            )
         if vllm_config.num_speculative_tokens > 0:
             raise ValueError(f"{prefix} does not support speculative decoding")
         if vllm_config.mamba_config.backend != MambaBackendEnum.TRITON:

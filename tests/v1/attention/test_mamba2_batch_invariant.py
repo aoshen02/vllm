@@ -8,6 +8,7 @@ import torch
 import vllm.envs as envs
 from vllm.config import CacheConfig, SchedulerConfig, VllmConfig
 from vllm.model_executor.layers.mamba.mamba_utils import (
+    MambaStateCopyFuncCalculator,
     MambaStateDtypeCalculator,
     MambaStateShapeCalculator,
 )
@@ -58,6 +59,18 @@ def test_state_layout_adds_buffers_and_fp32_ssm_state(monkeypatch):
         MambaStateDtypeCalculator.mamba2_state_dtype(torch.bfloat16, "auto", "bfloat16")
 
 
+def test_align_copy_covers_every_state(monkeypatch):
+    """Prefix caching copies a block's state; the replay buffers are state."""
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", False)
+    assert len(MambaStateCopyFuncCalculator.mamba2_state_copy_func()) == 2
+
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
+    shapes = MambaStateShapeCalculator.mamba2_state_shape(
+        **SHAPE_KWARGS, chunk_size=256
+    )
+    assert len(MambaStateCopyFuncCalculator.mamba2_state_copy_func()) == len(shapes)
+
+
 def _config(**cache_overrides) -> VllmConfig:
     kwargs = dict(enable_prefix_caching=False)
     kwargs.update(cache_overrides)
@@ -67,9 +80,12 @@ def _config(**cache_overrides) -> VllmConfig:
     )
 
 
-def test_check_accepts_the_supported_configuration():
+@pytest.mark.parametrize("mamba_cache_mode", ["none", "align"])
+def test_check_accepts_the_supported_configuration(mamba_cache_mode):
     assert Mamba2AttentionBackend.supports_batch_invariance()
-    Mamba2AttentionBackend.check_batch_invariant_config(_config())
+    cfg = _config()
+    cfg.cache_config.mamba_cache_mode = mamba_cache_mode
+    Mamba2AttentionBackend.check_batch_invariant_config(cfg)
 
 
 def test_decode_keeps_full_cudagraph_support(monkeypatch):
@@ -93,7 +109,6 @@ def test_decode_positions_ignore_cudagraph_padding_rows():
 @pytest.mark.parametrize(
     "mutate,message",
     [
-        (lambda c: setattr(c.cache_config, "mamba_cache_mode", "align"), "prefix"),
         (lambda c: setattr(c.cache_config, "use_replayssm", True), "replayssm"),
         (lambda c: setattr(c.parallel_config, "enable_dbo", True), "micro-batching"),
         (lambda c: setattr(c.parallel_config, "ubatch_size", 2), "micro-batching"),

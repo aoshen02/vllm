@@ -33,7 +33,7 @@ def mamba2_llm():
     """
     llms: list[LLM] = []
 
-    def build(max_num_seqs: int) -> LLM:
+    def build(max_num_seqs: int, **kwargs) -> LLM:
         llm = LLM(
             model=MODEL,
             # this checkpoint's config has no `architectures` entry
@@ -42,11 +42,11 @@ def mamba2_llm():
             dtype="bfloat16",
             max_model_len=2048,
             max_num_seqs=max_num_seqs,
-            enable_prefix_caching=False,
             logprobs_mode="raw_logprobs",
             max_logprobs=1,
             gpu_memory_utilization=GPU_MEMORY_UTILIZATION,
             seed=0,
+            **{"enable_prefix_caching": False, **kwargs},
         )
         llms.append(llm)
         return llm
@@ -143,3 +143,71 @@ def test_one_token_prompt_joining_a_decode_batch_matches_prefill_logprobs(
             if decode_lp != prefill_lp:
                 mismatches.append((name, j, decode_lp, prefill_lp))
     assert not mismatches, mismatches[:10]
+
+
+# Mid-chunk block boundaries for the model's 256-token SSD chunk: 400 % 256 = 144
+# and 800 % 256 = 32 tokens sit in the partial-chunk buffers there.
+BLOCK_SIZE = 400
+
+
+def _greedy(llm: LLM, prompts: list[list[int]], max_tokens: int):
+    outputs = llm.generate(
+        [TokensPrompt(prompt_token_ids=p) for p in prompts],
+        SamplingParams(max_tokens=max_tokens, temperature=0.0, logprobs=0),
+        use_tqdm=False,
+    )
+    results = []
+    for output in outputs:
+        completion = output.outputs[0]
+        tokens = list(completion.token_ids)
+        assert completion.logprobs is not None
+        logprobs = [lp and lp[t].logprob for lp, t in zip(completion.logprobs, tokens)]
+        results.append((tokens, logprobs, output.num_cached_tokens))
+    return results
+
+
+@skip_if_not_cuda
+@pytest.mark.timeout(1200)
+@pytest.mark.parametrize("model_runner_v2", [False, True])
+def test_prefix_cache_hits_match_prefix_caching_off(
+    mamba2_llm, monkeypatch, model_runner_v2
+):
+    """Prefix-cache hits and misses produce the bits of a run without caching.
+
+    A hit resumes from the state cached at a block boundary. Under exact replay
+    that state includes the inputs buffered since the last chunk boundary, so
+    restoring it without them diverges at every mid-chunk boundary, on hits
+    and on misses whose prefill or decode crosses a block.
+    """
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1" if model_runner_v2 else "0")
+    gen = torch.Generator().manual_seed(2)
+
+    def rand(n: int) -> list[int]:
+        return torch.randint(100, 50000, (n,), generator=gen).tolist()
+
+    max_tokens = 64
+    shorter, equal, longer, two_blocks = rand(300), rand(400), rand(700), rand(1000)
+    # 350 + 64 generated tokens: the block boundary is crossed while decoding
+    crosses_in_decode = rand(350)
+    cold = [shorter, equal, longer, two_blocks, crosses_in_decode]
+
+    llm = mamba2_llm(max_num_seqs=16, enable_prefix_caching=True, block_size=BLOCK_SIZE)
+    cold_out = _greedy(llm, cold, max_tokens)
+    assert [cached for *_, cached in cold_out] == [0] * len(cold)
+    warm = [
+        (shorter, 0),
+        (longer, 400),
+        (longer[:600] + rand(50), 400),
+        (two_blocks, 800),
+    ]
+    warm_out = _greedy(llm, [p for p, _ in warm], max_tokens)
+    assert [cached for *_, cached in warm_out] == [c for _, c in warm]
+
+    prompts = cold + [p for p, _ in warm]
+    ref_out = _greedy(mamba2_llm(max_num_seqs=16), prompts, max_tokens)
+    mismatches = [
+        (i, len(prompts[i]))
+        for i, (out, ref) in enumerate(zip(cold_out + warm_out, ref_out))
+        if out[:2] != ref[:2]
+    ]
+    assert not mismatches, mismatches

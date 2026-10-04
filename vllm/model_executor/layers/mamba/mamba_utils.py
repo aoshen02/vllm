@@ -483,6 +483,10 @@ class MambaStateCopyFuncCalculator:
 
     @classmethod
     def mamba2_state_copy_func(cls):
+        if envs.VLLM_BATCH_INVARIANT:
+            # The partial-chunk buffers (x, dt, B) are per-slot state like the
+            # SSM state, so an align-mode block copy must carry them too.
+            return (get_conv_copy_spec, *(get_temporal_copy_spec,) * 4)
         return get_conv_copy_spec, get_temporal_copy_spec
 
     @classmethod
