@@ -134,6 +134,7 @@ class _OutputProcessorEngine:
                             new_logprobs=(
                                 None
                                 if sampling_params.num_logprobs is None
+                                or logprobs is None
                                 else LogprobsLists(token_ids, logprobs, ranks)
                             ),
                             new_prompt_logprobs_tensors=(
@@ -1590,3 +1591,105 @@ def test_generate_request_schema_keeps_all_fields():
     for model in (GenerateResponseChoice, GenerateResponseStreamChoice):
         props = model.model_json_schema(mode="serialization")["properties"]
         assert "compact_logprobs" in props and "token_ids" in props
+
+
+# ------------------------------------------- SPEC amendments (round 3)
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_compact_full_vocab_logprobs_is_http_400(stream):
+    """SPEC: compact + logprobs=-1 is rejected at request validation."""
+    with pytest.raises(ValidationError, match="logprobs=-1"):
+        _request(logprobs=-1, logprobs_format="compact", stream=stream)
+    assert _request(logprobs=-1).sampling_params.logprobs == -1  # default ok
+    app = FastAPI()
+    app.state.args = Namespace(log_error_stack=False, tokens_only=False)
+    app.state.serving_tokens = MagicMock()
+    init_exception_handler(app)
+    api_router.attach_router(app)
+    with TestClient(app) as client:
+        result = client.post(
+            "/inference/v1/generate",
+            json={
+                "token_ids": [1],
+                "sampling_params": {"logprobs": -1},
+                "logprobs_format": "compact",
+                "stream": stream,
+            },
+        )
+    assert result.status_code == 400
+    app.state.serving_tokens.serve_tokens.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+async def test_compact_positions_must_match_tokens(stream):
+    """SPEC: a step with tokens but no logprob rows misaligns the rows; the
+    compact response fails (500 / error chunk) instead of rendering."""
+    ids, _, _ = _engine_rows(0, 1, 4)
+    chunks = [(ids, None, None), _engine_rows(1, 2, 4)]
+    feeder = _OutputProcessorEngine(chunks)
+    request = _request(logprobs=3, logprobs_format="compact", stream=stream)
+    if not stream:
+        with pytest.raises(GenerationError, match="2 logprob positions for 3"):
+            await _serving(feeder).serve_tokens(request)
+        return
+    generator = await _serving(feeder).serve_tokens(request)
+    events = _parse_sse_chunks([chunk async for chunk in generator])
+    data = [e for e in events if isinstance(e, dict)]
+    assert "error" in data[0]
+    assert "0 logprob positions for 1" in json.dumps(data[0])
+
+
+@pytest.mark.asyncio
+async def test_compact_stream_logprob_token_ids_only_and_null_logprobs():
+    """SPEC: blocks are emitted iff logprobs or logprob_token_ids are
+    requested (S = len(ids)+1); stream choices keep "logprobs": null."""
+    chunks = [_engine_rows(0, 2, 3), _engine_rows(2, 1, 3)]
+    feeder = _OutputProcessorEngine(chunks)
+    generator = await _serving(feeder).serve_tokens(
+        _request(
+            logprobs=None,
+            logprobs_format="compact",
+            stream=True,
+            sampling={"logprob_token_ids": [5, 9]},
+        )
+    )
+    events = _parse_sse_chunks([chunk async for chunk in generator])
+    data = [e for e in events if isinstance(e, dict) and e["choices"]]
+    assert len(data) == 2
+    for event, chunk in zip(data, chunks):
+        choice = event["choices"][0]
+        assert "logprobs" in choice and choice["logprobs"] is None
+        assert choice["compact_logprobs"]["num_slots"] == 3
+        np.testing.assert_array_equal(_decode(choice["compact_logprobs"])[0], chunk[0])
+    # Neither logprobs nor logprob_token_ids: no compact key at all.
+    feeder = _OutputProcessorEngine(chunks)
+    generator = await _serving(feeder).serve_tokens(
+        _request(logprobs=None, logprobs_format="compact", stream=True)
+    )
+    events = _parse_sse_chunks([chunk async for chunk in generator])
+    for event in events:
+        if isinstance(event, dict):
+            for choice in event["choices"]:
+                assert "compact_logprobs" not in choice
+
+
+@pytest.mark.asyncio
+async def test_compact_zero_token_abort_stream_vs_full():
+    """Zero-token abort: the stream emits no chunk carrying a compact key
+    (zero-token deltas are skipped, as on the base path); the full response
+    carries an empty block."""
+    feeder = _OutputProcessorEngine([])
+    generator = await _serving(feeder).serve_tokens(
+        _request(logprobs=3, logprobs_format="compact", stream=True)
+    )
+    events = _parse_sse_chunks([chunk async for chunk in generator])
+    assert events == ["[DONE]"]
+    feeder = _OutputProcessorEngine([])
+    response = await _serving(feeder).serve_tokens(
+        _request(logprobs=3, logprobs_format="compact")
+    )
+    block = json.loads(response.body)["choices"][0]["compact_logprobs"]
+    assert block["num_positions"] == 0 and block["num_slots"] == 4
+    assert block["token_ids"] == block["logprobs"] == block["ranks"] == ""

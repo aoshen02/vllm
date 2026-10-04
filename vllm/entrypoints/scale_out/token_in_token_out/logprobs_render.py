@@ -58,7 +58,11 @@ def _as_wire_int32(values: np.ndarray, what: str) -> np.ndarray:
     return values.astype("<i4")
 
 
-def _check_compact_rows(container: ArrayLogprobs, num_logprobs: int | None) -> None:
+def _check_compact_rows(
+    container: ArrayLogprobs,
+    num_logprobs: int | None,
+    expected_positions: int | None = None,
+) -> None:
     """Refuse rows the compact format cannot represent (GenerationError, 500):
     inconsistent widths, or a width other than ``k + 1`` for ``k >= 0``
     (e.g. narrower rows when a co-batched request's ``logprob_token_ids``
@@ -67,6 +71,13 @@ def _check_compact_rows(container: ArrayLogprobs, num_logprobs: int | None) -> N
         raise GenerationError(
             "Engine logprob rows have inconsistent widths; the compact "
             "logprobs format cannot represent them"
+        )
+    if expected_positions is not None and len(container) != expected_positions:
+        # E.g. an engine step with tokens but no logprob rows: rows would no
+        # longer line up with the generated tokens.
+        raise GenerationError(
+            f"{len(container)} logprob positions for {expected_positions} "
+            "generated tokens; the compact logprobs format cannot represent them"
         )
     stored = container.num_slots
     if (
@@ -83,14 +94,16 @@ def _check_compact_rows(container: ArrayLogprobs, num_logprobs: int | None) -> N
 
 
 def compact_logprobs_fields(
-    container: ArrayLogprobs, num_logprobs: int | None
+    container: ArrayLogprobs,
+    num_logprobs: int | None,
+    expected_positions: int | None = None,
 ) -> tuple[int, int, bytes, bytes, bytes]:
     """Return ``(N, S, b64(token_ids), b64(logprobs), b64(ranks))``.
 
     Raises GenerationError (HTTP 500) when the engine rows cannot be
     represented: inconsistent row widths or ids/ranks beyond int32.
     """
-    _check_compact_rows(container, num_logprobs)
+    _check_compact_rows(container, num_logprobs, expected_positions)
     token_ids, logprobs, ranks = container.arrays()
     # Arrays are C-contiguous little-endian (ArrayLogprobs). The wire format
     # is int32/float32; engine data normally already has these dtypes.
@@ -108,14 +121,16 @@ def compact_logprobs_fields(
 
 
 def render_compact_logprobs_parts(
-    container: ArrayLogprobs, num_logprobs: int | None
+    container: ArrayLogprobs,
+    num_logprobs: int | None,
+    expected_positions: int | None = None,
 ) -> list[bytes]:
     """The ``compact_logprobs`` JSON object (see the generate SPEC) as parts
     whose concatenation is the JSON; avoids copying the large payloads."""
     token_ids: bytes | list[bytes]
     logprobs: bytes | list[bytes]
     ranks: bytes | list[bytes]
-    _check_compact_rows(container, num_logprobs)
+    _check_compact_rows(container, num_logprobs, expected_positions)
     wire = container.wire_parts()
     if wire is not None:
         # Encoded while the rows arrived (ArrayLogprobs wire mode).
@@ -127,7 +142,7 @@ def render_compact_logprobs_parts(
         )
     else:
         n, s, token_ids, logprobs, ranks = compact_logprobs_fields(
-            container, num_logprobs
+            container, num_logprobs, expected_positions
         )
     head = (
         f'{{"num_positions":{n},"num_slots":{s},'

@@ -465,6 +465,7 @@ class ServingTokens(GenerateBaseServing):
                         "compact_logprobs": render_compact_logprobs_parts(
                             self._require_array_logprobs(out_logprobs),
                             sampling_params.num_logprobs,
+                            expected_positions=len(token_ids),
                         )
                     }
             elif sampling_params.logprobs is not None:
@@ -602,6 +603,7 @@ class ServingTokens(GenerateBaseServing):
                             compact_logprobs = self._compact_logprobs_model(
                                 self._require_array_logprobs(out_logprobs),
                                 sampling_params.num_logprobs,
+                                expected_positions=len(delta_token_ids),
                             )
                     elif sampling_params.logprobs is not None:
                         out_logprobs = output.logprobs
@@ -674,9 +676,13 @@ class ServingTokens(GenerateBaseServing):
 
     @staticmethod
     def _compact_logprobs_model(
-        logprobs: ArrayLogprobs, num_logprobs: int | None
+        logprobs: ArrayLogprobs,
+        num_logprobs: int | None,
+        expected_positions: int | None = None,
     ) -> CompactLogprobs:
-        n, s, token_ids, values, ranks = compact_logprobs_fields(logprobs, num_logprobs)
+        n, s, token_ids, values, ranks = compact_logprobs_fields(
+            logprobs, num_logprobs, expected_positions
+        )
         return CompactLogprobs(
             num_positions=n,
             num_slots=s,

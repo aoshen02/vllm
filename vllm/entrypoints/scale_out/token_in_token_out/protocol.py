@@ -115,6 +115,16 @@ class GenerateRequest(BaseModel):
             raise ValueError("content_parts and features are mutually exclusive")
         return self
 
+    @model_validator(mode="after")
+    def _check_compact_logprobs(self) -> "GenerateRequest":
+        # logprobs=-1 returns full-vocabulary values without per-slot token ids
+        # and ranks, which the compact [N, k+1] layout cannot represent.
+        if self.logprobs_format == "compact" and self.sampling_params.logprobs == -1:
+            raise ValueError(
+                "logprobs_format='compact' does not support sampling_params.logprobs=-1"
+            )
+        return self
+
     sampling_params: SamplingParams
     """The sampling parameters for the model."""
 
