@@ -249,6 +249,19 @@ async fn generate_chunk_stream(
                     bail_server_error!("Internal server error");
                 }
 
+                // Compact: every output (including zero-token ones that are
+                // skipped or terminal) carries exactly one position per token,
+                // as in the non-streaming collector.
+                if logprobs_format == LogprobsFormat::Compact && include_compact_logprobs {
+                    let positions = output.logprobs.as_ref().map_or(0, Logprobs::len);
+                    if positions != token_ids.len() {
+                        bail_server_error!(
+                            "raw generate output carried {positions} logprob positions for {} new tokens",
+                            token_ids.len()
+                        );
+                    }
+                }
+
                 if let Some(finish_reason) = finish_reason.as_ref()
                     && enable_log_requests
                 {
@@ -948,6 +961,52 @@ mod tests {
         .try_collect()
         .await;
         assert!(result.is_err());
+    }
+
+    async fn compact_stream(
+        steps: Vec<vllm_llm::Result<GenerateOutput>>,
+    ) -> Result<Vec<GenerateStreamResponse>, ApiError> {
+        generate_chunk_stream(
+            stream::iter(steps),
+            "raw-stream".to_string(),
+            ApiServerOptions::default(),
+            ResponseOptions {
+                include_compact_logprobs: true,
+                logprobs_format: LogprobsFormat::Compact,
+                logprobs_slots: 3,
+                ..Default::default()
+            },
+        )
+        .try_collect()
+        .await
+    }
+
+    #[tokio::test]
+    async fn stream_compact_rejects_rows_on_zero_token_outputs() {
+        let row = || tricky_positions()[..1].to_vec();
+        // Terminal zero-token output carrying a position.
+        let terminal = compact_stream(vec![
+            step(vec![0], Some(row()), None),
+            step(vec![], Some(row()), Some(FinishReason::Abort)),
+        ])
+        .await;
+        assert!(terminal.is_err(), "{terminal:?}");
+        // Nonterminal zero-token output carrying rows.
+        let nonterminal = compact_stream(vec![
+            step(vec![], Some(row()), None),
+            step(vec![0], Some(row()), Some(FinishReason::Length)),
+        ])
+        .await;
+        assert!(nonterminal.is_err(), "{nonterminal:?}");
+        // Zero tokens with no or empty payloads stay valid.
+        let chunks = compact_stream(vec![
+            step(vec![0], Some(row()), None),
+            step(vec![], None, None),
+            step(vec![], Some(Vec::new()), Some(FinishReason::Abort)),
+        ])
+        .await
+        .expect("zero tokens without positions");
+        assert_eq!(chunks.len(), 2);
     }
 
     #[tokio::test]
