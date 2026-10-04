@@ -244,13 +244,7 @@ class ServingTokens(GenerateBaseServing):
         sampling_params.output_kind = (
             RequestOutputKind.DELTA if request.stream else RequestOutputKind.FINAL_ONLY
         )
-        # Internal storage is decided by the request's logprobs_format, never
-        # by a client-provided sampling_params.array_logprobs.
-        sampling_params.array_logprobs = self._use_array_logprobs(request)
-        if sampling_params.array_logprobs and not sampling_params.stop:
-            # Generate responses carry no text: without stop strings the
-            # sampled-token detokenizer has no observable effect.
-            sampling_params.detokenize = False
+        self._configure_logprobs(request, sampling_params)
 
         self._log_inputs(
             request_id,
@@ -305,6 +299,28 @@ class ServingTokens(GenerateBaseServing):
         streaming deltas keep the legacy containers.
         """
         return request.logprobs_format == "compact" or not request.stream
+
+    @classmethod
+    def _configure_logprobs(
+        cls, request: GenerateRequest, sampling_params: SamplingParams
+    ) -> None:
+        """Select the logprobs container and, for compact, detokenization.
+
+        Internal storage is decided by the request's logprobs_format, never by
+        a client-provided ``sampling_params.array_logprobs``. ArrayLogprobs
+        never decodes candidate tokens (no response contains their text).
+        Only compact requests may skip the sampled-token detokenizer, and only
+        when nothing in the response depends on the tokenizer: no stop
+        strings (stop checks) and no prompt logprobs (their decoded_token).
+        The default format keeps ``detokenize`` exactly as requested.
+        """
+        sampling_params.array_logprobs = cls._use_array_logprobs(request)
+        if (
+            request.logprobs_format == "compact"
+            and not sampling_params.stop
+            and sampling_params.prompt_logprobs is None
+        ):
+            sampling_params.detokenize = False
 
     @staticmethod
     def _require_array_logprobs(logprobs: object) -> ArrayLogprobs:
