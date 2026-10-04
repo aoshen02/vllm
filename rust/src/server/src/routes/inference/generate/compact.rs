@@ -152,9 +152,9 @@ impl EncodedArray {
 #[derive(Debug, Default)]
 pub(crate) struct CompactLogprobsAccumulator {
     /// The request's row width `k + 1` (`0` when unknown, i.e. `logprobs`
-    /// absent or `-1`). Wider engine rows (padded to the batch-wide max
-    /// top-k) are truncated to it, like the Python frontend; it is also the
-    /// reported `num_slots` when no position was scored.
+    /// absent or `-1`). When known it is always the reported `num_slots`:
+    /// wider engine rows (padded to the batch-wide max top-k) are truncated
+    /// to it, like the Python frontend, and narrower rows are an error.
     requested_slots: usize,
     num_slots: Option<usize>,
     num_positions: usize,
@@ -209,10 +209,12 @@ impl LogprobsAccumulator for CompactLogprobsAccumulator {
         if self.error.is_some() || step.positions.is_empty() {
             return;
         }
+        // S = k + 1 is fixed by the request when known; only an unknown k
+        // (`-1`) takes the engine row width.
         let width = step.positions[0].entries.len();
         let slots = *self.num_slots.get_or_insert(match self.requested_slots {
             0 => width,
-            requested => width.min(requested),
+            requested => requested,
         });
         if slots == 0 {
             self.fail("raw generate logprobs position unexpectedly had no token candidates".into());
@@ -519,5 +521,26 @@ pub(crate) mod tests {
             positions: vec![position(&[(1, -0.1, 1)])],
         });
         assert!(accumulator.finish().is_err());
+    }
+
+    #[test]
+    fn compact_narrow_first_row_does_not_shrink_requested_width() {
+        // k = 2 -> S = 3 is fixed by the request; a narrow first row must not
+        // set num_slots = 2 and truncate the later, valid rows.
+        let mut accumulator = CompactLogprobsAccumulator::new(3);
+        accumulator.extend(Logprobs {
+            positions: vec![position(&[(1, -0.1, 1), (1, -0.1, 1)])],
+        });
+        accumulator.extend(Logprobs {
+            positions: vec![position(&[(2, -0.1, 1), (2, -0.1, 1), (3, -0.2, 2)])],
+        });
+        assert!(accumulator.finish().is_err());
+
+        // Valid rows keep S = k + 1 exactly.
+        let mut accumulator = CompactLogprobsAccumulator::new(3);
+        accumulator.extend(Logprobs {
+            positions: vec![position(&[(2, -0.1, 1), (2, -0.1, 1), (3, -0.2, 2)])],
+        });
+        assert_eq!(accumulator.finish().unwrap().num_slots, 3);
     }
 }
