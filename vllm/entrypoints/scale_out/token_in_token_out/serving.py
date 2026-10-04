@@ -64,6 +64,10 @@ from .protocol import (
 
 logger = init_logger(__name__)
 
+# ArrayLogprobs entries (positions x slots) from which the final
+# non-streaming response is built in a worker thread (~0.03 s inline).
+OFFLOAD_MIN_LOGPROB_ENTRIES = 1 << 20
+
 
 class ServingTokens(GenerateBaseServing):
     """Provides Tokens IN <> Tokens OUT functionality to vLLM API."""
@@ -304,23 +308,16 @@ class ServingTokens(GenerateBaseServing):
     def _configure_logprobs(
         cls, request: GenerateRequest, sampling_params: SamplingParams
     ) -> None:
-        """Select the logprobs container and, for compact, detokenization.
+        """Select the sample-logprobs container.
 
         Internal storage is decided by the request's logprobs_format, never by
-        a client-provided ``sampling_params.array_logprobs``. ArrayLogprobs
-        never decodes candidate tokens (no response contains their text).
-        Only compact requests may skip the sampled-token detokenizer, and only
-        when nothing in the response depends on the tokenizer: no stop
-        strings (stop checks) and no prompt logprobs (their decoded_token).
-        The default format keeps ``detokenize`` exactly as requested.
+        a client-provided ``sampling_params.array_logprobs``. ``detokenize``
+        is left as requested: with ``array_logprobs`` the OutputProcessor
+        itself skips what generate responses never show (candidate text, and
+        sampled text when there are no stop strings) while prompt logprobs
+        keep their decoded tokens.
         """
         sampling_params.array_logprobs = cls._use_array_logprobs(request)
-        if (
-            request.logprobs_format == "compact"
-            and not sampling_params.stop
-            and sampling_params.prompt_logprobs is None
-        ):
-            sampling_params.detokenize = False
 
     @staticmethod
     def _require_array_logprobs(logprobs: object) -> ArrayLogprobs:
@@ -341,10 +338,6 @@ class ServingTokens(GenerateBaseServing):
     ) -> ErrorResponse | GenerateResponse | RenderedGenerateResponse:
         created_time = int(time.time())
         final_res: RequestOutput | None = None
-        sampling_params: SamplingParams = request.sampling_params
-        compact = request.logprobs_format == "compact"
-        # choice position -> field name -> pre-rendered JSON value
-        fragments: dict[int, dict[str, bytes | list[bytes]]] = {}
 
         try:
             async for res in result_generator:
@@ -353,6 +346,51 @@ class ServingTokens(GenerateBaseServing):
             return self.create_error_response("Client disconnected")
 
         assert final_res is not None
+
+        if self._num_logprob_entries(request, final_res) >= OFFLOAD_MIN_LOGPROB_ENTRIES:
+            # Large bodies (e.g. ~6.5 s for 245k positions x top-128) would
+            # block the event loop; build them in a worker thread so other
+            # requests (pause, health, sends) keep being served.
+            return await asyncio.to_thread(
+                self._build_full_response,
+                request,
+                final_res,
+                request_id,
+                model_name,
+                request_metadata,
+                created_time,
+            )
+        return self._build_full_response(
+            request, final_res, request_id, model_name, request_metadata, created_time
+        )
+
+    @staticmethod
+    def _num_logprob_entries(request: GenerateRequest, final_res: RequestOutput) -> int:
+        num_logprobs = request.sampling_params.num_logprobs
+        if num_logprobs is None:
+            return 0
+        total = 0
+        for output in final_res.outputs:
+            logprobs = output.logprobs
+            if not isinstance(logprobs, ArrayLogprobs):
+                return 0  # legacy containers: unchanged (inline) behavior
+            total += len(logprobs) * (logprobs.num_slots or 1)
+        return total
+
+    def _build_full_response(
+        self,
+        request: GenerateRequest,
+        final_res: RequestOutput,
+        request_id: str,
+        model_name: str,
+        request_metadata: RequestResponseMetadata,
+        created_time: int,
+    ) -> GenerateResponse | RenderedGenerateResponse:
+        """Build the final response (CPU only; may run in a worker thread)."""
+        sampling_params: SamplingParams = request.sampling_params
+        compact = request.logprobs_format == "compact"
+        # choice position -> field name -> pre-rendered JSON value
+        fragments: dict[int, dict[str, bytes | list[bytes]]] = {}
 
         choices: list[GenerateResponseChoice] = []
         num_generated_tokens = 0

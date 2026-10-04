@@ -4,6 +4,7 @@
 
 import hashlib
 import json
+import threading
 import time
 from argparse import Namespace
 from typing import Any, cast
@@ -47,6 +48,10 @@ from vllm.logprobs import ArrayLogprobs, append_logprobs_for_next_position
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 from vllm.tokenizers import get_tokenizer
 from vllm.v1.engine import EngineCoreOutput, EngineCoreRequest, FinishReason
+from vllm.v1.engine.detokenizer import (
+    BaseIncrementalDetokenizer,
+    IncrementalDetokenizer,
+)
 from vllm.v1.engine.logprobs import LogprobsProcessor
 from vllm.v1.engine.output_processor import OutputProcessor, RequestOutputCollector
 from vllm.v1.outputs import LogprobsLists, LogprobsTensors
@@ -95,6 +100,7 @@ class _OutputProcessorEngine:
         self.tokenizer = tokenizer
         self.sampling_params: Any = None
         self.engine_request: Any = None
+        self.detokenizer: Any = None
 
     def generate(self, engine_input, sampling_params, request_id, **kwargs):
         self.sampling_params = sampling_params
@@ -116,6 +122,7 @@ class _OutputProcessorEngine:
             queue = RequestOutputCollector(sampling_params.output_kind, request_id)
             processor.add_request(request, None, queue=queue)
             self.engine_request = request
+            self.detokenizer = processor.request_states[request.request_id].detokenizer
             prompt_k = sampling_params.prompt_logprobs
             for i, (token_ids, logprobs, ranks) in enumerate(self.chunks):
                 processor.process_outputs(
@@ -371,7 +378,7 @@ async def test_compact_abort_with_partial_output(engine_width):
     response = await serving.serve_tokens(_request(logprobs_format="compact"))
 
     assert feeder.sampling_params.array_logprobs is True
-    assert feeder.sampling_params.detokenize is False
+    assert feeder.sampling_params.detokenize is True
     assert isinstance(response, RenderedGenerateResponse)
     data = json.loads(response.body)
     (choice,) = data["choices"]
@@ -1126,3 +1133,61 @@ async def test_default_body_matches_pre_change_golden(name):
     assert set(SCENARIOS) == set(GOLDEN_SHA256)
     body = await render_body(name)
     assert hashlib.sha256(body).hexdigest() == GOLDEN_SHA256[name]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("threshold,offloaded", [(0, True), (1 << 40, False)])
+@pytest.mark.parametrize("fmt", ["openai", "compact"])
+async def test_large_responses_are_built_off_the_event_loop(
+    monkeypatch, threshold, offloaded, fmt
+):
+    """Large array-logprob responses are built in a worker thread so the
+    event loop keeps serving other requests; the body is unchanged."""
+    from vllm.entrypoints.scale_out.token_in_token_out import serving as serving_mod
+
+    threads: list[int] = []
+    original = ServingTokens._build_full_response
+
+    def recording(self, *args, **kwargs):
+        threads.append(threading.get_ident())
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(ServingTokens, "_build_full_response", recording)
+    monkeypatch.setattr(time, "time", lambda: 1700000000.0)
+    bodies = []
+    for limit in (threshold, 1 << 40):
+        monkeypatch.setattr(serving_mod, "OFFLOAD_MIN_LOGPROB_ENTRIES", limit)
+        feeder = _OutputProcessorEngine([_engine_rows(0, 4, 4)])
+        response = await _serving(feeder).serve_tokens(
+            _request(logprobs=3, request_id="fixed-id", logprobs_format=fmt)
+        )
+        bodies.append(response.body)
+    assert (threads[0] != threading.get_ident()) is offloaded
+    assert threads[1] == threading.get_ident()
+    assert bodies[0] == bodies[1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fmt", ["openai", "compact"])
+@pytest.mark.parametrize("stop", [None, ["x"]])
+@pytest.mark.parametrize("prompt_logprobs", [None, 1])
+async def test_sampled_text_detokenizer_only_for_stop_strings(
+    gpt2_tokenizer, fmt, stop, prompt_logprobs
+):
+    """Generate responses carry no text: the sampled-token detokenizer runs
+    only for stop strings, while prompt logprobs keep decoded tokens."""
+    sampling: dict[str, Any] = {}
+    if stop:
+        sampling["stop"] = stop
+    if prompt_logprobs is not None:
+        sampling["prompt_logprobs"] = prompt_logprobs
+    feeder = _OutputProcessorEngine([_engine_rows(0, 2, 3)], tokenizer=gpt2_tokenizer)
+    response = await _serving(feeder).serve_tokens(
+        _request(logprobs=2, logprobs_format=fmt, sampling=sampling)
+    )
+    assert feeder.sampling_params.detokenize is True
+    assert isinstance(feeder.detokenizer, IncrementalDetokenizer)
+    assert isinstance(feeder.detokenizer, BaseIncrementalDetokenizer) == bool(stop)
+    if prompt_logprobs is not None:
+        prompt = json.loads(response.body)["prompt_logprobs"]
+        assert prompt[1]["2"]["decoded_token"] == gpt2_tokenizer.decode([2])

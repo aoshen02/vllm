@@ -240,7 +240,13 @@ class RequestState:
                 request=request,
             )
             detokenizer = IncrementalDetokenizer.from_new_request(
-                tokenizer=tokenizer,
+                # array_logprobs requests (/inference/v1/generate) never return
+                # text; sampled text is only needed for stop-string checks.
+                tokenizer=(
+                    None
+                    if sampling_params.array_logprobs and not sampling_params.stop
+                    else tokenizer
+                ),
                 request=request,
             )
             max_tokens_param = sampling_params.max_tokens
