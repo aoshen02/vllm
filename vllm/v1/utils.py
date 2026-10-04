@@ -181,6 +181,7 @@ class APIServerProcessManager:
         target_server_fn: Callable | None = None,
         stats_update_address: str | None = None,
         tensor_queue: Queue | None = None,
+        socket_factory: Callable[[], Any] | None = None,
     ):
         """Initialize and start API server worker processes.
 
@@ -193,13 +194,14 @@ class APIServerProcessManager:
         Args:
             target_server_fn: Override function to call for each API server process
             listen_address: Address to listen for client connections
-            sock: Socket for client connections
+            sock: Borrowed socket, passed to workers only without socket_factory.
             args: Command line arguments
             num_servers: Number of API server processes to start
             input_addresses: Input addresses for each API server
             output_addresses: Output addresses for each API server
             stats_update_address: Optional stats update address
             tensor_queue: Optional tensor IPC queue for sharing MM tensors
+            socket_factory: Fresh socket per worker, closed in parent after spawn.
         """
         self.listen_address = listen_address
         self.sock = sock
@@ -227,16 +229,19 @@ class APIServerProcessManager:
             self._address_pipes.append(parent_recv)
             client_config["actual_address_pipe"] = child_send
 
-            proc = spawn_context.Process(
-                target=target_server_fn or run_api_server_worker_proc,
-                name=f"ApiServer_{i}",
-                args=(listen_address, sock, args, client_config),
-            )
-            self.processes.append(proc)
-            proc.start()
-
-            # Drop parent's write end so reader sees EOF on child death.
-            child_send.close()
+            with (
+                child_send,
+                socket_factory()
+                if socket_factory is not None
+                else contextlib.nullcontext(sock) as worker_sock,
+            ):
+                proc = spawn_context.Process(
+                    target=target_server_fn or run_api_server_worker_proc,
+                    name=f"ApiServer_{i}",
+                    args=(listen_address, worker_sock, args, client_config),
+                )
+                self.processes.append(proc)
+                proc.start()
 
         logger.info("Started %d API server processes", len(self.processes))
 

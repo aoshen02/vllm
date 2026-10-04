@@ -1,10 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import argparse
 import multiprocessing
+import os
 import socket
+import sys
 import threading
 import time
+from functools import partial
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -450,3 +455,124 @@ def test_rust_frontend_launch_log_redacts_credentials(monkeypatch, caplog):
     assert hf_token not in message
     assert api_key not in message
     assert '"hf_token": "***"' in message
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux REUSEPORT semantics")
+@pytest.mark.parametrize("host", ["127.0.0.1", "::1"])
+@pytest.mark.parametrize("num_servers,reuse_port", [(3, True), (1, True), (3, False)])
+def test_reuseport_workers_have_independent_accept_queues(
+    host, num_servers, reuse_port
+):
+    """Duplicating one fd must not defeat kernel REUSEPORT load distribution."""
+    from tests.entrypoints.launchers.api_server._api_server_spawn_workers import (
+        report_listener_worker,
+    )
+    from vllm.entrypoints.launchers.launcher import create_server_socket
+
+    if host == "::1":
+        try:
+            with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as probe:
+                probe.bind((host, 0))
+        except OSError:
+            pytest.skip("IPv6 loopback unavailable")
+    with create_server_socket((host, 0), reuse_port=reuse_port) as sock:
+        address = sock.getsockname()
+        parent_inode = os.fstat(sock.fileno()).st_ino
+        manager = APIServerProcessManager(
+            listen_address=f"http://{address[0]}:{address[1]}",
+            sock=sock,
+            args=None,
+            num_servers=num_servers,
+            input_addresses=["tcp://127.0.0.1:0"] * num_servers,
+            output_addresses=["tcp://127.0.0.1:0"] * num_servers,
+            target_server_fn=report_listener_worker,
+            socket_factory=(
+                partial(create_server_socket, address, reuse_port=True)
+                if num_servers > 1 and reuse_port
+                else None
+            ),
+        )
+        try:
+            listeners = []
+            for pipe in manager._address_pipes:
+                assert pipe.poll(30), "Worker did not report its listener"
+                listeners.append(pipe.recv())
+            assert all(bound_address == address for bound_address, _ in listeners)
+            inodes = {inode for _, inode in listeners}
+            if num_servers > 1 and reuse_port:
+                assert len(inodes) == num_servers
+                assert parent_inode not in inodes
+                assert not sock.getsockopt(socket.SOL_SOCKET, socket.SO_ACCEPTCONN)
+            else:
+                assert inodes == {parent_inode}
+        finally:
+            manager.shutdown()
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux REUSEPORT semantics")
+@pytest.mark.parametrize(
+    "count,uds,independent",
+    [
+        (3, None, True),
+        (1, None, False),
+        (3, "/tmp/vllm.sock", False),
+    ],
+)
+def test_multi_server_selects_listener_policy(count, uds, independent):
+    """HTTP startup selects listeners; the process manager receives that choice."""
+    from vllm.entrypoints.cli.serve import run_multi_api_server
+    from vllm.entrypoints.launchers.launcher import create_server_socket
+
+    args = argparse.Namespace(headless=False, api_server_count=count, uds=uds)
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            data_parallel_rank=0,
+            local_engines_only=True,
+            data_parallel_backend="mp",
+        ),
+    )
+    addresses = SimpleNamespace(inputs=["in"] * count, outputs=["out"] * count)
+    engine_launch = SimpleNamespace(
+        engine_manager=None, coordinator=None, addresses=addresses, tensor_queue=None
+    )
+    with (
+        create_server_socket(("127.0.0.1", 0), reuse_port=True) as sock,
+        patch("vllm.entrypoints.cli.serve.signal.signal"),
+        patch("vllm.entrypoints.cli.serve.setup_multiprocess_prometheus"),
+        patch("vllm.entrypoints.cli.serve.envs.VLLM_USE_RUST_FRONTEND", False),
+        patch(
+            "vllm.entrypoints.cli.serve.setup_server", return_value=("http://", sock)
+        ),
+        patch(
+            "vllm.entrypoints.cli.serve.vllm.AsyncEngineArgs.from_cli_args"
+        ) as engine,
+        patch("vllm.entrypoints.cli.serve.Executor.get_class"),
+        patch("vllm.v1.engine.utils.get_engine_zmq_addresses", return_value=addresses),
+        patch("vllm.entrypoints.cli.serve.launch_core_engines") as launch,
+        patch("vllm.entrypoints.cli.serve.APIServerProcessManager") as manager,
+        patch("vllm.entrypoints.cli.serve.wait_for_completion_or_failure"),
+    ):
+        engine.return_value.create_engine_config.return_value = config
+        launch.return_value.__enter__.return_value = engine_launch
+        manager.return_value.gather_actual_addresses.return_value = (
+            addresses.inputs,
+            addresses.outputs,
+        )
+        instance = manager.return_value
+
+        def make_manager(**kwargs):
+            factory = kwargs["socket_factory"]
+            if independent:
+                with factory() as listener:
+                    assert listener.getsockname() == sock.getsockname()
+                    assert (
+                        os.fstat(listener.fileno()).st_ino
+                        != os.fstat(sock.fileno()).st_ino
+                    )
+            else:
+                assert factory is None
+            return instance
+
+        manager.side_effect = make_manager
+        run_multi_api_server(args)
+        instance.shutdown.assert_called_once()

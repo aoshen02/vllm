@@ -4,6 +4,7 @@
 import argparse
 import signal
 import time
+from functools import partial
 
 import uvloop
 
@@ -16,6 +17,7 @@ from vllm.entrypoints.launchers.cli_args import (
     validate_parsed_serve_args,
 )
 from vllm.entrypoints.launchers.dp_supervisor import run_dp_supervisor
+from vllm.entrypoints.launchers.launcher import create_server_socket
 from vllm.entrypoints.serve.utils.api_utils import VLLM_SUBCMD_PARSER_EPILOG
 from vllm.logger import init_logger
 from vllm.usage.usage_lib import UsageContext
@@ -358,6 +360,11 @@ def run_multi_api_server(args: argparse.Namespace):
             )
         else:
             # Start API server(s).
+            socket_factory = None
+            if num_api_servers > 1 and not args.uds:
+                socket_factory = partial(
+                    create_server_socket, sock.getsockname(), reuse_port=True
+                )
             api_server_manager = APIServerProcessManager(
                 listen_address=listen_address,
                 sock=sock,
@@ -367,6 +374,7 @@ def run_multi_api_server(args: argparse.Namespace):
                 output_addresses=addresses.outputs,
                 stats_update_address=stats_update_address,
                 tensor_queue=engine_launch.tensor_queue,
+                socket_factory=socket_factory,
             )
 
             if not is_ray_dp:
