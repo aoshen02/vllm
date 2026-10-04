@@ -335,6 +335,13 @@ impl Drop for GenerateOutputStream {
 pub trait LogprobsAccumulator: Send {
     /// Consume one engine step's sample logprobs.
     fn extend(&mut self, step: Logprobs);
+    /// Observe every engine output before its logprobs (if any) are passed
+    /// to [`Self::extend`]: the number of new tokens and of logprob positions
+    /// it carries. The default ignores it.
+    fn observe_output(&mut self, new_tokens: usize, logprob_positions: Option<usize>) {
+        let _ = (new_tokens, logprob_positions);
+    }
+
     /// Number of scored positions accumulated so far.
     fn num_positions(&self) -> usize;
 }
@@ -394,6 +401,10 @@ impl<T: Stream<Item = Result<GenerateOutput>> + Send> T {
                     }
                 }
 
+                logprobs.observe_output(
+                    output.token_ids.len(),
+                    output.logprobs.as_ref().map(Logprobs::len),
+                );
                 if let Some(step_logprobs) = output.logprobs {
                     logprobs.extend(step_logprobs);
                 }

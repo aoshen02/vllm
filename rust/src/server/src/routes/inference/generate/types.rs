@@ -89,7 +89,9 @@ pub(super) struct GenerateResponseChoice {
 #[derive(Debug, Clone, Serialize)]
 pub(super) struct GenerateResponseStreamChoice {
     pub index: u32,
-    pub logprobs: Option<ChatLogProbs>,
+    /// Outer `None` omits the key (default format without logprobs);
+    /// `Some(None)` is the explicit `null` of compact chunks.
+    pub logprobs: Option<Option<ChatLogProbs>>,
     pub finish_reason: Option<String>,
     pub token_ids: Vec<u32>,
     /// Present only for `logprobs_format: "compact"`.

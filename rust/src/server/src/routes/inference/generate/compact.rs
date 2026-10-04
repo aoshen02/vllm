@@ -19,7 +19,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use bytes::Bytes;
 use serde::Serialize;
-use vllm_llm::{Logprobs, LogprobsAccumulator, PositionLogprobs};
+use vllm_llm::{Logprobs, LogprobsAccumulator};
 
 /// Wire value of the request `logprobs_format` field.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -169,15 +169,14 @@ impl EncodedArray {
 /// Accumulates sample logprobs directly into the compact wire encoding.
 #[derive(Debug, Default)]
 pub(crate) struct CompactLogprobsAccumulator {
-    /// The request's row width `k + 1` (`0` when unknown, i.e. `logprobs`
-    /// absent or `-1`). When known it is always the reported `num_slots`:
-    /// wider engine rows (padded to the batch-wide max top-k) are truncated
-    /// to it, like the Python frontend, and narrower rows are an error.
+    /// The request's row width `S = k + 1` (`k` = `logprobs`, else
+    /// `len(logprob_token_ids)`); `0` when the request asked for no logprobs,
+    /// in which case payloads are ignored. Wider engine rows (padded to the
+    /// batch-wide max) are truncated to it, like the Python frontend;
+    /// narrower rows are an error. (`logprobs: -1` is rejected for compact
+    /// at validation, so the width never comes from engine data.)
     requested_slots: usize,
-    num_slots: Option<usize>,
     num_positions: usize,
-    /// Whether the engine attached a logprobs payload to any step.
-    saw_payload: bool,
     token_ids: Base64Segments,
     logprobs: Base64Segments,
     ranks: Base64Segments,
@@ -204,11 +203,6 @@ impl CompactLogprobsAccumulator {
             .max(self.scratch_ranks.capacity())
     }
 
-    /// Whether any step carried a logprobs payload.
-    pub(crate) fn saw_payload(&self) -> bool {
-        self.saw_payload
-    }
-
     fn fail(&mut self, message: String) {
         if self.error.is_none() {
             self.error = Some(message);
@@ -222,88 +216,94 @@ impl CompactLogprobsAccumulator {
         }
         Ok(CompactLogprobs {
             num_positions: self.num_positions,
-            num_slots: self.num_slots.unwrap_or(self.requested_slots),
+            num_slots: self.requested_slots,
             token_ids: self.token_ids.finish(),
             logprobs: self.logprobs.finish(),
             ranks: self.ranks.finish(),
         })
     }
+
+    fn flush_candidates(&mut self) {
+        self.token_ids.push(&self.scratch_token_ids);
+        self.logprobs.push(&self.scratch_logprobs);
+        self.scratch_token_ids.clear();
+        self.scratch_logprobs.clear();
+    }
+
+    fn flush_ranks(&mut self) {
+        self.ranks.push(&self.scratch_ranks);
+        self.scratch_ranks.clear();
+    }
 }
 
 impl LogprobsAccumulator for CompactLogprobsAccumulator {
+    fn observe_output(&mut self, new_tokens: usize, logprob_positions: Option<usize>) {
+        // Every generated token needs exactly one position, step by step (a
+        // zero-token output, e.g. an abort before any token, needs none).
+        let positions = logprob_positions.unwrap_or(0);
+        if self.requested_slots > 0 && positions != new_tokens {
+            self.fail(format!(
+                "raw generate output carried {positions} logprob positions for {new_tokens} new tokens"
+            ));
+        }
+    }
+
     fn extend(&mut self, step: Logprobs) {
-        self.saw_payload = true;
-        if self.error.is_some() || step.positions.is_empty() {
+        let slots = self.requested_slots;
+        if slots == 0 || self.error.is_some() || step.positions.is_empty() {
             return;
         }
-        // S = k + 1 is fixed by the request when known; only an unknown k
-        // (`-1`) takes the engine row width.
-        let width = step.positions[0].entries.len();
-        let slots = *self.num_slots.get_or_insert(match self.requested_slots {
-            0 => width,
-            requested => requested,
-        });
-        if slots == 0 {
-            self.fail("raw generate logprobs position unexpectedly had no token candidates".into());
+        // Validate every row before reserving anything.
+        if let Some(narrow) = step.positions.iter().find(|p| p.entries.len() < slots) {
+            let width = narrow.entries.len();
+            self.fail(format!(
+                "raw generate logprobs row has {width} candidates, expected at least {slots}"
+            ));
             return;
         }
 
-        // Pack in bounded batches so the retained scratch capacity stays at
-        // about SCRATCH_TARGET_BYTES per array regardless of step size.
-        let rows_per_batch = (SCRATCH_TARGET_BYTES / (slots * 4)).max(1);
-        for batch in step.positions.chunks(rows_per_batch) {
-            if !self.pack_batch(batch, slots) {
+        // Pack candidates incrementally, flushing to the encoders whenever a
+        // scratch buffer reaches SCRATCH_TARGET_BYTES, independently of row
+        // boundaries: retained scratch stays bounded for any row width.
+        let rows = step.positions.len();
+        let candidate_bytes = rows.saturating_mul(slots).saturating_mul(4);
+        let wanted = candidate_bytes.min(SCRATCH_TARGET_BYTES);
+        self.scratch_token_ids
+            .reserve(wanted.saturating_sub(self.scratch_token_ids.len()));
+        self.scratch_logprobs
+            .reserve(wanted.saturating_sub(self.scratch_logprobs.len()));
+        self.scratch_ranks
+            .reserve((rows * 4).min(SCRATCH_TARGET_BYTES).saturating_sub(self.scratch_ranks.len()));
+
+        for position in &step.positions {
+            let sampled_rank = position.entries[0].rank;
+            if sampled_rank > i32::MAX as u32 {
+                self.fail(format!("sampled rank {sampled_rank} does not fit int32"));
                 return;
             }
+            self.scratch_ranks.extend_from_slice(&sampled_rank.to_le_bytes());
+            if self.scratch_ranks.len() >= SCRATCH_TARGET_BYTES {
+                self.flush_ranks();
+            }
+            for entry in &position.entries[..slots] {
+                if entry.token_id > i32::MAX as u32 {
+                    self.fail(format!("token id {} does not fit int32", entry.token_id));
+                    return;
+                }
+                self.scratch_token_ids.extend_from_slice(&entry.token_id.to_le_bytes());
+                self.scratch_logprobs.extend_from_slice(&entry.logprob.to_bits().to_le_bytes());
+                if self.scratch_token_ids.len() >= SCRATCH_TARGET_BYTES {
+                    self.flush_candidates();
+                }
+            }
         }
+        self.flush_candidates();
+        self.flush_ranks();
+        self.num_positions += rows;
     }
 
     fn num_positions(&self) -> usize {
         self.num_positions
-    }
-}
-
-impl CompactLogprobsAccumulator {
-    /// Pack and encode one batch of rows; returns `false` after recording an
-    /// error.
-    fn pack_batch(&mut self, batch: &[PositionLogprobs], slots: usize) -> bool {
-        let rows = batch.len();
-        self.scratch_token_ids.clear();
-        self.scratch_logprobs.clear();
-        self.scratch_ranks.clear();
-        self.scratch_token_ids.reserve(rows * slots * 4);
-        self.scratch_logprobs.reserve(rows * slots * 4);
-        self.scratch_ranks.reserve(rows * 4);
-
-        for position in batch {
-            if position.entries.len() < slots {
-                self.fail(format!(
-                    "raw generate logprobs row has {} candidates, expected at least {slots}",
-                    position.entries.len()
-                ));
-                return false;
-            }
-            let sampled_rank = position.entries[0].rank;
-            if sampled_rank > i32::MAX as u32 {
-                self.fail(format!("sampled rank {sampled_rank} does not fit int32"));
-                return false;
-            }
-            self.scratch_ranks.extend_from_slice(&sampled_rank.to_le_bytes());
-            for entry in &position.entries[..slots] {
-                if entry.token_id > i32::MAX as u32 {
-                    self.fail(format!("token id {} does not fit int32", entry.token_id));
-                    return false;
-                }
-                self.scratch_token_ids.extend_from_slice(&entry.token_id.to_le_bytes());
-                self.scratch_logprobs.extend_from_slice(&entry.logprob.to_bits().to_le_bytes());
-            }
-        }
-
-        self.token_ids.push(&self.scratch_token_ids);
-        self.logprobs.push(&self.scratch_logprobs);
-        self.ranks.push(&self.scratch_ranks);
-        self.num_positions += rows;
-        true
     }
 }
 
@@ -353,9 +353,11 @@ impl From<&CompactLogprobs> for CompactLogprobsJson {
 /// Encode one step's logprobs (e.g. one streaming chunk) as a compact block.
 pub(crate) fn encode_compact(
     logprobs: Logprobs,
+    new_tokens: usize,
     requested_slots: usize,
 ) -> Result<CompactLogprobsJson, String> {
     let mut accumulator = CompactLogprobsAccumulator::new(requested_slots);
+    accumulator.observe_output(new_tokens, Some(logprobs.len()));
     accumulator.extend(logprobs);
     accumulator.finish().map(|block| CompactLogprobsJson::from(&block))
 }
@@ -442,12 +444,12 @@ pub(crate) mod tests {
         );
         assert_eq!(ranks, vec![2, 1]);
 
-        // Unknown requested width (`logprobs: -1`): keep the engine width.
+        // A request that asked for no logprobs (S = 0) ignores payloads.
         let mut accumulator = CompactLogprobsAccumulator::new(0);
         accumulator.extend(Logprobs {
             positions: vec![position(&[(5, -0.5, 2), (4, -0.25, 1), (5, -0.5, 2)])],
         });
-        assert_eq!(accumulator.finish().unwrap().num_slots, 3);
+        assert_eq!(accumulator.num_positions(), 0);
     }
 
     #[test]
@@ -622,6 +624,57 @@ pub(crate) mod tests {
         accumulator.extend(Logprobs {
             positions: vec![position(&[(1, -0.1, 1)])],
         });
+        assert!(accumulator.finish().is_err());
+    }
+
+    fn wide_row(slots: u32) -> PositionLogprobs {
+        PositionLogprobs {
+            entries: (0..slots)
+                .map(|slot| TokenLogprob {
+                    token_id: slot,
+                    logprob: -(slot as f32),
+                    rank: slot.max(1),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn single_row_wider_than_scratch_target_keeps_scratch_bounded() {
+        let slots = 300_001_u32;
+        let mut accumulator = CompactLogprobsAccumulator::new(slots as usize);
+        accumulator.extend(Logprobs {
+            positions: vec![wide_row(slots)],
+        });
+        assert!(
+            accumulator.scratch_capacity() <= SCRATCH_TARGET_BYTES,
+            "scratch capacity {}",
+            accumulator.scratch_capacity()
+        );
+        let block = accumulator.finish().unwrap();
+        let value = serde_json::to_value(CompactLogprobsJson::from(&block)).unwrap();
+        let (token_ids, bits, ranks) = decode_compact(&value);
+        assert_eq!(token_ids, (0..slots as i32).collect::<Vec<_>>());
+        assert_eq!(
+            bits,
+            (0..slots).map(|s| (-(s as f32)).to_bits()).collect::<Vec<_>>()
+        );
+        assert_eq!(ranks, vec![1]);
+    }
+
+    #[test]
+    fn huge_requested_width_does_not_reserve_before_checking_rows() {
+        // A requested width far above the actual rows must fail cleanly
+        // without reserving `rows * requested * 4` bytes first.
+        let mut accumulator = CompactLogprobsAccumulator::new(1 << 31);
+        accumulator.extend(Logprobs {
+            positions: vec![wide_row(3)],
+        });
+        assert!(
+            accumulator.scratch_capacity() <= SCRATCH_TARGET_BYTES,
+            "scratch capacity {}",
+            accumulator.scratch_capacity()
+        );
         assert!(accumulator.finish().is_err());
     }
 

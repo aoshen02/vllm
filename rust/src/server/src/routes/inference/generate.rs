@@ -186,19 +186,18 @@ fn compact_choice_logprobs(
     if !include_logprobs {
         return Ok(ChoiceLogprobs::Compact(None));
     }
-    // A request that produced no tokens (e.g. aborted while waiting: the
-    // engine / client abort output has no tokens and no logprobs payload)
-    // gets an empty block with the requested width. Missing logprobs for
-    // produced tokens are still an engine failure.
-    if !accumulator.saw_payload() && output_tokens > 0 {
-        return Err(ApiError::server_error(
-            "raw generate response requested logprobs but generation returned none".to_string(),
-        ));
+    // Every generated token must have exactly one position (checked per
+    // engine output by the accumulator and again here). A request that
+    // produced no tokens (e.g. aborted while waiting: the abort output has
+    // no tokens and no payload) gets an empty block with the requested width.
+    let block = accumulator.finish().map_err(ApiError::server_error)?;
+    if block.num_positions != output_tokens {
+        return Err(ApiError::server_error(format!(
+            "raw generate logprobs cover {} positions but generation returned {output_tokens} tokens",
+            block.num_positions
+        )));
     }
-    accumulator
-        .finish()
-        .map(|block| ChoiceLogprobs::Compact(Some(block)))
-        .map_err(ApiError::server_error)
+    Ok(ChoiceLogprobs::Compact(Some(block)))
 }
 
 fn empty_position_error() -> ApiError {
@@ -278,19 +277,25 @@ async fn generate_chunk_stream(
                     })?;
                     match logprobs_format {
                         LogprobsFormat::OpenAi => {
-                            (Some(raw_logprobs_to_openai_chat(&logprobs)?), None)
+                            (Some(Some(raw_logprobs_to_openai_chat(&logprobs)?)), None)
                         }
                         // Per-chunk compact block covering this chunk's positions.
                         LogprobsFormat::Compact => (
                             None,
                             Some(
-                                encode_compact(logprobs, logprobs_slots)
+                                encode_compact(logprobs, token_ids.len(), logprobs_slots)
                                     .map_err(ApiError::server_error)?,
                             ),
                         ),
                     }
                 } else {
                     (None, None)
+                };
+                // Compact chunks carry an explicit `"logprobs": null`; the
+                // default stream keeps omitting the key when absent.
+                let logprobs = match logprobs_format {
+                    LogprobsFormat::OpenAi => logprobs,
+                    LogprobsFormat::Compact => Some(None),
                 };
 
                 y.yield_ok(GenerateStreamResponse {
@@ -878,12 +883,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn compact_rejects_positions_misaligned_with_tokens() {
+        let row = |id: u32| position(&[(id, -0.5, 1), (id, -0.5, 1), (id + 1, -0.6, 2)]);
+        // Step 1 has a token but no payload; step 2 has one row.
+        let missing_intermediate = compact_response_json(
+            vec![
+                step(vec![10], None, None),
+                step(vec![20], Some(vec![row(20)]), Some(FinishReason::Abort)),
+            ],
+            true,
+        )
+        .await;
+        assert!(missing_intermediate.is_err(), "{missing_intermediate:?}");
+        // Token-bearing terminal output with an empty payload.
+        let empty_payload = compact_response_json(
+            vec![step(vec![30], Some(Vec::new()), Some(FinishReason::Length))],
+            true,
+        )
+        .await;
+        assert!(empty_payload.is_err(), "{empty_payload:?}");
+        // Counts that cancel out across steps (0 rows then 2 rows).
+        let shifted = compact_response_json(
+            vec![
+                step(vec![1], Some(Vec::new()), None),
+                step(
+                    vec![2],
+                    Some(vec![row(1), row(2)]),
+                    Some(FinishReason::Abort),
+                ),
+            ],
+            true,
+        )
+        .await;
+        assert!(shifted.is_err(), "{shifted:?}");
+        // Aligned steps still succeed.
+        compact_response_json(
+            vec![
+                step(vec![1], Some(vec![row(1)]), None),
+                step(vec![2], Some(vec![row(2)]), Some(FinishReason::Abort)),
+            ],
+            true,
+        )
+        .await
+        .expect("aligned steps");
+    }
+
+    #[tokio::test]
+    async fn stream_compact_rejects_chunk_positions_misaligned_with_tokens() {
+        let result: Result<Vec<_>, _> = generate_chunk_stream(
+            stream::iter(vec![step(
+                vec![1, 2],
+                Some(tricky_positions()[..1].to_vec()),
+                None,
+            )]),
+            "raw-stream".to_string(),
+            ApiServerOptions::default(),
+            ResponseOptions {
+                include_compact_logprobs: true,
+                logprobs_format: LogprobsFormat::Compact,
+                logprobs_slots: 3,
+                ..Default::default()
+            },
+        )
+        .try_collect()
+        .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
     async fn compact_missing_logprobs_payload_is_server_error() {
         let error =
             compact_response_json(vec![step(vec![1], None, Some(FinishReason::Length))], true)
                 .await
                 .expect_err("missing payload");
-        assert!(format!("{error:?}").contains("returned none"), "{error:?}");
+        assert!(format!("{error:?}").contains("positions"), "{error:?}");
     }
 
     #[tokio::test]
@@ -914,7 +987,21 @@ mod tests {
         for (chunk, row) in chunks.iter().zip(&rows) {
             let json = serde_json::to_value(chunk).unwrap();
             let choice = &json["choices"][0];
-            assert!(choice.get("logprobs").is_none());
+            // Compact chunks carry an explicit `"logprobs": null`.
+            assert!(choice.get("logprobs").is_some_and(serde_json::Value::is_null));
+            let keys: Vec<_> = choice.as_object().unwrap().keys().map(String::as_str).collect();
+            assert!(
+                keys == ["index", "logprobs", "token_ids", "compact_logprobs"]
+                    || keys
+                        == [
+                            "index",
+                            "logprobs",
+                            "finish_reason",
+                            "token_ids",
+                            "compact_logprobs"
+                        ],
+                "{keys:?}"
+            );
             let block = &choice["compact_logprobs"];
             assert_eq!(block["num_positions"], 1);
             let (token_ids, bits, _) = decode_compact(block);
