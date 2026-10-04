@@ -55,12 +55,46 @@ const SEGMENT_TARGET_BYTES: usize = 1 << 20;
 /// Upper bound on the bytes packed per scratch batch (per array).
 const SCRATCH_TARGET_BYTES: usize = 1 << 20;
 
+/// Standard base64 alphabet (`base64::engine::general_purpose::STANDARD`).
+const BASE64_ALPHABET: &[u8; 64] =
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/// The two output characters for every 12-bit input value, so each 3-byte
+/// group is encoded with two table lookups (8 KiB, stays in L1).
+static BASE64_PAIRS: [[u8; 2]; 4096] = {
+    let mut table = [[0_u8; 2]; 4096];
+    let mut index = 0;
+    while index < 4096 {
+        table[index] = [BASE64_ALPHABET[index >> 6], BASE64_ALPHABET[index & 63]];
+        index += 1;
+    }
+    table
+};
+
+/// Append the standard padded base64 encoding of `input` to `out`; byte-
+/// identical to `STANDARD.encode`, about twice as fast as the scalar `base64`
+/// engine for whole 3-byte groups (padding only for a final partial group).
+fn encode_base64_into(input: &[u8], out: &mut Vec<u8>) {
+    let whole = input.len() - input.len() % 3;
+    let start = out.len();
+    out.resize(start + whole / 3 * 4, 0);
+    for (src, dst) in input[..whole].chunks_exact(3).zip(out[start..].chunks_exact_mut(4)) {
+        let group = (src[0] as usize) << 16 | (src[1] as usize) << 8 | src[2] as usize;
+        dst[..2].copy_from_slice(&BASE64_PAIRS[group >> 12]);
+        dst[2..].copy_from_slice(&BASE64_PAIRS[group & 0xfff]);
+    }
+    let tail = &input[whole..];
+    if !tail.is_empty() {
+        out.extend_from_slice(STANDARD.encode(tail).as_bytes());
+    }
+}
+
 /// Incremental padded base64 encoder whose output is kept as immutable
 /// segments that can be handed to the HTTP body without copying.
 #[derive(Debug, Default)]
 struct Base64Segments {
     segments: Vec<Bytes>,
-    current: String,
+    current: Vec<u8>,
     carry: [u8; 2],
     carry_len: usize,
     encoded_len: usize,
@@ -115,7 +149,7 @@ impl Base64Segments {
                     encoded.max(self.current.len()).min(SEGMENT_TARGET_BYTES - self.current.len());
                 self.current.reserve_exact(grow);
             }
-            STANDARD.encode_string(piece, &mut self.current);
+            encode_base64_into(piece, &mut self.current);
             self.encoded_len += encoded;
             data = rest;
         }
@@ -286,16 +320,31 @@ impl LogprobsAccumulator for CompactLogprobsAccumulator {
             if self.scratch_ranks.len() >= SCRATCH_TARGET_BYTES {
                 self.flush_ranks();
             }
-            for entry in &position.entries[..slots] {
-                if entry.token_id > i32::MAX as u32 {
+            let mut row = &position.entries[..slots];
+            while !row.is_empty() {
+                // Copy as many candidates as fit before the next flush, in
+                // one tight loop over pre-sized scratch.
+                let room = (SCRATCH_TARGET_BYTES - self.scratch_token_ids.len()) / 4;
+                let (chunk, rest) = row.split_at(row.len().min(room.max(1)));
+                if let Some(entry) = chunk.iter().find(|e| e.token_id > i32::MAX as u32) {
                     self.fail(format!("token id {} does not fit int32", entry.token_id));
                     return;
                 }
-                self.scratch_token_ids.extend_from_slice(&entry.token_id.to_le_bytes());
-                self.scratch_logprobs.extend_from_slice(&entry.logprob.to_bits().to_le_bytes());
+                let start = self.scratch_token_ids.len();
+                self.scratch_token_ids.resize(start + chunk.len() * 4, 0);
+                self.scratch_logprobs.resize(start + chunk.len() * 4, 0);
+                for ((ids, logprobs), entry) in self.scratch_token_ids[start..]
+                    .chunks_exact_mut(4)
+                    .zip(self.scratch_logprobs[start..].chunks_exact_mut(4))
+                    .zip(chunk)
+                {
+                    ids.copy_from_slice(&entry.token_id.to_le_bytes());
+                    logprobs.copy_from_slice(&entry.logprob.to_bits().to_le_bytes());
+                }
                 if self.scratch_token_ids.len() >= SCRATCH_TARGET_BYTES {
                     self.flush_candidates();
                 }
+                row = rest;
             }
         }
         self.flush_candidates();
@@ -637,6 +686,27 @@ pub(crate) mod tests {
                     rank: slot.max(1),
                 })
                 .collect(),
+        }
+    }
+
+    #[test]
+    fn table_base64_matches_standard_engine() {
+        // Every 3-byte group value (2^24 groups), plus all tail lengths.
+        let mut every_group = Vec::with_capacity(3 << 24);
+        for value in 0_u32..1 << 24 {
+            every_group.extend_from_slice(&value.to_be_bytes()[1..]);
+        }
+        let mut out = Vec::new();
+        encode_base64_into(&every_group, &mut out);
+        assert!(out == STANDARD.encode(&every_group).into_bytes());
+        for len in 0..8 {
+            let input = &every_group[1000..1000 + len];
+            let mut out = b"prefix".to_vec();
+            encode_base64_into(input, &mut out);
+            assert_eq!(
+                out,
+                [b"prefix".as_slice(), STANDARD.encode(input).as_bytes()].concat()
+            );
         }
     }
 
