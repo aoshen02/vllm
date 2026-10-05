@@ -466,6 +466,9 @@ class ArrayLogprobs(MutableSequence[LogprobsOnePosition | None]):
         }
 
     def _append_legacy(self, positions: list[LogprobsOnePosition]) -> None:
+        if self.broken:  # storage was discarded: only count positions
+            self.num_positions += len(positions)
+            return
         if self._legacy is None:
             self._legacy = []
         self._legacy.extend(positions)
@@ -671,9 +674,12 @@ class ArrayLogprobs(MutableSequence[LogprobsOnePosition | None]):
         self._append_legacy(list(values))
 
     def _extend(self, values: "ArrayLogprobs") -> None:
-        if values.broken:
-            # Merging a broken delta: the merged positions are unusable too.
-            self.mark_broken()
+        if values.broken or self.broken:
+            # Merging with a broken side: the merged positions are unusable,
+            # so nothing is unwired, copied or re-attached (the caller counts
+            # the positions).
+            if not self.broken:
+                self.mark_broken()
             return
         values._unwire()
         # Snapshot first: ``values`` may be ``self``.
@@ -681,6 +687,8 @@ class ArrayLogprobs(MutableSequence[LogprobsOnePosition | None]):
         legacy = list(values._legacy) if values._legacy is not None else None
         for t, lp, r in blocks:
             self.append_rows(t, lp, r)
+            if self.broken:  # became broken mid-merge: stop copying
+                return
         if legacy is not None:
             self._append_legacy(legacy)
 

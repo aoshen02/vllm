@@ -46,7 +46,7 @@ from vllm.entrypoints.scale_out.token_in_token_out.protocol import (
 )
 from vllm.entrypoints.scale_out.token_in_token_out.serving import ServingTokens
 from vllm.entrypoints.serve.exception_handling.register import init_exception_handler
-from vllm.logprobs import ArrayLogprobs, append_logprobs_for_next_position
+from vllm.logprobs import ArrayLogprobs, Logprob, append_logprobs_for_next_position
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 from vllm.tokenizers import get_tokenizer
 from vllm.v1.engine import EngineCoreOutput, EngineCoreRequest, FinishReason
@@ -2736,3 +2736,32 @@ def test_compact_with_user_middleware_joins_off_loop(monkeypatch):
     assert int(result.headers["content-length"]) == len(result.content)
     assert len(threads) == 1
     assert threads[0].startswith("generate-response")
+
+
+@pytest.mark.parametrize("broken_side", ["target", "source"])
+def test_merge_with_broken_side_copies_nothing(monkeypatch, broken_side):
+    """Claude r8 NIT: merging into/from a broken container only counts
+    positions; nothing is unwired, snapshotted or re-attached."""
+    token_ids, logprobs, ranks = _engine_rows(0, 4, 3)
+    target = ArrayLogprobs()
+    target.append_rows(token_ids[:2], logprobs[:2], ranks[:2])
+    source = ArrayLogprobs(wire_base64=True)
+    source.append_rows(token_ids[2:], logprobs[2:], ranks[2:])
+    source._append_legacy([{1: Logprob(-1.0)}])
+    (target if broken_side == "target" else source).mark_broken()
+    if broken_side == "target":
+        target.num_positions = 2
+    else:
+        source.num_positions = 3
+    calls: list[str] = []
+    monkeypatch.setattr(ArrayLogprobs, "_unwire", lambda self: calls.append("unwire"))
+
+    def record_blocks(self):
+        calls.append("blocks")
+        return []
+
+    monkeypatch.setattr(ArrayLogprobs, "_filled_blocks", record_blocks)
+    target.extend(source)
+    assert calls == []
+    assert target.broken and len(target) == 5
+    assert target._legacy is None and target.token_id_chunks == []
