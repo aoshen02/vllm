@@ -132,6 +132,9 @@ class StreamingUpdate:
 
 
 class RequestState:
+    # Class-level default: also covers states built without __init__.
+    routed_experts_encoder: RoutedExpertsNpyBase64 | None = None
+
     def __init__(
         self,
         request_id: str,
