@@ -361,6 +361,8 @@ class RenderedGenerateResponse:
     """
 
     parts: list[bytes | memoryview]
+    # Send as one message like JSONResponse (default format).
+    single_message: bool = False
 
     def __post_init__(self) -> None:
         if isinstance(self.parts, (bytes, bytearray, memoryview)):

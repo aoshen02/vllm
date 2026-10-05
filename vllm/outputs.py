@@ -66,11 +66,6 @@ class CompletionOutput:
     lora_request: LoRARequest | None = None
     sampling_mask: SamplingMask | None = None
     spec_decode_metrics: RequestSpecDecodeMetrics | None = None
-    # Alternative to ``routed_experts`` (frontend-only
-    # ``SamplingParams.routed_experts_base64``): base64 text parts whose
-    # concatenation equals ``numpy2base64(routed_experts)``. Last field, so
-    # positional construction stays compatible.
-    routed_experts_b64: list[bytes] | None = None
 
     def finished(self) -> bool:
         return self.finish_reason is not None

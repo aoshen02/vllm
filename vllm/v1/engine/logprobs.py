@@ -92,9 +92,19 @@ class LogprobsProcessor:
         token_ids_lst, logprobs_lst, ranks_lst, _ = logprobs_lists
 
         if isinstance(self.logprobs, ArrayLogprobs):
-            self._append_array_logprobs(
-                self.logprobs, token_ids_lst, logprobs_lst, ranks_lst
-            )
+            container = self.logprobs
+            try:
+                self._append_array_logprobs(
+                    container, token_ids_lst, logprobs_lst, ranks_lst
+                )
+            except Exception:
+                # Frontend-only fast path: never break the shared
+                # OutputProcessor loop; fail only this request.
+                logger.exception("Array logprobs failed; failing the request")
+                if not container.broken:
+                    count = container.num_positions + len(ranks_lst)
+                    container.mark_broken()
+                    container.num_positions = count
             return
 
         for rank_np, logprobs_np, token_ids_np in zip(

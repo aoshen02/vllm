@@ -322,12 +322,6 @@ class SamplingParams(
     """Frontend-only, with `array_logprobs_base64`: the encoded id/logprob
     arrays hold only the top-k slots (`compact_include_sampled=false`).
     Never sent to EngineCore."""
-    routed_experts_base64: bool = False
-    """Frontend-only: encode returned routed experts into the response wire
-    format (base64 of `.npy`) as they arrive, without keeping the chunks
-    (`CompletionOutput.routed_experts_b64` instead of `routed_experts`).
-    Set by non-streaming `/inference/v1/generate`. Never sent to
-    EngineCore."""
     # NOTE: This parameter is only exposed at the engine level for now.
     # It is not exposed in the OpenAI API server, as the OpenAI API does
     # not support returning only a list of token IDs.

@@ -929,7 +929,6 @@ def test_array_logprobs_flag_stays_off_engine_wire():
         array_logprobs=True,
         array_logprobs_base64=True,
         array_logprobs_wire_topk_only=True,
-        routed_experts_base64=True,
     )
     request = EngineCoreRequest(
         request_id="r-int",
@@ -952,8 +951,6 @@ def test_array_logprobs_flag_stays_off_engine_wire():
     assert request.sampling_params.array_logprobs is False
     assert request.sampling_params.array_logprobs_base64 is False
     assert request.sampling_params.array_logprobs_wire_topk_only is False
-    assert request.sampling_params.routed_experts_base64 is False
-    assert state.routed_experts_encoder is not None
     # The caller's (possibly shared) params object is not mutated.
     assert params.array_logprobs is True
     assert params.array_logprobs_base64 is True
@@ -2066,40 +2063,8 @@ def _r3_chunks(layers, topk, dtype, sizes, seed=0):
     return [rng.integers(0, high, size=(n, layers, topk)).astype(dtype) for n in sizes]
 
 
-@pytest.mark.parametrize("dtype", [np.uint8, np.uint16, np.int32])
-@pytest.mark.parametrize("layers", [1, 4, 61])
-@pytest.mark.parametrize(
-    "sizes", [[16384 % 97 + 5, 1, 1, 1, 3], [0], [1], [2, 0, 5], [40, 1024 % 13]]
-)
-@pytest.mark.parametrize("flush", [3, 64, 1 << 20])
-def test_routed_experts_encoder_matches_numpy2base64(
-    monkeypatch, dtype, layers, sizes, flush
-):
-    """R3: incremental .npy+base64 == numpy2base64(np.concatenate(chunks))."""
-    from vllm import logprobs as logprobs_mod
-    from vllm.utils.serial_utils import numpy2base64
-    from vllm.v1.engine.routed_experts import RoutedExpertsNpyBase64
-
-    monkeypatch.setattr(logprobs_mod._Base64Stream, "FLUSH_BYTES", flush)
-    chunks = _r3_chunks(layers, 8, dtype, sizes)
-    expected = numpy2base64(np.concatenate(chunks, axis=0)).encode()
-    for hint in (0, sum(sizes), 262143, 10**30):
-        encoder = RoutedExpertsNpyBase64(max_rows_hint=hint)
-        for chunk in chunks:
-            assert encoder.try_append(chunk)
-        parts = encoder.parts()
-        if parts is None:  # header length residue differs from the hint's
-            assert numpy2base64(encoder.array()).encode() == expected
-        else:
-            assert b"".join(parts) == expected
-        np.testing.assert_array_equal(encoder.array(), np.concatenate(chunks))
-    assert not encoder.try_append(chunks[0].astype(np.int64))
-
-
-def _r3_request_state(routed_base64: bool, layers: int = 4):
-    params = SamplingParams(
-        max_tokens=100, logprobs=2, routed_experts_base64=routed_base64
-    )
+def _r3_request_state():
+    params = SamplingParams(max_tokens=100, logprobs=2)
     params.output_kind = RequestOutputKind.FINAL_ONLY
     processor = OutputProcessor(tokenizer=None, log_stats=False)
     request = EngineCoreRequest(
@@ -2119,13 +2084,12 @@ def _r3_request_state(routed_base64: bool, layers: int = 4):
     return processor, queue
 
 
-@pytest.mark.parametrize("routed_base64", [True, False])
 @pytest.mark.parametrize("mixed_dtype", [False, True])
-def test_routed_experts_survive_abort(routed_base64, mixed_dtype):
-    """R3 is returned on abort (FINAL_ONLY), encoded or as an array."""
+def test_routed_experts_survive_abort(mixed_dtype):
+    """R3 is returned on abort (FINAL_ONLY), byte-identical to base."""
     from vllm.utils.serial_utils import numpy2base64
 
-    processor, queue = _r3_request_state(routed_base64)
+    processor, queue = _r3_request_state()
     chunks = _r3_chunks(4, 8, np.uint8, [3, 1, 1])
     if mixed_dtype:
         chunks[2] = chunks[2].astype(np.uint16)
@@ -2146,12 +2110,7 @@ def test_routed_experts_survive_abort(routed_base64, mixed_dtype):
     processor.abort_requests(["r"], internal=True)
     output = queue.get_nowait().outputs[0]
     expected = numpy2base64(np.concatenate(chunks, axis=0))
-    if routed_base64 and not mixed_dtype:
-        assert output.routed_experts is None
-        assert b"".join(output.routed_experts_b64).decode() == expected
-    else:
-        assert output.routed_experts_b64 is None
-        assert numpy2base64(output.routed_experts) == expected
+    assert numpy2base64(output.routed_experts) == expected
 
 
 @pytest.mark.asyncio
@@ -2168,8 +2127,6 @@ async def test_routed_experts_in_full_responses(fmt):
     response = await _serving(feeder).serve_tokens(
         _request(logprobs=3, logprobs_format=fmt)
     )
-    # R3 descoped: the incremental encoder is not enabled by serving.
-    assert feeder.sampling_params.routed_experts_base64 is False
     choice = json.loads(response.body)["choices"][0]
     assert choice["routed_experts"] == numpy2base64(np.concatenate(routed))
     feeder = _OutputProcessorEngine([])
@@ -2184,7 +2141,6 @@ async def test_routed_experts_in_full_responses(fmt):
         _request(logprobs=3, logprobs_format=fmt, stream=True)
     )
     _ = [chunk async for chunk in generator]
-    assert feeder.sampling_params.routed_experts_base64 is False
 
 
 def test_fragments_spliced_in_document_order():
@@ -2288,46 +2244,165 @@ async def test_topk_only_zero_logprobs_full_request():
 
 
 def test_encoder_failures_fail_only_their_request(monkeypatch):
-    """Frontend-only encoders never raise out of process_outputs: a failing
-    wire encode fails that request's compact render (500); a failing R3
-    encode finishes that request with an error; others are unaffected."""
+    """Frontend-only storage never raises out of process_outputs: a failing
+    wire encode fails that request's compact render (500); others are
+    unaffected."""
     from vllm import logprobs as logprobs_mod
-    from vllm.v1.engine import routed_experts as routed_mod
 
     compact = SamplingParams(
-        max_tokens=10,
-        logprobs=2,
-        array_logprobs=True,
-        array_logprobs_base64=True,
-        routed_experts_base64=True,
+        max_tokens=10, logprobs=2, array_logprobs=True, array_logprobs_base64=True
     )
     other = SamplingParams(max_tokens=10, logprobs=2, array_logprobs=True)
     processor, queues = _two_request_processor(compact, other)
     ids, lps, ranks = _engine_rows(0, 3, 3)
-    routed = _r3_chunks(4, 8, np.uint8, [3, 1, 1])
-    processor.process_outputs([_step("a", ids[:1], lps[:1], ranks[:1], routed[0])])
+    processor.process_outputs([_step("a", ids[:1], lps[:1], ranks[:1])])
 
     def boom(self, data):
         raise RuntimeError("encoder failure")
 
     monkeypatch.setattr(logprobs_mod._Base64Stream, "write", boom)
-    monkeypatch.setattr(routed_mod._Base64Stream, "write", boom)
     processor.process_outputs(
         [
-            _step("a", ids[1:2], lps[1:2], ranks[1:2], routed[1]),
-            _step("b", ids[1:2], lps[1:2], ranks[1:2], routed[1]),
+            _step("a", ids[1:2], lps[1:2], ranks[1:2]),
+            _step("b", ids[1:2], lps[1:2], ranks[1:2]),
         ]
     )
     monkeypatch.undo()
     processor.abort_requests(["a", "b"], internal=True)
     out_a = queues["a"].get_nowait().outputs[0]
     out_b = queues["b"].get_nowait().outputs[0]
-    assert out_a.finish_reason == "error"
-    assert out_a.logprobs.broken
+    assert out_a.logprobs.broken and len(out_a.logprobs) == 2
     with pytest.raises(GenerationError, match="encoding failed"):
         render_compact_logprobs(out_a.logprobs, 2)
     assert out_b.finish_reason == "abort"
     assert len(out_b.logprobs) == 1
+
+
+@pytest.mark.parametrize("failing", ["decode"])
+def test_unwire_failure_is_contained(monkeypatch, failing):
+    """Codex r6 #1: a failure while leaving wire mode (float64 fallback) is
+    contained: the request's storage is discarded and marked broken, and the
+    rest of the batch is processed."""
+    from vllm import logprobs as logprobs_mod
+
+    compact = SamplingParams(
+        max_tokens=10, logprobs=2, array_logprobs=True, array_logprobs_base64=True
+    )
+    other = SamplingParams(max_tokens=10, logprobs=2, array_logprobs=True)
+    processor, queues = _two_request_processor(compact, other)
+    ids, lps, ranks = _engine_rows(0, 3, 3)
+    processor.process_outputs([_step("a", ids[:1], lps[:1], ranks[:1])])
+
+    def boom(*args, **kwargs):
+        raise MemoryError("injected")
+
+    monkeypatch.setattr(logprobs_mod._WireEncoder, "decode", boom)
+    processor.process_outputs(
+        [
+            _step("a", ids[1:2], lps[1:2].astype(np.float64), ranks[1:2]),
+            _step("b", ids[1:2], lps[1:2], ranks[1:2]),
+        ]
+    )
+    monkeypatch.undo()
+    processor.process_outputs(
+        [
+            _step("a", ids[2:3], lps[2:3], ranks[2:3]),
+            _step("b", ids[2:3], lps[2:3], ranks[2:3]),
+        ]
+    )
+    processor.abort_requests(["a", "b"], internal=True)
+    out_a = queues["a"].get_nowait().outputs[0]
+    out_b = queues["b"].get_nowait().outputs[0]
+    assert out_a.logprobs.broken and len(out_a.logprobs) == 3
+    with pytest.raises(GenerationError):
+        render_compact_logprobs(out_a.logprobs, 2)
+    assert len(out_b.logprobs) == 2
+    np.testing.assert_array_equal(out_b.logprobs.arrays()[0], ids[1:3])
+
+
+def test_broken_container_semantics():
+    """Claude r6 NIT 2: a broken container raises a clear error on access,
+    and slices/merges stay broken (no exception in DELTA slicing)."""
+    token_ids, logprobs, ranks = _engine_rows(0, 3, 3)
+    container = ArrayLogprobs()
+    container.append_rows(token_ids, logprobs, ranks)
+    container.mark_broken()
+    container.num_positions = 3
+    with pytest.raises(ValueError, match="broken"):
+        container[0]
+    with pytest.raises(ValueError, match="broken"):
+        list(container)
+    with pytest.raises(ValueError, match="broken"):
+        container.arrays()
+    tail = container[-2:]
+    assert tail.broken and len(tail) == 2 and not tail.is_regular
+    merged = ArrayLogprobs()
+    merged.append_rows(token_ids[:1], logprobs[:1], ranks[:1])
+    merged.extend(tail)
+    assert merged.broken and len(merged) == 3
+    container.append_rows(token_ids[:1], logprobs[:1], ranks[:1])
+    assert len(container) == 4
+
+
+@pytest.mark.parametrize("wire", [False, True])
+def test_non_native_byte_order_keeps_precision(wire):
+    """Codex r6 #3: storage dtype by kind and size, not equality with native
+    dtypes (``>f8`` used to be stored as float32)."""
+    token_ids, logprobs, ranks = _engine_rows(0, 3, 4)
+    values = logprobs.astype(np.float64)
+    values[1, 2] = -0.12345678901234566
+    container = ArrayLogprobs(wire_base64=wire)
+    container.append_rows(
+        token_ids.astype(">i8"), values.astype(">f8"), ranks.astype(">i8")
+    )
+    native, legacy = _containers(token_ids, values, ranks, 3)
+    assert container[1][int(token_ids[1, 2])].logprob == -0.12345678901234566
+    assert list(container) == legacy
+    sampled = token_ids[:, 0].tolist()
+    assert render_openai_logprobs(sampled, container, 3) == _legacy_logprobs_bytes(
+        sampled, legacy, 3
+    )
+    stored = container.arrays()
+    assert stored[1].dtype == np.dtype("<f8") and stored[0].dtype.isnative
+    # Big-endian float32 stays in wire mode and encodes like native rows.
+    wire32 = ArrayLogprobs(wire_base64=True)
+    wire32.append_rows(token_ids.astype(">i4"), logprobs.astype(">f4"), ranks)
+    assert wire32.wire_parts() is not None
+    plain = ArrayLogprobs()
+    plain.append_rows(token_ids, logprobs, ranks)
+    assert render_compact_logprobs(wire32, 3) == render_compact_logprobs(plain, 3)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fmt", ["openai", "compact"])
+async def test_default_format_is_sent_as_one_message(fmt):
+    """Round 7 decision: the default format is always one body message (like
+    JSONResponse, joined off-loop); multi-part only for compact."""
+    chunks = [_engine_rows(0, 3, 4)]
+    feeder = _OutputProcessorEngine(chunks)
+    response = await _serving(feeder).serve_tokens(
+        _request(logprobs=3, logprobs_format=fmt)
+    )
+    assert isinstance(response, RenderedGenerateResponse)
+    if fmt == "openai":
+        assert response.single_message and len(response.parts) == 1
+    else:
+        assert not response.single_message and len(response.parts) > 1
+    big = [b'{"a":"' + b"x" * (3 << 20), b'"}']
+    client = _gzip_client(big)
+
+    async def _serve(request, raw_request):
+        return RenderedGenerateResponse(list(big), single_message=fmt == "openai")
+
+    client.app.state.serving_tokens.serve_tokens = _serve
+    with client:
+        result = client.post(
+            "/inference/v1/generate",
+            json={"token_ids": [1], "sampling_params": {}},
+            headers={"accept-encoding": "gzip"},
+        )
+    assert result.content == b"".join(big)
+    assert ("content-length" in result.headers) is (fmt == "openai")
 
 
 def test_completion_output_positional_fields_unchanged():
@@ -2354,7 +2429,6 @@ def test_completion_output_positional_fields_unchanged():
     assert names[: len(base)] == base
     output = CompletionOutput(0, "", [1], None, None, None, "stop")
     assert output.finish_reason == "stop" and output.finished()
-    assert output.routed_experts_b64 is None
 
 
 def test_lead_table_reader_sees_consistent_snapshot():
@@ -2424,44 +2498,6 @@ def test_uint64_beyond_int64_is_never_wrapped():
     container = ArrayLogprobs()
     container.append_rows(token_ids, logprobs, ranks_big)
     assert container[1][int(token_ids[1, 0])].rank == 2**63
-
-
-@pytest.mark.parametrize("case", ["big_endian", "fortran", "big_endian_first"])
-def test_routed_experts_encoder_refuses_non_native_or_fortran(case):
-    """Claude/Codex r45: such chunks fall back so the bytes equal
-    numpy2base64(np.concatenate(chunks))."""
-    from vllm.utils.serial_utils import numpy2base64
-
-    processor, queue = _r3_request_state(True)
-    chunks = _r3_chunks(3, 4, np.uint16, [3, 2, 2])
-    if case == "big_endian":
-        chunks[1] = chunks[1].astype(">u2")
-    elif case == "fortran":
-        chunks[1] = np.asfortranarray(chunks[1])
-    else:
-        chunks = [c.astype(">u2") for c in chunks]
-    token_ids, logprobs, ranks = _engine_rows(0, 3, 3)
-    for i, chunk in enumerate(chunks):
-        processor.process_outputs(
-            [
-                _step(
-                    "r",
-                    token_ids[i : i + 1],
-                    logprobs[i : i + 1],
-                    ranks[i : i + 1],
-                    chunk,
-                )
-            ]
-        )
-    processor.abort_requests(["r"], internal=True)
-    output = queue.get_nowait().outputs[0]
-    expected = numpy2base64(np.concatenate(chunks, axis=0))
-    got = (
-        b"".join(output.routed_experts_b64).decode()
-        if output.routed_experts_b64 is not None
-        else numpy2base64(output.routed_experts)
-    )
-    assert got == expected
 
 
 def test_user_middleware_gets_single_message_bodies():

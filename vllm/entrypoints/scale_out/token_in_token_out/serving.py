@@ -333,10 +333,6 @@ class ServingTokens(GenerateBaseServing):
             sampling_params.array_logprobs_base64
             and not request.compact_include_sampled
         )
-        # R3 is out of scope for now: keep the base chunk accumulation (the
-        # incremental RoutedExpertsNpyBase64 encoder stays opt-in internally,
-        # off here), and never take a client-provided value.
-        sampling_params.routed_experts_base64 = False
 
     @staticmethod
     def _require_array_logprobs(logprobs: object) -> ArrayLogprobs:
@@ -507,13 +503,7 @@ class ServingTokens(GenerateBaseServing):
             # escaping), skipping json.dumps / pydantic of a string that is
             # ~170 MB at 61 layers.
             routed_experts_b64 = None
-            if output.routed_experts_b64 is not None:
-                fragments.setdefault(len(choices), {})["routed_experts"] = [
-                    b'"',
-                    *output.routed_experts_b64,
-                    b'"',
-                ]
-            elif output.routed_experts is not None:
+            if output.routed_experts is not None:
                 fragments.setdefault(len(choices), {})["routed_experts"] = [
                     b'"',
                     numpy2base64(output.routed_experts).encode("ascii"),
@@ -568,9 +558,19 @@ class ServingTokens(GenerateBaseServing):
 
         choice_meta = [(choice.index, choice.finish_reason) for choice in choices]
         if fragments:
-            rendered_response = RenderedGenerateResponse(
-                render_json_with_fragments_parts(response.model_dump(), fragments)
-            )
+            parts = render_json_with_fragments_parts(response.model_dump(), fragments)
+            if not compact:
+                # Default format: one message like JSONResponse (compatibility
+                # with body-transforming middleware); joined here, i.e. in the
+                # worker thread for large bodies, not on the event loop.
+                body = b"".join(parts)
+                del parts
+                return (
+                    RenderedGenerateResponse([body], single_message=True),
+                    usage,
+                    choice_meta,
+                )
+            rendered_response = RenderedGenerateResponse(parts)
             return rendered_response, usage, choice_meta
         return response, usage, choice_meta
 

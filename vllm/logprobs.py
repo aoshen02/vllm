@@ -173,9 +173,13 @@ _INT32_INFO = np.iinfo(np.int32)
 _INT64_INFO = np.iinfo(np.int64)
 
 
-_NARROW_INTS = frozenset(
-    np.dtype(t) for t in (np.int8, np.int16, np.int32, np.uint8, np.uint16)
-)
+def _is_narrow_int(dtype: np.dtype) -> bool:
+    """Integer dtypes that always fit int32, in any byte order."""
+    return (dtype.kind == "i" and dtype.itemsize <= 4) or (
+        dtype.kind == "u" and dtype.itemsize <= 2
+    )
+
+
 _MIN_REDUCE = np.minimum.reduce
 _MAX_REDUCE = np.maximum.reduce
 
@@ -188,7 +192,7 @@ def _storage_int_dtype(values: np.ndarray) -> np.dtype | None:
     arrays (e.g. one rank per step) are checked in Python, which is several
     times cheaper than numpy reductions at that size.
     """
-    if values.dtype in _NARROW_INTS or values.size == 0:
+    if _is_narrow_int(values.dtype) or values.size == 0:
         return _INT32
     flat = values.reshape(-1)
     if flat.size <= 8:
@@ -204,8 +208,17 @@ def _storage_int_dtype(values: np.ndarray) -> np.dtype | None:
 
 
 def _storage_float_dtype(values: np.ndarray) -> np.dtype:
-    """float32 (the engine dtype; float16 widens exactly) or float64."""
-    return _FLOAT64 if values.dtype == np.float64 else _FLOAT32
+    """Native little-endian float32 for floats of up to 4 bytes (the engine
+    dtype; float16 widens exactly), else float64. By kind and size, so a
+    non-native byte order (e.g. ``>f8``) keeps its precision."""
+    dtype = values.dtype
+    if dtype.kind == "f" and dtype.itemsize <= 4:
+        return _FLOAT32
+    return _FLOAT64
+
+
+def _is_float32_compatible(dtype: np.dtype) -> bool:
+    return dtype.kind == "f" and dtype.itemsize <= 4
 
 
 class _Base64Stream:
@@ -268,7 +281,7 @@ class _WireEncoder:
         """Encode the rows, or return False if they are not representable
         (width change, ids/ranks beyond int32, logprobs wider than float32,
         which the container then keeps losslessly in array mode)."""
-        if logprobs.dtype not in (_FLOAT32, np.dtype(np.float16)):
+        if not _is_float32_compatible(logprobs.dtype):
             return False
         width = token_ids.shape[1]
         if self.slots is not None and width != self.slots:
@@ -457,29 +470,54 @@ class ArrayLogprobs(MutableSequence[LogprobsOnePosition | None]):
         self, token_ids: np.ndarray, logprobs: np.ndarray, ranks: np.ndarray
     ) -> None:
         """Append ``n`` positions given as ``[n, S]``, ``[n, S]`` and ``[n]``
-        arrays. Values are copied, so engine buffers are not retained."""
+        arrays. Values are copied, so engine buffers are not retained.
+
+        Never raises (it runs inside the shared OutputProcessor loop): any
+        failure (encoding, unwiring, allocation) discards this container's
+        storage and marks it :attr:`broken`; rendering then fails only this
+        request (500), and positional access raises ValueError.
+        """
         n = len(ranks)
         if n == 0:
             return
+        expected = self.num_positions + n
+        try:
+            self._append_rows(token_ids, logprobs, ranks, n)
+        except Exception:
+            logger.exception("Storing sample logprobs failed; failing the request")
+            self.mark_broken()
+        if self.broken:
+            self.num_positions = expected
+
+    def mark_broken(self) -> None:
+        """Discard all stored rows; positions stay counted but unusable."""
+        self.broken = True
+        self._wire = None
+        self._legacy = None
+        self.token_id_chunks = []
+        self.logprob_chunks = []
+        self.rank_chunks = []
+        self._tail_fill = 0
+        self._tail_block = None
+        self._tail_dtypes = None
+
+    def _check_usable(self) -> None:
+        if self.broken:
+            raise ValueError(
+                "ArrayLogprobs is broken: its rows were discarded after a "
+                "storage failure"
+            )
+
+    def _append_rows(
+        self, token_ids: np.ndarray, logprobs: np.ndarray, ranks: np.ndarray, n: int
+    ) -> None:
+        if self.broken:
+            return
         if self._wire is not None:
-            try:
-                written = self._wire.try_write(token_ids, logprobs, ranks)
-            except Exception:
-                # Never let the frontend-only encoder break process_outputs:
-                # the streams may be partially written, so this request's
-                # logprobs become unusable (compact rendering fails it, 500).
-                logger.exception("Compact logprobs encoding failed")
-                self._wire = None
-                self.broken = True
-                self.num_positions += n
-                return
-            if written:
+            if self._wire.try_write(token_ids, logprobs, ranks):
                 self.num_positions += n
                 return
             self._unwire()
-        if self.broken:
-            self.num_positions += n
-            return
         width = token_ids.shape[1]
         if self._legacy is not None or (
             self.token_id_chunks and width != self.token_id_chunks[0].shape[1]
@@ -589,8 +627,7 @@ class ArrayLogprobs(MutableSequence[LogprobsOnePosition | None]):
         arrays when there are no positions. Raises ValueError when the
         container is not :attr:`is_regular`.
         """
-        if self.broken:
-            raise ValueError("Logprob rows were lost by a failed encoding")
+        self._check_usable()
         self._unwire()
         if self._legacy is not None:
             raise ValueError("Logprob rows have inconsistent widths")
@@ -609,6 +646,14 @@ class ArrayLogprobs(MutableSequence[LogprobsOnePosition | None]):
         return self.token_id_chunks[0], self.logprob_chunks[0], self.rank_chunks[0]
 
     def extend(self, values) -> None:
+        if isinstance(values, ArrayLogprobs) and values.broken:
+            # Merging a broken delta: the merged positions are unusable too.
+            n = self.num_positions + len(values)
+            self.mark_broken()
+            self.num_positions = n
+            if values.source_positions is not None:
+                self.source_positions = values.source_positions
+            return
         if isinstance(values, ArrayLogprobs):
             if values.source_positions is not None:
                 # Merged DELTA outputs: the newest slice's source count.
@@ -636,9 +681,19 @@ class ArrayLogprobs(MutableSequence[LogprobsOnePosition | None]):
     def __getitem__(self, s: slice, /) -> "ArrayLogprobs": ...
 
     def __getitem__(self, index: int | slice):
-        self._unwire()
         if isinstance(index, slice):
+            if self.broken:
+                # Slices of a broken container stay broken (no exception in
+                # the OutputProcessor's DELTA slicing).
+                start, stop, _ = index.indices(self.num_positions)
+                result = ArrayLogprobs(source_positions=self.num_positions)
+                result.broken = True
+                result.num_positions = max(stop - start, 0)
+                return result
+            self._unwire()
             return self._slice(index)
+        self._check_usable()
+        self._unwire()
         try:
             index = operator.index(index)
         except TypeError:
@@ -711,6 +766,7 @@ class ArrayLogprobs(MutableSequence[LogprobsOnePosition | None]):
 
     def __iter__(self) -> Iterator[LogprobsOnePosition]:
         """Positions in order, in one pass over the blocks."""
+        self._check_usable()
         self._unwire()
         for i in range(len(self.rank_chunks)):
             t, lp, r = self._filled_block(i)

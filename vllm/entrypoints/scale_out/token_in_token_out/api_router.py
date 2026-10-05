@@ -51,14 +51,20 @@ class _RenderedJSONResponse(JSONResponse):
 
     Subclassing JSONResponse keeps ``load_aware_call`` bookkeeping and the
     headers (``content-type``, ``content-length``) identical to the default
-    path. The parts are sent as consecutive ``http.response.body`` messages
-    (small ones coalesced) instead of one joined body: no full-size copy,
-    the server's write flow control applies, and each part is released
-    once sent. Bodies up to ``COALESCE_BYTES`` go out as a single message,
-    exactly like ``JSONResponse``; larger ones are a stream of messages whose
-    last carries ``more_body=False`` (body-rewriting middleware such as
-    GZipMiddleware then sees a streaming response). Single-use: the parts are
-    consumed by the first send.
+    path. Framing:
+
+    * single message (exactly like ``JSONResponse``): the default format
+      always (``RenderedGenerateResponse.single_message``; the parts were
+      joined off the event loop), and any response when user
+      ``--middleware`` is configured, so body-transforming middleware such
+      as GZipMiddleware sees a regular response (Content-Length, size
+      thresholds);
+    * otherwise (opt-in compact format) consecutive ``http.response.body``
+      messages, small parts coalesced, the last with ``more_body=False``: no
+      full-size join, write flow control, parts released as sent.
+
+    Single-use: the parts are consumed by the first send; a second send
+    raises RuntimeError before anything is sent.
     """
 
     COALESCE_BYTES = 1 << 20
@@ -169,7 +175,9 @@ async def generate(request: GenerateRequest, raw_request: Request):
         # JSONResponse framing (one message) for exact compatibility then.
         args = getattr(raw_request.app.state, "args", None)
         user_middleware = bool(getattr(args, "middleware", None))
-        return _RenderedJSONResponse(generator, single_message=user_middleware)
+        return _RenderedJSONResponse(
+            generator, single_message=generator.single_message or user_middleware
+        )
 
     elif isinstance(generator, GenerateResponse):
         return JSONResponse(content=generator.model_dump())
