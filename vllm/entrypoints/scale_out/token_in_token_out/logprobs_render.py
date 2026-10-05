@@ -516,7 +516,7 @@ def render_json_with_fragments(
 def render_json_with_fragments_parts(
     content: dict[str, Any],
     choice_fragments: Mapping[int, Mapping[str, bytes | list[bytes]]],
-) -> list[bytes | memoryview]:
+) -> list[bytes]:
     """Render ``content`` like ``JSONResponse`` with pre-rendered values.
 
     ``choice_fragments[i][key]`` is the JSON (bytes, or a list of parts to
@@ -536,7 +536,7 @@ def render_json_with_fragments_parts(
     pieces = _dumps(content).split(f'"{token}:'.encode())
     if len(pieces) != len(fragments) + 1:
         raise AssertionError("Fragment placeholder collision")
-    out: list[bytes | memoryview] = [pieces[0]]
+    out: list[bytes] = [pieces[0]]
     seen: set[int] = set()
     for piece in pieces[1:]:
         # Placeholders appear in document order, which need not be the order
@@ -552,5 +552,15 @@ def render_json_with_fragments_parts(
             out.append(fragment)
         else:
             out.extend(fragment)
-        out.append(memoryview(piece)[len(marker) :])
+        # Exact bytes (a small copy of the JSON between fragments): a join
+        # over exact bytes releases the GIL during the copy, a join with any
+        # memoryview part holds it for the whole multi-GB body.
+        out.append(piece[len(marker) :])
     return out
+
+
+def join_parts(parts: list[bytes | memoryview]) -> bytes:
+    """``b"".join`` of body parts with every part as exact ``bytes``, so
+    CPython releases the GIL while copying (the event loop keeps running
+    when this runs in a worker thread)."""
+    return b"".join([p if type(p) is bytes else bytes(p) for p in parts])

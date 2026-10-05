@@ -31,6 +31,7 @@ from vllm.entrypoints.scale_out.token_in_token_out.logprobs_render import (
     render_compact_logprobs,
     render_compact_logprobs_parts,
     render_json_with_fragments,
+    render_json_with_fragments_parts,
     render_openai_logprobs,
     render_openai_logprobs_parts,
 )
@@ -1185,7 +1186,7 @@ async def test_large_responses_are_built_off_the_event_loop(
     event loop keeps serving other requests; the body is unchanged."""
     from vllm.entrypoints.scale_out.token_in_token_out import serving as serving_mod
 
-    threads: list[int] = []
+    threads: list[Any] = []
     original = ServingTokens._build_full_response
 
     def recording(self, *args, **kwargs):
@@ -2671,3 +2672,67 @@ def test_stepped_slices_raise(broken):
     with pytest.raises(ValueError, match="contiguous"):
         container[::2]
     assert len(container[1:3]) == 2
+
+
+# --------------------------------------------- Claude round-7 audit items
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fmt", ["openai", "compact"])
+async def test_rendered_parts_are_exact_bytes(fmt):
+    """Claude r7 #1: every body part is exact bytes, so the off-loop join of
+    the default body releases the GIL (a memoryview part made bytes.join hold
+    it for the whole 2.2 GB copy: ~217 ms event-loop stalls)."""
+    chunks = [_engine_rows(0, 3, 4)]
+    feeder = _OutputProcessorEngine(chunks)
+    response = await _serving(feeder).serve_tokens(
+        _request(logprobs=3, logprobs_format=fmt)
+    )
+    assert all(type(part) is bytes for part in response.parts)
+    parts = render_json_with_fragments_parts(
+        {"choices": [{"a": None, "b": 1}]}, {0: {"a": [b"1", b"2"]}}
+    )
+    assert all(type(part) is bytes for part in parts)
+    assert logprobs_render.join_parts([b"x", memoryview(b"yz")]) == b"xyz"
+
+
+def test_second_failure_on_broken_container_keeps_counting(monkeypatch):
+    """Claude r7 NIT 2: positions keep counting on an already broken
+    container."""
+    request = MagicMock(spec=EngineCoreRequest)
+    request.sampling_params = SamplingParams(logprobs=2, array_logprobs=True)
+    processor = LogprobsProcessor.from_new_request(None, request)
+
+    def boom(*args, **kwargs):
+        raise MemoryError("injected")
+
+    monkeypatch.setattr(LogprobsProcessor, "_append_array_logprobs", boom)
+    for step in range(3):
+        ids, lps, ranks = _engine_rows(step * 2, 2, 3)
+        processor._update_sample_logprobs(LogprobsLists(ids, lps, ranks))
+    assert processor.logprobs.broken and len(processor.logprobs) == 6
+
+
+def test_compact_with_user_middleware_joins_off_loop(monkeypatch):
+    """Claude r7 NIT 3: compact + --middleware is joined in the builder
+    thread, not on the event loop."""
+    threads: list[Any] = []
+    real_join = logprobs_render.join_parts
+
+    def recording_join(parts):
+        threads.append(threading.current_thread().name)
+        return real_join(parts)
+
+    monkeypatch.setattr(api_router, "join_parts", recording_join)
+    parts = [b'{"a":"', b"x" * 10, b'"}']
+    client = _gzip_client(parts)
+    client.app.state.args.middleware = ["some.module.Middleware"]
+    with client:
+        result = client.post(
+            "/inference/v1/generate",
+            json={"token_ids": [1], "sampling_params": {}},
+        )
+    assert result.content == b"".join(parts)
+    assert int(result.headers["content-length"]) == len(result.content)
+    assert len(threads) == 1
+    assert threads[0].startswith("generate-response")

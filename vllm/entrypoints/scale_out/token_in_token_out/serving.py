@@ -50,6 +50,7 @@ from vllm.utils.serial_utils import numpy2base64
 
 from .logprobs_render import (
     compact_logprobs_fields,
+    join_parts,
     render_compact_logprobs_parts,
     render_json_with_fragments_parts,
     render_openai_logprobs_parts,
@@ -563,7 +564,7 @@ class ServingTokens(GenerateBaseServing):
                 # Default format: one message like JSONResponse (compatibility
                 # with body-transforming middleware); joined here, i.e. in the
                 # worker thread for large bodies, not on the event loop.
-                body = b"".join(parts)
+                body = join_parts(parts)
                 del parts
                 return (
                     RenderedGenerateResponse([body], single_message=True),
