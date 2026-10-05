@@ -2530,3 +2530,144 @@ async def test_single_use_guard_before_response_start():
     with pytest.raises(RuntimeError, match="only be sent once"):
         await response({"type": "http"}, None, send)
     assert messages == []
+
+
+# ------------------------------------------------ round-7 audit regressions
+
+
+def _delta_two_request_processor():
+    params = {
+        rid: SamplingParams(
+            max_tokens=10,
+            logprobs=2,
+            array_logprobs=True,
+            array_logprobs_base64=False,
+        )
+        for rid in ("a", "b")
+    }
+    processor = OutputProcessor(tokenizer=None, log_stats=False)
+    queues = {}
+    for rid, sp in params.items():
+        sp.output_kind = RequestOutputKind.DELTA
+        request = EngineCoreRequest(
+            request_id=rid,
+            external_req_id=rid,
+            prompt_token_ids=[1, 2, 3],
+            mm_features=None,
+            arrival_time=0,
+            lora_request=None,
+            cache_salt=None,
+            data_parallel_rank=None,
+            sampling_params=sp,
+            pooling_params=None,
+        )
+        queues[rid] = RequestOutputCollector(sp.output_kind, rid)
+        processor.add_request(request, None, queue=queues[rid])
+    return processor, queues
+
+
+def test_delta_slicing_failure_is_contained(monkeypatch):
+    """Codex r7 #1: a failure while slicing the DELTA output (inside
+    RequestState._new_completion_output) fails only that request; the
+    co-batched request is processed."""
+    from vllm import logprobs as logprobs_mod
+
+    processor, queues = _delta_two_request_processor()
+    ids, lps, ranks = _engine_rows(0, 2, 3)
+    original = logprobs_mod.ArrayLogprobs._slice
+    calls = {"n": 0}
+
+    def failing_slice(self, index):
+        calls["n"] += 1
+        if calls["n"] == 1:  # request "a" (first in the batch)
+            raise MemoryError("injected")
+        return original(self, index)
+
+    monkeypatch.setattr(logprobs_mod.ArrayLogprobs, "_slice", failing_slice)
+    processor.process_outputs(
+        [
+            _step("a", ids[:1], lps[:1], ranks[:1]),
+            _step("b", ids[:1], lps[:1], ranks[:1]),
+        ]
+    )
+    monkeypatch.undo()
+    out_a = queues["a"].get_nowait().outputs[0]
+    out_b = queues["b"].get_nowait().outputs[0]
+    assert out_a.logprobs.broken and len(out_a.logprobs) == 1
+    with pytest.raises(GenerationError):
+        render_compact_logprobs(out_a.logprobs, 2)
+    assert not out_b.logprobs.broken
+    np.testing.assert_array_equal(out_b.logprobs.arrays()[0], ids[:1])
+
+
+def test_delta_merge_failure_is_contained(monkeypatch):
+    """Codex r7 #2: a failure while merging queued DELTA outputs
+    (RequestOutputCollector.put -> ArrayLogprobs.extend) fails only that
+    request; the co-batched request is merged normally."""
+    from vllm import logprobs as logprobs_mod
+
+    processor, queues = _delta_two_request_processor()
+    ids, lps, ranks = _engine_rows(0, 3, 3)
+    # Two steps without get(): the second output is merged into the first.
+    processor.process_outputs(
+        [
+            _step("a", ids[:1], lps[:1], ranks[:1]),
+            _step("b", ids[:1], lps[:1], ranks[:1]),
+        ]
+    )
+    original = logprobs_mod.ArrayLogprobs._filled_blocks
+    calls = {"n": 0}
+
+    def failing_blocks(self):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise MemoryError("injected")
+        return original(self)
+
+    monkeypatch.setattr(logprobs_mod.ArrayLogprobs, "_filled_blocks", failing_blocks)
+    processor.process_outputs(
+        [
+            _step("a", ids[1:2], lps[1:2], ranks[1:2]),
+            _step("b", ids[1:2], lps[1:2], ranks[1:2]),
+        ]
+    )
+    monkeypatch.undo()
+    out_a = queues["a"].get_nowait().outputs[0]
+    out_b = queues["b"].get_nowait().outputs[0]
+    assert out_a.logprobs.broken and len(out_a.logprobs) == 2
+    assert list(out_a.token_ids) == ids[:2, 0].tolist()
+    assert not out_b.logprobs.broken
+    np.testing.assert_array_equal(out_b.logprobs.arrays()[0], ids[:2])
+
+
+def test_unwire_failure_keeps_wire_data():
+    """A failed decode leaves the wire storage intact (no silent loss)."""
+    from unittest.mock import patch
+
+    from vllm import logprobs as logprobs_mod
+
+    token_ids, logprobs, ranks = _engine_rows(0, 3, 3)
+    container = ArrayLogprobs(wire_base64=True)
+    container.append_rows(token_ids, logprobs, ranks)
+    with (
+        patch.object(logprobs_mod._WireEncoder, "decode", side_effect=MemoryError("x")),
+        pytest.raises(MemoryError),
+    ):
+        container._unwire()
+    assert container.wire_parts() is not None
+    np.testing.assert_array_equal(container.arrays()[0], token_ids)
+
+
+@pytest.mark.parametrize("broken", [False, True])
+def test_stepped_slices_raise(broken):
+    """Kimi r7 NIT: stepped slices raise, also for broken containers (no
+    misleading length)."""
+    token_ids, logprobs, ranks = _engine_rows(0, 4, 3)
+    container = ArrayLogprobs()
+    container.append_rows(token_ids, logprobs, ranks)
+    if broken:
+        container.mark_broken()
+        container.num_positions = 4
+    with pytest.raises(ValueError, match="contiguous"):
+        container[::2]
+    assert len(container[1:3]) == 2

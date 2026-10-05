@@ -407,14 +407,19 @@ class ArrayLogprobs(MutableSequence[LogprobsOnePosition | None]):
         wire = self._wire
         if wire is None:
             return
-        self._wire = None
         if wire.num_rows:
             token_ids, logprobs, ranks = wire.decode()
             # Writable copies, like array-mode storage.
-            self.token_id_chunks = [token_ids.copy()]
-            self.logprob_chunks = [logprobs.copy()]
-            self.rank_chunks = [ranks.copy()]
+            token_ids, logprobs, ranks = (
+                token_ids.copy(),
+                logprobs.copy(),
+                ranks.copy(),
+            )
+            self.token_id_chunks = [token_ids]
+            self.logprob_chunks = [logprobs]
+            self.rank_chunks = [ranks]
             self._tail_fill = wire.num_rows
+        self._wire = None
 
     def wire_parts(
         self,
@@ -646,29 +651,38 @@ class ArrayLogprobs(MutableSequence[LogprobsOnePosition | None]):
         return self.token_id_chunks[0], self.logprob_chunks[0], self.rank_chunks[0]
 
     def extend(self, values) -> None:
-        if isinstance(values, ArrayLogprobs) and values.broken:
-            # Merging a broken delta: the merged positions are unusable too.
-            n = self.num_positions + len(values)
-            self.mark_broken()
-            self.num_positions = n
-            if values.source_positions is not None:
-                self.source_positions = values.source_positions
-            return
+        """Append the positions of ``values`` (DELTA aggregation in
+        ``RequestOutput.add``). Never raises for ArrayLogprobs sources: a
+        failure marks this container broken (the request fails at render)."""
         if isinstance(values, ArrayLogprobs):
+            count = self.num_positions + len(values)
+            try:
+                self._extend(values)
+            except Exception:
+                logger.exception("Merging sample logprobs failed; failing the request")
+                self.mark_broken()
+            if self.broken:
+                self.num_positions = count
             if values.source_positions is not None:
                 # Merged DELTA outputs: the newest slice's source count.
                 self.source_positions = values.source_positions
-            values._unwire()
-            # Snapshot first: ``values`` may be ``self``.
-            blocks = values._filled_blocks()
-            legacy = list(values._legacy) if values._legacy is not None else None
-            for t, lp, r in blocks:
-                self.append_rows(t, lp, r)
-            if legacy is not None:
-                self._append_legacy(legacy)
             return
         # Other position containers (list, FlatLogprobs): keep legacy dicts.
         self._append_legacy(list(values))
+
+    def _extend(self, values: "ArrayLogprobs") -> None:
+        if values.broken:
+            # Merging a broken delta: the merged positions are unusable too.
+            self.mark_broken()
+            return
+        values._unwire()
+        # Snapshot first: ``values`` may be ``self``.
+        blocks = values._filled_blocks()
+        legacy = list(values._legacy) if values._legacy is not None else None
+        for t, lp, r in blocks:
+            self.append_rows(t, lp, r)
+        if legacy is not None:
+            self._append_legacy(legacy)
 
     def __len__(self) -> int:
         """Gets number of positions stored in the container"""
@@ -682,16 +696,27 @@ class ArrayLogprobs(MutableSequence[LogprobsOnePosition | None]):
 
     def __getitem__(self, index: int | slice):
         if isinstance(index, slice):
-            if self.broken:
-                # Slices of a broken container stay broken (no exception in
-                # the OutputProcessor's DELTA slicing).
-                start, stop, _ = index.indices(self.num_positions)
-                result = ArrayLogprobs(source_positions=self.num_positions)
-                result.broken = True
-                result.num_positions = max(stop - start, 0)
-                return result
-            self._unwire()
-            return self._slice(index)
+            start, stop, step = index.indices(self.num_positions)
+            if step != 1:
+                raise ValueError("ArrayLogprobs only supports contiguous slices")
+            if not self.broken:
+                # DELTA slicing runs while building request outputs inside
+                # the OutputProcessor loop: never raise from here.
+                try:
+                    self._unwire()
+                    return self._slice(index)
+                except Exception:
+                    logger.exception(
+                        "Slicing sample logprobs failed; failing the request"
+                    )
+                    count = self.num_positions
+                    self.mark_broken()
+                    self.num_positions = count
+            # Slices of a broken container stay broken.
+            result = ArrayLogprobs(source_positions=self.num_positions)
+            result.broken = True
+            result.num_positions = max(stop - start, 0)
+            return result
         self._check_usable()
         self._unwire()
         try:
