@@ -8,6 +8,7 @@ import queue
 import socket
 import threading
 import time
+from concurrent.futures import Future
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -1145,6 +1146,117 @@ def test_consumer_releases_transfer_finished_mid_load(load_done: bool, dropped_b
     release = pulls.get("p", {}).get(request.request_id)
     assert (release is not None) == (not load_done)
     assert release is None or release.local_block_ids == []
+
+
+@pytest.mark.parametrize(
+    ("case", "rebootstraps"),
+    [
+        ("prefilled", True),
+        ("prefill-failed", True),
+        ("finished-while-queued", True),
+        ("finished-while-prefilling", True),
+        ("second-reset", True),
+        ("second-reset-before-load", True),
+        ("rebootstrap-off", False),
+        ("no-reset", False),
+        ("lora", False),
+        ("prompt-embeds", False),
+    ],
+)
+def test_reset_has_producer_recompute_dropped_kv(case: str, rebootstraps: bool):
+    """After a cache reset, a request whose KV came from P has P recompute it
+    under a new transfer id, then loads all of it; it recomputes locally when P
+    fails, when rebootstrap is off, or for inputs P cannot be handed as token
+    ids. A recompute the request no longer needs is cancelled or released."""
+    vllm_config = create_vllm_config(
+        kv_connector="MooncakeConnector",
+        kv_role="kv_consumer",
+        kv_connector_extra_config={"rebootstrap": case != "rebootstrap-off"},
+    )
+    connector = create_scheduler(vllm_config).get_kv_connector()
+    request = create_request(request_id=1, do_remote_prefill=True)
+    params = request.kv_transfer_params
+    params.update(
+        transfer_id="xfer-1",
+        remote_engine_id="p",
+        remote_bootstrap_addr="http://p:8998",
+        remote_url="http://p:8000",
+    )
+    if case == "lora":
+        request.lora_request = MagicMock()
+    if case == "prompt-embeds":
+        request.prompt_embeds = torch.zeros(request.num_tokens, 8)
+    blocks = MagicMock()
+    blocks.get_unhashed_block_ids_all_groups.return_value = ([5],)
+    connector.update_state_after_alloc(request, blocks, request.num_tokens)
+    # The first load from P completes; the request then generates a token.
+    connector.build_connector_meta(SchedulerOutput.make_empty())
+    connector.update_connector_output(
+        KVConnectorOutput(finished_recving={request.request_id})
+    )
+    request.append_output_token_ids(7)
+    if case != "no-reset":
+        connector.reset_cache()
+
+    def released_transfer() -> str | None:
+        pulls = connector.build_connector_meta(SchedulerOutput.make_empty())
+        release = pulls.reqs_to_recv.get("p", {}).get(request.request_id)
+        assert release is None or release.local_block_ids == []
+        return release and release.transfer_id
+
+    with patch.object(mooncake_connector, "_prefill_on_producer") as prefill:
+        executor = connector.connector_scheduler._prefill_executor
+        future = Future()
+        if executor is not None:
+            executor.submit = MagicMock(side_effect=[future, Future()])
+        result = connector.get_num_new_matched_tokens(request, 0)
+        if not rebootstraps:
+            assert result == (0, False)
+            assert executor is None or not executor.submit.called
+            return
+        # P is asked for the prompt and the outputs so far, under a new id.
+        assert result == (None, False)
+        fn, url, dp_rank, transfer_id, token_ids = executor.submit.call_args.args
+        assert (fn, url, dp_rank) == (prefill, "http://p:8000", None)
+        assert transfer_id != "xfer-1" and token_ids == list(request.all_token_ids)
+        assert connector.get_num_new_matched_tokens(request, 0) == (None, False)
+
+        if case.startswith("finished"):
+            if case == "finished-while-prefilling":
+                future.set_running_or_notify_cancel()
+            request.status = RequestStatus.FINISHED_ABORTED
+            assert connector.request_finished(request, [5]) == (False, None)
+            # A queued recompute never reaches P; a started one is released.
+            assert future.cancelled() == (case == "finished-while-queued")
+            assert released_transfer() == (None if future.cancelled() else transfer_id)
+            return
+        if case == "prefill-failed":
+            future.set_exception(RuntimeError("P is down"))
+            assert connector.get_num_new_matched_tokens(request, 0) == (0, False)
+            assert params["transfer_id"] == "xfer-1"
+            return
+        future.set_result(None)
+        if case == "second-reset-before-load":
+            # D took P's answer, but allocation failed before the load started.
+            assert connector.get_num_new_matched_tokens(request, 0)[1]
+        if case.startswith("second-reset"):
+            # P drops what it recomputed; D releases it and asks again.
+            connector.reset_cache()
+            assert released_transfer() == transfer_id
+            assert connector.get_num_new_matched_tokens(request, 0) == (None, False)
+            assert executor.submit.call_args.args[3] not in ("xfer-1", transfer_id)
+            return
+        # The load covers every token P computed, also when allocation fails
+        # and the scheduler asks again.
+        for _ in range(2):
+            assert connector.get_num_new_matched_tokens(request, 0) == (
+                request.num_tokens,
+                True,
+            )
+        assert params["transfer_id"] == transfer_id and params["do_remote_prefill"]
+        # Once the load starts, the recompute is done with.
+        connector.update_state_after_alloc(request, blocks, request.num_tokens)
+        assert request.request_id not in connector.connector_scheduler._prefills
 
 
 @contextlib.contextmanager

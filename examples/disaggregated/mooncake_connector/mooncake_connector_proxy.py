@@ -298,6 +298,9 @@ async def stream_service_response(
         "remote_bootstrap_addr": prefill_client_info["bootstrap_addr"],
         "remote_engine_id": prefill_client_info["dp_engine_id"][prefill_dp_rank],
         "transfer_id": f"xfer-{request_id}",
+        # Lets D have P recompute the KV after a cache reset (rebootstrap).
+        "remote_url": prefill_client_info["url"],
+        "remote_dp_rank": prefill_dp_rank,
     }
 
     async with decode_client_info["client"].stream(
