@@ -248,11 +248,16 @@ def _report_failure(what: str, error: BaseException) -> None:
 @final
 class SampleLogprobsHandle:
     """Core-owned handle of a registered container: the only object the
-    OutputProcessor and ``RequestOutput.add`` see. Positions are counted by
-    core (positions the engine emitted for the request); every container call
-    is guarded, and a failure turns the handle broken (request-local: the
-    request fails when its endpoint unwraps it). Endpoints call
-    :meth:`unwrap` outside shared processing."""
+    OutputProcessor and ``RequestOutput.add`` see. Every container call is
+    guarded, and a failure turns the handle broken (request-local: the request
+    fails when its endpoint unwraps it). Endpoints call :meth:`unwrap` outside
+    shared processing.
+
+    ``len()`` is counted by core: the positions the engine emitted for the
+    request (attempted, not stored). ``append_rows`` counts before calling the
+    container, and a broken handle keeps counting (``extend`` adds the
+    source's count), so it never depends on the container; what a container
+    holds is only defined while the handle is not broken."""
 
     __slots__ = ("_container", "_count")
 

@@ -135,9 +135,9 @@ class LogprobsProcessor:
             for value in logprobs[: len(ranks), 0].tolist():  # same as the zip above
                 cumulative_logprob += value
             self.cumulative_logprob = cumulative_logprob
-        except Exception:
-            logger.exception("Inconsistent logprob rows")  # the container rejects them
-        handle.append_rows(token_ids, logprobs, ranks)
+        except Exception as e:  # malformed engine rows: fail this request
+            handle._fail("engine rows", e)
+        handle.append_rows(token_ids, logprobs, ranks)  # counts the positions
 
     def _update_prompt_logprobs(
         self,

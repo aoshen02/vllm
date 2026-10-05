@@ -570,6 +570,23 @@ def test_handle_cannot_be_copied_or_pickled(registry):
             operation(handle)
 
 
+def test_inconsistent_engine_rows_fail_the_request_in_core(registry):
+    """Kimi r18: rows core cannot slice fail the request in core (not only if
+    the container happens to reject them); the positions are still counted."""
+    from vllm.v1.engine.logprobs import LogprobsProcessor
+
+    _register("rows", RowsContainer)  # accepts anything
+    params = SamplingParams(logprobs=1)
+    set_sample_logprobs_container(params, "rows")
+    handle = create_sample_logprobs(False, params)
+    processor = object.__new__(LogprobsProcessor)
+    processor.num_logprobs = 1
+    processor.cumulative_logprob = 0.0
+    ids, lps, ranks = _rows(2, 2)
+    processor._append_rows(handle, ids, lps[:, 0], ranks)  # 1-d logprobs
+    assert handle.broken and len(handle) == 2
+
+
 def test_foreign_destination_in_request_output_add(registry):
     """Codex r17 #1: a handle destination merged with a non-handle (cannot
     happen for one request) degrades instead of raising."""
