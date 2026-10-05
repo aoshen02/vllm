@@ -148,7 +148,8 @@ class ServingTokens(GenerateBaseServing):
         like :meth:`serve_tokens`, without building the response: for
         components (e.g. endpoint plugins) that render their own response from
         the ``RequestOutput`` stream. Nothing is submitted to the engine until
-        ``GenerateStart.result_generator`` is iterated."""
+        ``GenerateStart.result_generator`` is iterated; when an
+        ``ErrorResponse`` is returned, the engine was not called."""
         error_check_ret = await self._check_model(request)
         if error_check_ret is not None:
             logger.error("Error with model %s", error_check_ret)
@@ -244,7 +245,8 @@ class ServingTokens(GenerateBaseServing):
                 skip_mm_cache=True,
             )
 
-        # Schedule the request and get the result generator.
+        # The engine's output stream (the request is submitted when it is
+        # first iterated).
         result_generator: AsyncGenerator[RequestOutput, None] | None = None
 
         # Pass disaggregated-serving parameters through to the engine.

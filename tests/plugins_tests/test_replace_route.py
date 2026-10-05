@@ -3,6 +3,8 @@
 """`replace_route`: an endpoint plugin taking over a core route in place, with
 conflict detection."""
 
+import gc
+
 import pytest
 from fastapi import APIRouter, Depends, FastAPI, Request
 from fastapi.testclient import TestClient
@@ -60,7 +62,7 @@ def _replace(app: FastAPI):
 def test_replaces_in_place_and_returns_the_replaced_endpoint():
     app = _app(after=[_catch_all()])
     paths = [getattr(r, "path", None) for r in app.router.routes]
-    app.openapi()  # cached schema is reset by the replacement
+    operation_id = app.openapi()["paths"][PATH]["post"]["operationId"]
     assert _replace(app) is core
     assert [getattr(r, "path", None) for r in app.router.routes] == paths
     client = TestClient(app)
@@ -70,7 +72,9 @@ def test_replaces_in_place_and_returns_the_replaced_endpoint():
     assert client.post("/inference/v1/other").json() == {"served_by": "other"}
     operations = app.openapi()["paths"][PATH]
     assert list(operations) == ["post"]
-    assert operations["post"]["operationId"].startswith("plugin")
+    # The cached schema was reset; the inherited route name keeps the
+    # operation id of the replaced route.
+    assert operations["post"]["operationId"] == operation_id
 
 
 def test_dependency_overrides_apply_to_the_new_route():
@@ -122,7 +126,7 @@ def test_partial_method_sets_are_a_conflict():
     assert replace_route(app, PATH, _plugin([]), methods=["post", "put"]) is core
 
 
-@pytest.mark.parametrize("methods", ["POST", [], ()])
+@pytest.mark.parametrize("methods", ["POST", b"POST", [], (), [1]])
 def test_invalid_methods_are_rejected(methods):
     app = _app()
     routes = list(app.router.routes)
@@ -154,6 +158,79 @@ def test_failure_after_the_route_was_added_restores_the_routes(monkeypatch):
     with pytest.raises(OSError):
         _replace(app)
     assert all(a is b for a, b in zip(app.router.routes, routes, strict=True))
+
+
+def test_inherited_app_dependencies_and_tags_are_not_added_twice():
+    """Stack v2 audit: the app router's own dependencies and tags are part of
+    the replaced route's and are added again by add_api_route: inherited
+    once, an uncached nested dependency runs once, as before."""
+    calls = []
+
+    def inner():
+        calls.append("inner")
+
+    def outer(_: None = Depends(inner, use_cache=False)):
+        calls.append("outer")
+
+    app = FastAPI(dependencies=[Depends(outer)])
+    app.router.tags = ["app"]
+    app.add_api_route(PATH, core, methods=["POST"])
+    client = TestClient(app)
+    client.post(PATH)
+    before, calls[:] = list(calls), []
+    _replace(app)
+    client.post(PATH)
+    assert calls == before == ["inner", "outer"]
+    new = next(r for r in app.router.routes if getattr(r, "path", None) == PATH)
+    assert new.tags == ["app"] and len(new.dependencies) == 1
+
+
+def test_rollback_keeps_the_cached_openapi_schema(monkeypatch):
+    """Stack v2 audit: a late failure leaves the cached schema as it was."""
+    app = _app()
+    schema = app.openapi()
+
+    class Failing(list):
+        def append(self, item):
+            raise OSError("late failure")
+
+    monkeypatch.setattr(routing, "_REPLACEMENTS", Failing())
+    with pytest.raises(OSError):
+        _replace(app)
+    assert app.openapi_schema is schema
+
+
+def test_replacement_registry_forgets_collected_routes(monkeypatch):
+    """Kimi stack v2 audit: the registry does not grow with every app."""
+    monkeypatch.setattr(routing, "_REPLACEMENTS", [])
+    for _ in range(3):
+        _replace(_app())
+    gc.collect()
+    keep = _app()
+    _replace(keep)
+    assert len(routing._REPLACEMENTS) == 1
+
+
+def test_given_dependencies_are_added_to_the_inherited_ones():
+    """Claude stack v2 audit: passing dependencies must not drop the core
+    route's (e.g. its router's validation or auth)."""
+    calls = []
+
+    def router_dep():
+        calls.append("router")
+
+    def plugin_dep():
+        calls.append("plugin")
+
+    router = APIRouter(dependencies=[Depends(router_dep)])
+    router.add_api_route(PATH, core, methods=["POST"], name="core_generate")
+    app = FastAPI()
+    app.include_router(router)
+    replace_route(app, PATH, _plugin([]), dependencies=[Depends(plugin_dep)])
+    TestClient(app).post(PATH)
+    assert calls == ["router", "plugin"]
+    # The route name is inherited: url_path_for still resolves it.
+    assert app.url_path_for("core_generate") == PATH
 
 
 def test_replaced_route_settings_are_inherited():
