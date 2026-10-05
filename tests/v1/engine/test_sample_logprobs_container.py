@@ -454,6 +454,16 @@ def vllm_log_stream():
         log.removeHandler(handler)
 
 
+def _escaped(call) -> str | None:
+    """The type name of an exception escaping ``call`` (only the name: the
+    hostile exceptions here must not be formatted, not even by pytest)."""
+    try:
+        call()
+    except BaseException as e:
+        return type(e).__name__
+    return None
+
+
 def _rows_container_raising(error):
     class Raising(RowsContainer):
         def append_rows(self, token_ids, logprobs, ranks):
@@ -469,7 +479,7 @@ def test_failure_logging_runs_no_container_hooks_unguarded(registry, vllm_log_st
     params = SamplingParams(logprobs=1)
     set_sample_logprobs_container(params, "hooked")
     handle = create_sample_logprobs(False, params)
-    handle.append_rows(*_rows(2, 2))  # no exception escapes
+    assert _escaped(lambda: handle.append_rows(*_rows(2, 2))) is None
     assert handle.broken and len(handle) == 2
     assert "append_rows failed" in vllm_log_stream.getvalue()
 
@@ -478,7 +488,11 @@ def test_failure_logging_runs_no_container_hooks_unguarded(registry, vllm_log_st
 
     _register("hooked_factory", factory)
     set_sample_logprobs_container(params, "hooked_factory")
-    assert create_sample_logprobs(False, params).broken
+    handles: list = []
+    assert (
+        _escaped(lambda: handles.append(create_sample_logprobs(False, params))) is None
+    )
+    assert handles[0].broken
     assert "factory 'hooked_factory' failed" in vllm_log_stream.getvalue()
 
 
