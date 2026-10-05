@@ -463,7 +463,6 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
         self._workspace_buffer: torch.Tensor | None = None
         self.bmm1_scale: float | None = None
         self.bmm2_scale: float | None = None
-        self._kv_scales: tuple[float, float] | None = None
 
         # Native no-rope MLA additionally requires a per-query-token active
         # top-k length tensor.
@@ -606,15 +605,12 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
         if self._workspace_buffer is None:
             self._workspace_buffer = _get_workspace_buffer(device)
 
-        # Recompute when a weight reload changes the KV scales.
-        kv_scales = (layer._q_scale_float, layer._k_scale_float)
-        if self.bmm1_scale is None or kv_scales != self._kv_scales:
-            self._kv_scales = kv_scales
-            self.bmm1_scale = self.scale
-            self.bmm2_scale = 1.0
-            if is_quantized_kv_cache(self.kv_cache_dtype):
-                self.bmm1_scale *= layer._q_scale_float * layer._k_scale_float
-                self.bmm2_scale *= layer._k_scale_float
+        # Recomputed every call: a weight reload can change the KV scales.
+        self.bmm1_scale = self.scale
+        self.bmm2_scale = 1.0
+        if is_quantized_kv_cache(self.kv_cache_dtype):
+            self.bmm1_scale *= layer._q_scale_float * layer._k_scale_float
+            self.bmm2_scale *= layer._k_scale_float
 
     def autotune_hisparse_decode(self, layer: AttentionLayer) -> None:
         """Autotune the largest legal HiSparse decode batch."""

@@ -1934,8 +1934,6 @@ class FlashInferImpl(AttentionImpl):
         )
         self.bmm1_scale: float | None = None
         self.bmm2_scale: float | None = None
-        self._kv_scales: tuple[float, float, float] | None = None
-        self.o_scale_inv: float | None = None
         self.o_sf_scale: float | None = None
 
         # Pre-allocated FP8 output buffer for NVFP4 without fused output quant.
@@ -1989,39 +1987,27 @@ class FlashInferImpl(AttentionImpl):
         else:
             self.sinks.copy_(source_sinks)
 
-    def _refresh_bmm_scales(self, layer: torch.nn.Module) -> None:
-        """Recompute the host BMM scales when the layer's KV scales change.
-
-        A weight reload (e.g. an RL weight sync) can change k/v scales after the
-        first forward; caching the product computed then would keep the old ones.
-        """
-        kv_scales = (layer._q_scale_float, layer._k_scale_float, layer._v_scale_float)
-        if self.bmm1_scale is not None and kv_scales == self._kv_scales:
-            return
-        self._kv_scales = kv_scales
-        self.bmm1_scale = self.scale
-        self.bmm2_scale = 1.0
-        if is_quantized_kv_cache(self.kv_cache_dtype):
-            self.bmm1_scale *= layer._q_scale_float * layer._k_scale_float
-            self.bmm2_scale *= layer._v_scale_float
-        if self.o_scale_inv is not None:
-            self.bmm2_scale *= self.o_scale_inv
-
-    def _trtllm_bmm_scales(
-        self, layer: torch.nn.Module
+    def trtllm_gen_decode_bmm_scales(
+        self,
+        layer: torch.nn.Module,
+        output: torch.Tensor,
+        output_scale: torch.Tensor | None,
     ) -> tuple[float | torch.Tensor, float | torch.Tensor]:
-        """BMM scales for the TRTLLM kernels.
+        """BMM scales for trtllm-gen decode.
 
-        With a quantized KV cache they are computed on device from the layer's
-        scale buffers, which a weight reload updates in place, so CUDA graphs
-        captured earlier replay with the current scales.
+        Host scalars are baked into a captured CUDA graph, so while capturing
+        with a quantized KV cache compute them on device from the scale buffers
+        a weight reload updates in place.
         """
-        if not is_quantized_kv_cache(self.kv_cache_dtype):
+        if not (
+            is_quantized_kv_cache(self.kv_cache_dtype)
+            and torch.cuda.is_current_stream_capturing()
+        ):
             return self.bmm1_scale, self.bmm2_scale
         bmm1_scale = layer._q_scale * layer._k_scale * self.scale
         bmm2_scale = layer._v_scale
-        if self.o_scale_inv is not None:
-            bmm2_scale = bmm2_scale * self.o_scale_inv
+        if output_scale is not None and output.dtype == FP8_DTYPE:
+            bmm2_scale = bmm2_scale / output_scale
         return bmm1_scale, bmm2_scale
 
     def get_xqa_bmm1_scale(self, layer: torch.nn.Module, q_data_type: torch.dtype):
@@ -2092,7 +2078,12 @@ class FlashInferImpl(AttentionImpl):
             # Profiling run.
             return output.fill_(0)
 
-        self._refresh_bmm_scales(layer)
+        # Recomputed every forward: a weight reload can change the KV scales.
+        self.bmm1_scale = self.scale
+        self.bmm2_scale = 1.0
+        if is_quantized_kv_cache(self.kv_cache_dtype):
+            self.bmm1_scale *= layer._q_scale_float * layer._k_scale_float
+            self.bmm2_scale *= layer._v_scale_float
 
         prefill_use_trtllm = isinstance(attn_metadata.prefill, TRTLLMPrefill)
         decode_kernel = (
@@ -2131,17 +2122,15 @@ class FlashInferImpl(AttentionImpl):
             else:
                 raise ValueError(f"Unsupported output dtype: {output.dtype}")
 
-            # TRTLLM attn kernel requires to scale to pass as a host scalar,
-            # store the o scale as a host scalar in warmup run with cuda graph
-            # not enabled
+            # Host copy of the o scale for the kernels that take host scalars,
+            # read in an eager forward (warmup, or the first one after a weight
+            # reload resets it in BaseKVCacheMethod.process_weights_after_loading).
             if layer._o_scale_float is None:
                 layer._o_scale_float = output_scale.cpu().item()
-                if output.dtype == FP8_DTYPE:
-                    self.o_scale_inv = 1.0 / layer._o_scale_float
-                    self._kv_scales = None
-                    self._refresh_bmm_scales(layer)
-                elif output.dtype == FP4_DTYPE:
+                if output.dtype == FP4_DTYPE:
                     self.o_sf_scale = layer._o_scale_float
+            if output.dtype == FP8_DTYPE:
+                self.bmm2_scale = self.bmm2_scale / layer._o_scale_float
 
         # IMPORTANT!
         # NOTE(woosuk): With piece-wise CUDA graphs, this method is executed in
@@ -2642,13 +2631,11 @@ class FlashInferImpl(AttentionImpl):
                         device=decode_query.device,
                     )
 
-                # Decode runs inside full CUDA graphs: pass device scales so a
-                # replay sees KV scales updated by a later weight reload. DCP
-                # decode takes host scalars only.
+                # DCP decode takes host scalars only.
                 bmm1_scale, bmm2_scale = (
                     (self.bmm1_scale, self.bmm2_scale)
                     if use_dcp
-                    else self._trtllm_bmm_scales(layer)
+                    else self.trtllm_gen_decode_bmm_scales(layer, output, output_scale)
                 )
                 trtllm_batch_decode_with_kv_cache(
                     query=decode_query,

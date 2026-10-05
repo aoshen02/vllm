@@ -1018,6 +1018,116 @@ def test_flashinfer_xqa_single_token_decode_preserves_cudagraph_padding(monkeypa
     AttentionBackendEnum.FLASHINFER not in BACKENDS_TO_TEST,
     reason="FlashInfer is not available.",
 )
+def test_flashinfer_trtllm_gen_decode_scales_follow_weight_reload(monkeypatch):
+    """A weight reload after the first forward (e.g. an RL refit of a
+    dummy-initialized engine) changes the k/v and fused-output scales. Eager
+    decode must see the new host scales; decode captured into a CUDA graph must
+    read device scales from the buffers the reload updates in place."""
+    from types import SimpleNamespace
+
+    from vllm.model_executor.layers.attention import Attention
+    from vllm.v1.attention.backends import flashinfer as flashinfer_backend
+
+    fp8 = flashinfer_backend.FP8_DTYPE
+    impl = object.__new__(flashinfer_backend.FlashInferImpl)
+    impl.scale = 0.5
+    impl.kv_cache_dtype = "fp8"
+    impl.is_kvcache_nvfp4 = False
+    impl.head_size = 16
+    impl.dcp_world_size = 1
+    impl.o_sf_scale = None
+    impl.window_left = -1
+    impl.sinks = None
+    impl.need_to_return_lse_for_decode = False
+    impl._sinks_source = None
+
+    layer = SimpleNamespace(
+        impl=impl,
+        quant_config=None,
+        _q_scale=torch.tensor(1.0),
+        _k_scale=torch.tensor(1.0),
+        _v_scale=torch.tensor(1.0),
+        _prob_scale=torch.tensor(1.0),
+        _q_scale_float=1.0,
+        _k_scale_float=1.0,
+        _v_scale_float=1.0,
+        _o_scale_float=None,
+    )
+    output_scale = torch.tensor(0.5)
+    attn_metadata = flashinfer_backend.FlashInferMetadata(
+        kv_cache_layout=KVCacheLayout.LBHNC,
+        num_actual_tokens=2,
+        slot_mapping=torch.empty(0, dtype=torch.int64),
+        q_data_type_prefill=fp8,
+        q_data_type_decode=fp8,
+        num_decodes=2,
+        num_decode_tokens=2,
+        num_prefills=0,
+        num_prefill_tokens=0,
+        causal=True,
+        prefill=None,
+        decode=flashinfer_backend.FlashInferTrtllmAPIDecode(
+            kernel=flashinfer_backend.FlashInferDecodeKernel.TRTLLM_GEN,
+            block_tables=torch.zeros((2, 1), dtype=torch.int32),
+            seq_lens=torch.tensor([8, 8], dtype=torch.int32),
+            max_seq_len=8,
+            q_len_per_req=1,
+        ),
+        use_cascade=False,
+        cascade_wrapper=None,
+    )
+
+    seen = {}
+
+    def mock_decode(**kwargs):
+        seen["bmm1_scale"] = kwargs["bmm1_scale"]
+        seen["bmm2_scale"] = kwargs["bmm2_scale"]
+
+    monkeypatch.setattr(
+        flashinfer_backend,
+        "_get_trtllm_workspace_buffer",
+        lambda: torch.empty(1, dtype=torch.uint8),
+    )
+    monkeypatch.setattr(
+        flashinfer_backend, "trtllm_batch_decode_with_kv_cache", mock_decode
+    )
+
+    def decode():
+        query = torch.zeros((2, 1, 16), dtype=fp8)
+        impl.forward(
+            layer,
+            query,
+            None,
+            None,
+            torch.zeros((1, 1, 1, 32), dtype=torch.uint8),
+            attn_metadata,
+            torch.empty_like(query),
+            output_scale=output_scale,
+        )
+        return seen["bmm1_scale"], seen["bmm2_scale"]
+
+    assert decode() == (0.5, 2.0)
+
+    # A reload runs Attention.process_weights_after_loading, updates the scale
+    # buffers in place and replaces the host floats.
+    Attention.process_weights_after_loading(layer, torch.bfloat16)
+    layer._k_scale.fill_(0.25)
+    layer._v_scale.fill_(0.5)
+    layer._k_scale_float, layer._v_scale_float = 0.25, 0.5
+    output_scale.fill_(0.125)
+    assert decode() == (0.125, 4.0)
+
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    bmm1_scale, bmm2_scale = decode()
+    assert isinstance(bmm1_scale, torch.Tensor)
+    assert isinstance(bmm2_scale, torch.Tensor)
+    assert (bmm1_scale.item(), bmm2_scale.item()) == (0.125, 4.0)
+
+
+@pytest.mark.skipif(
+    AttentionBackendEnum.FLASHINFER not in BACKENDS_TO_TEST,
+    reason="FlashInfer is not available.",
+)
 def test_flashinfer_xqa_query_lens_require_exact_uniform_product():
     from vllm.v1.attention.backends import flashinfer as flashinfer_backend
 
@@ -1945,53 +2055,3 @@ def test_non_causal_backend_correctness(
             causal=False,
             block_size=128,
         )
-
-
-@pytest.mark.skipif(not current_platform.is_cuda(), reason="FlashInfer needs CUDA")
-def test_flashinfer_bmm_scales_follow_kv_scale_reload():
-    """KV scales changed by a weight reload after the first forward (e.g. an RL
-    refit of a dummy-initialized engine) reach the host BMM scales and CUDA
-    graphs captured before the reload."""
-    from vllm.config import VllmConfig
-    from vllm.v1.attention.backends import flashinfer as fi
-
-    device = torch.device("cuda:0")
-    scale = 128**-0.5
-    with set_current_vllm_config(VllmConfig()):
-        impl = fi.FlashInferImpl(
-            num_heads=8,
-            num_kv_heads=2,
-            head_size=128,
-            scale=scale,
-            alibi_slopes=None,
-            sliding_window=None,
-            kv_cache_dtype="fp8",
-            attn_type=AttentionType.DECODER,
-        )
-    layer = MockAttentionLayer(device)
-    impl._refresh_bmm_scales(layer)
-    assert impl.bmm1_scale == pytest.approx(scale)
-
-    out = torch.zeros(2, device=device)
-
-    def device_scales():
-        bmm1_scale, bmm2_scale = impl._trtllm_bmm_scales(layer)
-        out[0].copy_(bmm1_scale)
-        out[1].copy_(bmm2_scale)
-
-    device_scales()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        device_scales()
-
-    # A reload updates the scale buffers in place and replaces the floats.
-    layer._k_scale.fill_(0.25)
-    layer._v_scale.fill_(0.5)
-    layer._k_scale_float, layer._v_scale_float = 0.25, 0.5
-
-    impl._refresh_bmm_scales(layer)
-    assert impl.bmm1_scale == pytest.approx(scale * 0.25)
-    assert impl.bmm2_scale == pytest.approx(0.5)
-    out.zero_()
-    graph.replay()
-    torch.testing.assert_close(out.cpu(), torch.tensor([scale * 0.25, 0.5]))

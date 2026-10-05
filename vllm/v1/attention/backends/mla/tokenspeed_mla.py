@@ -218,7 +218,6 @@ class TokenspeedMLAImpl(MLACommonImpl[MLACommonMetadata]):
         self._workspace_buffer: torch.Tensor | None = None
         self.softmax_scale: float | None = None
         self.output_scale: float | None = None
-        self._kv_scales: tuple[float, float] | None = None
         # NIXL resolves interleaving after model construction; retain the config
         # rather than caching its initial interleave size.
         self._parallel_config = get_current_vllm_config().parallel_config
@@ -281,18 +280,13 @@ class TokenspeedMLAImpl(MLACommonImpl[MLACommonMetadata]):
         else:
             q = q.view(num_decodes, -1, q.shape[-2], q.shape[-1])
 
-        # Recompute when a weight reload changes the KV scales.
-        kv_scales = (layer._q_scale_float, layer._k_scale_float)
-        if self.softmax_scale is None or kv_scales != self._kv_scales:
-            self._kv_scales = kv_scales
-            # FP8 KV cache is mandatory for this backend, so q_scale/k_scale
-            # always apply. softmax_scale is bmm1; output_scale is bmm2 — both
-            # required to recover the correct attention output from the FP8
-            # KV cache (V is stored as V_real/k_scale).
-            self.softmax_scale = (
-                self.scale * layer._q_scale_float * layer._k_scale_float
-            )
-            self.output_scale = layer._k_scale_float
+        # FP8 KV cache is mandatory for this backend, so q_scale/k_scale
+        # always apply. softmax_scale is bmm1; output_scale is bmm2 — both
+        # required to recover the correct attention output from the FP8
+        # KV cache (V is stored as V_real/k_scale). Recomputed every call: a
+        # weight reload can change the KV scales.
+        self.softmax_scale = self.scale * layer._q_scale_float * layer._k_scale_float
+        self.output_scale = layer._k_scale_float
 
         if self._workspace_buffer is None:
             # Parallelism can change the runtime query head count.
