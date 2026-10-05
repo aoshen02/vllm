@@ -639,10 +639,6 @@ KNOWN_UNREGISTERED: tuple[str, ...] = (
     r"\.impl\.(alibi_slopes|sinks)$",  # attention impls
     r"\.quant_method\.(moe_quant_config|moe_kernel|_cache_permute_indices)\b",
     r"\.routed_experts\.w(13|2)_input_scale$",  # MoE input scales
-    r"norm\.weight$",  # RMSNorm(has_weight=False)
-    r"\.(slope_rate|tp_slope)$",  # linear attention slopes
-    r"\.attention_dists$",  # Granite Speech
-    r"\.pos_emb\.pe$",  # Phi-4-MM
     r"\.hc_attn_fn_broadcast$",  # DeepSeek-V4
 )
 
