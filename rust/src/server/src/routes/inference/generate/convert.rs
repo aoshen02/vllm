@@ -39,6 +39,10 @@ pub(super) struct ResponseOptions {
     /// Requested engine row width (`logprobs + 1`), used as `num_slots` for a
     /// compact block with no scored positions; `0` when unknown (`-1`).
     pub logprobs_slots: usize,
+    /// SPEC v3 `compact_include_sampled: false`.
+    pub compact_skip_sampled: bool,
+    /// SPEC v3 `compact_include_ranks: false`.
+    pub compact_skip_ranks: bool,
 }
 
 /// Validate and lower one raw generate request into the internal
@@ -120,6 +124,10 @@ pub(super) fn prepare_generate_request(
             logprobs_format,
             include_compact_logprobs,
             logprobs_slots,
+            compact_skip_sampled: request.compact_include_sampled
+                == Some(serde_json::Value::Bool(false)),
+            compact_skip_ranks: request.compact_include_ranks
+                == Some(serde_json::Value::Bool(false)),
         },
     })
 }

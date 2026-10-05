@@ -7277,3 +7277,131 @@ async fn non_stream_raw_generate_compact_logprob_token_ids_without_logprobs() {
         .collect();
     assert_eq!(ids, vec![33, 5, 6, 44, 5, 6]);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn raw_generate_returns_routed_experts_from_the_engine_wire() {
+    use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD;
+    use vllm_engine_core_client::protocol::routed_experts::{
+        MaybeWireRoutedExperts, RoutedExperts,
+    };
+
+    let ipc = IpcNamespace::new().expect("create ipc namespace");
+    let handshake_address = ipc.handshake_endpoint();
+    let engine_id = b"engine-raw-generate-routed".to_vec();
+    // uint8 routing rows: a 3-row prompt block, then one row per token.
+    let routed = |rows: usize, first: u8| {
+        MaybeWireRoutedExperts::Direct(RoutedExperts {
+            dtype: "|u1".to_string(),
+            shape: vec![rows, 2, 4],
+            data: Bytes::from((0..rows * 8).map(|i| first + i as u8).collect::<Vec<u8>>()),
+        })
+    };
+
+    let engine_task = MockEngineTask::new(spawn_mock_engine_task(
+        handshake_address.clone(),
+        engine_id.clone(),
+        move |dealer, push| {
+            boxed_test_future(async move {
+                let add = recv_engine_message(dealer).await;
+                let request: EngineCoreRequest =
+                    rmp_serde::from_slice(&add[1]).expect("decode request");
+                let mut first = request_output_with_logprobs(
+                    &request.request_id,
+                    vec![33],
+                    None,
+                    None,
+                    Some(sample_logprobs_for_token(33, 34)),
+                    None,
+                );
+                first.routed_experts = Some(routed(3, 0));
+                let mut last = request_output_with_logprobs(
+                    &request.request_id,
+                    vec![44],
+                    Some(EngineCoreFinishReason::Abort),
+                    None,
+                    Some(sample_logprobs_for_token(44, 45)),
+                    None,
+                );
+                last.routed_experts = Some(routed(1, 24));
+                send_outputs(
+                    push,
+                    RequestBatchOutputs {
+                        outputs: vec![first, last],
+                        ..Default::default()
+                    }
+                    .into(),
+                )
+                .await;
+            })
+        },
+    ));
+
+    let client = EngineCoreClient::connect(
+        EngineCoreClientConfig::new_single(handshake_address)
+            .with_model_name("test-model")
+            .with_local_input_output_addresses(
+                Some(ipc.input_endpoint()),
+                Some(ipc.output_endpoint()),
+            ),
+    )
+    .await
+    .expect("connect client");
+    let chat = ChatLlm::from_shared_backend(Llm::new(client), Arc::new(FakeChatBackend::new()));
+    let mut app = build_router(Arc::new(
+        AppState::new(vec!["Qwen/Qwen1.5-0.5B-Chat".to_string()], chat).with_api_server_options(
+            ApiServerOptions {
+                enable_return_routed_experts: true,
+                ..Default::default()
+            },
+        ),
+    ));
+
+    let response = app
+        .call(
+            Request::builder()
+                .method("POST")
+                .uri("/inference/v1/generate")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "Qwen/Qwen1.5-0.5B-Chat",
+                        "token_ids": [11, 22, 23],
+                        "logprobs_format": "compact",
+                        "compact_include_sampled": false,
+                        "compact_include_ranks": false,
+                        "sampling_params": {"max_tokens": 4, "logprobs": 1}
+                    })
+                    .to_string(),
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("call app");
+    let status = response.status();
+    let body = to_bytes(response.into_body(), usize::MAX).await.expect("read body");
+    engine_task.await.expect("mock engine task");
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("decode json");
+    let choice = &json["choices"][0];
+
+    // routed_experts: the .npy of all 4 rows (3 prompt + 1 token).
+    let npy = STANDARD
+        .decode(choice["routed_experts"].as_str().expect("routed experts"))
+        .unwrap();
+    let header_end = npy.iter().position(|&b| b == b'\n').unwrap() + 1;
+    let header = String::from_utf8_lossy(&npy[10..header_end]);
+    assert!(
+        header.starts_with("{'descr': '|u1', 'fortran_order': False, 'shape': (4, 2, 4), }"),
+        "{header}"
+    );
+    assert_eq!(header_end % 64, 0);
+    assert_eq!(&npy[header_end..], (0..32).collect::<Vec<u8>>().as_slice());
+
+    // Field switches: only the k = 1 top-k slot, no ranks.
+    let block = &choice["compact_logprobs"];
+    assert_eq!(block["num_slots"], 1);
+    assert_eq!(block["sampled_slot"], false);
+    assert!(block.get("ranks").is_none());
+}

@@ -19,6 +19,7 @@ pub use output::{
 pub use request::GenerateRequest;
 pub use request_metrics::current_unix_timestamp_secs;
 pub use vllm_engine_core_client::protocol::logprobs::{Logprobs, PositionLogprobs, TokenLogprob};
+pub use vllm_engine_core_client::protocol::routed_experts::RoutedExperts;
 
 use crate::inflight::InflightRequests;
 use crate::log_stats::StatsLogger;

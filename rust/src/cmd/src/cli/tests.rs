@@ -107,6 +107,7 @@ fn serve_args_forward_python_flags_with_separator() {
                         enable_log_requests: false,
                         enable_prompt_tokens_details: false,
                         enable_request_id_headers: false,
+                        enable_return_routed_experts: false,
                         disable_log_stats: false,
                         served_model_name: [],
                         allowed_origins: JsonStringList(
@@ -826,6 +827,7 @@ fn frontend_args_accept_json() {
                         enable_log_requests: false,
                         enable_prompt_tokens_details: false,
                         enable_request_id_headers: false,
+                        enable_return_routed_experts: false,
                         disable_log_stats: false,
                         served_model_name: [],
                         allowed_origins: JsonStringList(
@@ -1420,6 +1422,7 @@ fn serve_args_accept_handshake_aliases() {
                         enable_log_requests: false,
                         enable_prompt_tokens_details: false,
                         enable_request_id_headers: false,
+                        enable_return_routed_experts: false,
                         disable_log_stats: false,
                         served_model_name: [],
                         allowed_origins: JsonStringList(
@@ -1567,6 +1570,7 @@ fn serve_frontend_config_uses_dp_address_as_advertised_host() {
                 enable_log_requests: false,
                 enable_prompt_tokens_details: false,
                 enable_request_id_headers: false,
+                enable_return_routed_experts: false,
             },
             cors: CorsConfig {
                 allow_origins: [
@@ -1653,6 +1657,7 @@ fn serve_frontend_config_keeps_tcp_transport_for_non_local_only_topology() {
                 enable_log_requests: false,
                 enable_prompt_tokens_details: false,
                 enable_request_id_headers: false,
+                enable_return_routed_experts: false,
             },
             cors: CorsConfig {
                 allow_origins: [
@@ -1760,6 +1765,7 @@ fn frontend_config_uses_external_coordinator_when_coordinator_address_is_present
                 enable_log_requests: false,
                 enable_prompt_tokens_details: false,
                 enable_request_id_headers: false,
+                enable_return_routed_experts: false,
             },
             cors: CorsConfig {
                 allow_origins: [
@@ -1879,4 +1885,16 @@ fn frontend_args_json_disables_profiling_when_profiler_type_is_null() {
     assert_eq!(args.runtime.profiler(), None);
     let config = args.into_config();
     assert_eq!(config.profiler, None);
+}
+
+#[test]
+fn args_json_forwards_enable_return_routed_experts() {
+    // Python forwards non-default serve args, including
+    // `--enable-return-routed-experts`, in --args-json.
+    let args =
+        super::parse_runtime_args_json(r#"{"model_tag":"m","enable_return_routed_experts":true}"#)
+            .expect("parse args json");
+    assert!(args.api_server_options().enable_return_routed_experts);
+    let args = super::parse_runtime_args_json(r#"{"model_tag":"m"}"#).expect("parse args json");
+    assert!(!args.api_server_options().enable_return_routed_experts);
 }

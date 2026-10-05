@@ -74,7 +74,7 @@ static BASE64_PAIRS: [[u8; 2]; 4096] = {
 /// Append the standard padded base64 encoding of `input` to `out`; byte-
 /// identical to `STANDARD.encode`, about twice as fast as the scalar `base64`
 /// engine for whole 3-byte groups (padding only for a final partial group).
-fn encode_base64_into(input: &[u8], out: &mut Vec<u8>) {
+pub(super) fn encode_base64_into(input: &[u8], out: &mut Vec<u8>) {
     let whole = input.len() - input.len() % 3;
     let start = out.len();
     out.resize(start + whole / 3 * 4, 0);
@@ -92,7 +92,7 @@ fn encode_base64_into(input: &[u8], out: &mut Vec<u8>) {
 /// Incremental padded base64 encoder whose output is kept as immutable
 /// segments that can be handed to the HTTP body without copying.
 #[derive(Debug, Default)]
-struct Base64Segments {
+pub(super) struct Base64Segments {
     segments: Vec<Bytes>,
     current: Vec<u8>,
     carry: [u8; 2],
@@ -101,7 +101,7 @@ struct Base64Segments {
 }
 
 impl Base64Segments {
-    fn push(&mut self, mut data: &[u8]) {
+    pub(super) fn push(&mut self, mut data: &[u8]) {
         if self.carry_len > 0 {
             let need = 3 - self.carry_len;
             if data.len() < need {
@@ -163,7 +163,7 @@ impl Base64Segments {
         self.segments.push(Bytes::from(current));
     }
 
-    fn finish(mut self) -> EncodedArray {
+    pub(super) fn finish(mut self) -> EncodedArray {
         if self.carry_len > 0 {
             let carry = self.carry;
             let len = self.carry_len;
@@ -210,6 +210,11 @@ pub(crate) struct CompactLogprobsAccumulator {
     /// narrower rows are an error. (`logprobs: -1` is rejected for compact
     /// at validation, so the width never comes from engine data.)
     requested_slots: usize,
+    /// SPEC v3 `compact_include_sampled: false`: drop engine slot 0 (the
+    /// sampled token), keeping only the k top-k slots.
+    skip_sampled: bool,
+    /// SPEC v3 `compact_include_ranks: false`: omit `ranks`.
+    skip_ranks: bool,
     num_positions: usize,
     token_ids: Base64Segments,
     logprobs: Base64Segments,
@@ -226,6 +231,20 @@ impl CompactLogprobsAccumulator {
             requested_slots,
             ..Default::default()
         }
+    }
+
+    /// Apply the SPEC v3 field switches (`compact_include_sampled`,
+    /// `compact_include_ranks`); both default to included.
+    pub(crate) fn with_switches(mut self, include_sampled: bool, include_ranks: bool) -> Self {
+        self.skip_sampled = !include_sampled;
+        self.skip_ranks = !include_ranks;
+        self
+    }
+
+    /// Engine slots emitted per position.
+    fn emitted_slots(&self) -> std::ops::Range<usize> {
+        let first = usize::from(self.skip_sampled).min(self.requested_slots);
+        first..self.requested_slots
     }
 
     /// Retained capacity of the packing scratch buffers.
@@ -248,12 +267,14 @@ impl CompactLogprobsAccumulator {
         if let Some(error) = self.error {
             return Err(error);
         }
+        let num_slots = self.emitted_slots().len();
         Ok(CompactLogprobs {
             num_positions: self.num_positions,
-            num_slots: self.requested_slots,
+            num_slots,
+            sampled_slot: !self.skip_sampled,
             token_ids: self.token_ids.finish(),
             logprobs: self.logprobs.finish(),
-            ranks: self.ranks.finish(),
+            ranks: (!self.skip_ranks).then(|| self.ranks.finish()),
         })
     }
 
@@ -300,27 +321,32 @@ impl LogprobsAccumulator for CompactLogprobsAccumulator {
         // scratch buffer reaches SCRATCH_TARGET_BYTES, independently of row
         // boundaries: retained scratch stays bounded for any row width.
         let rows = step.positions.len();
-        let candidate_bytes = rows.saturating_mul(slots).saturating_mul(4);
+        let emitted = self.emitted_slots();
+        let candidate_bytes = rows.saturating_mul(emitted.len()).saturating_mul(4);
         let wanted = candidate_bytes.min(SCRATCH_TARGET_BYTES);
         self.scratch_token_ids
             .reserve_exact(wanted.saturating_sub(self.scratch_token_ids.len()));
         self.scratch_logprobs
             .reserve_exact(wanted.saturating_sub(self.scratch_logprobs.len()));
-        self.scratch_ranks.reserve_exact(
-            (rows * 4).min(SCRATCH_TARGET_BYTES).saturating_sub(self.scratch_ranks.len()),
-        );
+        if !self.skip_ranks {
+            self.scratch_ranks.reserve_exact(
+                (rows * 4).min(SCRATCH_TARGET_BYTES).saturating_sub(self.scratch_ranks.len()),
+            );
+        }
 
         for position in &step.positions {
-            let sampled_rank = position.entries[0].rank;
-            if sampled_rank > i32::MAX as u32 {
-                self.fail(format!("sampled rank {sampled_rank} does not fit int32"));
-                return;
+            if !self.skip_ranks {
+                let sampled_rank = position.entries[0].rank;
+                if sampled_rank > i32::MAX as u32 {
+                    self.fail(format!("sampled rank {sampled_rank} does not fit int32"));
+                    return;
+                }
+                self.scratch_ranks.extend_from_slice(&sampled_rank.to_le_bytes());
+                if self.scratch_ranks.len() >= SCRATCH_TARGET_BYTES {
+                    self.flush_ranks();
+                }
             }
-            self.scratch_ranks.extend_from_slice(&sampled_rank.to_le_bytes());
-            if self.scratch_ranks.len() >= SCRATCH_TARGET_BYTES {
-                self.flush_ranks();
-            }
-            let mut row = &position.entries[..slots];
+            let mut row = &position.entries[emitted.clone()];
             while !row.is_empty() {
                 // Copy as many candidates as fit before the next flush, in
                 // one tight loop over pre-sized scratch.
@@ -362,9 +388,13 @@ impl LogprobsAccumulator for CompactLogprobsAccumulator {
 pub(crate) struct CompactLogprobs {
     pub num_positions: usize,
     pub num_slots: usize,
+    /// `false` when slot 0 (the sampled token) was dropped; rendered as
+    /// `"sampled_slot": false`, omitted when `true`.
+    pub sampled_slot: bool,
     pub token_ids: EncodedArray,
     pub logprobs: EncodedArray,
-    pub ranks: EncodedArray,
+    /// `None` when ranks were not requested (key omitted).
+    pub ranks: Option<EncodedArray>,
 }
 
 pub(crate) const DTYPE_TOKEN_IDS: &str = "int32";
@@ -377,12 +407,15 @@ pub(crate) const BYTEORDER: &str = "little";
 pub(crate) struct CompactLogprobsJson {
     pub num_positions: usize,
     pub num_slots: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sampled_slot: Option<bool>,
     pub dtype_token_ids: &'static str,
     pub dtype_logprobs: &'static str,
     pub byteorder: &'static str,
     pub token_ids: String,
     pub logprobs: String,
-    pub ranks: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ranks: Option<String>,
 }
 
 impl From<&CompactLogprobs> for CompactLogprobsJson {
@@ -390,12 +423,13 @@ impl From<&CompactLogprobs> for CompactLogprobsJson {
         Self {
             num_positions: value.num_positions,
             num_slots: value.num_slots,
+            sampled_slot: (!value.sampled_slot).then_some(false),
             dtype_token_ids: DTYPE_TOKEN_IDS,
             dtype_logprobs: DTYPE_LOGPROBS,
             byteorder: BYTEORDER,
             token_ids: value.token_ids.to_base64_string(),
             logprobs: value.logprobs.to_base64_string(),
-            ranks: value.ranks.to_base64_string(),
+            ranks: value.ranks.as_ref().map(EncodedArray::to_base64_string),
         }
     }
 }
@@ -405,8 +439,11 @@ pub(crate) fn encode_compact(
     logprobs: Logprobs,
     new_tokens: usize,
     requested_slots: usize,
+    include_sampled: bool,
+    include_ranks: bool,
 ) -> Result<CompactLogprobsJson, String> {
-    let mut accumulator = CompactLogprobsAccumulator::new(requested_slots);
+    let mut accumulator = CompactLogprobsAccumulator::new(requested_slots)
+        .with_switches(include_sampled, include_ranks);
     accumulator.observe_output(new_tokens, Some(logprobs.len()));
     accumulator.extend(logprobs);
     accumulator.finish().map(|block| CompactLogprobsJson::from(&block))
@@ -591,7 +628,11 @@ pub(crate) mod tests {
             accumulator.token_ids.current.capacity()
         );
         let block = accumulator.finish().unwrap();
-        for array in [&block.token_ids, &block.logprobs, &block.ranks] {
+        for array in [
+            &block.token_ids,
+            &block.logprobs,
+            block.ranks.as_ref().unwrap(),
+        ] {
             assert!(array.segments.iter().all(|s| s.len() <= SEGMENT_TARGET_BYTES));
         }
         let value = serde_json::to_value(CompactLogprobsJson::from(&block)).unwrap();

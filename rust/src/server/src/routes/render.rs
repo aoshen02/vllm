@@ -98,6 +98,8 @@ fn lower_render_request(
         ec_transfer_params: None,
         content_parts: None,
         logprobs_format: None,
+        compact_include_sampled: None,
+        compact_include_ranks: None,
         other: Default::default(),
     };
     validate_generate_request(&request, &state.served_model_names)?;

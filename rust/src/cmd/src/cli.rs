@@ -304,6 +304,12 @@ pub struct SharedRuntimeArgs {
     #[serde(default)]
     pub enable_request_id_headers: bool,
 
+    /// Return the expert routing decisions (`routed_experts`) of each request;
+    /// the engine must be started with the same flag.
+    #[arg(long)]
+    #[serde(default)]
+    pub enable_return_routed_experts: bool,
+
     /// If provided, the server will require one of these keys to be presented
     /// in the Authorization header.
     #[educe(Debug(ignore))]
@@ -571,6 +577,7 @@ impl SharedRuntimeArgs {
             enable_log_requests: self.enable_log_requests,
             enable_prompt_tokens_details: self.enable_prompt_tokens_details,
             enable_request_id_headers: self.enable_request_id_headers,
+            enable_return_routed_experts: self.enable_return_routed_experts,
         }
     }
 

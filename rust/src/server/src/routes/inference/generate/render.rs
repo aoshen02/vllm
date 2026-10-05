@@ -50,6 +50,21 @@ pub(super) struct GenerateEnvelope {
     pub prompt_logprobs: Option<Vec<Option<HashMap<u32, GenerateLogprob>>>>,
     pub kv_transfer_params: Option<Value>,
     pub ec_transfer_params: Option<Value>,
+    pub routed_experts: RoutedExpertsField,
+}
+
+/// `choices[0].routed_experts` of a non-streaming response.
+#[derive(Debug, Clone, Default)]
+pub(super) enum RoutedExpertsField {
+    /// Key omitted: routed experts are not enabled on this server and the
+    /// engine sent none (today's response bytes).
+    #[default]
+    Omitted,
+    /// `null`: enabled, but no forward pass produced routing rows (e.g. an
+    /// abort before the first forward).
+    Null,
+    /// Base64 of the `.npy` serialization (see `routed_experts.rs`).
+    Npy(EncodedArray),
 }
 
 /// Output logprobs of the single choice.
@@ -114,6 +129,14 @@ fn write_choice_fields(out: &mut PartsWriter, envelope: &GenerateEnvelope) {
     out.json(&envelope.finish_reason);
     out.raw(b",\"token_ids\":");
     out.json(&envelope.token_ids);
+    match &envelope.routed_experts {
+        RoutedExpertsField::Omitted => {}
+        RoutedExpertsField::Null => out.raw(b",\"routed_experts\":null"),
+        RoutedExpertsField::Npy(array) => {
+            out.raw(b",\"routed_experts\":");
+            out.encoded(array);
+        }
+    }
 }
 
 fn write_tail(out: &mut PartsWriter, envelope: &GenerateEnvelope) {
@@ -131,6 +154,9 @@ fn write_compact(out: &mut PartsWriter, block: &CompactLogprobs) {
     out.json(&block.num_positions);
     out.raw(b",\"num_slots\":");
     out.json(&block.num_slots);
+    if !block.sampled_slot {
+        out.raw(b",\"sampled_slot\":false");
+    }
     out.raw(b",\"dtype_token_ids\":");
     out.json(DTYPE_TOKEN_IDS);
     out.raw(b",\"dtype_logprobs\":");
@@ -141,8 +167,10 @@ fn write_compact(out: &mut PartsWriter, block: &CompactLogprobs) {
     out.encoded(&block.token_ids);
     out.raw(b",\"logprobs\":");
     out.encoded(&block.logprobs);
-    out.raw(b",\"ranks\":");
-    out.encoded(&block.ranks);
+    if let Some(ranks) = &block.ranks {
+        out.raw(b",\"ranks\":");
+        out.encoded(ranks);
+    }
     out.raw(b"}");
 }
 
@@ -659,6 +687,9 @@ mod tests {
         let rendered = std::sync::Arc::new(std::sync::Barrier::new(threads + 1));
         let release = std::sync::Arc::new(std::sync::Barrier::new(threads + 1));
         let before = rss_kib();
+        // Growth of the shared table, so ids other tests inserted earlier do
+        // not count (the assertion is independent of test order).
+        let table_before = TOKEN_FRAGMENTS.read().unwrap().retained_bytes();
         let handles: Vec<_> = (0..threads)
             .map(|_| {
                 let rendered = rendered.clone();
@@ -689,14 +720,14 @@ mod tests {
         let grown_mib = rss_kib().saturating_sub(before) / 1024;
         // One table for all threads (RSS is printed for information only:
         // allocator arenas and concurrently running tests make it noisy).
-        let table = TOKEN_FRAGMENTS.read().unwrap().retained_bytes();
-        println!("render threads: RSS +{grown_mib} MiB, shared table {table} B");
+        let table = TOKEN_FRAGMENTS.read().unwrap().retained_bytes() - table_before;
+        println!("render threads: RSS +{grown_mib} MiB, shared table +{table} B");
         release.wait();
         for handle in handles {
             handle.join().unwrap();
         }
         // Shared table for 151,936 ids: ~1.2 MiB index + ~14 MiB fragments.
-        assert!(table < 16 << 20, "shared table retained {table} B");
+        assert!(table < 16 << 20, "shared table grew by {table} B");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -899,6 +930,7 @@ mod tests {
             prompt_logprobs: None,
             kv_transfer_params: None,
             ec_transfer_params: None,
+            routed_experts: RoutedExpertsField::Omitted,
         }
     }
 

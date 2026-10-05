@@ -4,6 +4,7 @@
 mod compact;
 mod convert;
 mod render;
+mod routed_experts;
 mod types;
 mod validate;
 
@@ -23,12 +24,14 @@ use tracing::{error, info, trace};
 use tracing_futures::Instrument as _;
 use vllm_engine_core_client::protocol::logprobs::{Logprobs, PositionLogprobs};
 use vllm_llm::{
-    CollectedGenerateOutput, FinishReason, GenerateOutput, GenerateOutputStreamExt as _, TokenUsage,
+    CollectedGenerateOutput, FinishReason, GenerateOutput, GenerateOutputStreamExt as _,
+    LogprobsAccumulator, RoutedExperts, TokenUsage,
 };
 
 use self::compact::{CompactLogprobsAccumulator, LogprobsFormat, encode_compact};
 use self::convert::{ResponseOptions, prepare_generate_request};
-use self::render::{ChoiceLogprobs, GenerateEnvelope, generate_response};
+use self::render::{ChoiceLogprobs, GenerateEnvelope, RoutedExpertsField, generate_response};
+use self::routed_experts::RoutedExpertsEncoder;
 use self::types::{GenerateLogprob, GenerateResponseStreamChoice, GenerateStreamResponse};
 pub(crate) use self::types::{GenerateRequest, GenerateSamplingParams};
 pub(crate) use self::validate::validate_request_compat;
@@ -113,47 +116,107 @@ pub async fn generate(
         .into_response()
     };
 
-    let result = match options.logprobs_format {
-        LogprobsFormat::OpenAi => {
-            let mut collected =
-                match raw_stream.collect_output().instrument(request_span.clone()).await {
-                    Ok(collected) => collected,
-                    Err(error) => return collect_error(error),
-                };
-            let logprobs = collected.logprobs.take();
-            openai_choice_logprobs(logprobs, options.include_logprobs).and_then(|logprobs| {
-                let envelope =
-                    collect_generate(collected, prepared.request_id, api_server_options, options)?;
-                Ok((envelope, logprobs))
-            })
-        }
-        LogprobsFormat::Compact => {
-            let accumulator = CompactLogprobsAccumulator::new(options.logprobs_slots);
-            let (collected, accumulator) = match raw_stream
-                .collect_output_into(accumulator)
-                .instrument(request_span.clone())
-                .await
-            {
-                Ok(collected) => collected,
-                Err(error) => return collect_error(error),
-            };
-            compact_choice_logprobs(
-                accumulator,
-                options.include_compact_logprobs,
-                collected.token_ids.len(),
-            )
-            .and_then(|logprobs| {
-                let envelope =
-                    collect_generate(collected, prepared.request_id, api_server_options, options)?;
-                Ok((envelope, logprobs))
-            })
-        }
-    };
+    let result =
+        match collect_response(raw_stream, prepared.request_id, api_server_options, options)
+            .instrument(request_span.clone())
+            .await
+        {
+            Ok(result) => result,
+            Err(error) => return collect_error(error),
+        };
 
     match result {
         // In the request span so the body render task inherits it.
         Ok((envelope, logprobs)) => request_span.in_scope(|| generate_response(envelope, logprobs)),
         Err(error) => error.into_response(),
+    }
+}
+
+/// Collect a non-streaming raw generate request and build the response
+/// envelope and output logprobs (outer error: the engine stream failed).
+async fn collect_response(
+    raw_stream: impl futures::Stream<Item = vllm_llm::Result<GenerateOutput>> + Send,
+    request_id: String,
+    api_server_options: ApiServerOptions,
+    options: ResponseOptions,
+) -> vllm_llm::Result<Result<(GenerateEnvelope, ChoiceLogprobs), ApiError>> {
+    Ok(match options.logprobs_format {
+        LogprobsFormat::OpenAi => {
+            let accumulator = WithRoutedExperts::new(None::<Logprobs>);
+            let (collected, accumulator) = raw_stream.collect_output_into(accumulator).await?;
+            let WithRoutedExperts { inner, routed } = accumulator;
+            openai_choice_logprobs(inner, options.include_logprobs).and_then(|logprobs| {
+                let envelope =
+                    collect_generate(collected, routed, request_id, api_server_options, options)?;
+                Ok((envelope, logprobs))
+            })
+        }
+        LogprobsFormat::Compact => {
+            let accumulator = WithRoutedExperts::new(
+                CompactLogprobsAccumulator::new(options.logprobs_slots)
+                    .with_switches(!options.compact_skip_sampled, !options.compact_skip_ranks),
+            );
+            let (collected, accumulator) = raw_stream.collect_output_into(accumulator).await?;
+            let WithRoutedExperts { inner, routed } = accumulator;
+            compact_choice_logprobs(
+                inner,
+                options.include_compact_logprobs,
+                collected.token_ids.len(),
+            )
+            .and_then(|logprobs| {
+                let envelope =
+                    collect_generate(collected, routed, request_id, api_server_options, options)?;
+                Ok((envelope, logprobs))
+            })
+        }
+    })
+}
+
+/// A logprobs accumulator plus the request's routed-experts encoder.
+struct WithRoutedExperts<L> {
+    inner: L,
+    routed: RoutedExpertsEncoder,
+}
+
+impl<L> WithRoutedExperts<L> {
+    fn new(inner: L) -> Self {
+        Self {
+            inner,
+            routed: RoutedExpertsEncoder::default(),
+        }
+    }
+}
+
+impl<L: LogprobsAccumulator> LogprobsAccumulator for WithRoutedExperts<L> {
+    fn extend(&mut self, step: Logprobs) {
+        self.inner.extend(step);
+    }
+
+    fn observe_output(&mut self, new_tokens: usize, logprob_positions: Option<usize>) {
+        self.inner.observe_output(new_tokens, logprob_positions);
+    }
+
+    fn num_positions(&self) -> usize {
+        self.inner.num_positions()
+    }
+
+    fn extend_routed_experts(&mut self, routed_experts: RoutedExperts) {
+        self.routed.push(routed_experts);
+    }
+}
+
+/// `choices[0].routed_experts`: present when the server returns routed
+/// experts (`--enable-return-routed-experts`) or the engine sent any.
+fn routed_experts_field(
+    routed: RoutedExpertsEncoder,
+    enabled: bool,
+) -> Result<RoutedExpertsField, ApiError> {
+    if !enabled && !routed.has_data() {
+        return Ok(RoutedExpertsField::Omitted);
+    }
+    match routed.finish().map_err(ApiError::server_error)? {
+        Some(npy) => Ok(RoutedExpertsField::Npy(npy)),
+        None => Ok(RoutedExpertsField::Null),
     }
 }
 
@@ -213,6 +276,7 @@ async fn generate_chunk_stream(
     ApiServerOptions {
         enable_log_requests,
         enable_prompt_tokens_details,
+        enable_return_routed_experts,
         ..
     }: ApiServerOptions,
     ResponseOptions {
@@ -224,12 +288,17 @@ async fn generate_chunk_stream(
         logprobs_format,
         include_compact_logprobs,
         logprobs_slots,
+        compact_skip_sampled,
+        compact_skip_ranks,
     }: ResponseOptions,
     mut y: TryYielder<GenerateStreamResponse, ApiError>,
 ) -> Result<(), ApiError> {
     pin_mut!(stream);
     let mut prompt_tokens = None;
     let mut usage = TokenUsage::default();
+    // Like Python, routed experts are returned once, on the finishing chunk,
+    // as the concatenation of every chunk the engine sent.
+    let mut routed = Some(RoutedExpertsEncoder::default());
 
     while let Some(next) = stream.next().await {
         match next {
@@ -274,9 +343,28 @@ async fn generate_chunk_stream(
                     );
                 }
 
+                if let (Some(chunk), Some(routed)) = (output.routed_experts, routed.as_mut()) {
+                    routed.push(chunk);
+                }
+
                 if token_ids.is_empty() && finish_reason.is_none() {
                     continue;
                 }
+
+                let routed_experts = match (finish_reason.is_some(), routed.take()) {
+                    (true, Some(routed)) => {
+                        match routed_experts_field(routed, enable_return_routed_experts)? {
+                            RoutedExpertsField::Omitted => None,
+                            RoutedExpertsField::Null => Some(None),
+                            RoutedExpertsField::Npy(npy) => Some(Some(npy.to_base64_string())),
+                        }
+                    }
+                    (false, taken) => {
+                        routed = taken;
+                        None
+                    }
+                    (true, None) => None,
+                };
 
                 let wants_logprobs = match logprobs_format {
                     LogprobsFormat::OpenAi => include_logprobs,
@@ -296,8 +384,14 @@ async fn generate_chunk_stream(
                         LogprobsFormat::Compact => (
                             None,
                             Some(
-                                encode_compact(logprobs, token_ids.len(), logprobs_slots)
-                                    .map_err(ApiError::server_error)?,
+                                encode_compact(
+                                    logprobs,
+                                    token_ids.len(),
+                                    logprobs_slots,
+                                    !compact_skip_sampled,
+                                    !compact_skip_ranks,
+                                )
+                                .map_err(ApiError::server_error)?,
                             ),
                         ),
                     }
@@ -318,6 +412,7 @@ async fn generate_chunk_stream(
                         logprobs,
                         finish_reason: finish_reason.map(|reason| reason.as_str().to_string()),
                         token_ids,
+                        routed_experts,
                         compact_logprobs,
                     }],
                     usage: include_continuous_usage
@@ -351,9 +446,11 @@ async fn generate_chunk_stream(
 /// (which the caller takes out of `collected` beforehand).
 fn collect_generate(
     collected: CollectedGenerateOutput,
+    routed: RoutedExpertsEncoder,
     request_id: String,
     ApiServerOptions {
         enable_log_requests,
+        enable_return_routed_experts,
         ..
     }: ApiServerOptions,
     ResponseOptions {
@@ -378,6 +475,7 @@ fn collect_generate(
         None
     };
     let finish_reason = collected.finish_reason.as_str().to_string();
+    let routed_experts = routed_experts_field(routed, enable_return_routed_experts)?;
 
     if enable_log_requests {
         info!(
@@ -395,6 +493,7 @@ fn collect_generate(
         prompt_logprobs,
         kv_transfer_params: collected.kv_transfer_params,
         ec_transfer_params: collected.ec_transfer_params,
+        routed_experts,
     })
 }
 
@@ -530,6 +629,7 @@ mod tests {
                 cached_token_count: 0,
                 kv_transfer_params: None,
                 ec_transfer_params: None,
+                routed_experts: None,
             }),
             Ok(GenerateOutput {
                 request_id: String::new(),
@@ -543,6 +643,7 @@ mod tests {
                 cached_token_count: 2,
                 kv_transfer_params: None,
                 ec_transfer_params: None,
+                routed_experts: None,
             }),
         ]);
 
@@ -671,6 +772,7 @@ mod tests {
             .unwrap_or_else(|_| panic!("valid logprobs"));
         let envelope = collect_generate(
             collected,
+            RoutedExpertsEncoder::default(),
             request_id.to_string(),
             ApiServerOptions::default(),
             ResponseOptions {
@@ -758,6 +860,7 @@ mod tests {
             cached_token_count: 0,
             kv_transfer_params: None,
             ec_transfer_params: None,
+            routed_experts: None,
         })
     }
 
@@ -774,6 +877,7 @@ mod tests {
             compact_choice_logprobs(accumulator, include_logprobs, collected.token_ids.len())?;
         let envelope = collect_generate(
             collected,
+            RoutedExpertsEncoder::default(),
             "compact-1".to_string(),
             ApiServerOptions::default(),
             ResponseOptions::default(),
@@ -1116,6 +1220,7 @@ mod tests {
 
         let response = collect_generate(
             output_without_payload(vec![9707]),
+            RoutedExpertsEncoder::default(),
             "raw-1".to_string(),
             ApiServerOptions::default(),
             ResponseOptions {
@@ -1130,6 +1235,7 @@ mod tests {
 
         collect_generate(
             output_without_payload(vec![9707, 11]),
+            RoutedExpertsEncoder::default(),
             "raw-2".to_string(),
             ApiServerOptions::default(),
             ResponseOptions {
@@ -1138,5 +1244,248 @@ mod tests {
             },
         )
         .expect_err("multi-token prompt without payload is an engine failure");
+    }
+
+    // ---- SPEC v3: compact field switches and routed experts (R3) ----
+
+    use super::routed_experts::npy_header;
+    use super::routed_experts::tests::reference_bytes as routed_reference_bytes;
+
+    fn options_for(format: LogprobsFormat, slots: usize) -> ResponseOptions {
+        ResponseOptions {
+            include_logprobs: true,
+            include_compact_logprobs: true,
+            logprobs_format: format,
+            logprobs_slots: slots,
+            ..Default::default()
+        }
+    }
+
+    /// Render a non-streaming response through the same path as the handler.
+    async fn response_json(
+        steps: Vec<vllm_llm::Result<GenerateOutput>>,
+        options: ResponseOptions,
+        enable_return_routed_experts: bool,
+    ) -> Result<serde_json::Value, ApiError> {
+        let (envelope, logprobs) = collect_response(
+            stream::iter(steps),
+            "r3-1".to_string(),
+            ApiServerOptions {
+                enable_return_routed_experts,
+                ..Default::default()
+            },
+            options,
+        )
+        .await
+        .expect("stream")?;
+        let body = to_bytes(
+            generate_response(envelope, logprobs).into_body(),
+            usize::MAX,
+        )
+        .await
+        .expect("body");
+        Ok(serde_json::from_slice(&body).expect("valid json"))
+    }
+
+    fn routed(rows: usize, layers: usize, topk: usize, offset: usize) -> RoutedExperts {
+        let all = routed_reference_bytes("|u1", (offset + rows) * layers * topk);
+        RoutedExperts {
+            dtype: "|u1".to_string(),
+            shape: vec![rows, layers, topk],
+            data: bytes::Bytes::copy_from_slice(&all[offset * layers * topk..]),
+        }
+    }
+
+    fn with_routed(
+        output: vllm_llm::Result<GenerateOutput>,
+        chunk: RoutedExperts,
+    ) -> vllm_llm::Result<GenerateOutput> {
+        output.map(|mut output| {
+            output.routed_experts = Some(chunk);
+            output
+        })
+    }
+
+    /// Steps of a request with a 5-row prompt block, then 1 routing row per
+    /// token for the first two tokens (the last token has no row).
+    fn routed_steps(layers: usize) -> Vec<vllm_llm::Result<GenerateOutput>> {
+        let row = |id: u32| position(&[(id, -0.5, 1), (id, -0.5, 1), (id + 1, -0.75, 2)]);
+        vec![
+            with_routed(
+                step(vec![10], Some(vec![row(10)]), None),
+                routed(5, layers, 8, 0),
+            ),
+            with_routed(
+                step(vec![11], Some(vec![row(11)]), None),
+                routed(1, layers, 8, 5),
+            ),
+            with_routed(
+                step(vec![12], Some(vec![row(12)]), Some(FinishReason::Abort)),
+                routed(1, layers, 8, 6),
+            ),
+        ]
+    }
+
+    fn expected_npy_base64(rows: usize, layers: usize) -> String {
+        use base64::Engine as _;
+        let mut npy = npy_header("|u1", &[rows, layers, 8]);
+        npy.extend_from_slice(&routed_reference_bytes("|u1", rows * layers * 8));
+        base64::engine::general_purpose::STANDARD.encode(npy)
+    }
+
+    #[tokio::test]
+    async fn routed_experts_concatenate_all_chunks_for_both_formats() {
+        for layers in [4, 61] {
+            for format in [LogprobsFormat::OpenAi, LogprobsFormat::Compact] {
+                let json = response_json(routed_steps(layers), options_for(format, 3), false)
+                    .await
+                    .expect("response");
+                let choice = &json["choices"][0];
+                assert_eq!(choice["token_ids"], json!([10, 11, 12]));
+                assert_eq!(
+                    choice["routed_experts"].as_str().unwrap(),
+                    expected_npy_base64(7, layers),
+                    "{format:?} layers {layers}"
+                );
+                let keys: Vec<_> = choice.as_object().unwrap().keys().cloned().collect();
+                let token_ids = keys.iter().position(|k| k == "token_ids").unwrap();
+                assert_eq!(keys[token_ids + 1], "routed_experts");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn routed_experts_null_when_enabled_without_forward_and_omitted_when_disabled() {
+        let abort = || vec![step(vec![], None, Some(FinishReason::Abort))];
+        for format in [LogprobsFormat::OpenAi, LogprobsFormat::Compact] {
+            let mut options = options_for(format, 3);
+            options.include_logprobs = false;
+            options.include_compact_logprobs = false;
+            // Enabled, aborted before any forward pass: null.
+            let json = response_json(abort(), options, true).await.expect("response");
+            assert!(json["choices"][0]["routed_experts"].is_null());
+            assert!(json["choices"][0].get("routed_experts").is_some());
+            // Disabled and no rows: key omitted (default bytes unchanged).
+            let json = response_json(abort(), options, false).await.expect("response");
+            assert!(json["choices"][0].get("routed_experts").is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn routed_experts_layout_change_is_server_error() {
+        let mut steps = routed_steps(4);
+        steps[1] = with_routed(step(vec![11], None, None), routed(1, 5, 8, 0));
+        let mut options = options_for(LogprobsFormat::OpenAi, 3);
+        options.include_logprobs = false;
+        assert!(response_json(steps, options, true).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn stream_returns_routed_experts_on_the_finishing_chunk() {
+        let chunks: Vec<_> = generate_chunk_stream(
+            stream::iter(routed_steps(4)),
+            "raw-stream".to_string(),
+            ApiServerOptions::default(),
+            options_for(LogprobsFormat::Compact, 3),
+        )
+        .try_collect()
+        .await
+        .expect("collect chunks");
+        assert_eq!(chunks.len(), 3);
+        for chunk in &chunks[..2] {
+            let json = serde_json::to_value(chunk).unwrap();
+            assert!(json["choices"][0].get("routed_experts").is_none());
+        }
+        let last = serde_json::to_value(&chunks[2]).unwrap();
+        assert_eq!(
+            last["choices"][0]["routed_experts"].as_str().unwrap(),
+            expected_npy_base64(7, 4)
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_switches_drop_sampled_slot_and_ranks() {
+        let rows = tricky_positions()
+            .into_iter()
+            .map(|mut p| {
+                p.entries.truncate(3);
+                p
+            })
+            .collect::<Vec<_>>();
+        let steps = || {
+            vec![
+                step(vec![0, 151_935], Some(rows[..2].to_vec()), None),
+                step(
+                    vec![42],
+                    Some(rows[2..3].to_vec()),
+                    Some(FinishReason::Abort),
+                ),
+            ]
+        };
+        // Default switches: today's block.
+        let json = response_json(steps(), options_for(LogprobsFormat::Compact, 3), false)
+            .await
+            .unwrap();
+        let block = &json["choices"][0]["compact_logprobs"];
+        assert!(block.get("sampled_slot").is_none());
+        assert!(block.get("ranks").is_some());
+        assert_eq!(block["num_slots"], 3);
+
+        let mut options = options_for(LogprobsFormat::Compact, 3);
+        options.compact_skip_sampled = true;
+        options.compact_skip_ranks = true;
+        let json = response_json(steps(), options, false).await.unwrap();
+        let block = &json["choices"][0]["compact_logprobs"];
+        assert_eq!(block["num_positions"], 3);
+        assert_eq!(block["num_slots"], 2);
+        assert_eq!(block["sampled_slot"], false);
+        assert!(block.get("ranks").is_none());
+        let decode = |key: &str| {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD
+                .decode(block[key].as_str().unwrap())
+                .unwrap()
+                .chunks_exact(4)
+                .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+                .collect::<Vec<_>>()
+        };
+        // Engine slots 1..3 of each row, raw bits.
+        let expected_ids: Vec<u32> = rows[..3]
+            .iter()
+            .flat_map(|p| p.entries[1..].iter().map(|e| e.token_id))
+            .collect();
+        let expected_bits: Vec<u32> = rows[..3]
+            .iter()
+            .flat_map(|p| p.entries[1..].iter().map(|e| e.logprob.to_bits()))
+            .collect();
+        assert_eq!(decode("token_ids"), expected_ids);
+        assert_eq!(decode("logprobs"), expected_bits);
+
+        // Ranks only off: sampled slot kept, ranks omitted.
+        let mut options = options_for(LogprobsFormat::Compact, 3);
+        options.compact_skip_ranks = true;
+        let json = response_json(steps(), options, false).await.unwrap();
+        let block = &json["choices"][0]["compact_logprobs"];
+        assert!(block.get("sampled_slot").is_none());
+        assert!(block.get("ranks").is_none());
+        assert_eq!(block["num_slots"], 3);
+
+        // Streaming chunks apply the same switches.
+        let mut options = options_for(LogprobsFormat::Compact, 3);
+        options.compact_skip_sampled = true;
+        let chunks: Vec<_> = generate_chunk_stream(
+            stream::iter(steps()),
+            "s".to_string(),
+            ApiServerOptions::default(),
+            options,
+        )
+        .try_collect()
+        .await
+        .unwrap();
+        let json = serde_json::to_value(&chunks[0]).unwrap();
+        let block = &json["choices"][0]["compact_logprobs"];
+        assert_eq!(block["num_slots"], 2);
+        assert_eq!(block["sampled_slot"], false);
+        assert!(block.get("ranks").is_some());
     }
 }

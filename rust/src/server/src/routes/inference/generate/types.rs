@@ -53,6 +53,13 @@ pub struct GenerateRequest {
     /// with a 400 by validation (only an absent field means the default).
     #[serde(default, deserialize_with = "deserialize_present")]
     pub logprobs_format: Option<Value>,
+    /// SPEC v3, compact only: include engine slot 0 (the sampled token);
+    /// default `true`. Raw value so non-booleans are a 400.
+    #[serde(default, deserialize_with = "deserialize_present")]
+    pub compact_include_sampled: Option<Value>,
+    /// SPEC v3, compact only: include `ranks`; default `true`.
+    #[serde(default, deserialize_with = "deserialize_present")]
+    pub compact_include_ranks: Option<Value>,
     #[serde(flatten)]
     pub other: Map<String, Value>,
 }
@@ -94,6 +101,9 @@ pub(super) struct GenerateResponseStreamChoice {
     pub logprobs: Option<Option<ChatLogProbs>>,
     pub finish_reason: Option<String>,
     pub token_ids: Vec<u32>,
+    /// On the finishing chunk when routed experts are returned: base64 `.npy`
+    /// or `null` (outer `None` omits the key).
+    pub routed_experts: Option<Option<String>>,
     /// Present only for `logprobs_format: "compact"`.
     pub compact_logprobs: Option<CompactLogprobsJson>,
 }

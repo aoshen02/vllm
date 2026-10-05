@@ -54,6 +54,10 @@ pub struct ApiServerOptions {
     pub enable_prompt_tokens_details: bool,
     /// When `true`, set `X-Request-Id` on every HTTP response.
     pub enable_request_id_headers: bool,
+    /// Mirrors Python `--enable-return-routed-experts`: raw generate
+    /// responses always carry `routed_experts` (`null` when none arrived).
+    /// Routing rows the engine sends are returned either way.
+    pub enable_return_routed_experts: bool,
 }
 
 /// CORS settings mirroring Python's `CORSMiddleware`; the default is permissive.

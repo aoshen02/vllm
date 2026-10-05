@@ -12,6 +12,7 @@ use futures::{Stream, StreamExt as _, pin_mut};
 use serde::{Deserialize, Serialize};
 use vllm_engine_core_client::protocol::logprobs::Logprobs;
 use vllm_engine_core_client::protocol::output::{EngineCoreFinishReason, StopReason};
+use vllm_engine_core_client::protocol::routed_experts::RoutedExperts;
 use vllm_engine_core_client::{AbortCause, EngineCoreOutputStream};
 
 use crate::error::Result;
@@ -155,6 +156,9 @@ pub struct GenerateOutput {
     /// Connector-specific encoder cache transfer parameters for disaggregated
     /// serving.
     pub ec_transfer_params: Option<serde_json::Value>,
+    /// Expert routing rows returned with this output, when the engine has
+    /// `enable_return_routed_experts` on.
+    pub routed_experts: Option<RoutedExperts>,
 }
 
 impl GenerateOutput {
@@ -202,6 +206,7 @@ impl GenerateOutput {
             cached_token_count: 0,
             kv_transfer_params: None,
             ec_transfer_params: None,
+            routed_experts: None,
         }
     }
 }
@@ -291,6 +296,7 @@ impl Stream for GenerateOutputStream {
             cached_token_count,
             kv_transfer_params: raw.kv_transfer_params,
             ec_transfer_params: raw.ec_transfer_params,
+            routed_experts: raw.routed_experts.map(|value| value.into_direct().unwrap()),
         };
 
         Poll::Ready(Some(Ok(output)))
@@ -344,6 +350,12 @@ pub trait LogprobsAccumulator: Send {
 
     /// Number of scored positions accumulated so far.
     fn num_positions(&self) -> usize;
+
+    /// Consume one output's expert routing rows. The default drops them
+    /// (routes that do not return routed experts).
+    fn extend_routed_experts(&mut self, routed_experts: RoutedExperts) {
+        let _ = routed_experts;
+    }
 }
 
 impl LogprobsAccumulator for Option<Logprobs> {
@@ -407,6 +419,9 @@ impl<T: Stream<Item = Result<GenerateOutput>> + Send> T {
                 );
                 if let Some(step_logprobs) = output.logprobs {
                     logprobs.extend(step_logprobs);
+                }
+                if let Some(routed_experts) = output.routed_experts {
+                    logprobs.extend_routed_experts(routed_experts);
                 }
 
                 if let Some(existing) = collected.as_mut() {

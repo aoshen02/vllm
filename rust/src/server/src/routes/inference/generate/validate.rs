@@ -31,6 +31,30 @@ pub(crate) fn validate_request_compat(
         );
     };
 
+    // SPEC v3 field switches: booleans, and non-default values only with
+    // the compact format.
+    for (param, value) in [
+        ("compact_include_sampled", &request.compact_include_sampled),
+        ("compact_include_ranks", &request.compact_include_ranks),
+    ] {
+        match value {
+            None | Some(serde_json::Value::Bool(true)) => {}
+            Some(serde_json::Value::Bool(false)) if logprobs_format == LogprobsFormat::Compact => {}
+            Some(serde_json::Value::Bool(false)) => {
+                return Err(ApiError::invalid_request(
+                    format!("{param}=false requires logprobs_format \"compact\"."),
+                    Some(param),
+                ));
+            }
+            Some(_) => {
+                return Err(ApiError::invalid_request(
+                    format!("{param} must be a boolean."),
+                    Some(param),
+                ));
+            }
+        }
+    }
+
     // The full-vocabulary payload (`logprobs: -1`) has no compact encoding.
     if logprobs_format == LogprobsFormat::Compact
         && request.sampling_params.inner.logprobs.is_some_and(|k| k < 0)
@@ -259,5 +283,47 @@ mod tests {
         }))
         .expect("parse request");
         assert!(validate_request_compat(&request, &served(&["Qwen/Qwen1.5-0.5B-Chat"])).is_ok());
+    }
+
+    #[test]
+    fn validate_request_compat_checks_compact_switches() {
+        let served = served(&["Qwen/Qwen1.5-0.5B-Chat"]);
+        let check = |format: Option<&str>, field: &str, value: serde_json::Value| {
+            let mut body = json!({
+                "token_ids": [11, 22],
+                "sampling_params": {"logprobs": 2}
+            });
+            if let Some(format) = format {
+                body["logprobs_format"] = json!(format);
+            }
+            body[field] = value;
+            let request: GenerateRequest = serde_json::from_value(body).expect("parse request");
+            validate_request_compat(&request, &served)
+                .map_err(|error| error.to_error_response().error.param)
+        };
+        for field in ["compact_include_sampled", "compact_include_ranks"] {
+            // Compact accepts both values.
+            assert!(check(Some("compact"), field, json!(false)).is_ok());
+            assert!(check(Some("compact"), field, json!(true)).is_ok());
+            // The default value is accepted with any format.
+            assert!(check(None, field, json!(true)).is_ok());
+            assert!(check(Some("openai"), field, json!(true)).is_ok());
+            // A non-default value needs compact.
+            assert_eq!(
+                check(None, field, json!(false)),
+                Err(Some(field.to_string()))
+            );
+            assert_eq!(
+                check(Some("openai"), field, json!(false)),
+                Err(Some(field.to_string()))
+            );
+            // Non-booleans (including null) are rejected.
+            for bad in [json!(null), json!(0), json!("false")] {
+                assert_eq!(
+                    check(Some("compact"), field, bad),
+                    Err(Some(field.to_string()))
+                );
+            }
+        }
     }
 }
