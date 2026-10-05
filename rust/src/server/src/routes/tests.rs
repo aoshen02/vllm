@@ -7541,3 +7541,155 @@ async fn raw_generate_bad_routed_experts_fail_only_their_request() {
     assert_eq!(json["choices"][0]["token_ids"], json!([44]));
     assert!(json["choices"][0]["routed_experts"].is_string());
 }
+
+/// Body of one request against a mock engine whose outputs carry an
+/// undecodable routed_experts value (`<f2`) when `invalid_r3`.
+async fn openai_body_with_routed_experts(
+    engine_id: &'static [u8],
+    uri: &'static str,
+    request: serde_json::Value,
+    invalid_r3: bool,
+) -> (StatusCode, String) {
+    use vllm_engine_core_client::protocol::routed_experts::{
+        MaybeWireRoutedExperts, RoutedExperts,
+    };
+
+    let ipc = IpcNamespace::new().expect("create ipc namespace");
+    let handshake_address = ipc.handshake_endpoint();
+    let engine_task = MockEngineTask::new(spawn_mock_engine_task(
+        handshake_address.clone(),
+        engine_id.to_vec(),
+        move |dealer, push| {
+            boxed_test_future(async move {
+                let add = recv_engine_message(dealer).await;
+                let request: EngineCoreRequest =
+                    rmp_serde::from_slice(&add[1]).expect("decode request");
+                let mut outputs =
+                    engine_outputs_for_request(&request.request_id, default_stream_output_specs());
+                if invalid_r3 && let EngineCoreOutputs::RequestBatch(batch) = &mut outputs {
+                    for output in &mut batch.outputs {
+                        output.routed_experts =
+                            Some(MaybeWireRoutedExperts::Direct(RoutedExperts {
+                                dtype: "<f2".to_string(),
+                                shape: vec![1, 2, 4],
+                                data: Bytes::from(vec![0_u8; 16]),
+                            }));
+                    }
+                }
+                send_outputs(push, outputs).await;
+            })
+        },
+    ));
+    let client = EngineCoreClient::connect(
+        EngineCoreClientConfig::new_single(handshake_address)
+            .with_model_name("test-model")
+            .with_local_input_output_addresses(
+                Some(ipc.input_endpoint()),
+                Some(ipc.output_endpoint()),
+            ),
+    )
+    .await
+    .expect("connect client");
+    let chat = ChatLlm::from_shared_backend(test_llm(client), Arc::new(FakeChatBackend::new()));
+    let mut app = build_router(Arc::new(
+        AppState::new(vec!["Qwen/Qwen1.5-0.5B-Chat".to_string()], chat).with_api_server_options(
+            ApiServerOptions {
+                enable_return_routed_experts: true,
+                ..Default::default()
+            },
+        ),
+    ));
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        app.call(
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(Body::from(request.to_string()))
+                .expect("build request"),
+        ),
+    )
+    .await
+    .expect("request completes")
+    .expect("call app");
+    let status = response.status();
+    let body = to_bytes(response.into_body(), usize::MAX).await.expect("read body");
+    drop(app);
+    engine_task.await.expect("mock engine task");
+    (status, String::from_utf8_lossy(&body).into_owned())
+}
+
+/// Drop the per-response `created` timestamps and `id` values (the only
+/// non-deterministic parts) so two runs can be compared byte for byte.
+fn without_created(body: &str) -> String {
+    const CREATED: &str = "\"created\":";
+    const ID: &str = "\"id\":\"";
+    let mut out = String::new();
+    let mut rest = body;
+    loop {
+        let (start, key, is_id) = match (rest.find(CREATED), rest.find(ID)) {
+            (None, None) => break,
+            (Some(c), Some(i)) if i < c => (i, ID, true),
+            (Some(c), _) => (c, CREATED, false),
+            (None, Some(i)) => (i, ID, true),
+        };
+        out.push_str(&rest[..start + key.len()]);
+        let after = &rest[start + key.len()..];
+        let end = if is_id {
+            after.find('"').unwrap_or(after.len())
+        } else {
+            after.find(|c: char| !c.is_ascii_digit()).unwrap_or(after.len())
+        };
+        rest = &after[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Routes that do not return routed experts ignore an undecodable
+/// routed_experts value, as before R3: same status and bytes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn openai_routes_ignore_invalid_routed_experts() {
+    for (uri, base) in [
+        (
+            "/v1/completions",
+            json!({"model": "Qwen/Qwen1.5-0.5B-Chat", "prompt": "hello", "max_tokens": 3}),
+        ),
+        (
+            "/v1/chat/completions",
+            json!({
+                "model": "Qwen/Qwen1.5-0.5B-Chat",
+                "messages": [{"role": "user", "content": "hello"}]
+            }),
+        ),
+    ] {
+        for stream in [false, true] {
+            let mut request = base.clone();
+            request["stream"] = json!(stream);
+            let (clean_status, clean) = openai_body_with_routed_experts(
+                b"engine-openai-r3-clean",
+                uri,
+                request.clone(),
+                false,
+            )
+            .await;
+            let (status, body) =
+                openai_body_with_routed_experts(b"engine-openai-r3-invalid", uri, request, true)
+                    .await;
+            assert_eq!(
+                clean_status,
+                StatusCode::OK,
+                "{uri} stream={stream}: {clean}"
+            );
+            assert_eq!(status, StatusCode::OK, "{uri} stream={stream}: {body}");
+            assert_eq!(
+                without_created(&body),
+                without_created(&clean),
+                "{uri} stream={stream}"
+            );
+            assert!(!body.is_empty());
+        }
+    }
+}

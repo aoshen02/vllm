@@ -203,6 +203,10 @@ impl<L: LogprobsAccumulator> LogprobsAccumulator for WithRoutedExperts<L> {
     fn extend_routed_experts(&mut self, routed_experts: RoutedExperts) {
         self.routed.push(routed_experts);
     }
+
+    fn invalid_routed_experts(&mut self, reason: String) {
+        self.routed.fail(reason);
+    }
 }
 
 /// `choices[0].routed_experts`: present when the server returns routed
@@ -343,8 +347,10 @@ async fn generate_chunk_stream(
                     );
                 }
 
-                if let (Some(chunk), Some(routed)) = (output.routed_experts, routed.as_mut()) {
-                    routed.push(chunk);
+                match (output.routed_experts, routed.as_mut()) {
+                    (Some(Ok(chunk)), Some(routed)) => routed.push(chunk),
+                    (Some(Err(reason)), Some(routed)) => routed.fail(reason),
+                    _ => {}
                 }
 
                 if token_ids.is_empty() && finish_reason.is_none() {
@@ -1301,7 +1307,7 @@ mod tests {
         chunk: RoutedExperts,
     ) -> vllm_llm::Result<GenerateOutput> {
         output.map(|mut output| {
-            output.routed_experts = Some(chunk);
+            output.routed_experts = Some(Ok(chunk));
             output
         })
     }
@@ -1399,6 +1405,58 @@ mod tests {
                 error.into_response().status(),
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR
             );
+        }
+    }
+
+    /// Zero-element chunks whose row counts overflow `usize` are a request
+    /// error (non-streaming 500, streaming error), never a panic or a bogus
+    /// array, with the flag on or off; so is an undecodable engine value.
+    #[tokio::test]
+    async fn routed_experts_row_overflow_and_invalid_values_fail_the_request() {
+        let empty = |rows: usize| RoutedExperts {
+            dtype: "|u1".to_string(),
+            shape: vec![rows, 0, 1],
+            data: bytes::Bytes::new(),
+        };
+        let cases: Vec<Vec<Option<Result<RoutedExperts, String>>>> = vec![
+            vec![Some(Ok(empty(usize::MAX))), Some(Ok(empty(1))), None],
+            vec![
+                None,
+                Some(Err("routed_experts: unsupported dtype \"<f2\"".to_string())),
+                None,
+            ],
+        ];
+        for chunks in cases {
+            let steps = || {
+                let mut steps = routed_steps(4);
+                for (step, chunk) in steps.iter_mut().zip(chunks.clone()) {
+                    if let Ok(step) = step {
+                        step.routed_experts = chunk;
+                    }
+                }
+                steps
+            };
+            for enabled in [true, false] {
+                let mut options = options_for(LogprobsFormat::OpenAi, 3);
+                options.include_logprobs = false;
+                let error = response_json(steps(), options, enabled).await.unwrap_err();
+                assert_eq!(
+                    error.into_response().status(),
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR
+                );
+                let streamed: Result<Vec<_>, _> = generate_chunk_stream(
+                    stream::iter(steps()),
+                    "overflow".to_string(),
+                    ApiServerOptions {
+                        enable_return_routed_experts: enabled,
+                        ..Default::default()
+                    },
+                    options,
+                )
+                .try_collect()
+                .await;
+                assert!(streamed.is_err(), "flag {enabled}");
+            }
         }
     }
 

@@ -157,8 +157,10 @@ pub struct GenerateOutput {
     /// serving.
     pub ec_transfer_params: Option<serde_json::Value>,
     /// Expert routing rows returned with this output, when the engine has
-    /// `enable_return_routed_experts` on.
-    pub routed_experts: Option<RoutedExperts>,
+    /// `enable_return_routed_experts` on. `Err` carries the reason when the
+    /// engine value is not a supported routed-experts array: only consumers
+    /// that return routed experts act on it, everyone else ignores the field.
+    pub routed_experts: Option<std::result::Result<RoutedExperts, String>>,
 }
 
 impl GenerateOutput {
@@ -287,17 +289,12 @@ impl Stream for GenerateOutputStream {
             self.request_metrics.record_finished(received_at, finish_reason.clone());
         }
 
-        // A malformed routed_experts value fails only this request.
-        let routed_experts = match raw.routed_experts {
-            None => None,
-            Some(MaybeWireRoutedExperts::Invalid(message)) => {
-                return Poll::Ready(Some(Err(crate::Error::InvalidRoutedExperts {
-                    request_id: raw.request_id,
-                    message,
-                })));
-            }
-            Some(value) => Some(value.into_direct().unwrap()),
-        };
+        // A malformed routed_experts value is passed on as an error marker;
+        // only routes that return routed experts fail the request on it.
+        let routed_experts = raw.routed_experts.map(|value| match value {
+            MaybeWireRoutedExperts::Invalid(reason) => Err(reason),
+            value => Ok(value.into_direct().unwrap()),
+        });
 
         let output = GenerateOutput {
             request_id: raw.request_id,
@@ -368,6 +365,12 @@ pub trait LogprobsAccumulator: Send {
     fn extend_routed_experts(&mut self, routed_experts: RoutedExperts) {
         let _ = routed_experts;
     }
+
+    /// Observe a routed-experts value the engine sent but the frontend could
+    /// not decode (the reason). The default ignores it, like the rows.
+    fn invalid_routed_experts(&mut self, reason: String) {
+        let _ = reason;
+    }
 }
 
 impl LogprobsAccumulator for Option<Logprobs> {
@@ -432,8 +435,10 @@ impl<T: Stream<Item = Result<GenerateOutput>> + Send> T {
                 if let Some(step_logprobs) = output.logprobs {
                     logprobs.extend(step_logprobs);
                 }
-                if let Some(routed_experts) = output.routed_experts {
-                    logprobs.extend_routed_experts(routed_experts);
+                match output.routed_experts {
+                    Some(Ok(routed_experts)) => logprobs.extend_routed_experts(routed_experts),
+                    Some(Err(reason)) => logprobs.invalid_routed_experts(reason),
+                    None => {}
                 }
 
                 if let Some(existing) = collected.as_mut() {

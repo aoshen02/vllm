@@ -122,6 +122,12 @@ impl RoutedExpertsEncoder {
         (3 - self.header_len % 3) % 3
     }
 
+    /// Fail the request's routed experts with `reason` (an engine value the
+    /// frontend cannot decode); the first error wins.
+    pub(crate) fn fail(&mut self, reason: String) {
+        self.error.get_or_insert(reason);
+    }
+
     /// Append one engine chunk (rows along axis 0).
     pub(crate) fn push(&mut self, chunk: RoutedExperts) {
         if self.error.is_some() {
@@ -174,7 +180,16 @@ impl RoutedExpertsEncoder {
                 }
             }
         }
-        self.rows += chunk.rows();
+        // Zero-element chunks can claim any row count: keep the total checked.
+        let Some(rows) = self.rows.checked_add(chunk.rows()) else {
+            self.error = Some(format!(
+                "routed_experts: total row count overflows ({} + {})",
+                self.rows,
+                chunk.rows()
+            ));
+            return;
+        };
+        self.rows = rows;
         let swapped;
         let mut data = if chunk.dtype.starts_with('>') && size > 1 {
             swapped = swap_element_bytes(&chunk.data, size);
@@ -511,6 +526,28 @@ pub(crate) mod tests {
                 assert_eq!(text, STANDARD.encode(&whole), "{descr} {split:?}");
             }
         }
+    }
+
+    /// Zero-element chunks with huge row counts (accepted by the wire and
+    /// length checks) must not overflow the row total.
+    #[test]
+    fn row_count_overflow_is_an_error() {
+        for first in [usize::MAX, usize::MAX / 2 + 1] {
+            let mut encoder = RoutedExpertsEncoder::default();
+            encoder.push(chunk("|u1", &[first, 0, 1], &[]));
+            encoder.push(chunk("|u1", &[usize::MAX / 2 + 1, 0, 1], &[]));
+            let error = encoder.finish().unwrap_err();
+            assert!(error.contains("overflows"), "{error}");
+        }
+        // A single huge zero-element chunk is a valid (empty) array.
+        let mut encoder = RoutedExpertsEncoder::default();
+        encoder.push(chunk("|u1", &[usize::MAX, 0, 1], &[]));
+        assert!(encoder.finish().unwrap().is_some());
+        // An invalid value reported by the engine fails the encoder.
+        let mut encoder = RoutedExpertsEncoder::default();
+        encoder.fail("routed_experts: unsupported dtype \"<f2\"".to_string());
+        assert!(encoder.has_data());
+        assert!(encoder.finish().is_err());
     }
 
     /// Wire-accepted metadata outside the R3 contract (e.g. 22,000 axes of

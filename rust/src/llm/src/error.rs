@@ -12,6 +12,4 @@ pub enum Error {
     EmptyPromptTokenIds { request_id: String },
     #[error("engine-core error")]
     EngineCoreClient(#[from] vllm_engine_core_client::Error),
-    #[error("request `{request_id}`: invalid {message}")]
-    InvalidRoutedExperts { request_id: String, message: String },
 }
