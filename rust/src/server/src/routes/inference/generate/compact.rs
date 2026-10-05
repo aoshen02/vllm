@@ -335,12 +335,20 @@ impl LogprobsAccumulator for CompactLogprobsAccumulator {
         }
 
         for position in &step.positions {
+            // Like Python, range-check the full arrays even when the switches
+            // drop the sampled slot or the ranks.
+            let sampled_rank = position.entries[0].rank;
+            if sampled_rank > i32::MAX as u32 {
+                self.fail(format!("sampled rank {sampled_rank} does not fit int32"));
+                return;
+            }
+            if let Some(entry) =
+                position.entries[..emitted.start].iter().find(|e| e.token_id > i32::MAX as u32)
+            {
+                self.fail(format!("token id {} does not fit int32", entry.token_id));
+                return;
+            }
             if !self.skip_ranks {
-                let sampled_rank = position.entries[0].rank;
-                if sampled_rank > i32::MAX as u32 {
-                    self.fail(format!("sampled rank {sampled_rank} does not fit int32"));
-                    return;
-                }
                 self.scratch_ranks.extend_from_slice(&sampled_rank.to_le_bytes());
                 if self.scratch_ranks.len() >= SCRATCH_TARGET_BYTES {
                     self.flush_ranks();
@@ -487,6 +495,29 @@ pub(crate) mod tests {
                 })
                 .collect(),
         }
+    }
+
+    /// Dropped data is still range-checked (Python checks full arrays).
+    #[test]
+    fn switches_keep_int32_checks_on_dropped_slot_and_ranks() {
+        let too_big = i32::MAX as u32 + 1;
+        let check = |row: &[(u32, f32, u32)], sampled: bool, ranks: bool| {
+            let mut accumulator = CompactLogprobsAccumulator::new(3).with_switches(sampled, ranks);
+            accumulator.observe_output(1, Some(1));
+            accumulator.extend(Logprobs {
+                positions: vec![position(row)],
+            });
+            accumulator.finish().map(|_| ())
+        };
+        let id_row = [(too_big, -0.5, 1), (1, -0.5, 1), (2, -0.7, 2)];
+        let rank_row = [(5, -0.5, too_big), (1, -0.5, 1), (2, -0.7, 2)];
+        for (sampled, ranks) in [(true, true), (false, true), (true, false), (false, false)] {
+            let error = check(&id_row, sampled, ranks).unwrap_err();
+            assert!(error.contains("does not fit int32"), "{error}");
+            let error = check(&rank_row, sampled, ranks).unwrap_err();
+            assert!(error.contains("does not fit int32"), "{error}");
+        }
+        assert!(check(&[(5, -0.5, 1), (1, -0.5, 1), (2, -0.7, 2)], false, false).is_ok());
     }
 
     #[test]
