@@ -694,6 +694,7 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
         self.reqs_to_recv: dict[EngineId, dict[ReqId, PullReqMeta]] = defaultdict(dict)
         self.reqs_to_send: dict[ReqId, tuple[TransferId, list[list[int]]]] = {}
         self.reqs_not_processed: set[TransferId] = set()
+        self.abort_pending_sends = False
 
     def add_new_req(
         self,
@@ -798,6 +799,10 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
     def update_connector_output(self, connector_output: KVConnectorOutput):
         assert self.connector_scheduler is not None
         self.connector_scheduler.update_connector_output(connector_output)
+
+    def abort_transfers(self) -> None:
+        assert self.connector_scheduler is not None
+        self.connector_scheduler.abort_transfers()
 
     def request_finished(
         self,
@@ -940,6 +945,8 @@ class MooncakeConnectorScheduler:
         self._reqs_not_processed: set[TransferId] = set()
         # D: requests whose KV is still being pulled.
         self._reqs_loading: dict[ReqId, Request] = {}
+        # P: drop the KV held for D at the next step.
+        self._abort_pending_sends = False
 
         # Compute sliding window block counts per KV cache group.
         sw_sizes_tokens: list[tuple[int, int]] = [
@@ -1131,12 +1138,20 @@ class MooncakeConnectorScheduler:
             self._reqs_need_send.clear()
             meta.reqs_not_processed = self._reqs_not_processed
             self._reqs_not_processed = set()
+        meta.abort_pending_sends = self._abort_pending_sends
+        self._abort_pending_sends = False
 
         return meta
 
     def update_connector_output(self, connector_output: KVConnectorOutput):
         for req_id in connector_output.finished_recving or ():
             self._reqs_loading.pop(req_id, None)
+
+    def abort_transfers(self) -> None:
+        self._abort_pending_sends = True
+        # Ask P to drop each load in flight; the load ends with P's answer.
+        for req_id, request in self._reqs_loading.items():
+            self._reqs_need_recv[req_id] = (request, [])
 
     def request_finished(
         self,
@@ -2718,6 +2733,11 @@ class MooncakeConnectorWorker:
             send_meta = self._get_send_meta(transfer_id)
             send_meta.expire_time = expire_time
             self._end_send(send_meta)
+        if metadata.abort_pending_sends:
+            # Only finished requests' KV; P still owns its unfinished ones.
+            for send_meta in self.reqs_need_send.values():
+                if send_meta.state is SendState.READY:
+                    self._end_send(send_meta)
 
     def _end_send(self, send_meta: SendBlockMeta) -> None:
         """Send nothing more: pulls fail fast until the state expires, and P's
@@ -2735,7 +2755,9 @@ class MooncakeConnectorWorker:
             )
 
         if not self.is_kv_consumer and (
-            metadata.reqs_to_send or metadata.reqs_not_processed
+            metadata.reqs_to_send
+            or metadata.reqs_not_processed
+            or metadata.abort_pending_sends
         ):
             asyncio.run_coroutine_threadsafe(
                 self.record_send_reqs(metadata), self.sender_loop

@@ -627,6 +627,10 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
     def has_pending_push_work(self) -> bool:
         return any(c.has_pending_push_work() for c in self._connectors)
 
+    def abort_transfers(self) -> None:
+        for c in self._connectors:
+            c.abort_transfers()
+
     @classmethod
     def get_required_kvcache_layout(cls, vllm_config: "VllmConfig") -> str | None:
         """Get the required KV cache layout for this connector.
