@@ -323,7 +323,8 @@ class SampleLogprobsHandle:
         except BaseException as e:  # malformed engine rows: positions unknown
             if not _contained(e):
                 raise
-            self._fail("Malformed engine logprob rows", e)
+            if self._container is not None:  # else already broken and reported
+                self._fail("Malformed engine logprob rows", e)
         self._call("append_rows", token_ids, logprobs, ranks)
 
     def extend(self, other: Any) -> None:

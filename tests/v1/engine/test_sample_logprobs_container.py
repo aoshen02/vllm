@@ -640,6 +640,18 @@ def test_row_preprocessing_contains_base_exceptions(registry):
     assert handle.broken
 
 
+def test_malformed_rows_are_reported_once(registry, vllm_log_stream):
+    """Claude stack v2 audit NIT: ranks whose len() raises are reported once
+    (not again when the broken handle counts the positions)."""
+    ids, lps, ranks = _rows(1, 2)
+    handle = _handle(registry)
+    _processor(handle)._update_sample_logprobs(
+        LogprobsLists(ids, lps, ranks.view(CancellingRanks))
+    )
+    assert handle.broken
+    assert vllm_log_stream.getvalue().count("Malformed engine logprob rows") == 1
+
+
 def test_unequal_row_counts_break_the_handle(registry):
     """Claude stack audit NIT: rows of different counts (the default path's zip
     would silently use the shortest) are malformed engine rows: the handle is
