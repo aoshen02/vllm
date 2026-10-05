@@ -24,6 +24,10 @@ use crate::routes::openai::utils::types::{ChatLogProbs, Normalizable, StreamOpti
 pub struct GenerateSamplingParams {
     /// Number of output sequences to generate. Only `1` is supported.
     pub n: Option<u32>,
+    /// Python's R3 prompt offset. Not lowered by the Rust frontend, so only
+    /// the default `0` is accepted (captured so it is not silently dropped).
+    #[serde(default, deserialize_with = "deserialize_present")]
+    pub routed_experts_prompt_start: Option<Value>,
     /// The supported sampling parameters, lowered to the engine.
     #[serde(flatten)]
     pub inner: SamplingParams,

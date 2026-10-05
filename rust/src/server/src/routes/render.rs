@@ -88,6 +88,7 @@ fn lower_render_request(
         token_ids,
         sampling_params: GenerateSamplingParams {
             n: None,
+            routed_experts_prompt_start: None,
             inner: text_request.sampling_params,
         },
         stream,

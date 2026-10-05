@@ -69,6 +69,15 @@ pub(crate) fn validate_request_compat(
         bail_invalid_request!(param = "n", "Only n=1 is supported.");
     }
 
+    if let Some(start) = &request.sampling_params.routed_experts_prompt_start
+        && start.as_u64() != Some(0)
+    {
+        bail_invalid_request!(
+            param = "routed_experts_prompt_start",
+            "Only routed_experts_prompt_start=0 is supported."
+        );
+    }
+
     if request.token_ids.is_empty() {
         bail_invalid_request!(
             param = "token_ids",
@@ -283,6 +292,27 @@ mod tests {
         }))
         .expect("parse request");
         assert!(validate_request_compat(&request, &served(&["Qwen/Qwen1.5-0.5B-Chat"])).is_ok());
+    }
+
+    #[test]
+    fn validate_request_compat_rejects_nonzero_routed_experts_prompt_start() {
+        let served = served(&["Qwen/Qwen1.5-0.5B-Chat"]);
+        let check = |value: serde_json::Value| {
+            let request: GenerateRequest = serde_json::from_value(json!({
+                "token_ids": [11, 22],
+                "sampling_params": {"routed_experts_prompt_start": value}
+            }))
+            .expect("parse request");
+            validate_request_compat(&request, &served)
+                .map_err(|error| error.to_error_response().error.param)
+        };
+        assert!(check(json!(0)).is_ok());
+        for bad in [json!(1), json!(-1), json!(2.5), json!("0"), json!(null)] {
+            assert_eq!(
+                check(bad),
+                Err(Some("routed_experts_prompt_start".to_string()))
+            );
+        }
     }
 
     #[test]
