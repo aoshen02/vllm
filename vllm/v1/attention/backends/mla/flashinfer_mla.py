@@ -303,6 +303,7 @@ class FlashInferMLAImpl(MLACommonImpl[FlashInferMLAMetadata]):
 
         self.bmm1_scale: float | None = None
         self.bmm2_scale: float | None = None
+        self._kv_scales: tuple[float, float] | None = None
         # Worst-case decode batch for the persistent trtllm-gen multi-CTA-KV
         # counter buffer (see _get_multi_ctas_kv_counter_buffer). Captured here
         # (config is in scope during construction) so the byte size can be
@@ -368,14 +369,14 @@ class FlashInferMLAImpl(MLACommonImpl[FlashInferMLAMetadata]):
         else:
             q = q.view(attn_metadata.num_decodes, -1, q.shape[-2], q.shape[-1])
 
-        if self.bmm1_scale is None:
+        # Recompute when a weight reload changes the KV scales.
+        kv_scales = (layer._q_scale_float, layer._k_scale_float)
+        if self.bmm1_scale is None or kv_scales != self._kv_scales:
+            self._kv_scales = kv_scales
             self.bmm1_scale = self.scale
-            if is_quantized_kv_cache(self.kv_cache_dtype):
-                self.bmm1_scale *= layer._q_scale_float * layer._k_scale_float
-
-        if self.bmm2_scale is None:
             self.bmm2_scale = 1.0
             if is_quantized_kv_cache(self.kv_cache_dtype):
+                self.bmm1_scale *= layer._q_scale_float * layer._k_scale_float
                 self.bmm2_scale *= layer._k_scale_float
 
         return_lse = self.need_to_return_lse_for_decode

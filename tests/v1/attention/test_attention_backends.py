@@ -1945,3 +1945,53 @@ def test_non_causal_backend_correctness(
             causal=False,
             block_size=128,
         )
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="FlashInfer needs CUDA")
+def test_flashinfer_bmm_scales_follow_kv_scale_reload():
+    """KV scales changed by a weight reload after the first forward (e.g. an RL
+    refit of a dummy-initialized engine) reach the host BMM scales and CUDA
+    graphs captured before the reload."""
+    from vllm.config import VllmConfig
+    from vllm.v1.attention.backends import flashinfer as fi
+
+    device = torch.device("cuda:0")
+    scale = 128**-0.5
+    with set_current_vllm_config(VllmConfig()):
+        impl = fi.FlashInferImpl(
+            num_heads=8,
+            num_kv_heads=2,
+            head_size=128,
+            scale=scale,
+            alibi_slopes=None,
+            sliding_window=None,
+            kv_cache_dtype="fp8",
+            attn_type=AttentionType.DECODER,
+        )
+    layer = MockAttentionLayer(device)
+    impl._refresh_bmm_scales(layer)
+    assert impl.bmm1_scale == pytest.approx(scale)
+
+    out = torch.zeros(2, device=device)
+
+    def device_scales():
+        bmm1_scale, bmm2_scale = impl._trtllm_bmm_scales(layer)
+        out[0].copy_(bmm1_scale)
+        out[1].copy_(bmm2_scale)
+
+    device_scales()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        device_scales()
+
+    # A reload updates the scale buffers in place and replaces the floats.
+    layer._k_scale.fill_(0.25)
+    layer._v_scale.fill_(0.5)
+    layer._k_scale_float, layer._v_scale_float = 0.25, 0.5
+
+    impl._refresh_bmm_scales(layer)
+    assert impl.bmm1_scale == pytest.approx(scale * 0.25)
+    assert impl.bmm2_scale == pytest.approx(0.5)
+    out.zero_()
+    graph.replay()
+    torch.testing.assert_close(out.cpu(), torch.tensor([scale * 0.25, 0.5]))
