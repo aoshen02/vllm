@@ -89,6 +89,7 @@ impl ManagedEngineArgs {
         reasoning_parser: Option<&str>,
         language_model_only: bool,
         disable_log_stats: bool,
+        enable_return_routed_experts: bool,
         shutdown_timeout: u64,
         handshake_port: u16,
         limit_mm_per_prompt: Option<String>,
@@ -116,6 +117,11 @@ impl ManagedEngineArgs {
         }
         if disable_log_stats {
             python_args.push("--disable-log-stats".to_string());
+        }
+        // Consumed by the Rust frontend too (it shapes the response), but the
+        // engine must capture routing for it to return anything.
+        if enable_return_routed_experts {
+            python_args.push("--enable-return-routed-experts".to_string());
         }
         // we must pass through shutdown_timeout to the engine,
         // otherwise inflight requests get aborted on shutdown

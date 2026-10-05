@@ -245,6 +245,33 @@ fn serve_args_forward_disable_log_stats_to_managed_engine() {
 }
 
 #[test]
+fn serve_args_forward_enable_return_routed_experts_to_managed_engine() {
+    let cli = Cli::try_parse_from([
+        "vllm-rs",
+        "serve",
+        "Qwen/Qwen3-0.6B",
+        "--enable-return-routed-experts",
+    ])
+    .unwrap();
+
+    let Command::Serve(args) = cli.command else {
+        panic!("expected serve args");
+    };
+    assert!(args.runtime.enable_return_routed_experts);
+    assert!(args.runtime.api_server_options().enable_return_routed_experts);
+
+    let config = args.to_managed_engine_config(5555);
+    expect![[r#"
+        [
+            "--reasoning-parser",
+            "qwen3",
+            "--enable-return-routed-experts",
+        ]
+    "#]]
+    .assert_debug_eq(&config.python_args);
+}
+
+#[test]
 fn serve_args_forward_profiler_config_to_managed_engine() {
     let cli = Cli::try_parse_from([
         "vllm-rs",

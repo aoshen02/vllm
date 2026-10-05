@@ -777,6 +777,7 @@ impl ServeArgs {
             reasoning_parser.as_deref(),
             self.runtime.language_model_only,
             self.runtime.disable_log_stats,
+            self.runtime.enable_return_routed_experts,
             self.runtime.shutdown_timeout,
             handshake_port,
             self.runtime.limit_mm_per_prompt_json(),
