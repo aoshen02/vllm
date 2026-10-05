@@ -21,7 +21,6 @@ from vllm.entrypoints.serve.utils.api_utils import (
 )
 from vllm.logger import init_logger
 
-from . import serving as serving_module
 from .logprobs_render import join_parts
 from .protocol import (
     GenerateRequest,
@@ -48,11 +47,6 @@ def engine_client(request: Request) -> EngineClient:
 router = APIRouter()
 
 
-# Compact + --middleware: bodies up to this size are joined on the event loop
-# (a ~1 MiB memcpy is well under a millisecond), larger ones off-loop.
-INLINE_JOIN_MAX_BYTES = 1 << 20
-
-
 class _RenderedJSONResponse(JSONResponse):
     """``JSONResponse`` for an already-rendered body given as parts.
 
@@ -61,11 +55,13 @@ class _RenderedJSONResponse(JSONResponse):
     path. Framing:
 
     * single message (exactly like ``JSONResponse``): the default format
-      always (``RenderedGenerateResponse.single_message``; the parts were
-      joined off the event loop), and any response when user
-      ``--middleware`` is configured, so body-transforming middleware such
-      as GZipMiddleware sees a regular response (Content-Length, size
-      thresholds);
+      always, and compact too when user ``--middleware`` is configured, so
+      body-transforming middleware such as GZipMiddleware sees a regular
+      response (Content-Length, size thresholds). ``ServingTokens`` joins
+      these bodies where the build ran (inline for small builds, in the
+      response-builder job for large ones) and marks them
+      ``single_message``; any other rendered response sent with
+      ``single_message=True`` is joined here;
     * otherwise (opt-in compact format) consecutive ``http.response.body``
       messages, small parts coalesced, the last with ``more_body=False``: no
       full-size join, write flow control, parts released as sent.
@@ -120,7 +116,7 @@ class _RenderedJSONResponse(JSONResponse):
             raise RuntimeError("A rendered generate response can only be sent once")
         if self._single_message:
             parts, self._parts = self._parts, None
-            # Already a single part when joined by serving / generate().
+            # Already a single part when joined by ServingTokens.
             body = (
                 parts[0]
                 if len(parts) == 1 and type(parts[0]) is bytes
@@ -185,21 +181,11 @@ async def generate(request: GenerateRequest, raw_request: Request):
     elif isinstance(generator, RenderedGenerateResponse):
         # User middleware (--middleware) may transform bodies; keep the
         # JSONResponse framing (one message) for exact compatibility then.
-        args = getattr(raw_request.app.state, "args", None)
-        user_middleware = bool(getattr(args, "middleware", None))
-        if user_middleware and not generator.single_message:
-            # Compact under user middleware: one message as well. A small
-            # body is joined inline (negligible GIL hold), so it never queues
-            # behind an unrelated large build in the single response-builder
-            # thread; only a large body is joined there.
-            if generator.content_length <= INLINE_JOIN_MAX_BYTES:
-                body = join_parts(generator.parts)
-            else:
-                body = await asyncio.get_running_loop().run_in_executor(
-                    serving_module._RESPONSE_BUILDER, join_parts, generator.parts
-                )
-            generator = RenderedGenerateResponse([body], single_message=True)
-        return _RenderedJSONResponse(generator, single_message=generator.single_message)
+        # ServingTokens already joined it then (single_message).
+        user_middleware = ServingTokens._has_user_middleware(raw_request)
+        return _RenderedJSONResponse(
+            generator, single_message=generator.single_message or user_middleware
+        )
 
     elif isinstance(generator, GenerateResponse):
         return JSONResponse(content=generator.model_dump())

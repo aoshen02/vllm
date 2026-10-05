@@ -2713,57 +2713,123 @@ def test_second_failure_on_broken_container_keeps_counting(monkeypatch):
     assert processor.logprobs.broken and len(processor.logprobs) == 6
 
 
-def test_compact_with_user_middleware_joins_off_loop(monkeypatch):
-    """Claude r7 NIT 3: a large compact + --middleware body is joined in the
-    builder thread, not on the event loop."""
-    threads: list[Any] = []
+def _middleware_app(feeder: _OutputProcessorEngine) -> TestClient:
+    """Real router + ServingTokens, user --middleware configured."""
+    app = FastAPI()
+    app.state.args = Namespace(
+        log_error_stack=False, tokens_only=False, middleware=["some.Middleware"]
+    )
+    app.state.serving_tokens = _serving(feeder)
+    init_exception_handler(app)
+    api_router.attach_router(app)
+    return TestClient(app)
+
+
+def _compact_post(client: TestClient, positions: int):
+    return client.post(
+        "/inference/v1/generate",
+        json={
+            "token_ids": [1, 2, 3],
+            "sampling_params": {"max_tokens": positions, "logprobs": 128},
+            "logprobs_format": "compact",
+        },
+    )
+
+
+def _check_compact_body(result, chunks):
+    assert result.status_code == 200
+    assert int(result.headers["content-length"]) == len(result.content)
+    block = result.json()["choices"][0]["compact_logprobs"]
+    token_ids, logprobs, ranks = _decode(block)
+    expected = _expected(chunks, 129)
+    np.testing.assert_array_equal(token_ids, expected[0])
+    np.testing.assert_array_equal(logprobs, expected[1])
+    np.testing.assert_array_equal(ranks, expected[2])
+
+
+@pytest.mark.parametrize("positions", [1500, 5500])
+def test_compact_middleware_inline_build_skips_busy_builder(monkeypatch, positions):
+    """Claude r9/r10 MINOR: a compact + --middleware body built inline
+    (below OFFLOAD_MIN_LOGPROB_ENTRIES; here ~2 and ~7.5 MB) is joined inline
+    too, so it does not wait behind an unrelated build occupying the single
+    response-builder thread."""
+    from vllm.entrypoints.scale_out.token_in_token_out import serving as serving_mod
+
+    assert positions * 129 < serving_mod.OFFLOAD_MIN_LOGPROB_ENTRIES
+    joins: list[str] = []
     real_join = logprobs_render.join_parts
 
     def recording_join(parts):
-        threads.append(threading.current_thread().name)
+        joins.append(threading.current_thread().name)
         return real_join(parts)
 
-    monkeypatch.setattr(api_router, "join_parts", recording_join)
-    parts = [b'{"a":"', b"x" * (api_router.INLINE_JOIN_MAX_BYTES + 1), b'"}']
+    monkeypatch.setattr(serving_mod, "join_parts", recording_join)
+    chunks = [_engine_rows(0, positions, 129)]
+    release = threading.Event()
+    busy = serving_mod._RESPONSE_BUILDER.submit(release.wait, 20)
+    try:
+        with _middleware_app(_OutputProcessorEngine(chunks)) as client:
+            t0 = time.perf_counter()
+            result = _compact_post(client, positions)
+            elapsed = time.perf_counter() - t0
+        assert not busy.done()
+        assert elapsed < 10
+    finally:
+        release.set()
+        busy.result(timeout=30)
+    assert 2_000_000 < len(result.content) < 8_000_000
+    _check_compact_body(result, chunks)
+    assert len(joins) == 1 and not joins[0].startswith("generate-response")
+
+
+def test_compact_middleware_offloaded_build_joins_in_same_job(monkeypatch):
+    """An offloaded compact + --middleware build is joined inside the same
+    response-builder job: one builder trip, no join on the event loop."""
+    from vllm.entrypoints.scale_out.token_in_token_out import serving as serving_mod
+
+    monkeypatch.setattr(serving_mod, "OFFLOAD_MIN_LOGPROB_ENTRIES", 0)
+    joins: list[str] = []
+    real_join = logprobs_render.join_parts
+
+    def recording_join(parts):
+        joins.append(threading.current_thread().name)
+        return real_join(parts)
+
+    def no_router_join(parts):
+        raise AssertionError("router must not join")
+
+    monkeypatch.setattr(serving_mod, "join_parts", recording_join)
+    monkeypatch.setattr(api_router, "join_parts", no_router_join)
+    submits: list[Any] = []
+    builder = serving_mod._RESPONSE_BUILDER
+    real_submit = builder.submit
+
+    def counting_submit(fn, *args, **kwargs):
+        submits.append(fn)
+        return real_submit(fn, *args, **kwargs)
+
+    monkeypatch.setattr(builder, "submit", counting_submit)
+    chunks = [_engine_rows(0, 40, 129)]
+    with _middleware_app(_OutputProcessorEngine(chunks)) as client:
+        result = _compact_post(client, 40)
+    _check_compact_body(result, chunks)
+    assert len(submits) == 1
+    assert len(joins) == 1 and joins[0].startswith("generate-response")
+
+
+def test_router_joins_unjoined_parts_under_user_middleware():
+    """Fallback: a rendered response that is not single_message is still sent
+    as one message (correct Content-Length) under user middleware."""
+    parts = [b'{"a":"', memoryview(b"x" * 10), b'"}']
     client = _gzip_client(parts)
     client.app.state.args.middleware = ["some.module.Middleware"]
     with client:
         result = client.post(
             "/inference/v1/generate",
             json={"token_ids": [1], "sampling_params": {}},
-            # The body exceeds the gzip minimum_size; read it uncompressed.
-            headers={"accept-encoding": "identity"},
         )
     assert result.content == b"".join(parts)
     assert int(result.headers["content-length"]) == len(result.content)
-    assert len(threads) == 1
-    assert threads[0].startswith("generate-response")
-
-
-def test_small_compact_with_user_middleware_skips_busy_builder():
-    """Claude r9 MINOR: a small compact + --middleware body is joined inline,
-    so it does not wait behind an unrelated build occupying the single
-    response-builder thread."""
-    release = threading.Event()
-    busy = api_router.serving_module._RESPONSE_BUILDER.submit(release.wait, 10)
-    try:
-        parts = [b'{"a":"', b"x" * 10, b'"}']
-        client = _gzip_client(parts)
-        client.app.state.args.middleware = ["some.module.Middleware"]
-        with client:
-            t0 = time.perf_counter()
-            result = client.post(
-                "/inference/v1/generate",
-                json={"token_ids": [1], "sampling_params": {}},
-            )
-            elapsed = time.perf_counter() - t0
-        assert not busy.done()
-        assert result.content == b"".join(parts)
-        assert int(result.headers["content-length"]) == len(result.content)
-        assert elapsed < 5
-    finally:
-        release.set()
-        busy.result(timeout=30)
 
 
 @pytest.mark.parametrize("broken_side", ["target", "source"])

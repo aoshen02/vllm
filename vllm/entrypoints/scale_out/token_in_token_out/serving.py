@@ -297,8 +297,24 @@ class ServingTokens(GenerateBaseServing):
             )
 
         return await self.serve_tokens_full_generator(
-            request, result_generator, request_id, model_name, request_metadata
+            request,
+            result_generator,
+            request_id,
+            model_name,
+            request_metadata,
+            join_compact=self._has_user_middleware(raw_request),
         )
+
+    @staticmethod
+    def _has_user_middleware(raw_request: Request | None) -> bool:
+        """Whether user ``--middleware`` is configured: it may transform
+        bodies, so responses are then sent as one message (JSONResponse
+        framing), compact included."""
+        if raw_request is None:
+            return False
+        args = getattr(raw_request.app.state, "args", None)
+        middleware = getattr(args, "middleware", None)
+        return isinstance(middleware, (list, tuple)) and len(middleware) > 0
 
     @staticmethod
     def _use_array_logprobs(request: GenerateRequest) -> bool:
@@ -351,6 +367,7 @@ class ServingTokens(GenerateBaseServing):
         request_id: str,
         model_name: str,
         request_metadata: RequestResponseMetadata,
+        join_compact: bool = False,
     ) -> ErrorResponse | GenerateResponse | RenderedGenerateResponse:
         created_time = int(time.time())
         final_res: RequestOutput | None = None
@@ -381,11 +398,17 @@ class ServingTokens(GenerateBaseServing):
                     request_id,
                     model_name,
                     created_time,
+                    join_compact=join_compact,
                 ),
             )
         else:
             built = self._build_full_response(
-                request, final_res, request_id, model_name, created_time
+                request,
+                final_res,
+                request_id,
+                model_name,
+                created_time,
+                join_compact=join_compact,
             )
         # Shared-state side effects stay on the event loop.
         response, usage, choice_meta = built
@@ -438,6 +461,7 @@ class ServingTokens(GenerateBaseServing):
         request_id: str,
         model_name: str,
         created_time: int,
+        join_compact: bool = False,
     ) -> tuple[
         GenerateResponse | RenderedGenerateResponse,
         UsageInfo,
@@ -445,7 +469,8 @@ class ServingTokens(GenerateBaseServing):
     ]:
         """Build the final response, its usage and (index, finish_reason) per
         choice. CPU only, no shared-state side effects: may run in a worker
-        thread."""
+        thread. ``join_compact``: also join a compact body into one message
+        (user middleware configured)."""
         sampling_params: SamplingParams = request.sampling_params
         compact = request.logprobs_format == "compact"
         # choice position -> field name -> pre-rendered JSON value
@@ -560,10 +585,12 @@ class ServingTokens(GenerateBaseServing):
         choice_meta = [(choice.index, choice.finish_reason) for choice in choices]
         if fragments:
             parts = render_json_with_fragments_parts(response.model_dump(), fragments)
-            if not compact:
-                # Default format: one message like JSONResponse (compatibility
-                # with body-transforming middleware); joined here, i.e. in the
-                # worker thread for large bodies, not on the event loop.
+            if not compact or join_compact:
+                # One message like JSONResponse (compatibility with
+                # body-transforming middleware): always for the default
+                # format, for compact under user middleware. Joined here,
+                # where the build ran: inline for small builds, in the same
+                # worker-thread job for large ones (no second queue trip).
                 body = join_parts(parts)
                 del parts
                 return (
