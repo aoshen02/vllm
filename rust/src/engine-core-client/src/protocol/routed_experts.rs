@@ -16,7 +16,7 @@ use crate::error::{Error, Result, bail_ext_value_decode};
 use crate::protocol::tensor::{ShapeExt as _, WireArrayData, WireNdArray};
 
 /// Decoded routed experts of one engine output: the raw C-order bytes of a
-/// little-endian (or single-byte) integer array.
+/// integer array, in the byte order of `dtype` as sent by the engine.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RoutedExperts {
     /// numpy dtype string as sent by the engine (`dtype.str`), e.g. `"|u1"`

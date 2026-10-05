@@ -1328,7 +1328,7 @@ mod tests {
 
     fn expected_npy_base64(rows: usize, layers: usize) -> String {
         use base64::Engine as _;
-        let mut npy = npy_header("|u1", &[rows, layers, 8]);
+        let mut npy = npy_header("|u1", &[rows, layers, 8]).unwrap();
         npy.extend_from_slice(&routed_reference_bytes("|u1", rows * layers * 8));
         base64::engine::general_purpose::STANDARD.encode(npy)
     }
@@ -1378,6 +1378,28 @@ mod tests {
         let mut options = options_for(LogprobsFormat::OpenAi, 3);
         options.include_logprobs = false;
         assert!(response_json(steps, options, true).await.is_err());
+    }
+
+    /// A chunk outside the R3 contract (huge rank, accepted by the wire
+    /// decoder) is a server error for that request, not a panic.
+    #[tokio::test]
+    async fn routed_experts_huge_rank_is_server_error() {
+        let huge = RoutedExperts {
+            dtype: "|u1".to_string(),
+            shape: vec![1; 22_000],
+            data: bytes::Bytes::from_static(&[3]),
+        };
+        for (first, enabled) in [(true, true), (false, true), (true, false), (false, false)] {
+            let mut steps = routed_steps(4);
+            steps[usize::from(!first)] = with_routed(step(vec![10], None, None), huge.clone());
+            let mut options = options_for(LogprobsFormat::OpenAi, 3);
+            options.include_logprobs = false;
+            let error = response_json(steps, options, enabled).await.unwrap_err();
+            assert_eq!(
+                error.into_response().status(),
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR
+            );
+        }
     }
 
     #[tokio::test]
