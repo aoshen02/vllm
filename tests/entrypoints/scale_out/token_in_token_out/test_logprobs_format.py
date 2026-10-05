@@ -2378,6 +2378,24 @@ def test_lead_table_reader_sees_consistent_snapshot():
         def _table(self, value):
             self.__dict__["_table"] = value
 
+        # The pre-fix reader loaded ``filled`` separately (after ``values``):
+        # interleave the same concurrent growth there too, so the test also
+        # reproduces the race on that implementation.
+        @property
+        def filled(self):
+            filled = self.__dict__.get("filled")
+            if filled is None:
+                return self._table[1]
+            if self.armed:
+                self.armed = False
+                logprobs_render._LeadTable.lookup(self, np.array([5, 40]))
+                return self.__dict__["filled"]
+            return filled
+
+        @filled.setter
+        def filled(self, value):
+            self.__dict__["filled"] = value
+
     table = Interleaved(b"")
     table.lookup(np.array([1, 2, 7]))
     table.armed = True
