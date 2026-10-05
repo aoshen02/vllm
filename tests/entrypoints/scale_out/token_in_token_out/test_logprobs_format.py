@@ -2731,6 +2731,8 @@ def test_compact_with_user_middleware_joins_off_loop(monkeypatch):
         result = client.post(
             "/inference/v1/generate",
             json={"token_ids": [1], "sampling_params": {}},
+            # The body exceeds the gzip minimum_size; read it uncompressed.
+            headers={"accept-encoding": "identity"},
         )
     assert result.content == b"".join(parts)
     assert int(result.headers["content-length"]) == len(result.content)
