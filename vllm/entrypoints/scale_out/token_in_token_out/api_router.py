@@ -63,8 +63,14 @@ class _RenderedJSONResponse(JSONResponse):
 
     COALESCE_BYTES = 1 << 20
 
-    def __init__(self, rendered: RenderedGenerateResponse) -> None:
+    def __init__(
+        self, rendered: RenderedGenerateResponse, single_message: bool = False
+    ) -> None:
         self._parts: list[bytes | memoryview] | None = rendered.parts
+        # Join into one message, exactly like JSONResponse, e.g. when user
+        # middleware may transform bodies (GZipMiddleware keeps a
+        # Content-Length only for single-message bodies).
+        self._single_message = single_message
         # Same header order as JSONResponse: content-length, content-type.
         super().__init__(
             content=None,
@@ -97,6 +103,23 @@ class _RenderedJSONResponse(JSONResponse):
             yield bytes(buffer)
 
     async def __call__(self, scope, receive, send) -> None:
+        if self._parts is None:
+            raise RuntimeError("A rendered generate response can only be sent once")
+        if self._single_message:
+            parts, self._parts = self._parts, None
+            body = b"".join(parts)
+            del parts
+            await send(
+                {
+                    "type": "http.response.start",
+                    "status": self.status_code,
+                    "headers": self.raw_headers,
+                }
+            )
+            await send({"type": "http.response.body", "body": body})
+            if self.background is not None:
+                await self.background()
+            return
         await send(
             {
                 "type": "http.response.start",
@@ -142,7 +165,11 @@ async def generate(request: GenerateRequest, raw_request: Request):
         )
 
     elif isinstance(generator, RenderedGenerateResponse):
-        return _RenderedJSONResponse(generator)
+        # User middleware (--middleware) may transform bodies; keep the
+        # JSONResponse framing (one message) for exact compatibility then.
+        args = getattr(raw_request.app.state, "args", None)
+        user_middleware = bool(getattr(args, "middleware", None))
+        return _RenderedJSONResponse(generator, single_message=user_middleware)
 
     elif isinstance(generator, GenerateResponse):
         return JSONResponse(content=generator.model_dump())

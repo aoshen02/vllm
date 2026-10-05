@@ -333,9 +333,10 @@ class ServingTokens(GenerateBaseServing):
             sampling_params.array_logprobs_base64
             and not request.compact_include_sampled
         )
-        # Non-streaming responses also encode routed experts (R3) while they
-        # arrive (same bytes as numpy2base64 of the concatenated chunks).
-        sampling_params.routed_experts_base64 = not request.stream
+        # R3 is out of scope for now: keep the base chunk accumulation (the
+        # incremental RoutedExpertsNpyBase64 encoder stays opt-in internally,
+        # off here), and never take a client-provided value.
+        sampling_params.routed_experts_base64 = False
 
     @staticmethod
     def _require_array_logprobs(logprobs: object) -> ArrayLogprobs:

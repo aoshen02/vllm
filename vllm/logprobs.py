@@ -9,6 +9,10 @@ from typing import ClassVar, overload
 import numpy as np
 import pybase64
 
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
+
 
 # We use dataclass for now because it is used for
 # openai server output, and msgspec is not serializable.
@@ -166,6 +170,7 @@ _INT64 = np.dtype("<i8")
 _FLOAT32 = np.dtype("<f4")
 _FLOAT64 = np.dtype("<f8")
 _INT32_INFO = np.iinfo(np.int32)
+_INT64_INFO = np.iinfo(np.int64)
 
 
 _NARROW_INTS = frozenset(
@@ -175,8 +180,9 @@ _MIN_REDUCE = np.minimum.reduce
 _MAX_REDUCE = np.maximum.reduce
 
 
-def _storage_int_dtype(values: np.ndarray) -> np.dtype:
-    """int32 unless a value does not fit (then int64; never wraps).
+def _storage_int_dtype(values: np.ndarray) -> np.dtype | None:
+    """int32 unless a value does not fit (then int64); None if a value does
+    not even fit int64 (e.g. huge uint64), so it is never wrapped.
 
     Called per engine step: the engine's int32 ids need no scan, and tiny
     arrays (e.g. one rank per step) are checked in Python, which is several
@@ -192,7 +198,9 @@ def _storage_int_dtype(values: np.ndarray) -> np.dtype:
         lo, hi = int(_MIN_REDUCE(flat)), int(_MAX_REDUCE(flat))
     if lo >= _INT32_INFO.min and hi <= _INT32_INFO.max:
         return _INT32
-    return _INT64
+    if lo >= _INT64_INFO.min and hi <= _INT64_INFO.max:
+        return _INT64
+    return None
 
 
 def _storage_float_dtype(values: np.ndarray) -> np.dtype:
@@ -216,6 +224,8 @@ class _Base64Stream:
         self.pending = bytearray()
 
     def write(self, data: np.ndarray) -> None:
+        if data.size == 0:
+            return  # memoryview.cast() rejects zero-size shapes
         self.pending += memoryview(data).cast("B")
         if len(self.pending) >= self.FLUSH_BYTES:
             cut = len(self.pending) - len(self.pending) % 3
@@ -267,18 +277,26 @@ class _WireEncoder:
             _storage_int_dtype(ranks) != _INT32
         ):
             return False
-        self.slots = width
+        # Convert everything first: a failure here leaves the streams intact.
         if self.topk_only:
-            self.token_ids.write(np.ascontiguousarray(token_ids[:, 1:], dtype=_INT32))
-            self.logprobs.write(np.ascontiguousarray(logprobs[:, 1:], dtype=_FLOAT32))
-            self.sampled_ids.write(np.ascontiguousarray(token_ids[:, 0], dtype=_INT32))
-            self.sampled_logprobs.write(
-                np.ascontiguousarray(logprobs[:, 0], dtype=_FLOAT32)
-            )
+            writes = [
+                (self.token_ids, np.ascontiguousarray(token_ids[:, 1:], dtype=_INT32)),
+                (self.logprobs, np.ascontiguousarray(logprobs[:, 1:], dtype=_FLOAT32)),
+                (self.sampled_ids, np.ascontiguousarray(token_ids[:, 0], dtype=_INT32)),
+                (
+                    self.sampled_logprobs,
+                    np.ascontiguousarray(logprobs[:, 0], dtype=_FLOAT32),
+                ),
+            ]
         else:
-            self.token_ids.write(np.ascontiguousarray(token_ids, dtype=_INT32))
-            self.logprobs.write(np.ascontiguousarray(logprobs, dtype=_FLOAT32))
-        self.ranks.write(np.ascontiguousarray(ranks, dtype=_INT32))
+            writes = [
+                (self.token_ids, np.ascontiguousarray(token_ids, dtype=_INT32)),
+                (self.logprobs, np.ascontiguousarray(logprobs, dtype=_FLOAT32)),
+            ]
+        writes.append((self.ranks, np.ascontiguousarray(ranks, dtype=_INT32)))
+        self.slots = width
+        for stream, data in writes:
+            stream.write(data)
         self.num_rows += len(ranks)
         return True
 
@@ -360,6 +378,8 @@ class ArrayLogprobs(MutableSequence[LogprobsOnePosition | None]):
     wire_topk_only: InitVar[bool] = False
     # Fast path for appends into the tail block (see _tail_can_hold).
     _tail_block: np.ndarray | None = field(default=None, init=False, repr=False)
+    # Set if the wire encoder failed: positions are counted but unusable.
+    broken: bool = field(default=False, init=False)
     _tail_dtypes: tuple[np.dtype, np.dtype, np.dtype] | None = field(
         default=None, init=False, repr=False
     )
@@ -409,7 +429,7 @@ class ArrayLogprobs(MutableSequence[LogprobsOnePosition | None]):
     @property
     def is_regular(self) -> bool:
         """Whether every position is stored as an array row."""
-        return self._legacy is None
+        return self._legacy is None and not self.broken
 
     @property
     def _array_positions(self) -> int:
@@ -442,10 +462,24 @@ class ArrayLogprobs(MutableSequence[LogprobsOnePosition | None]):
         if n == 0:
             return
         if self._wire is not None:
-            if self._wire.try_write(token_ids, logprobs, ranks):
+            try:
+                written = self._wire.try_write(token_ids, logprobs, ranks)
+            except Exception:
+                # Never let the frontend-only encoder break process_outputs:
+                # the streams may be partially written, so this request's
+                # logprobs become unusable (compact rendering fails it, 500).
+                logger.exception("Compact logprobs encoding failed")
+                self._wire = None
+                self.broken = True
+                self.num_positions += n
+                return
+            if written:
                 self.num_positions += n
                 return
             self._unwire()
+        if self.broken:
+            self.num_positions += n
+            return
         width = token_ids.shape[1]
         if self._legacy is not None or (
             self.token_id_chunks and width != self.token_id_chunks[0].shape[1]
@@ -454,11 +488,16 @@ class ArrayLogprobs(MutableSequence[LogprobsOnePosition | None]):
                 [self._row_dict(token_ids[i], logprobs[i], ranks[i]) for i in range(n)]
             )
             return
-        dtypes = (
-            _storage_int_dtype(token_ids),
-            _storage_float_dtype(logprobs),
-            _storage_int_dtype(ranks),
-        )
+        id_dtype = _storage_int_dtype(token_ids)
+        rank_dtype = _storage_int_dtype(ranks)
+        if id_dtype is None or rank_dtype is None:
+            # Beyond int64 (e.g. huge uint64): exact Python ints as legacy
+            # positions; compact then fails the request as non-representable.
+            self._append_legacy(
+                [self._row_dict(token_ids[i], logprobs[i], ranks[i]) for i in range(n)]
+            )
+            return
+        dtypes = (id_dtype, _storage_float_dtype(logprobs), rank_dtype)
         pos = 0
         while pos < n:
             if not self._tail_can_hold(dtypes):
@@ -550,6 +589,8 @@ class ArrayLogprobs(MutableSequence[LogprobsOnePosition | None]):
         arrays when there are no positions. Raises ValueError when the
         container is not :attr:`is_regular`.
         """
+        if self.broken:
+            raise ValueError("Logprob rows were lost by a failed encoding")
         self._unwire()
         if self._legacy is not None:
             raise ValueError("Logprob rows have inconsistent widths")

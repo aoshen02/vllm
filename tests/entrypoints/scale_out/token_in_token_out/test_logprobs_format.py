@@ -73,14 +73,20 @@ def _engine_rows(start: int, count: int, width: int, seed: int = 0):
     sampled token), odd positions do not.
     """
     rng = np.random.default_rng(seed + start)
-    top = np.stack(
-        [rng.choice(50_000, size=width - 1, replace=False) for _ in range(count)]
-    ).astype(np.int64)
-    sampled = np.where(
-        np.arange(start, start + count) % 2 == 0,
-        top[:, min(1, width - 2)],
-        50_000 + np.arange(start, start + count),
+    top = (
+        np.stack(
+            [rng.choice(50_000, size=width - 1, replace=False) for _ in range(count)]
+        )
+        .astype(np.int64)
+        .reshape(count, width - 1)
     )
+    positions = np.arange(start, start + count)
+    if width == 1:  # logprobs=0: sampled slot only
+        sampled = 50_000 + positions
+    else:
+        sampled = np.where(
+            positions % 2 == 0, top[:, min(1, width - 2)], 50_000 + positions
+        )
     token_ids = np.column_stack((sampled, top))
     logprobs = -rng.random((count, width), dtype=np.float32) * 20
     ranks = rng.integers(1, 1000, size=count).astype(np.int64)
@@ -2151,8 +2157,8 @@ def test_routed_experts_survive_abort(routed_base64, mixed_dtype):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("fmt", ["openai", "compact"])
 async def test_routed_experts_in_full_responses(fmt):
-    """R3 is present in default and compact responses; null without any
-    forward; the encoded flag is set for non-streaming requests only."""
+    """R3 is present in default and compact responses (legacy chunk path,
+    spliced as a JSON fragment); null without any forward."""
     from vllm.utils.serial_utils import numpy2base64
 
     chunks = [_engine_rows(0, 2, 4), _engine_rows(2, 1, 4)]
@@ -2162,7 +2168,8 @@ async def test_routed_experts_in_full_responses(fmt):
     response = await _serving(feeder).serve_tokens(
         _request(logprobs=3, logprobs_format=fmt)
     )
-    assert feeder.sampling_params.routed_experts_base64 is True
+    # R3 descoped: the incremental encoder is not enabled by serving.
+    assert feeder.sampling_params.routed_experts_base64 is False
     choice = json.loads(response.body)["choices"][0]
     assert choice["routed_experts"] == numpy2base64(np.concatenate(routed))
     feeder = _OutputProcessorEngine([])
@@ -2194,3 +2201,278 @@ def test_wire_layout_defaults():
     assert not ArrayLogprobs(wire_base64=True).is_wire_topk_only
     assert ArrayLogprobs(wire_base64=True, wire_topk_only=True).is_wire_topk_only
     assert not ArrayLogprobs().is_wire_topk_only
+
+
+# --------------------------------------------- round 4+5 audit regressions
+
+
+def _two_request_processor(params_a: SamplingParams, params_b: SamplingParams):
+    processor = OutputProcessor(tokenizer=None, log_stats=False)
+    queues = {}
+    for rid, params in (("a", params_a), ("b", params_b)):
+        params.output_kind = RequestOutputKind.FINAL_ONLY
+        request = EngineCoreRequest(
+            request_id=rid,
+            external_req_id=rid,
+            prompt_token_ids=[1, 2, 3],
+            mm_features=None,
+            arrival_time=0,
+            lora_request=None,
+            cache_salt=None,
+            data_parallel_rank=None,
+            sampling_params=params,
+            pooling_params=None,
+        )
+        queues[rid] = RequestOutputCollector(params.output_kind, rid)
+        processor.add_request(request, None, queue=queues[rid])
+    return processor, queues
+
+
+def _step(rid: str, token_ids, logprobs, ranks, routed=None):
+    return EngineCoreOutput(
+        request_id=rid,
+        new_token_ids=token_ids[:, 0].tolist(),
+        new_logprobs=LogprobsLists(token_ids, logprobs, ranks),
+        routed_experts=routed,
+    )
+
+
+def test_topk_only_with_zero_logprobs_does_not_crash_process_outputs():
+    """r45 BLOCKER: compact + include_sampled=false + logprobs=0 wrote a
+    (n, 0) array; memoryview.cast raised inside process_outputs, killing the
+    output handler for every request."""
+    compact = SamplingParams(
+        max_tokens=10,
+        logprobs=0,
+        array_logprobs=True,
+        array_logprobs_base64=True,
+        array_logprobs_wire_topk_only=True,
+    )
+    other = SamplingParams(max_tokens=10, logprobs=2, array_logprobs=True)
+    processor, queues = _two_request_processor(compact, other)
+    ids1, lps1, ranks1 = _engine_rows(0, 2, 1)
+    ids3, lps3, ranks3 = _engine_rows(0, 2, 3)
+    for i in range(2):
+        processor.process_outputs(
+            [
+                _step("a", ids1[i : i + 1], lps1[i : i + 1], ranks1[i : i + 1]),
+                _step("b", ids3[i : i + 1], lps3[i : i + 1], ranks3[i : i + 1]),
+            ]
+        )
+    processor.abort_requests(["a", "b"], internal=True)
+    out_a = queues["a"].get_nowait().outputs[0]
+    out_b = queues["b"].get_nowait().outputs[0]
+    block = json.loads(
+        render_compact_logprobs(out_a.logprobs, 0, include_sampled=False)
+    )
+    assert block["num_positions"] == 2 and block["num_slots"] == 0
+    assert block["token_ids"] == block["logprobs"] == ""
+    assert block["sampled_slot"] is False
+    plain = ArrayLogprobs()
+    plain.append_rows(ids1, lps1, ranks1)
+    assert render_compact_logprobs(
+        out_a.logprobs, 0, include_sampled=False
+    ) == render_compact_logprobs(plain, 0, include_sampled=False)
+    assert len(out_b.logprobs) == 2
+
+
+@pytest.mark.asyncio
+async def test_topk_only_zero_logprobs_full_request():
+    chunks = [_engine_rows(0, 2, 1), _engine_rows(2, 1, 1)]
+    feeder = _OutputProcessorEngine(chunks)
+    response = await _serving(feeder).serve_tokens(
+        _request(logprobs=0, logprobs_format="compact", compact_include_sampled=False)
+    )
+    block = json.loads(response.body)["choices"][0]["compact_logprobs"]
+    assert block["num_positions"] == 3 and block["num_slots"] == 0
+
+
+def test_encoder_failures_fail_only_their_request(monkeypatch):
+    """Frontend-only encoders never raise out of process_outputs: a failing
+    wire encode fails that request's compact render (500); a failing R3
+    encode finishes that request with an error; others are unaffected."""
+    from vllm import logprobs as logprobs_mod
+    from vllm.v1.engine import routed_experts as routed_mod
+
+    compact = SamplingParams(
+        max_tokens=10,
+        logprobs=2,
+        array_logprobs=True,
+        array_logprobs_base64=True,
+        routed_experts_base64=True,
+    )
+    other = SamplingParams(max_tokens=10, logprobs=2, array_logprobs=True)
+    processor, queues = _two_request_processor(compact, other)
+    ids, lps, ranks = _engine_rows(0, 3, 3)
+    routed = _r3_chunks(4, 8, np.uint8, [3, 1, 1])
+    processor.process_outputs([_step("a", ids[:1], lps[:1], ranks[:1], routed[0])])
+
+    def boom(self, data):
+        raise RuntimeError("encoder failure")
+
+    monkeypatch.setattr(logprobs_mod._Base64Stream, "write", boom)
+    monkeypatch.setattr(routed_mod._Base64Stream, "write", boom)
+    processor.process_outputs(
+        [
+            _step("a", ids[1:2], lps[1:2], ranks[1:2], routed[1]),
+            _step("b", ids[1:2], lps[1:2], ranks[1:2], routed[1]),
+        ]
+    )
+    monkeypatch.undo()
+    processor.abort_requests(["a", "b"], internal=True)
+    out_a = queues["a"].get_nowait().outputs[0]
+    out_b = queues["b"].get_nowait().outputs[0]
+    assert out_a.finish_reason == "error"
+    assert out_a.logprobs.broken
+    with pytest.raises(GenerationError, match="encoding failed"):
+        render_compact_logprobs(out_a.logprobs, 2)
+    assert out_b.finish_reason == "abort"
+    assert len(out_b.logprobs) == 1
+
+
+def test_completion_output_positional_fields_unchanged():
+    """Codex r45 #2: new fields are appended, so positional construction
+    matches the base signature."""
+    import dataclasses
+
+    from vllm.outputs import CompletionOutput
+
+    base = [
+        "index",
+        "text",
+        "token_ids",
+        "cumulative_logprob",
+        "logprobs",
+        "routed_experts",
+        "finish_reason",
+        "stop_reason",
+        "lora_request",
+        "sampling_mask",
+        "spec_decode_metrics",
+    ]
+    names = [f.name for f in dataclasses.fields(CompletionOutput)]
+    assert names[: len(base)] == base
+    output = CompletionOutput(0, "", [1], None, None, None, "stop")
+    assert output.finish_reason == "stop" and output.finished()
+    assert output.routed_experts_b64 is None
+
+
+def test_lead_table_reader_sees_consistent_snapshot():
+    """Claude r45 #2: a growth between the warm reader's loads must not pair
+    old values with new flags (None leads)."""
+
+    class Interleaved(logprobs_render._LeadTable):
+        armed = False
+
+        @property
+        def _table(self):
+            table = self.__dict__["_table"]
+            if self.armed:
+                self.armed = False
+                # Another thread grows the table and fills id 5 right after
+                # this reader loaded the (old) snapshot.
+                logprobs_render._LeadTable.lookup(self, np.array([5, 40]))
+            return table
+
+        @_table.setter
+        def _table(self, value):
+            self.__dict__["_table"] = value
+
+    table = Interleaved(b"")
+    table.lookup(np.array([1, 2, 7]))
+    table.armed = True
+    result = table.lookup(np.array([5, 1]))
+    assert result.tolist() == [
+        b'{"token":"token_id:5","logprob":',
+        b'{"token":"token_id:1","logprob":',
+    ]
+
+
+def test_uint64_beyond_int64_is_never_wrapped():
+    """Codex r45 #3: uint64 ids/ranks beyond int64 are kept exactly (legacy
+    positions) and compact rejects them, in array and wire mode."""
+    token_ids, logprobs, ranks = _engine_rows(0, 2, 3)
+    big = token_ids.astype(np.uint64)
+    big[1, 2] = np.uint64(2**64 - 1)
+    for wire in (False, True):
+        container = ArrayLogprobs(wire_base64=wire)
+        container.append_rows(big[:1], logprobs[:1], ranks[:1])
+        container.append_rows(big[1:], logprobs[1:], ranks[1:])
+        assert container[1][2**64 - 1].logprob == float(logprobs[1, 2])
+        with pytest.raises(GenerationError):
+            render_compact_logprobs(container, 2)
+    ranks_big = ranks.astype(np.uint64)
+    ranks_big[1] = np.uint64(2**63)  # row 1: sampled id not in its top-k
+    container = ArrayLogprobs()
+    container.append_rows(token_ids, logprobs, ranks_big)
+    assert container[1][int(token_ids[1, 0])].rank == 2**63
+
+
+@pytest.mark.parametrize("case", ["big_endian", "fortran", "big_endian_first"])
+def test_routed_experts_encoder_refuses_non_native_or_fortran(case):
+    """Claude/Codex r45: such chunks fall back so the bytes equal
+    numpy2base64(np.concatenate(chunks))."""
+    from vllm.utils.serial_utils import numpy2base64
+
+    processor, queue = _r3_request_state(True)
+    chunks = _r3_chunks(3, 4, np.uint16, [3, 2, 2])
+    if case == "big_endian":
+        chunks[1] = chunks[1].astype(">u2")
+    elif case == "fortran":
+        chunks[1] = np.asfortranarray(chunks[1])
+    else:
+        chunks = [c.astype(">u2") for c in chunks]
+    token_ids, logprobs, ranks = _engine_rows(0, 3, 3)
+    for i, chunk in enumerate(chunks):
+        processor.process_outputs(
+            [
+                _step(
+                    "r",
+                    token_ids[i : i + 1],
+                    logprobs[i : i + 1],
+                    ranks[i : i + 1],
+                    chunk,
+                )
+            ]
+        )
+    processor.abort_requests(["r"], internal=True)
+    output = queue.get_nowait().outputs[0]
+    expected = numpy2base64(np.concatenate(chunks, axis=0))
+    got = (
+        b"".join(output.routed_experts_b64).decode()
+        if output.routed_experts_b64 is not None
+        else numpy2base64(output.routed_experts)
+    )
+    assert got == expected
+
+
+def test_user_middleware_gets_single_message_bodies():
+    """Codex r45 #5: with user --middleware (e.g. gzip), the body is one
+    message like JSONResponse, so GZipMiddleware keeps Content-Length."""
+    big = [b'{"a":"' + b"x" * (3 << 20), b'"}']
+    client = _gzip_client(big)
+    client.app.state.args.middleware = ["some.module.GZip"]
+    with client:
+        result = client.post(
+            "/inference/v1/generate",
+            json={"token_ids": [1], "sampling_params": {}},
+            headers={"accept-encoding": "gzip"},
+        )
+    assert result.content == b"".join(big)
+    assert result.headers["content-encoding"] == "gzip"
+    assert "content-length" in result.headers
+
+
+@pytest.mark.asyncio
+async def test_single_use_guard_before_response_start():
+    response = api_router._RenderedJSONResponse(RenderedGenerateResponse([b"{}"]))
+    messages: list[dict] = []
+
+    async def send(message):
+        messages.append(message)
+
+    await response({"type": "http"}, None, send)
+    messages.clear()
+    with pytest.raises(RuntimeError, match="only be sent once"):
+        await response({"type": "http"}, None, send)
+    assert messages == []

@@ -11,6 +11,7 @@ from typing import Any, cast
 import numpy as np
 import torch
 
+from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.outputs import (
     STREAM_FINISHED,
@@ -42,6 +43,8 @@ from vllm.v1.metrics.stats import (
     SchedulerStats,
 )
 from vllm.v1.outputs import SamplingMaskLists
+
+logger = init_logger(__name__)
 
 # shared empty CPU tensor used as a placeholder pooling output
 EMPTY_CPU_TENSOR = torch.empty(0, device="cpu")
@@ -132,8 +135,9 @@ class StreamingUpdate:
 
 
 class RequestState:
-    # Class-level default: also covers states built without __init__.
+    # Class-level defaults: also cover states built without __init__.
     routed_experts_encoder: RoutedExpertsNpyBase64 | None = None
+    routed_experts_failed: bool = False
 
     def __init__(
         self,
@@ -303,14 +307,22 @@ class RequestState:
     def add_routed_experts(self, chunk: np.ndarray) -> None:
         encoder = self.routed_experts_encoder
         if encoder is not None:
-            if encoder.try_append(chunk):
-                return
-            # Not encodable incrementally (dtype or row shape changed):
-            # continue with plain chunks, as without the encoder.
-            if encoder.has_data:
-                self.routed_experts_chunks.append(encoder.array())
+            try:
+                if encoder.try_append(chunk):
+                    return
+                # Not encodable incrementally: continue with plain chunks,
+                # as without the encoder.
+                if encoder.has_data:
+                    self.routed_experts_chunks.append(encoder.array())
+            except Exception:
+                # Never let the frontend-only encoder break process_outputs;
+                # this request's routed experts are lost, so it fails (500).
+                logger.exception("Routed experts encoding failed")
+                self.routed_experts_failed = True
+                self.routed_experts_chunks = []
             self.routed_experts_encoder = None
-        self.routed_experts_chunks.append(chunk)
+        if not self.routed_experts_failed:
+            self.routed_experts_chunks.append(chunk)
 
     def make_request_output(
         self,
@@ -321,6 +333,8 @@ class RequestState:
         kv_transfer_params: dict[str, Any] | None = None,
         ec_transfer_params: dict[str, Any] | None = None,
     ) -> RequestOutput | PoolingRequestOutput | None:
+        if finish_reason is not None and self.routed_experts_failed:
+            finish_reason = FinishReason.ERROR  # fail only this request
         finished = finish_reason is not None
         final_only = self.output_kind == RequestOutputKind.FINAL_ONLY
 

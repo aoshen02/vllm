@@ -57,8 +57,15 @@ class RoutedExpertsNpyBase64:
         return self.dtype is not None
 
     def try_append(self, chunk: np.ndarray) -> bool:
-        """Encode ``chunk``; False if its dtype or row shape differs from the
-        first chunk (concatenation would then convert, so it is refused)."""
+        """Encode ``chunk``; False if it cannot be encoded byte-identically:
+        dtype or row shape differs from the first chunk, non-native byte
+        order (concatenation normalizes it), or not C-contiguous (the
+        concatenation could be Fortran-ordered). The caller then keeps
+        plain chunks, as without the encoder."""
+        if chunk.dtype.byteorder not in ("=", "|") or (
+            chunk.ndim > 1 and not chunk.flags.c_contiguous
+        ):
+            return False
         if self.dtype is None:
             self.dtype = chunk.dtype
             self.row_shape = tuple(chunk.shape[1:])

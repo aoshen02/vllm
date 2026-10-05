@@ -68,10 +68,12 @@ def _check_compact_rows(
     inconsistent widths, or a width other than ``k + 1`` for ``k >= 0``
     (e.g. narrower rows when a co-batched request's ``logprob_token_ids``
     replaced the batch's logprob tensors)."""
+    if container.broken:
+        raise GenerationError("Compact logprobs encoding failed for this request")
     if not container.is_regular:
         raise GenerationError(
-            "Engine logprob rows have inconsistent widths; the compact "
-            "logprobs format cannot represent them"
+            "Engine logprob rows have inconsistent widths or values beyond "
+            "int64; the compact logprobs format cannot represent them"
         )
     if (
         expected_source_positions is not None
@@ -237,10 +239,22 @@ class _LeadTable:
 
     def __init__(self, sep: bytes):
         self.sep = sep
-        self.values = np.empty(0, dtype=object)
-        self.filled = np.zeros(0, dtype=bool)
+        # (values, filled), replaced as one tuple so a lock-free reader always
+        # sees a consistent pair.
+        self._table: tuple[np.ndarray, np.ndarray] = (
+            np.empty(0, dtype=object),
+            np.zeros(0, dtype=bool),
+        )
         # Renders may run on the event loop and in the worker thread.
         self.lock = threading.Lock()
+
+    @property
+    def values(self) -> np.ndarray:
+        return self._table[0]
+
+    @property
+    def filled(self) -> np.ndarray:
+        return self._table[1]
 
     def _format(self, token_id: int) -> bytes:
         return self.sep + f'{{"token":"token_id:{token_id}","logprob":'.encode()
@@ -260,7 +274,7 @@ class _LeadTable:
             column[:] = outside
             result[~inside] = column
             return result
-        values, filled = self.values, self.filled
+        values, filled = self._table
         if hi < len(values):
             missing = np.unique(ids[~filled[ids]])
             if not missing.size:
@@ -272,17 +286,19 @@ class _LeadTable:
         # formatting; the lock only covers growth and a few stores.
         formatted = [(i, self._format(i)) for i in missing.tolist()]
         with self.lock:
-            if hi >= len(self.values):
-                size = min(self.max_ids, max(hi + 1, 2 * len(self.values)))
+            values, filled = self._table
+            if hi >= len(values):
+                size = min(self.max_ids, max(hi + 1, 2 * len(values)))
                 grown = np.empty(size, dtype=object)
-                grown[: len(self.values)] = self.values
+                grown[: len(values)] = values
                 grown_filled = np.zeros(size, dtype=bool)
-                grown_filled[: len(self.filled)] = self.filled
-                self.values, self.filled = grown, grown_filled
-            values, filled = self.values, self.filled
+                grown_filled[: len(filled)] = filled
+                values, filled = grown, grown_filled
+            # Values before flags: a reader that sees a flag sees its value.
             for token_id, lead in formatted:
                 values[token_id] = lead
             filled[missing] = True
+            self._table = (values, filled)
             return values[ids]
 
 
@@ -397,6 +413,8 @@ def render_openai_logprobs_parts(
     clamp), like ``json.dumps(..., allow_nan=False)`` does on the legacy path.
     """
     if not container.is_regular:
+        if container.broken:
+            raise GenerationError("Logprobs encoding failed for this request")
         return None
     token_ids, logprobs, _ = container.arrays()
     n = len(sampled_token_ids)
