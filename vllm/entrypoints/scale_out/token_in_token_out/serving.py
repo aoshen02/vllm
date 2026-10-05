@@ -60,8 +60,11 @@ logger = init_logger(__name__)
 
 @dataclass
 class GenerateStart:
-    """A generate request scheduled on the engine (see
-    :meth:`ServingTokens.start_generate`)."""
+    """A prepared generate request (see :meth:`ServingTokens.start_generate`).
+
+    ``result_generator`` is the engine's lazy output stream: the request is
+    submitted to the engine when it is first iterated. The caller must consume
+    it to the end or close it (``aclose()``), as ``serve_tokens`` does."""
 
     request_id: str
     model_name: str
@@ -141,10 +144,11 @@ class ServingTokens(GenerateBaseServing):
         request: GenerateRequest,
         raw_request: Request | None = None,
     ) -> GenerateStart | ErrorResponse:
-        """Validate and preprocess ``request`` and schedule it on the engine,
+        """Validate and preprocess ``request`` and prepare the engine call,
         like :meth:`serve_tokens`, without building the response: for
-        components (e.g. endpoint plugins) that render their own response
-        from the ``RequestOutput`` stream."""
+        components (e.g. endpoint plugins) that render their own response from
+        the ``RequestOutput`` stream. Nothing is submitted to the engine until
+        ``GenerateStart.result_generator`` is iterated."""
         error_check_ret = await self._check_model(request)
         if error_check_ret is not None:
             logger.error("Error with model %s", error_check_ret)

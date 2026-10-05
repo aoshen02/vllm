@@ -8,7 +8,8 @@ from fastapi import APIRouter, Depends, FastAPI, Request
 from fastapi.testclient import TestClient
 from starlette.routing import Host, Router
 
-from vllm.plugins.endpoint_plugins.interface import replace_route
+from vllm.plugins.endpoint_plugins import routing
+from vllm.plugins.endpoint_plugins.routing import replace_route
 
 PATH = "/inference/v1/generate"
 
@@ -110,6 +111,68 @@ def test_no_route_or_another_method_is_a_conflict():
     _unchanged(
         app, lambda: replace_route(app, PATH, _plugin([]), methods=["POST", "GET"])
     )
+
+
+def test_partial_method_sets_are_a_conflict():
+    """Stack audit: replacing POST of a POST + PUT route would drop PUT."""
+    app = FastAPI()
+    app.add_api_route(PATH, core, methods=["POST", "PUT"])
+    assert "would drop" in _unchanged(app, lambda: _replace(app))
+    assert TestClient(app).put(PATH).json()["served_by"] == "core"
+    assert replace_route(app, PATH, _plugin([]), methods=["post", "put"]) is core
+
+
+@pytest.mark.parametrize("methods", ["POST", [], ()])
+def test_invalid_methods_are_rejected(methods):
+    app = _app()
+    routes = list(app.router.routes)
+    with pytest.raises(ValueError):
+        replace_route(app, PATH, _plugin([]), methods=methods)
+    assert all(a is b for a, b in zip(app.router.routes, routes, strict=True))
+
+
+def test_router_prefix_is_applied_once():
+    """Stack audit: a prefixed router must not end up at /api/api/..."""
+    app = FastAPI()
+    app.router.prefix = "/api"
+    app.router.add_api_route("/x", core, methods=["POST"])
+    assert replace_route(app, "/api/x", _plugin([])) is core
+    paths = [getattr(r, "path", None) for r in app.router.routes]
+    assert "/api/x" in paths and "/api/api/x" not in paths
+
+
+def test_failure_after_the_route_was_added_restores_the_routes(monkeypatch):
+    """Kimi stack audit: the post-add section is atomic."""
+    app = _app()
+    routes = list(app.router.routes)
+
+    class Failing(list):
+        def append(self, item):
+            raise OSError("late failure")
+
+    monkeypatch.setattr(routing, "_REPLACEMENTS", Failing())
+    with pytest.raises(OSError):
+        _replace(app)
+    assert all(a is b for a, b in zip(app.router.routes, routes, strict=True))
+
+
+def test_replaced_route_settings_are_inherited():
+    """Stack audit: the replaced route's (and its router's) dependencies,
+    response class, tags and schema visibility carry over unless given."""
+    calls = []
+
+    def router_dep():
+        calls.append("router")
+
+    router = APIRouter(dependencies=[Depends(router_dep)], tags=["core"])
+    router.add_api_route(PATH, core, methods=["POST"], include_in_schema=False)
+    app = FastAPI()
+    app.include_router(router)
+    _replace(app)
+    new = next(r for r in app.router.routes if getattr(r, "path", None) == PATH)
+    assert new.tags == ["core"] and new.include_in_schema is False
+    TestClient(app).post(PATH)
+    assert calls == ["router"]
 
 
 def test_different_routes_per_method_are_a_conflict():

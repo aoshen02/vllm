@@ -138,7 +138,9 @@ def _log_streaming_response(response, response_body: list) -> None:
 def _log_non_streaming_response(response_body: list) -> None:
     """Log non-streaming response."""
     try:
-        decoded_body = response_body[0].decode()
+        # A non-streaming body can arrive in several messages (e.g. a
+        # pre-rendered response sent in parts).
+        decoded_body = b"".join(response_body).decode()
         logger.info("response_body={%s}", decoded_body)
     except UnicodeDecodeError:
         logger.info("response_body={<binary_data>}")

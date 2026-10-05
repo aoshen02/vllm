@@ -161,7 +161,12 @@ def load_endpoint_plugins(
         allowed = envs.VLLM_PLUGINS or []
         excluded = [
             f"{group}:{ep.name}"
-            for group in (DEFAULT_PLUGINS_GROUP, PLATFORM_PLUGINS_GROUP)
+            for group in (
+                DEFAULT_PLUGINS_GROUP,
+                IO_PROCESSOR_PLUGINS_GROUP,
+                PLATFORM_PLUGINS_GROUP,
+                STAT_LOGGER_PLUGINS_GROUP,
+            )
             for ep in entry_points(group=group)
             if ep.name not in allowed
         ]
