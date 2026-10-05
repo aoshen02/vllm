@@ -521,6 +521,20 @@ class ArrayLogprobs(MutableSequence[LogprobsOnePosition | None]):
     ) -> None:
         if self.broken:
             return
+        # Validate before either storage path writes: numpy would broadcast
+        # fewer token-id/logprob rows than ranks (default render repeating
+        # rows; compact advertising more entries than it carries).
+        id_shape, lp_shape = np.shape(token_ids), np.shape(logprobs)
+        if (
+            len(id_shape) != 2
+            or lp_shape != id_shape
+            or id_shape[0] != n
+            or np.shape(ranks) != (n,)
+        ):
+            raise ValueError(
+                "Inconsistent logprob rows: token_ids "
+                f"{id_shape}, logprobs {lp_shape}, ranks {np.shape(ranks)}"
+            )
         if self._wire is not None:
             if self._wire.try_write(token_ids, logprobs, ranks):
                 self.num_positions += n

@@ -2194,6 +2194,66 @@ def _step(rid: str, token_ids, logprobs, ranks, routed=None):
     )
 
 
+@pytest.mark.parametrize("wire", [False, True])
+def test_row_count_mismatch_fails_only_its_request(wire):
+    """Codex r12 MINOR: fewer token-id rows than ranks (here 1 vs 2, with two
+    logprob rows) were broadcast by numpy: the default render repeated rows
+    and compact advertised more entries than it carried. Now the container
+    is broken (request-local 500); the co-batched request is unaffected."""
+    params = SamplingParams(
+        max_tokens=10, logprobs=2, array_logprobs=True, array_logprobs_base64=wire
+    )
+    other = SamplingParams(max_tokens=10, logprobs=2, array_logprobs=True)
+    processor, queues = _two_request_processor(params, other)
+    ids, lps, ranks = _engine_rows(0, 2, 3)
+    bad = EngineCoreOutput(
+        request_id="a",
+        new_token_ids=[5, 5],
+        new_logprobs=LogprobsLists(
+            np.array([[5, 6, 7]], dtype=np.int64),
+            np.array([[-0.5, -1.0, -2.0], [-0.25, -1.5, -3.0]], dtype=np.float32),
+            np.array([1, 2], dtype=np.int64),
+        ),
+    )
+    processor.process_outputs([bad, _step("b", ids, lps, ranks)])
+    processor.abort_requests(["a", "b"], internal=True)
+    out_a = queues["a"].get_nowait().outputs[0]
+    out_b = queues["b"].get_nowait().outputs[0]
+    assert out_a.token_ids == [5, 5]
+    assert out_a.logprobs.broken and len(out_a.logprobs) == 2
+    with pytest.raises(GenerationError, match="encoding failed"):
+        render_compact_logprobs(out_a.logprobs, 2)
+    with pytest.raises(GenerationError, match="encoding failed"):
+        render_openai_logprobs_parts(out_a.token_ids, out_a.logprobs, 2)
+    assert not out_b.logprobs.broken and len(out_b.logprobs) == 2
+    np.testing.assert_array_equal(out_b.logprobs.arrays()[0], ids)
+
+
+@pytest.mark.parametrize("wire", [False, True])
+@pytest.mark.parametrize(
+    "shapes",
+    [
+        ((1, 3), (2, 3), (2,)),  # fewer id rows
+        ((2, 3), (1, 3), (2,)),  # fewer logprob rows
+        ((2, 3), (2, 2), (2,)),  # width mismatch
+        ((2, 3), (2, 3), (2, 1)),  # 2-D ranks
+        ((3,), (3,), (1,)),  # 1-D rows
+    ],
+)
+def test_append_rows_rejects_inconsistent_shapes(wire, shapes):
+    id_shape, lp_shape, rank_shape = shapes
+    container = ArrayLogprobs(wire_base64=wire)
+    ok_ids, ok_lps, ok_ranks = _engine_rows(0, 1, 3)
+    container.append_rows(ok_ids, ok_lps, ok_ranks)
+    container.append_rows(
+        np.ones(id_shape, dtype=np.int64),
+        -np.ones(lp_shape, dtype=np.float32),
+        np.ones(rank_shape, dtype=np.int64),
+    )
+    assert container.broken
+    assert len(container) == 1 + rank_shape[0]
+
+
 def test_topk_only_with_zero_logprobs_does_not_crash_process_outputs():
     """r45 BLOCKER: compact + include_sampled=false + logprobs=0 wrote a
     (n, 0) array; memoryview.cast raised inside process_outputs, killing the
@@ -2844,9 +2904,12 @@ def test_lead_table_first_fill_triggers_no_gc():
     table = logprobs_render._LeadTable(b"")
     ids = np.arange(100_000, dtype=np.int64).reshape(1000, 100)
     collections: list[int] = []
+    caller = threading.get_ident()
 
     def callback(phase, info):
-        if phase == "start":
+        # Only collections run by this thread (others, e.g. a still-running
+        # response builder of an earlier test, do not count).
+        if phase == "start" and threading.get_ident() == caller:
             collections.append(info["generation"])
 
     old_threshold = gc.get_threshold()
