@@ -1112,10 +1112,11 @@ def test_scheduler_request_finished():
     assert "id-1" in scheduler_connector._reqs_not_processed
 
 
+@pytest.mark.parametrize("dropped_by", ["request-finished", "abort-transfers"])
 @pytest.mark.parametrize("load_done", [False, True])
-def test_consumer_releases_transfer_finished_mid_load(load_done: bool):
-    """D asks P to drop the transfer of a request that finishes while its KV
-    is still arriving, and only then."""
+def test_consumer_releases_transfer_finished_mid_load(load_done: bool, dropped_by: str):
+    """D asks P to drop the transfer of a request whose KV is still arriving,
+    once the request finishes or its transfers are aborted, and only then."""
     vllm_config = create_vllm_config(
         kv_connector="MooncakeConnector", kv_role="kv_consumer"
     )
@@ -1135,8 +1136,11 @@ def test_consumer_releases_transfer_finished_mid_load(load_done: bool):
             KVConnectorOutput(finished_recving={request.request_id})
         )
 
-    request.status = RequestStatus.FINISHED_ABORTED
-    assert connector.request_finished(request, [5, 6]) == (False, None)
+    if dropped_by == "abort-transfers":
+        connector.abort_transfers()
+    else:
+        request.status = RequestStatus.FINISHED_ABORTED
+        assert connector.request_finished(request, [5, 6]) == (False, None)
     pulls = connector.build_connector_meta(SchedulerOutput.make_empty()).reqs_to_recv
     release = pulls.get("p", {}).get(request.request_id)
     assert (release is not None) == (not load_done)
@@ -1741,6 +1745,8 @@ async def test_kv_consumuer(monkeypatch):
         (["release", "claim", "ready", "pull"], False, True),
         (["claim", "release", "expire", "ready"], None, True),
         (["claim", "ready", "failing-pull"], None, True),
+        (["claim", "ready", "abort-all"], None, True),
+        (["claim", "pull", "abort-all"], None, False),
         (["claim", "ready", "busy", "pull", "abort", "free"], False, True),
         (["claim", "ready", "busy", "abort", "pull"], False, True),
         (["claim", "abort", "neighbor", "busy", "pull"], False, False),
@@ -1769,6 +1775,8 @@ async def test_kv_consumuer(monkeypatch):
         "release-before-claim",
         "release-outlives-expiry-while-claimed",
         "failed-send-frees-kv",
+        "abort-all-frees-ready-kv",
+        "abort-all-spares-unfinished",
         "pull-waiting-for-a-sender-stays-abortable",
         "aborted-pull-answered-while-senders-are-busy",
         "aborted-pull-answered-before-its-batch-writes",
@@ -1819,12 +1827,13 @@ async def test_send_state_answers_every_pull_once(monkeypatch, events, pull_ok, 
         now = [time.perf_counter()]
         monkeypatch.setattr(mooncake_connector.time, "perf_counter", lambda: now[0])
 
-        def scheduler_meta(blocks=None, aborted=False):
+        def scheduler_meta(blocks=None, aborted=False, abort_all=False):
             meta = MooncakeConnectorMetadata()
             if blocks is not None:
                 meta.reqs_to_send["p-req"] = ("tx", blocks)
             if aborted:
                 meta.reqs_not_processed = {"tx"}
+            meta.abort_pending_sends = abort_all
             return meta
 
         with patch.object(worker, "_send_blocks", return_value=0) as send_blocks:
@@ -1859,6 +1868,8 @@ async def test_send_state_answers_every_pull_once(monkeypatch, events, pull_ok, 
                     await asyncio.wait([pull], timeout=3)
                 elif event == "free":
                     worker._send_slots.release()
+                elif event == "abort-all":
+                    await worker.record_send_reqs(scheduler_meta(abort_all=True))
                 elif event in ("pull", "failing-pull"):
                     if event == "failing-pull":
                         send_blocks.side_effect = RuntimeError("transfer engine died")
