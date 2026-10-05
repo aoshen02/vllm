@@ -3,12 +3,13 @@
 import asyncio
 import itertools
 import logging
+import os
 import queue
 import threading
 import time
 from collections import defaultdict
 from collections.abc import Collection, Coroutine
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from enum import Enum, IntEnum, auto
 from typing import TYPE_CHECKING, Any, Final
@@ -771,11 +772,19 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
 
     def get_num_new_matched_tokens(
         self, request: "Request", num_computed_tokens: int
-    ) -> tuple[int, bool]:
+    ) -> tuple[int | None, bool]:
         assert self.connector_scheduler is not None
         return self.connector_scheduler.get_num_new_matched_tokens(
             request, num_computed_tokens
         )
+
+    def reset_cache(self) -> None:
+        assert self.connector_scheduler is not None
+        self.connector_scheduler.reset_cache()
+
+    def shutdown(self):
+        if self.connector_scheduler is not None:
+            self.connector_scheduler.shutdown()
 
     def update_state_after_alloc(
         self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int
@@ -902,6 +911,35 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
         return MooncakeKVConnectorStats(data=data or {})
 
 
+def _prefill_on_producer(
+    url: str, dp_rank: int | None, transfer_id: TransferId, token_ids: list[int]
+) -> None:
+    """Ask P, over its HTTP API, to prefill token_ids and hold the KV for D
+    under transfer_id, as the PD proxy does for a new request."""
+    headers = {"X-Request-Id": transfer_id}
+    if dp_rank is not None:
+        headers["X-data-parallel-rank"] = str(dp_rank)
+    if api_key := os.environ.get("OPENAI_API_KEY"):
+        headers["Authorization"] = f"Bearer {api_key}"
+    body = {
+        "prompt": token_ids,
+        "max_tokens": 1,
+        # P holds the KV only for a request capped by length.
+        "ignore_eos": True,
+        "kv_transfer_params": {
+            "do_remote_decode": True,
+            "do_remote_prefill": False,
+            "transfer_id": transfer_id,
+        },
+    }
+    httpx.post(
+        f"{url}/v1/completions",
+        json=body,
+        headers=headers,
+        timeout=envs.VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT,
+    ).raise_for_status()
+
+
 class MooncakeConnectorScheduler:
     """Implementation of Scheduler side methods."""
 
@@ -947,6 +985,19 @@ class MooncakeConnectorScheduler:
         self._reqs_loading: dict[ReqId, Request] = {}
         # P: drop the KV held for D at the next step.
         self._abort_pending_sends = False
+        # D, opt-in: after a cache reset, P recomputes the KV that requests
+        # had loaded from it, rather than D prefilling it again.
+        extra_config = vllm_config.kv_transfer_config.kv_connector_extra_config
+        self._rebootstrap = bool(extra_config.get("rebootstrap", False))
+        self._remote_reqs: dict[ReqId, Request] = {}
+        self._reqs_to_rebootstrap: set[ReqId] = set()
+        self._prefills: dict[ReqId, tuple[TransferId, int, Future[None]]] = {}
+        self._prefill_ids = itertools.count()
+        self._prefill_executor = (
+            ThreadPoolExecutor(32, thread_name_prefix="vllm-mooncake-rebootstrap")
+            if self._rebootstrap
+            else None
+        )
 
         # Compute sliding window block counts per KV cache group.
         sw_sizes_tokens: list[tuple[int, int]] = [
@@ -1019,7 +1070,7 @@ class MooncakeConnectorScheduler:
 
     def get_num_new_matched_tokens(
         self, request: "Request", num_computed_tokens: int
-    ) -> tuple[int, bool]:
+    ) -> tuple[int | None, bool]:
         """For remote prefill, pull all prompt blocks from remote
         asynchronously relative to engine execution.
 
@@ -1046,17 +1097,95 @@ class MooncakeConnectorScheduler:
             return 0, False
 
         if params.get("do_remote_prefill"):
-            # Remote prefill: get all prompt blocks from remote.
+            # Remote prefill: get all blocks P computed (the prompt, unless
+            # P recomputed more for a rebootstrap).
             assert not self.is_kv_producer
-            token_ids = request.prompt_token_ids or []
-            count = self._get_remote_prefill_token_count(len(token_ids)) - (
+            num_tokens = params.get(
+                "remote_num_tokens", len(request.prompt_token_ids or [])
+            )
+            count = self._get_remote_prefill_token_count(num_tokens) - (
                 num_computed_tokens
             )
             if count > 0:
                 return count, True
 
+        if request.request_id in self._reqs_to_rebootstrap:
+            return self._rebootstrap_request(request, num_computed_tokens)
+
         # No remote prefill for this request.
         return 0, False
+
+    def shutdown(self) -> None:
+        # Queued recomputes are dropped; one already asking P can delay exit
+        # until its HTTP timeout.
+        if self._prefill_executor is not None:
+            self._prefill_executor.shutdown(wait=False, cancel_futures=True)
+
+    def reset_cache(self) -> None:
+        # The reset drops the KV these requests loaded from P, and P drops what
+        # it recomputed for them so far.
+        for req_id in list(self._prefills):
+            self._drop_prefill(self._remote_reqs[req_id])
+        self._reqs_to_rebootstrap.update(self._remote_reqs)
+
+    def _drop_prefill(self, request: "Request") -> None:
+        """Forget P's recompute of a request; once it may have reached P, have
+        P release its KV."""
+        transfer_id, _, future = self._prefills.pop(request.request_id)
+        if not future.cancel():
+            assert request.kv_transfer_params is not None
+            request.kv_transfer_params.update(
+                transfer_id=transfer_id, do_remote_prefill=False
+            )
+            self._reqs_need_recv[request.request_id] = (request, [])
+
+    def _rebootstrap_request(
+        self, request: "Request", num_computed_tokens: int
+    ) -> tuple[int | None, bool]:
+        """Have P recompute the KV of a request whose KV a cache reset dropped,
+        then load it; the request recomputes locally if P cannot."""
+        params = request.kv_transfer_params
+        assert params is not None
+        req_id = request.request_id
+        if req_id not in self._prefills:
+            if (
+                request.mm_features
+                or request.lora_request
+                or request.prompt_embeds is not None
+                or not params.get("remote_url")
+            ):
+                # P cannot be handed these inputs as token ids.
+                self._reqs_to_rebootstrap.discard(req_id)
+                return 0, False
+            transfer_id = f"{params['transfer_id']}-r{next(self._prefill_ids)}"
+            token_ids = list(request.all_token_ids)
+            assert self._prefill_executor is not None
+            future = self._prefill_executor.submit(
+                _prefill_on_producer,
+                params["remote_url"],
+                params.get("remote_dp_rank"),
+                transfer_id,
+                token_ids,
+            )
+            self._prefills[req_id] = (transfer_id, len(token_ids), future)
+            return None, False
+        transfer_id, num_tokens, future = self._prefills[req_id]
+        if not future.done():
+            return None, False
+        self._reqs_to_rebootstrap.discard(req_id)
+        if (error := future.exception()) is not None:
+            del self._prefills[req_id]
+            logger.warning("P could not recompute %s, recomputing: %s", req_id, error)
+            return 0, False
+        # P holds the KV now: load it like any remote prefill, which also
+        # releases it on a full local hit. Until the load starts, a reset or a
+        # finish still releases it.
+        params.update(
+            transfer_id=transfer_id,
+            do_remote_prefill=True,
+            remote_num_tokens=num_tokens,
+        )
+        return self.get_num_new_matched_tokens(request, num_computed_tokens)
 
     def update_state_after_alloc(
         self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int
@@ -1090,6 +1219,9 @@ class MooncakeConnectorScheduler:
                 local_block_ids = self.get_sw_clipped_blocks(unhashed_block_ids)
                 # Get unhashed blocks to pull from remote.
                 self._reqs_need_recv[request.request_id] = (request, local_block_ids)
+                if self._rebootstrap:
+                    self._remote_reqs[request.request_id] = request
+                    self._prefills.pop(request.request_id, None)
             else:
                 logger.warning(
                     "Got invalid KVTransferParams: %s. This "
@@ -1169,6 +1301,11 @@ class MooncakeConnectorScheduler:
             request.status,
             params,
         )
+        self._remote_reqs.pop(request.request_id, None)
+        self._reqs_to_rebootstrap.discard(request.request_id)
+        if request.request_id in self._prefills:
+            self._drop_prefill(request)
+            return False, None
         if not params or not params.get("transfer_id"):
             return False, None
 
