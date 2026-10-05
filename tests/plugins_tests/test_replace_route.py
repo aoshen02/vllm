@@ -64,6 +64,7 @@ def test_replaces_in_place_and_returns_the_replaced_endpoint():
     paths = [getattr(r, "path", None) for r in app.router.routes]
     operation_id = app.openapi()["paths"][PATH]["post"]["operationId"]
     assert _replace(app) is core
+    assert app.openapi_schema is None  # the cached schema was reset
     assert [getattr(r, "path", None) for r in app.router.routes] == paths
     client = TestClient(app)
     assert client.post(PATH).json() == {"served_by": "plugin", "dep": "core"}
