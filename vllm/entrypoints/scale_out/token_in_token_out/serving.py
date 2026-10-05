@@ -6,6 +6,7 @@ import asyncio
 import time
 from collections.abc import AsyncGenerator
 from collections.abc import Sequence as GenericSequence
+from dataclasses import dataclass
 
 import msgspec
 from fastapi import Request
@@ -57,6 +58,17 @@ from .protocol import (
 logger = init_logger(__name__)
 
 
+@dataclass
+class GenerateStart:
+    """A generate request scheduled on the engine (see
+    :meth:`ServingTokens.start_generate`)."""
+
+    request_id: str
+    model_name: str
+    request_metadata: RequestResponseMetadata
+    result_generator: AsyncGenerator[RequestOutput, None]
+
+
 class ServingTokens(GenerateBaseServing):
     """Provides Tokens IN <> Tokens OUT functionality to vLLM API."""
 
@@ -105,6 +117,34 @@ class ServingTokens(GenerateBaseServing):
         request: GenerateRequest,
         raw_request: Request | None = None,
     ) -> GenerateResponse | ErrorResponse | AsyncGenerator[str, None]:
+        start = await self.start_generate(request, raw_request)
+        if isinstance(start, ErrorResponse):
+            return start
+        if request.stream:
+            return self.serve_tokens_stream_generator(
+                request,
+                start.result_generator,
+                start.request_id,
+                start.model_name,
+                start.request_metadata,
+            )
+        return await self.serve_tokens_full_generator(
+            request,
+            start.result_generator,
+            start.request_id,
+            start.model_name,
+            start.request_metadata,
+        )
+
+    async def start_generate(
+        self,
+        request: GenerateRequest,
+        raw_request: Request | None = None,
+    ) -> GenerateStart | ErrorResponse:
+        """Validate and preprocess ``request`` and schedule it on the engine,
+        like :meth:`serve_tokens`, without building the response: for
+        components (e.g. endpoint plugins) that render their own response
+        from the ``RequestOutput`` stream."""
         error_check_ret = await self._check_model(request)
         if error_check_ret is not None:
             logger.error("Error with model %s", error_check_ret)
@@ -261,19 +301,7 @@ class ServingTokens(GenerateBaseServing):
         )
 
         assert result_generator is not None
-
-        if request.stream:
-            return self.serve_tokens_stream_generator(
-                request,
-                result_generator,
-                request_id,
-                model_name,
-                request_metadata,
-            )
-
-        return await self.serve_tokens_full_generator(
-            request, result_generator, request_id, model_name, request_metadata
-        )
+        return GenerateStart(request_id, model_name, request_metadata, result_generator)
 
     async def serve_tokens_full_generator(
         self,

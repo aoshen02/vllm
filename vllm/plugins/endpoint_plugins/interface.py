@@ -29,10 +29,13 @@ either exclude `"render"` from `required_tasks` or check for `None` in
 """
 
 from argparse import Namespace
-from typing import TYPE_CHECKING, Protocol, runtime_checkable
+from collections.abc import Callable, Sequence
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from fastapi import FastAPI
+from fastapi.routing import APIRoute
 from starlette.datastructures import State
+from starlette.routing import Host, Match
 
 from vllm.engine.protocol import EngineClient
 
@@ -64,8 +67,11 @@ class EndpointPlugin(Protocol):
         """Register this plugin's routes on `app`.
 
         Called once during `build_app()` after all core routers have been
-        attached. Routes attached here can shadow core routes with the same
-        path. There is currently no conflict enforcement (see RFC #46565 follow ups).
+        attached. Starlette dispatches to the first matching route, so a route
+        added here with the path and method of a core route is not reached:
+        to replace a core route, use `replace_route`, which also detects
+        conflicts. Plain added routes are not checked for conflicts (see RFC
+        #46565 follow ups).
         """
         ...
 
@@ -93,8 +99,8 @@ def attach_endpoint_plugins(
 ) -> None:
     """Phase A of endpoint plugin wiring: discover, gate and attach routes.
 
-    Attached last after all core routers. This is so endpoint plugin routes can
-    shadow core routes with the same path (see `EndpointPlugin.attach_router`
+    Attached last after all core routers, so a plugin route only takes over a
+    core path through `replace_route` (see `EndpointPlugin.attach_router`
     docstring). No-ops when no plugins are discovered/allowlisted.
     """
     from vllm.plugins import load_endpoint_plugins
@@ -103,6 +109,87 @@ def attach_endpoint_plugins(
     for plugin in endpoint_plugins:
         plugin.attach_router(app)
     app.state.endpoint_plugins = endpoint_plugins
+
+
+def replace_route(
+    app: FastAPI,
+    path: str,
+    endpoint: Callable[..., Any],
+    *,
+    methods: Sequence[str] = ("POST",),
+    **route_kwargs: Any,
+) -> Callable[..., Any]:
+    """Replace the API route that serves `methods` `path` with `endpoint`
+    (an endpoint plugin taking over a core route) and return the replaced
+    route's endpoint, e.g. to delegate the requests the plugin does not
+    handle.
+
+    The new route is added through `app.router` (with `route_kwargs`, as for
+    `APIRouter.add_api_route`), so `app.dependency_overrides` and app-level
+    dependencies apply, and takes the replaced route's place: precedence
+    relative to every other route is unchanged and OpenAPI shows one
+    operation.
+
+    Raises `RuntimeError` without changing `app` if the replacement is not
+    safe: for some method, the first route matching the request is not an
+    API route registered at exactly `path` (e.g. a catch-all), the routes
+    differ between methods, the route was already replaced (e.g. by another
+    plugin), a `Host` route precedes it (it may serve the path for some
+    hosts), or a route cannot be checked.
+    """
+    routes = app.router.routes
+    replaced: APIRoute | None = None
+    for method in methods:
+        first = _first_full_match(app, path, method)
+        if not isinstance(first, APIRoute) or first.path != path:
+            raise RuntimeError(
+                f"{method} {path} is served by {first!r}, not by an API route "
+                "at that path; refusing to replace it"
+            )
+        if replaced is not None and first is not replaced:
+            raise RuntimeError(f"{path} is served by different routes per method")
+        if getattr(first, "_vllm_replaces", None) is not None:
+            raise RuntimeError(f"{method} {path} was already replaced")
+        replaced = first
+    if replaced is None:
+        raise ValueError("replace_route needs at least one method")
+    app.router.add_api_route(path, endpoint, methods=list(methods), **route_kwargs)
+    new_route = routes.pop()
+    assert isinstance(new_route, APIRoute) and new_route.endpoint is endpoint
+    new_route._vllm_replaces = replaced.endpoint  # type: ignore[attr-defined]
+    index = next(i for i, route in enumerate(routes) if route is replaced)
+    routes[index] = new_route
+    app.openapi_schema = None
+    return replaced.endpoint
+
+
+def _first_full_match(app: FastAPI, path: str, method: str) -> Any:
+    """The route Starlette dispatches `method` `path` to (None if none)."""
+    scope = {
+        "type": "http",
+        "method": method,
+        "path": path,
+        "raw_path": path.encode(),
+        "root_path": "",
+        "query_string": b"",
+        "headers": [(b"host", b"localhost")],
+        "scheme": "http",
+        "server": ("localhost", 80),
+        "http_version": "1.1",
+        "app": app,
+    }
+    for route in app.router.routes:
+        if isinstance(route, Host):
+            raise RuntimeError(
+                f"Host route {route.host!r} precedes {method} {path}; "
+                "refusing to replace it (it may serve the path for some hosts)"
+            )
+        try:
+            if route.matches(scope)[0] == Match.FULL:
+                return route
+        except Exception as e:
+            raise RuntimeError(f"Cannot check route {route!r}: {e!r}") from e
+    return None
 
 
 async def init_endpoint_plugins_state(
