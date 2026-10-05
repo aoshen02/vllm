@@ -643,7 +643,6 @@ KNOWN_UNREGISTERED: tuple[str, ...] = (
     r"\.(slope_rate|tp_slope)$",  # linear attention slopes
     r"\.attention_dists$",  # Granite Speech
     r"\.pos_emb\.pe$",  # Phi-4-MM
-    r"\.hc_attn_fn_broadcast$",  # DeepSeek-V4
 )
 
 
