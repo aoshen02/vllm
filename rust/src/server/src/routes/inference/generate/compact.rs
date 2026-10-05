@@ -407,11 +407,11 @@ pub(crate) const BYTEORDER: &str = "little";
 pub(crate) struct CompactLogprobsJson {
     pub num_positions: usize,
     pub num_slots: usize,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub sampled_slot: Option<bool>,
     pub dtype_token_ids: &'static str,
     pub dtype_logprobs: &'static str,
     pub byteorder: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sampled_slot: Option<bool>,
     pub token_ids: String,
     pub logprobs: String,
     #[serde(skip_serializing_if = "Option::is_none")]

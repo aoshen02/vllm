@@ -154,15 +154,16 @@ fn write_compact(out: &mut PartsWriter, block: &CompactLogprobs) {
     out.json(&block.num_positions);
     out.raw(b",\"num_slots\":");
     out.json(&block.num_slots);
-    if !block.sampled_slot {
-        out.raw(b",\"sampled_slot\":false");
-    }
     out.raw(b",\"dtype_token_ids\":");
     out.json(DTYPE_TOKEN_IDS);
     out.raw(b",\"dtype_logprobs\":");
     out.json(DTYPE_LOGPROBS);
     out.raw(b",\"byteorder\":");
     out.json(BYTEORDER);
+    // Same position as the Python frontend: right after `byteorder`.
+    if !block.sampled_slot {
+        out.raw(b",\"sampled_slot\":false");
+    }
     out.raw(b",\"token_ids\":");
     out.encoded(&block.token_ids);
     out.raw(b",\"logprobs\":");

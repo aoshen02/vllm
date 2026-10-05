@@ -1403,6 +1403,99 @@ mod tests {
         );
     }
 
+    /// Keys of the first `compact_logprobs` object in `body`, in order.
+    fn compact_block_keys(body: &str) -> Vec<String> {
+        let start = body.find("\"compact_logprobs\":{").expect("compact block")
+            + "\"compact_logprobs\":{".len();
+        let end = start + body[start..].find('}').expect("block end");
+        body[start..end]
+            .split(',')
+            .map(|field| field.split(':').next().unwrap().trim_matches('"').to_string())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn compact_block_key_order_matches_python() {
+        let rows = tricky_positions()
+            .into_iter()
+            .map(|mut p| {
+                p.entries.truncate(3);
+                p
+            })
+            .collect::<Vec<_>>();
+        let steps = || {
+            vec![step(
+                vec![0, 151_935, 42],
+                Some(rows[..3].to_vec()),
+                Some(FinishReason::Abort),
+            )]
+        };
+        let python_order = |sampled: bool, ranks: bool| {
+            let mut keys = vec![
+                "num_positions",
+                "num_slots",
+                "dtype_token_ids",
+                "dtype_logprobs",
+                "byteorder",
+            ];
+            if !sampled {
+                keys.push("sampled_slot");
+            }
+            keys.extend(["token_ids", "logprobs"]);
+            if ranks {
+                keys.push("ranks");
+            }
+            keys
+        };
+        for (sampled, ranks) in [(true, true), (false, true), (true, false), (false, false)] {
+            let mut options = options_for(LogprobsFormat::Compact, 3);
+            options.compact_skip_sampled = !sampled;
+            options.compact_skip_ranks = !ranks;
+            let (envelope, logprobs) = collect_response(
+                stream::iter(steps()),
+                "order".to_string(),
+                ApiServerOptions::default(),
+                options,
+            )
+            .await
+            .expect("stream")
+            .expect("response");
+            let body = to_bytes(
+                generate_response(envelope, logprobs).into_body(),
+                usize::MAX,
+            )
+            .await
+            .expect("body");
+            let body = std::str::from_utf8(&body).unwrap();
+            assert_eq!(
+                compact_block_keys(body),
+                python_order(sampled, ranks),
+                "{sampled} {ranks}"
+            );
+            if !sampled {
+                assert!(
+                    body.contains("\"byteorder\":\"little\",\"sampled_slot\":false,\"token_ids\":")
+                );
+            }
+
+            let chunks: Vec<_> = generate_chunk_stream(
+                stream::iter(steps()),
+                "order".to_string(),
+                ApiServerOptions::default(),
+                options,
+            )
+            .try_collect()
+            .await
+            .expect("chunks");
+            let chunk = serde_json::to_string(&chunks[0]).unwrap();
+            assert_eq!(
+                compact_block_keys(&chunk),
+                python_order(sampled, ranks),
+                "stream {sampled} {ranks}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn compact_switches_drop_sampled_slot_and_ranks() {
         let rows = tricky_positions()
