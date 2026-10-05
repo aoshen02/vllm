@@ -4,6 +4,7 @@ import torch
 from torch.nn.parameter import Parameter
 
 import vllm._custom_ops as ops
+from vllm import envs
 from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.layers.linear import (
     ReplicatedLinear,
@@ -153,6 +154,9 @@ class GateLinear(ReplicatedLinear):
                 self.weight.dtype == torch.bfloat16
                 and self.out_dtype == torch.float32
                 and is_available()
+                # The small-M GEMM reduces differently from the large-M path,
+                # so a row's logits would depend on the batch size.
+                and not envs.VLLM_BATCH_INVARIANT
             )
 
     def set_out_dtype(self, out_dtype: torch.dtype) -> None:
@@ -182,6 +186,7 @@ class GateLinear(ReplicatedLinear):
                 self.weight.dtype == torch.bfloat16
                 and out_dtype == torch.float32
                 and is_available()
+                and not envs.VLLM_BATCH_INVARIANT
             )
 
     def _return(
