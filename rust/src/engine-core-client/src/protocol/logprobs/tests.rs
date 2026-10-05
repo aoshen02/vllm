@@ -724,3 +724,125 @@ fn rewritten_decoder_matches_reference_on_random_payloads() {
     // Both successes and every kind of error are exercised substantially.
     assert!(outcomes.0 > 3000 && outcomes.1 > 3000, "{outcomes:?}");
 }
+
+/// Round 8: row-count and width mismatches between token ids, logprobs and
+/// ranks (including counts *smaller* than the ranks count, which the
+/// randomized test only perturbs upward) are decode errors with exactly the
+/// base decoder's message, both directly and through the full wire path.
+#[test]
+fn mismatched_row_counts_and_widths_are_decode_errors_like_base() {
+    use super::WireLogprobs;
+    use crate::protocol::tensor::{WireArrayData, WireNdArray};
+
+    let int_array = |shape: &[usize]| {
+        let count: usize = shape.iter().product();
+        let raw: Vec<u8> = (0..count as i64).flat_map(|v| (v + 1).to_le_bytes()).collect();
+        WireNdArray {
+            dtype: "<i8".to_string(),
+            shape: shape.to_vec(),
+            data: WireArrayData::RawView(Bytes::from(raw)),
+        }
+    };
+    let float_array = |shape: &[usize]| {
+        let count: usize = shape.iter().product();
+        let raw: Vec<u8> = (0..count).flat_map(|v| (-(v as f32)).to_le_bytes()).collect();
+        WireNdArray {
+            dtype: "<f4".to_string(),
+            shape: shape.to_vec(),
+            data: WireArrayData::RawView(Bytes::from(raw)),
+        }
+    };
+    let wire = |array: WireNdArray| {
+        let WireArrayData::RawView(raw) = &array.data else {
+            unreachable!()
+        };
+        ndarray_value(&array.dtype, &array.shape, Value::Ext(3, raw.to_vec()))
+    };
+    // (ids shape, logprobs shape, ranks len, expected message)
+    let cases: [(&[usize], &[usize], usize, &str); 7] = [
+        (
+            &[1, 3],
+            &[2, 3],
+            2,
+            "row shape mismatch between token ids (1, 3) and logprobs (2, 3)",
+        ),
+        (
+            &[2, 3],
+            &[1, 3],
+            2,
+            "row shape mismatch between token ids (2, 3) and logprobs (1, 3)",
+        ),
+        (
+            &[1, 3],
+            &[1, 3],
+            2,
+            "token_ranks length 2 does not match row count 1",
+        ),
+        (
+            &[2, 3],
+            &[2, 3],
+            1,
+            "token_ranks length 1 does not match row count 2",
+        ),
+        (
+            &[2, 3],
+            &[2, 2],
+            2,
+            "row shape mismatch between token ids (2, 3) and logprobs (2, 2)",
+        ),
+        (
+            &[2, 2],
+            &[2, 3],
+            2,
+            "row shape mismatch between token ids (2, 2) and logprobs (2, 3)",
+        ),
+        (
+            &[0, 3],
+            &[0, 3],
+            1,
+            "token_ranks length 1 does not match row count 0",
+        ),
+    ];
+    let no_frames: Vec<Bytes> = Vec::new();
+    for (ids, lps, ranks, reason) in cases {
+        let expected = format!("new_logprobs: {reason}");
+        let reference = reference::resolve(
+            int_array(ids),
+            float_array(lps),
+            int_array(&[ranks]),
+            &no_frames,
+            "new_logprobs",
+        )
+        .expect_err("reference rejects");
+        let crate::error::Error::ExtValueDecode { message } = &reference else {
+            panic!("expected ExtValueDecode, got {reference:?}");
+        };
+        assert_eq!(message, &expected);
+        let actual = WireLogprobs {
+            logprob_token_ids: int_array(ids),
+            logprobs: float_array(lps),
+            token_ranks: int_array(&[ranks]),
+            cu_num_generated_tokens: None,
+            cu_num_generated_tokens_tensor: None,
+        }
+        .resolve(&no_frames, "new_logprobs")
+        .expect_err("rewritten decoder rejects");
+        assert_eq!(actual.to_string(), reference.to_string());
+
+        // Full engine-core output decode path.
+        let frames = vec![Bytes::from(encode_value(&output_wire_with_custom_fields(
+            Some(Value::Array(vec![
+                wire(int_array(ids)),
+                wire(float_array(lps)),
+                wire(int_array(&[ranks])),
+                Value::Nil,
+            ])),
+            None,
+        )))];
+        let error = decode_engine_core_outputs(&frames).expect_err("decode rejects");
+        let crate::error::Error::ExtValueDecode { message } = &error else {
+            panic!("expected ExtValueDecode, got {error:?}");
+        };
+        assert_eq!(message, &expected);
+    }
+}

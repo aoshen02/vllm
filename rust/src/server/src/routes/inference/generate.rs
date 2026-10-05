@@ -1661,4 +1661,228 @@ mod tests {
         assert_eq!(block["sampled_slot"], false);
         assert!(block.get("ranks").is_some());
     }
+
+    // ---- Round 8: malformed engine logprob rows (row counts / widths) ----
+
+    fn width_row(id: u32, width: u32) -> PositionLogprobs {
+        position(
+            &(0..width)
+                .map(|slot| (id + slot, -0.25 * slot as f32, slot.max(1)))
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    fn clone_steps(
+        steps: &[vllm_llm::Result<GenerateOutput>],
+    ) -> Vec<vllm_llm::Result<GenerateOutput>> {
+        steps.iter().map(|s| Ok(s.as_ref().unwrap().clone())).collect()
+    }
+
+    /// Malformed-but-decodable steps that base renders without error in the
+    /// default format (base never compared positions with tokens or widths).
+    fn openai_malformed_cases() -> Vec<(&'static str, Vec<vllm_llm::Result<GenerateOutput>>)> {
+        let w = width_row;
+        vec![
+            (
+                "fewer positions than tokens",
+                vec![step(
+                    vec![1, 2, 3],
+                    Some(vec![w(1, 3)]),
+                    Some(FinishReason::Length),
+                )],
+            ),
+            (
+                "more positions than tokens",
+                vec![step(
+                    vec![1],
+                    Some(vec![w(1, 3), w(2, 3)]),
+                    Some(FinishReason::Length),
+                )],
+            ),
+            (
+                "width changes across steps (narrower, wider than k+1)",
+                vec![
+                    step(vec![1], Some(vec![w(1, 3)]), None),
+                    step(vec![2], Some(vec![w(2, 2)]), None),
+                    step(vec![3], Some(vec![w(3, 5)]), Some(FinishReason::Length)),
+                ],
+            ),
+            (
+                "token step without payload",
+                vec![
+                    step(vec![1], None, None),
+                    step(vec![2], Some(vec![w(2, 3)]), Some(FinishReason::Length)),
+                ],
+            ),
+            (
+                "rows on a zero-token output",
+                vec![
+                    step(vec![1], Some(vec![w(1, 3)]), None),
+                    step(vec![], Some(vec![w(9, 3)]), Some(FinishReason::Abort)),
+                ],
+            ),
+        ]
+    }
+
+    async fn openai_body_bytes(
+        steps: Vec<vllm_llm::Result<GenerateOutput>>,
+    ) -> Result<Vec<u8>, ApiError> {
+        let (envelope, logprobs) = collect_response(
+            stream::iter(steps),
+            "probe".to_string(),
+            ApiServerOptions::default(),
+            ResponseOptions {
+                include_logprobs: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("stream")?;
+        Ok(to_bytes(
+            generate_response(envelope, logprobs).into_body(),
+            usize::MAX,
+        )
+        .await
+        .expect("body")
+        .to_vec())
+    }
+
+    /// Default format: malformed-but-decodable rows give exactly the base
+    /// bytes (base `collect_output` + eager conversion + serde_json), and an
+    /// empty row fails the request with a 500 like base.
+    #[tokio::test]
+    async fn openai_malformed_rows_match_base_bytes_or_fail_like_base() {
+        for (name, steps) in openai_malformed_cases() {
+            let base = stream::iter(clone_steps(&steps)).collect_output().await.expect("collect");
+            assert_eq!(
+                openai_body_bytes(steps).await.expect(name),
+                reference_bytes(&base, "probe"),
+                "{name}"
+            );
+        }
+        let empty_row = vec![
+            step(vec![1], Some(vec![position(&[(1, -0.1, 1)])]), None),
+            step(
+                vec![2],
+                Some(vec![PositionLogprobs { entries: vec![] }]),
+                Some(FinishReason::Length),
+            ),
+        ];
+        let error = openai_body_bytes(clone_steps(&empty_row)).await.expect_err("empty row");
+        assert_eq!(
+            error.into_response().status(),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
+        // Streaming: same eager conversion as base, so the empty row errors.
+        let streamed: Result<Vec<_>, _> = generate_chunk_stream(
+            stream::iter(empty_row),
+            "probe".to_string(),
+            ApiServerOptions::default(),
+            ResponseOptions {
+                include_logprobs: true,
+                ..Default::default()
+            },
+        )
+        .try_collect()
+        .await;
+        assert!(streamed.is_err());
+    }
+
+    /// Compact format (new path, k = 2 so S = 3): every row-count or width
+    /// mismatch the layout cannot represent fails the request (500) in both
+    /// the non-streaming collector and the stream, never a body with
+    /// misaligned arrays; a valid request afterwards is unaffected.
+    #[tokio::test]
+    async fn compact_malformed_rows_fail_the_request() {
+        let w = width_row;
+        let cases: Vec<(&str, Vec<vllm_llm::Result<GenerateOutput>>)> = vec![
+            (
+                "fewer positions than tokens",
+                vec![step(
+                    vec![1, 2, 3],
+                    Some(vec![w(1, 3), w(2, 3)]),
+                    Some(FinishReason::Length),
+                )],
+            ),
+            (
+                "more positions than tokens",
+                vec![step(
+                    vec![1],
+                    Some(vec![w(1, 3), w(2, 3)]),
+                    Some(FinishReason::Length),
+                )],
+            ),
+            (
+                "row narrower than k+1",
+                vec![step(
+                    vec![1],
+                    Some(vec![w(1, 2)]),
+                    Some(FinishReason::Length),
+                )],
+            ),
+            (
+                "later step narrower than k+1",
+                vec![
+                    step(vec![1], Some(vec![w(1, 3)]), None),
+                    step(vec![2], Some(vec![w(2, 2)]), Some(FinishReason::Length)),
+                ],
+            ),
+            (
+                "empty row",
+                vec![step(
+                    vec![1],
+                    Some(vec![PositionLogprobs { entries: vec![] }]),
+                    Some(FinishReason::Length),
+                )],
+            ),
+            (
+                "token step without payload",
+                vec![
+                    step(vec![1], None, None),
+                    step(vec![2], Some(vec![w(2, 3)]), Some(FinishReason::Length)),
+                ],
+            ),
+            (
+                "rows on a zero-token terminal output",
+                vec![
+                    step(vec![1], Some(vec![w(1, 3)]), None),
+                    step(vec![], Some(vec![w(9, 3)]), Some(FinishReason::Abort)),
+                ],
+            ),
+        ];
+        for (name, steps) in &cases {
+            let error = response_json(
+                clone_steps(steps),
+                options_for(LogprobsFormat::Compact, 3),
+                false,
+            )
+            .await
+            .expect_err(name);
+            assert_eq!(
+                error.into_response().status(),
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "{name}"
+            );
+            let streamed = compact_stream(clone_steps(steps)).await;
+            assert!(streamed.is_err(), "{name}: {streamed:?}");
+        }
+        // Rows wider than k+1 (engine padding) are truncated to S = 3 (SPEC
+        // amendment), and a valid request after the failures is unaffected.
+        let json = response_json(
+            vec![
+                step(vec![1], Some(vec![w(1, 3)]), None),
+                step(vec![2], Some(vec![w(2, 5)]), Some(FinishReason::Length)),
+            ],
+            options_for(LogprobsFormat::Compact, 3),
+            false,
+        )
+        .await
+        .expect("valid");
+        let block = &json["choices"][0]["compact_logprobs"];
+        assert_eq!(block["num_positions"], 2);
+        assert_eq!(block["num_slots"], 3);
+        let (token_ids, _, ranks) = decode_compact(block);
+        assert_eq!(token_ids, vec![1, 2, 3, 2, 3, 4]);
+        assert_eq!(ranks, vec![1, 1]);
+    }
 }
