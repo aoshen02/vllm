@@ -485,16 +485,18 @@ class ArrayLogprobs(MutableSequence[LogprobsOnePosition | None]):
         storage and marks it :attr:`broken`; rendering then fails only this
         request (500), and positional access raises ValueError.
         """
-        n = len(ranks)
-        if n == 0:
-            return
-        expected = self.num_positions + n
+        expected: int | None = None
         try:
+            n = len(ranks)
+            if n == 0:
+                return
+            expected = self.num_positions + n
             self._append_rows(token_ids, logprobs, ranks, n)
         except Exception:
             logger.exception("Storing sample logprobs failed; failing the request")
             self.mark_broken()
-        if self.broken:
+        # Positions keep counting when broken (unknown only if len() failed).
+        if self.broken and expected is not None:
             self.num_positions = expected
 
     def mark_broken(self) -> None:
@@ -523,7 +525,20 @@ class ArrayLogprobs(MutableSequence[LogprobsOnePosition | None]):
             return
         # Validate before either storage path writes: numpy would broadcast
         # fewer token-id/logprob rows than ranks (default render repeating
-        # rows; compact advertising more entries than it carries).
+        # rows; compact advertising more entries than it carries). Surplus
+        # rows (more id/logprob rows than ranks, or ids wider than logprobs),
+        # which the base per-position path silently truncates, are rejected
+        # too, intentionally: they mean inconsistent engine output.
+        for name, value in (
+            ("token_ids", token_ids),
+            ("logprobs", logprobs),
+            ("ranks", ranks),
+        ):
+            if not isinstance(value, np.ndarray):
+                raise TypeError(
+                    f"append_rows expects numpy arrays; {name} is "
+                    f"{type(value).__name__}"
+                )
         id_shape, lp_shape = np.shape(token_ids), np.shape(logprobs)
         if (
             len(id_shape) != 2

@@ -2254,6 +2254,36 @@ def test_append_rows_rejects_inconsistent_shapes(wire, shapes):
     assert len(container) == 1 + rank_shape[0]
 
 
+@pytest.mark.parametrize("wire", [False, True])
+@pytest.mark.parametrize("bad", ["list_ids", "list_ranks", "zero_d_ranks"])
+def test_append_rows_non_array_inputs_break_the_container(wire, bad):
+    """Kimi/Claude r13 NITs: list inputs fail with a clear error, and a 0-d
+    ranks array (len() raises) is contained too, never raised."""
+    container = ArrayLogprobs(wire_base64=wire)
+    ids, lps, ranks = _engine_rows(0, 2, 3)
+    container.append_rows(ids[:1], lps[:1], ranks[:1])
+    if bad == "list_ids":
+        container.append_rows(ids[1:].tolist(), lps[1:], ranks[1:])
+        assert len(container) == 2
+    elif bad == "list_ranks":
+        container.append_rows(ids[1:], lps[1:], ranks[1:].tolist())
+        assert len(container) == 2
+    else:
+        container.append_rows(ids[1:], lps[1:], np.array(3))
+        assert len(container) == 1  # positions unknown
+    assert container.broken
+
+
+def test_logprobs_processor_contains_zero_d_ranks():
+    request = MagicMock(spec=EngineCoreRequest)
+    request.sampling_params = SamplingParams(logprobs=2, array_logprobs=True)
+    processor = LogprobsProcessor.from_new_request(None, request)
+    ids, lps, ranks = _engine_rows(0, 1, 3)
+    processor._update_sample_logprobs(LogprobsLists(ids, lps, ranks))
+    processor._update_sample_logprobs(LogprobsLists(ids, lps, np.array(1)))
+    assert processor.logprobs.broken and len(processor.logprobs) == 1
+
+
 def test_topk_only_with_zero_logprobs_does_not_crash_process_outputs():
     """r45 BLOCKER: compact + include_sampled=false + logprobs=0 wrote a
     (n, 0) array; memoryview.cast raised inside process_outputs, killing the
@@ -2901,6 +2931,12 @@ def test_lead_table_first_fill_triggers_no_gc():
     event-loop gap on the first default-format request)."""
     import gc
 
+    from vllm.entrypoints.scale_out.token_in_token_out import serving as serving_mod
+
+    # Drain response builders left busy by earlier tests (their collections
+    # would otherwise run concurrently); the thread filter below stays.
+    for builder in (serving_mod._RESPONSE_BUILDER, serving_mod._MID_RESPONSE_BUILDER):
+        builder.submit(lambda: None).result(timeout=60)
     table = logprobs_render._LeadTable(b"")
     ids = np.arange(100_000, dtype=np.int64).reshape(1000, 100)
     collections: list[int] = []

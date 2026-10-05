@@ -93,8 +93,9 @@ class LogprobsProcessor:
 
         if isinstance(self.logprobs, ArrayLogprobs):
             container = self.logprobs
-            count = container.num_positions + len(ranks_lst)
+            count: int | None = None
             try:
+                count = container.num_positions + len(ranks_lst)
                 self._append_array_logprobs(
                     container, token_ids_lst, logprobs_lst, ranks_lst
                 )
@@ -104,8 +105,10 @@ class LogprobsProcessor:
                 logger.exception("Array logprobs failed; failing the request")
                 if not container.broken:
                     container.mark_broken()
-                # Positions keep counting, also on a container already broken.
-                container.num_positions = count
+                # Positions keep counting, also on a container already broken
+                # (unknown only if len() itself failed).
+                if count is not None:
+                    container.num_positions = count
             return
 
         for rank_np, logprobs_np, token_ids_np in zip(
