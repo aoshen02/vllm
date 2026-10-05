@@ -584,21 +584,84 @@ def test_handle_cannot_be_copied_or_pickled(registry):
             operation(handle)
 
 
-def test_inconsistent_engine_rows_fail_the_request_in_core(registry):
-    """Kimi r18: rows core cannot slice fail the request in core (not only if
-    the container happens to reject them); the positions are still counted."""
+def _processor(logprobs, num_logprobs=1):
     from vllm.v1.engine.logprobs import LogprobsProcessor
 
+    processor = object.__new__(LogprobsProcessor)
+    processor.tokenizer = None
+    processor.logprobs = logprobs
+    processor.num_logprobs = num_logprobs
+    processor.cumulative_logprob = 0.0
+    return processor
+
+
+def _handle(registry):
     _register("rows", RowsContainer)  # accepts anything
     params = SamplingParams(logprobs=1)
     set_sample_logprobs_container(params, "rows")
-    handle = create_sample_logprobs(False, params)
-    processor = object.__new__(LogprobsProcessor)
-    processor.num_logprobs = 1
-    processor.cumulative_logprob = 0.0
+    return create_sample_logprobs(False, params)
+
+
+def test_inconsistent_engine_rows_fail_the_request_in_core(registry):
+    """Kimi r18: rows core cannot slice fail the request in core (not only if
+    the container happens to reject them); the positions are still counted."""
+    handle = _handle(registry)
     ids, lps, ranks = _rows(2, 2)
-    processor._append_rows(handle, ids, lps[:, 0], ranks)  # 1-d logprobs
+    processor = _processor(handle)
+    processor._update_sample_logprobs(LogprobsLists(ids, lps[:, 0], ranks))
     assert handle.broken and len(handle) == 2
+
+
+class CancellingRanks(np.ndarray):
+    """Codex stack audit: an ndarray subclass whose len() raises."""
+
+    def __len__(self):
+        raise asyncio.CancelledError("ranks len")
+
+
+def test_row_preprocessing_contains_base_exceptions(registry):
+    """The rows' preprocessing follows the container failure policy: an
+    exception other than KeyboardInterrupt / SystemExit breaks the handle and
+    does not leave output processing (the default path iterates such ranks
+    without len() and stores them)."""
+    ids, lps, ranks = _rows(1, 2)
+    hostile = ranks.view(CancellingRanks)
+    default = _processor([])
+    default._update_sample_logprobs(LogprobsLists(ids, lps, hostile))
+    assert len(default.logprobs) == 1
+    handle = _handle(registry)
+    processor = _processor(handle)
+    assert (
+        _escaped(
+            lambda: processor._update_sample_logprobs(LogprobsLists(ids, lps, hostile))
+        )
+        is None
+    )
+    assert handle.broken
+
+
+def test_unequal_row_counts_break_the_handle(registry):
+    """Claude stack audit NIT: rows of different counts (the default path's zip
+    would silently use the shortest) are malformed engine rows: the handle is
+    broken in core and counts the positions of the ranks."""
+    ids, lps, ranks = _rows(3, 2)
+    handle = _handle(registry)
+    processor = _processor(handle)
+    processor._update_sample_logprobs(LogprobsLists(ids, lps, ranks[:2]))
+    assert handle.broken and len(handle) == 2
+
+
+def test_engine_rows_keep_the_default_cumulative_logprob(registry):
+    """Well-formed rows: the handle adds the sampled logprobs row by row, as
+    the default path does (same cumulative logprob, same positions)."""
+    ids, lps, ranks = _rows(3, 2)
+    default = _processor([])
+    default._update_sample_logprobs(LogprobsLists(ids, lps, ranks))
+    handle = _handle(registry)
+    processor = _processor(handle)
+    processor._update_sample_logprobs(LogprobsLists(ids, lps, ranks))
+    assert not handle.broken and len(handle) == len(default.logprobs) == 3
+    assert processor.cumulative_logprob == default.cumulative_logprob
 
 
 def test_foreign_destination_in_request_output_add(registry):
@@ -638,43 +701,3 @@ def test_handle_surface():
     with pytest.raises(ValueError, match="unavailable"):
         broken.unwrap()
     assert "broken=True" in repr(broken) and len(broken[-2:]) == 2
-
-
-class _DummyEndpointPlugin:
-    name = "wanted"
-    required_tasks = None
-
-
-@pytest.mark.parametrize("endpoint_plugin_loaded", [True, False])
-def test_vllm_plugins_exclusion_warning(monkeypatch, endpoint_plugin_loaded):
-    """Claude r17: warn only when an endpoint plugin is actually loaded (so a
-    plugin-absent server logs as on base), naming excluded other plugins."""
-    import importlib.metadata
-
-    from vllm import plugins
-
-    general = [
-        importlib.metadata.EntryPoint(
-            name="other", value="json:dumps", group="vllm.general_plugins"
-        )
-    ]
-    monkeypatch.setattr(
-        importlib.metadata,
-        "entry_points",
-        lambda group: general if group == "vllm.general_plugins" else [],
-    )
-    monkeypatch.setattr(
-        plugins,
-        "load_plugins_by_group",
-        lambda group: {"wanted": _DummyEndpointPlugin}
-        if endpoint_plugin_loaded
-        else {},
-    )
-    monkeypatch.setenv("VLLM_PLUGINS", "wanted" if endpoint_plugin_loaded else "")
-    warnings = []
-    monkeypatch.setattr(
-        plugins.logger, "warning", lambda msg, *args: warnings.append(msg % args)
-    )
-    loaded = plugins.load_endpoint_plugins(("generate",))
-    assert len(loaded) == int(endpoint_plugin_loaded)
-    assert any("other" in w for w in warnings) is endpoint_plugin_loaded

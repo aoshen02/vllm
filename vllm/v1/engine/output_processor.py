@@ -11,7 +11,11 @@ from typing import Any, cast
 import numpy as np
 import torch
 
-from vllm.logprobs import SampleLogprobsHandle, sample_logprobs_skip_text
+from vllm.logprobs import (
+    SampleLogprobs,
+    SampleLogprobsHandle,
+    sample_logprobs_skip_text,
+)
 from vllm.lora.request import LoRARequest
 from vllm.outputs import (
     STREAM_FINISHED,
@@ -442,7 +446,9 @@ class RequestState:
             token_ids=token_ids,
             routed_experts=routed_experts,
             sampling_mask=sampling_mask,
-            logprobs=logprobs,
+            # A handle only for the endpoint that selected its container (see
+            # CompletionOutput.logprobs): no other consumer sees one.
+            logprobs=cast("SampleLogprobs | None", logprobs),
             cumulative_logprob=self.logprobs_processor.cumulative_logprob,
             finish_reason=str(finish_reason) if finished else None,
             stop_reason=stop_reason if finished else None,

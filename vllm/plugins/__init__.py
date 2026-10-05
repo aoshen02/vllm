@@ -155,16 +155,4 @@ def load_endpoint_plugins(
         logger.info("Loaded endpoint plugin %s", name)
         endpoint_plugins.append(plugin)
 
-    if endpoint_plugins:
-        # VLLM_PLUGINS is one allowlist for all plugin groups: naming endpoint
-        # plugins also excludes every other plugin not named.
-        allowed = envs.VLLM_PLUGINS or []
-        excluded = [
-            f"{group}:{ep.name}"
-            for group in (DEFAULT_PLUGINS_GROUP, PLATFORM_PLUGINS_GROUP)
-            for ep in entry_points(group=group)
-            if ep.name not in allowed
-        ]
-        if excluded:
-            logger.warning("VLLM_PLUGINS does not name (not loaded): %s", excluded)
     return endpoint_plugins

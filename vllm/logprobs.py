@@ -219,7 +219,8 @@ def sample_logprobs_skip_text(params: "SamplingParams") -> bool:
 # synchronous, so a real task cancellation is never delivered inside one: any
 # other BaseException (CancelledError, GeneratorExit, ...) comes from the
 # container and would otherwise end the shared output handler. Checked on the
-# exception's real type (isinstance could run a hookable __class__).
+# exception's real type (isinstance could run a hookable __class__), so an
+# exception group raised by a container is contained whatever it wraps.
 _PROPAGATE = (KeyboardInterrupt, SystemExit)
 
 
@@ -227,22 +228,16 @@ def _contained(error: BaseException) -> bool:
     return not issubclass(type(error), _PROPAGATE)
 
 
-def _report_failure(what: str, error: BaseException) -> None:
-    """Log a container failure (after the handle was marked broken). Formatting
-    the traceback runs the container exception's hooks, so it is contained as
-    well, falling back to a message without it."""
+def _report_failure(message: str, error: BaseException) -> None:
+    """Log a failure (after the handle was marked broken). Formatting the
+    traceback runs the exception's hooks, so it is contained as well, falling
+    back to the message without it."""
     try:
-        logger.error(
-            "Sample logprobs container %s failed; failing the request",
-            what,
-            exc_info=error,
-        )
+        logger.error("%s; failing the request", message, exc_info=error)
     except BaseException as e:
         if not _contained(e):
             raise
-        logger.error(
-            "Sample logprobs container %s failed (traceback unavailable)", what
-        )
+        logger.error("%s (traceback unavailable)", message)
 
 
 @final
@@ -275,9 +270,9 @@ class SampleLogprobsHandle:
             raise ValueError("Sample logprobs are unavailable for this request")
         return self._container
 
-    def _fail(self, what: str, error: BaseException) -> None:
+    def _fail(self, message: str, error: BaseException) -> None:
         self._container = None  # broken first: logging runs the error's hooks
-        _report_failure(what, error)
+        _report_failure(message, error)
 
     def _call(self, method: str, *args: Any) -> Any:
         if self._container is not None:
@@ -286,8 +281,41 @@ class SampleLogprobsHandle:
             except BaseException as e:
                 if not _contained(e):
                     raise
-                self._fail(method, e)
+                self._fail(f"Sample logprobs container {method} failed", e)
         return None
+
+    def append_engine_rows(
+        self,
+        token_ids: "np.ndarray",
+        logprobs: "np.ndarray",
+        ranks: "np.ndarray",
+        num_slots: int | None,
+        cumulative_logprob: float,
+    ) -> float:
+        """Append this request's rows of an engine step (``LogprobsProcessor``),
+        ``num_slots`` (k + 1) columns or all if None. Returns the cumulative
+        logprob plus the sampled tokens' logprobs (slot 0), added row by row
+        like the default path. Malformed rows (e.g. row counts that differ
+        between ids, logprobs and ranks) break the handle (same failure policy
+        as container calls); the positions (``len(ranks)``) are counted."""
+        try:
+            if not len(token_ids) == len(logprobs) == len(ranks):
+                raise ValueError(
+                    f"{len(token_ids)} token id rows, {len(logprobs)} logprob "
+                    f"rows and {len(ranks)} ranks"
+                )
+            if num_slots is not None:
+                token_ids, logprobs = token_ids[:, :num_slots], logprobs[:, :num_slots]
+            total = cumulative_logprob
+            for value in logprobs[:, 0].tolist():
+                total += value
+            cumulative_logprob = total
+        except BaseException as e:
+            if not _contained(e):
+                raise
+            self._fail("Malformed engine logprob rows", e)
+        self.append_rows(token_ids, logprobs, ranks)
+        return cumulative_logprob
 
     def append_rows(self, token_ids: Any, logprobs: Any, ranks: "np.ndarray") -> None:
         try:
@@ -295,7 +323,7 @@ class SampleLogprobsHandle:
         except BaseException as e:  # malformed engine rows: positions unknown
             if not _contained(e):
                 raise
-            self._fail("rows", e)
+            self._fail("Malformed engine logprob rows", e)
         self._call("append_rows", token_ids, logprobs, ranks)
 
     def extend(self, other: Any) -> None:
@@ -342,6 +370,10 @@ class SampleLogprobsHandle:
 PromptLogprobs = FlatLogprobs | list[LogprobsOnePosition | None]
 # {token_id -> logprob} for each sequence group.
 SampleLogprobs = FlatLogprobs | list[LogprobsOnePosition]
+# What the frontend stores per request: the default containers, or the handle
+# of a registered container (see register_sample_logprobs_container), which is
+# neither iterable nor indexable by position.
+SampleLogprobsStorage = SampleLogprobs | SampleLogprobsHandle
 
 
 def create_prompt_logprobs(flat_logprobs: bool) -> PromptLogprobs:
@@ -354,7 +386,7 @@ def create_prompt_logprobs(flat_logprobs: bool) -> PromptLogprobs:
 
 def create_sample_logprobs(
     flat_logprobs: bool, sampling_params: "SamplingParams | None" = None
-) -> SampleLogprobs | SampleLogprobsHandle:
+) -> SampleLogprobsStorage:
     """Creates a container to store decode logprobs for a request"""
     name = sampling_params._sample_logprobs_container if sampling_params else None
     if sampling_params is None or name is None:
@@ -368,7 +400,7 @@ def create_sample_logprobs(
     except BaseException as e:
         if not _contained(e):
             raise
-        _report_failure(f"factory {name!r}", e)
+        _report_failure(f"Sample logprobs container factory {name!r} failed", e)
     else:
         if container is None:
             logger.error("Sample logprobs container factory %r returned None", name)

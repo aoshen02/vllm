@@ -64,10 +64,8 @@ class EndpointPlugin(Protocol):
         """Register this plugin's routes on `app`.
 
         Called once during `build_app()` after all core routers have been
-        attached. Starlette dispatches to the first matching route, so a route
-        added here with the path and method of a core route is not reached:
-        to replace a core route, remove it from `app.router.routes`. There is
-        currently no conflict enforcement (see RFC #46565 follow ups).
+        attached. Routes attached here can shadow core routes with the same
+        path. There is currently no conflict enforcement (see RFC #46565 follow ups).
         """
         ...
 
@@ -95,10 +93,9 @@ def attach_endpoint_plugins(
 ) -> None:
     """Phase A of endpoint plugin wiring: discover, gate and attach routes.
 
-    Attached last after all core routers, so a plugin route only takes over a
-    core path if the plugin removes the core route (see
-    `EndpointPlugin.attach_router` docstring). No-ops when no plugins are
-    discovered/allowlisted.
+    Attached last after all core routers. This is so endpoint plugin routes can
+    shadow core routes with the same path (see `EndpointPlugin.attach_router`
+    docstring). No-ops when no plugins are discovered/allowlisted.
     """
     from vllm.plugins import load_endpoint_plugins
 
