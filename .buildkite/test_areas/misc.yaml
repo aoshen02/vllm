@@ -690,6 +690,8 @@ steps:
   source_file_dependencies:
     - vllm/v1/attention
     - vllm/model_executor/layers
+    - vllm/model_executor/kernels/linear
+    - vllm/utils/flashinfer.py
     - tests/v1/determinism/
   commands:
     - export VLLM_WORKER_MULTIPROC_METHOD=spawn
@@ -702,6 +704,7 @@ steps:
     - pytest -v -s v1/determinism/test_nvfp4_batch_invariant.py
     - pytest -v -s v1/determinism/test_matmul_batch_invariant.py
     - pytest -v -s v1/determinism/test_cutlass_batch_invariance.py
+    - pytest -v -s v1/determinism/test_batch_invariant_gemm_dispatch.py
     - pytest -v -s v1/determinism/test_online_batch_invariance.py
 
 - label: ":nvidia: (H200 MIG 35GB) Acceptance Length (Large Models)"
