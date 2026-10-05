@@ -142,6 +142,9 @@ def process_weights_after_loading(
     methods skip tensor transforms and must declare
     ``supports_pre_processed_weights``, otherwise this raises ``RuntimeError``.
     """
+    # Circular import: fused_moe imports model utils, which import the loader.
+    from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
+
     # Reclaim memory when an explicit lm_head has been
     # loaded, but it is identical to the input embeddings.
     maybe_retie_word_embeddings(model, model_config)
@@ -191,6 +194,9 @@ def process_weights_after_loading(
             # of process_weights_after_loading
             with device_loading_context(module, target_device):
                 module.process_weights_after_loading(model_config.dtype)
+        elif isinstance(module, MoERunner):
+            with device_loading_context(module, target_device):
+                module.process_weights_after_loading()
 
     # Model-level post-load hook, after the per-layer quant finalize.
     if hasattr(model, "process_weights_after_loading"):
