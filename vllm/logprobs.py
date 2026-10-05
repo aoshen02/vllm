@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import asyncio
 import itertools
 import threading
 from collections.abc import Callable, Iterable, Iterator, MutableSequence
@@ -186,9 +185,10 @@ def register_sample_logprobs_container(
     ``extend(other_container)``. Core only ever holds it inside a
     :class:`SampleLogprobsHandle`: any failure of the factory or the container
     fails that request alone. ``skip_sampled_text``: responses carry no
-    sampled text (detokenized only for stop strings). Registering the same
-    factory and flag again is a no-op; a different one raises ValueError."""
-    if not isinstance(name, str) or not name:
+    sampled text (detokenized only for stop strings). ``name`` must be a
+    ``str`` (not a subclass). Registering the same factory object (identity)
+    and flag again is a no-op; anything else raises ValueError."""
+    if type(name) is not str or not name:
         raise ValueError(f"Invalid sample logprobs container name {name!r}")
     entry = (factory, bool(skip_sampled_text))
     with _REGISTRY_LOCK:  # no third-party code runs under the lock
@@ -200,7 +200,9 @@ def register_sample_logprobs_container(
 def set_sample_logprobs_container(params: "SamplingParams", name: str | None) -> None:
     """Select a registered container for this request (server-side only: the
     selector is private, so clients and the EngineCore wire never see it)."""
-    if name is not None and name not in _SAMPLE_LOGPROBS_CONTAINERS:
+    if name is not None and (
+        type(name) is not str or name not in _SAMPLE_LOGPROBS_CONTAINERS
+    ):
         raise ValueError(f"Unknown sample logprobs container {name!r}")
     params._sample_logprobs_container = name
 
@@ -212,11 +214,35 @@ def sample_logprobs_skip_text(params: "SamplingParams") -> bool:
     return entry is not None and entry[1]
 
 
-# Container failures contained by the handle. CancelledError is included: in
-# the synchronous output loop it can only come from the container itself and
-# would otherwise end the output handler. KeyboardInterrupt / SystemExit
-# propagate (process-level).
-_CONTAINER_ERRORS = (Exception, asyncio.CancelledError)
+# Container failures are contained (the request fails alone), except the
+# process-level KeyboardInterrupt / SystemExit. Every guarded call is
+# synchronous, so a real task cancellation is never delivered inside one: any
+# other BaseException (CancelledError, GeneratorExit, ...) comes from the
+# container and would otherwise end the shared output handler. Checked on the
+# exception's real type (isinstance could run a hookable __class__).
+_PROPAGATE = (KeyboardInterrupt, SystemExit)
+
+
+def _contained(error: BaseException) -> bool:
+    return not issubclass(type(error), _PROPAGATE)
+
+
+def _report_failure(what: str, error: BaseException) -> None:
+    """Log a container failure (after the handle was marked broken). Formatting
+    the traceback runs the container exception's hooks, so it is contained as
+    well, falling back to a message without it."""
+    try:
+        logger.error(
+            "Sample logprobs container %s failed; failing the request",
+            what,
+            exc_info=error,
+        )
+    except BaseException as e:
+        if not _contained(e):
+            raise
+        logger.error(
+            "Sample logprobs container %s failed (traceback unavailable)", what
+        )
 
 
 @final
@@ -244,24 +270,35 @@ class SampleLogprobsHandle:
             raise ValueError("Sample logprobs are unavailable for this request")
         return self._container
 
+    def _fail(self, what: str, error: BaseException) -> None:
+        self._container = None  # broken first: logging runs the error's hooks
+        _report_failure(what, error)
+
     def _call(self, method: str, *args: Any) -> Any:
         if self._container is not None:
             try:
                 return getattr(self._container, method)(*args)
-            except _CONTAINER_ERRORS:
-                logger.exception("Sample logprobs container failed; failing request")
-                self._container = None
+            except BaseException as e:
+                if not _contained(e):
+                    raise
+                self._fail(method, e)
         return None
 
     def append_rows(self, token_ids: Any, logprobs: Any, ranks: "np.ndarray") -> None:
         try:
             self._count += len(ranks)
-        except _CONTAINER_ERRORS:  # malformed engine rows: positions unknown
-            self._container = None
+        except BaseException as e:  # malformed engine rows: positions unknown
+            if not _contained(e):
+                raise
+            self._fail("rows", e)
         self._call("append_rows", token_ids, logprobs, ranks)
 
     def extend(self, other: Any) -> None:
-        """DELTA aggregation in ``RequestOutput.add`` (never raises)."""
+        """DELTA aggregation in ``RequestOutput.add`` (never raises). A request
+        keeps one container type for its lifetime (the container is chosen
+        once, n > 1 children share the parent's choice), so ``other`` is a
+        handle too, and a list / FlatLogprobs destination never meets a
+        handle source."""
         if type(other) is not SampleLogprobsHandle:  # cannot happen for one request
             self._count += len(other) if type(other) in (list, FlatLogprobs) else 0
             self._container = None
@@ -289,6 +326,10 @@ class SampleLogprobsHandle:
 
     def __repr__(self) -> str:
         return f"SampleLogprobsHandle(positions={self._count}, broken={self.broken})"
+
+    def __reduce__(self) -> Any:
+        # copy / deepcopy / pickle would run the container's hooks unguarded.
+        raise TypeError("SampleLogprobsHandle cannot be copied or pickled")
 
 
 # {token_id -> logprob} per each sequence group. None if the corresponding
@@ -319,8 +360,13 @@ def create_sample_logprobs(
     container = None  # a factory failing (or returning None) breaks the handle
     try:
         container = entry[0](sampling_params)
-    except _CONTAINER_ERRORS:
-        logger.exception("Sample logprobs container %r failed", name)
+    except BaseException as e:
+        if not _contained(e):
+            raise
+        _report_failure(f"factory {name!r}", e)
+    else:
+        if container is None:
+            logger.error("Sample logprobs container factory %r returned None", name)
     return SampleLogprobsHandle(container)
 
 

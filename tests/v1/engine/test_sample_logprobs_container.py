@@ -5,6 +5,9 @@ registration, selection, the core-owned ``SampleLogprobsHandle`` (structural
 containment of third-party containers), EngineCore wire, detokenizer skip."""
 
 import asyncio
+import copy
+import io
+import logging
 import threading
 from unittest.mock import MagicMock
 
@@ -13,6 +16,7 @@ import pytest
 
 from vllm import logprobs as logprobs_mod
 from vllm.entrypoints.scale_out.token_in_token_out.protocol import GenerateRequest
+from vllm.logging_utils import NewLineFormatter
 from vllm.logprobs import (
     SampleLogprobsHandle,
     create_sample_logprobs,
@@ -309,6 +313,21 @@ def _hostile(op):
     return type(f"Hostile_{op.strip('_')}", (Hostile,), {"op": op})
 
 
+class CustomBaseException(BaseException):
+    pass
+
+
+def _raising(error_type):
+    """A container whose append_rows raises ``error_type`` once it holds rows."""
+
+    def _maybe(self, op):
+        if op == self.op and self.rows:
+            raise error_type()
+
+    name = f"Raising{error_type.__name__}"
+    return type(name, (Hostile,), {"op": "append_rows", "_maybe": _maybe})
+
+
 CASES = {
     # factory -> whether core calls the failing operation (handle broken)
     "append_rows": (_hostile("append_rows"), True),
@@ -320,21 +339,9 @@ CASES = {
     "raising___class__": (HostileClass, False),
     "factory_raises": (lambda params: 1 / 0, True),
     "factory_returns_none": (lambda params: None, True),
-    "cancelled_error": (
-        type(
-            "Cancelling",
-            (Hostile,),
-            {
-                "op": "append_rows",
-                "_maybe": lambda self, op: (
-                    (_ for _ in ()).throw(asyncio.CancelledError())
-                    if op == self.op and self.rows
-                    else None
-                ),
-            },
-        ),
-        True,
-    ),
+    "cancelled_error": (_raising(asyncio.CancelledError), True),
+    "generator_exit": (_raising(GeneratorExit), True),
+    "custom_base_exception": (_raising(CustomBaseException), True),
 }
 
 
@@ -422,6 +429,145 @@ def test_malformed_engine_rows_break_only_the_handle(registry):
     ids, lps, _ = _rows(1, 2)
     handle.append_rows(ids, lps, np.int64(1))
     assert handle.broken and len(handle) == 0
+
+
+class HookedError(Exception):
+    """Codex r18 #1: an exception whose hooks raise while it is formatted."""
+
+    def __getattribute__(self, name):
+        if name in ("__cause__", "__context__", "__traceback__"):
+            raise asyncio.CancelledError("hostile exception hook")
+        return super().__getattribute__(name)
+
+
+@pytest.fixture
+def vllm_log_stream():
+    """vLLM's formatter on a plain StreamHandler (as configured by vLLM)."""
+    stream = io.StringIO()
+    handler = logging.StreamHandler(stream)
+    handler.setFormatter(NewLineFormatter("%(levelname)s %(message)s"))
+    log = logging.getLogger(logprobs_mod.__name__)
+    log.addHandler(handler)
+    try:
+        yield stream
+    finally:
+        log.removeHandler(handler)
+
+
+def _rows_container_raising(error):
+    class Raising(RowsContainer):
+        def append_rows(self, token_ids, logprobs, ranks):
+            raise error
+
+    return Raising
+
+
+def test_failure_logging_runs_no_container_hooks_unguarded(registry, vllm_log_stream):
+    """Codex r18 #1: formatting a container exception's traceback may run its
+    hooks; the handle is broken first and the logging itself is contained."""
+    _register("hooked", _rows_container_raising(HookedError("rows")))
+    params = SamplingParams(logprobs=1)
+    set_sample_logprobs_container(params, "hooked")
+    handle = create_sample_logprobs(False, params)
+    handle.append_rows(*_rows(2, 2))  # no exception escapes
+    assert handle.broken and len(handle) == 2
+    assert "append_rows failed" in vllm_log_stream.getvalue()
+
+    def factory(params):
+        raise HookedError("factory")
+
+    _register("hooked_factory", factory)
+    set_sample_logprobs_container(params, "hooked_factory")
+    assert create_sample_logprobs(False, params).broken
+    assert "factory 'hooked_factory' failed" in vllm_log_stream.getvalue()
+
+
+@pytest.mark.parametrize("error", [KeyboardInterrupt, SystemExit])
+def test_process_level_exceptions_propagate(registry, error):
+    """KeyboardInterrupt / SystemExit from a container are not contained."""
+    _register("raising", _rows_container_raising(error()))
+    params = SamplingParams(logprobs=1)
+    set_sample_logprobs_container(params, "raising")
+    handle = create_sample_logprobs(False, params)
+    with pytest.raises(error):
+        handle.append_rows(*_rows(1, 2))
+
+    def factory(params):
+        raise error()
+
+    _register("raising_factory", factory)
+    set_sample_logprobs_container(params, "raising_factory")
+    with pytest.raises(error):
+        create_sample_logprobs(False, params)
+
+
+def _output(logprobs, token_ids, finished=False):
+    return RequestOutput(
+        request_id="r",
+        prompt=None,
+        prompt_token_ids=[1],
+        prompt_logprobs=None,
+        outputs=[CompletionOutput(0, "", token_ids, None, logprobs)],
+        finished=finished,
+    )
+
+
+def test_broken_zero_position_source_is_merged(registry):
+    """Codex r18 #2: a terminal DELTA with no new positions whose slice of the
+    live container failed is a broken zero-position handle; aggregation must
+    carry the failure (base truth-testing would drop it)."""
+    _register("rows", RowsContainer)
+    params = SamplingParams(logprobs=1)
+    set_sample_logprobs_container(params, "rows")
+    pending = create_sample_logprobs(False, params)
+    pending.append_rows(*_rows(2, 2))
+    first = _output(pending, [1, 2])
+    first.add(_output(SampleLogprobsHandle(None, 0), [], finished=True), True)
+    merged = first.outputs[0].logprobs
+    assert first.finished and merged.broken and len(merged) == 2
+    # Lists keep the base truth test (an empty source is not merged).
+    plain = _output([{1: None}], [1])
+    plain.add(_output([], [], finished=True), True)
+    assert plain.outputs[0].logprobs == [{1: None}]
+
+
+class HookedName(str):
+    hashed = 0
+
+    def __hash__(self):
+        HookedName.hashed += 1
+        return super().__hash__()
+
+
+def test_names_and_selectors_must_be_exact_strings(registry):
+    """Codex r18 #3: a str subclass would run its hooks under the registry lock
+    (deadlock if they register); rejected before the lock, like selectors."""
+    with pytest.raises(ValueError):
+        _register(HookedName("sub"), RowsContainer)
+    assert HookedName.hashed == 0 and "sub" not in registry
+    _register("rows", RowsContainer)
+    with pytest.raises(ValueError):
+        set_sample_logprobs_container(SamplingParams(), HookedName("rows"))
+
+
+def test_handle_cannot_be_copied_or_pickled(registry):
+    """Claude r18 NIT: copy / deepcopy / pickle would run container hooks."""
+
+    class NoCopy(RowsContainer):
+        def __deepcopy__(self, memo):
+            raise AssertionError("container hook ran")
+
+        def __reduce_ex__(self, protocol):
+            raise AssertionError("container hook ran")
+
+    _register("nocopy", NoCopy)
+    params = SamplingParams(logprobs=1)
+    set_sample_logprobs_container(params, "nocopy")
+    handle = create_sample_logprobs(False, params)
+    # (pickle uses __reduce_ex__, like copy)
+    for operation in (copy.copy, copy.deepcopy, lambda h: h.__reduce_ex__(4)):
+        with pytest.raises(TypeError):
+            operation(handle)
 
 
 def test_foreign_destination_in_request_output_add(registry):

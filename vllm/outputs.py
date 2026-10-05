@@ -11,7 +11,7 @@ import torch
 from typing_extensions import TypeVar
 
 from vllm.logger import init_logger
-from vllm.logprobs import PromptLogprobs, SampleLogprobs
+from vllm.logprobs import PromptLogprobs, SampleLogprobs, SampleLogprobsHandle
 from vllm.lora.request import LoRARequest
 from vllm.v1.metrics.stats import RequestSpecDecodeMetrics, RequestStateStats
 
@@ -186,7 +186,12 @@ class RequestOutput:
                         if not isinstance(completion.token_ids, MutableSequence):
                             completion.token_ids = list(completion.token_ids)
                         completion.token_ids.extend(next_completion.token_ids)
-                        if next_completion.logprobs:
+                        # Handles always (a zero-position one may carry a
+                        # failure); list / FlatLogprobs when non-empty.
+                        if (
+                            type(next_completion.logprobs) is SampleLogprobsHandle
+                            or next_completion.logprobs
+                        ):
                             assert completion.logprobs is not None
                             completion.logprobs.extend(next_completion.logprobs)  # type: ignore[arg-type]
                         completion.cumulative_logprob = (
