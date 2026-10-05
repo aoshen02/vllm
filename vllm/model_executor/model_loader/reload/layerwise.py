@@ -238,6 +238,10 @@ def finalize_layerwise_processing(model: torch.nn.Module, model_config: ModelCon
         model_config: config needed for applying processing to attention layers
 
     """
+    # Circular import: fused_moe imports model utils, which import the loader.
+    from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
+    from vllm.model_executor.model_loader.utils import device_loading_context
+
     if hasattr(model, "_original_do_torchao_reload"):
         model._do_torchao_reload = model._original_do_torchao_reload
 
@@ -284,6 +288,13 @@ def finalize_layerwise_processing(model: torch.nn.Module, model_config: ModelCon
         info.reset()
 
     LOADING_LAYERS.clear()
+    for module in model.modules():
+        if isinstance(module, MoERunner):
+            device = (
+                get_layerwise_info(module).restore_device or torch.get_default_device()
+            )
+            with device_loading_context(module, device):
+                module.process_weights_after_loading()
     register_held_tensors(model)
 
 

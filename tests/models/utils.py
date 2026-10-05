@@ -637,8 +637,6 @@ KNOWN_UNREGISTERED: tuple[str, ...] = (
     r"\.head\.projector\.",  # Sentence-Transformers projector
     r"\._[kv]_scale_cpu$",  # attention default k/v scales
     r"\.impl\.(alibi_slopes|sinks)$",  # attention impls
-    r"\.quant_method\.(moe_quant_config|moe_kernel|_cache_permute_indices)\b",
-    r"\.routed_experts\.w(13|2)_input_scale$",  # MoE input scales
     r"norm\.weight$",  # RMSNorm(has_weight=False)
     r"\.(slope_rate|tp_slope)$",  # linear attention slopes
     r"\.attention_dists$",  # Granite Speech
