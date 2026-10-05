@@ -2782,6 +2782,87 @@ def test_compact_middleware_inline_build_skips_busy_builder(monkeypatch, positio
     assert len(joins) == 1 and not joins[0].startswith("generate-response")
 
 
+@pytest.mark.parametrize("fmt", ["openai", "compact"])
+def test_mid_size_default_build_off_loop_not_behind_large_builds(monkeypatch, fmt):
+    """Claude r11 NIT 3: a default-format build of OFFLOAD_MIN_DEFAULT_...
+    entries or more (here 300 x 129) runs off the event loop, in its own
+    thread, so it does not wait behind a large build; compact of the same
+    size stays inline."""
+    from vllm.entrypoints.scale_out.token_in_token_out import serving as serving_mod
+
+    positions = 300
+    entries = positions * 129
+    assert entries >= serving_mod.OFFLOAD_MIN_DEFAULT_LOGPROB_ENTRIES
+    assert entries < serving_mod.OFFLOAD_MIN_LOGPROB_ENTRIES
+    threads: list[str] = []
+    original = ServingTokens._build_full_response
+
+    def recording(self, *args, **kwargs):
+        threads.append(threading.current_thread().name)
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(ServingTokens, "_build_full_response", recording)
+    chunks = [_engine_rows(0, positions, 129)]
+    release = threading.Event()
+    busy = serving_mod._RESPONSE_BUILDER.submit(release.wait, 20)
+    try:
+        app = _middleware_app(_OutputProcessorEngine(chunks))
+        app.app.state.args.middleware = []
+        with app as client:
+            t0 = time.perf_counter()
+            result = client.post(
+                "/inference/v1/generate",
+                json={
+                    "token_ids": [1, 2, 3],
+                    "sampling_params": {"max_tokens": positions, "logprobs": 128},
+                    "logprobs_format": fmt,
+                },
+            )
+            elapsed = time.perf_counter() - t0
+        assert not busy.done()
+        assert elapsed < 10
+    finally:
+        release.set()
+        busy.result(timeout=30)
+    assert result.status_code == 200
+    assert int(result.headers["content-length"]) == len(result.content)
+    assert len(threads) == 1
+    if fmt == "compact":
+        assert not threads[0].startswith("generate-response")
+    else:
+        assert threads[0].startswith("generate-response-mid")
+        choice = result.json()["choices"][0]
+        assert len(choice["logprobs"]["content"]) == positions
+
+
+def test_lead_table_first_fill_triggers_no_gc():
+    """Claude r9-r11 NIT: the first fill of the lead table allocates no
+    GC-tracked object per id (tuples triggered a full collection: a ~160 ms
+    event-loop gap on the first default-format request)."""
+    import gc
+
+    table = logprobs_render._LeadTable(b"")
+    ids = np.arange(100_000, dtype=np.int64).reshape(1000, 100)
+    collections: list[int] = []
+
+    def callback(phase, info):
+        if phase == "start":
+            collections.append(info["generation"])
+
+    old_threshold = gc.get_threshold()
+    gc.set_threshold(700, 10, 10)
+    gc.collect()
+    gc.callbacks.append(callback)
+    try:
+        leads = table.lookup(ids)
+    finally:
+        gc.callbacks.remove(callback)
+        gc.set_threshold(*old_threshold)
+    assert leads[999, 99] == b'{"token":"token_id:99999","logprob":'
+    assert bool(table.filled[:100_000].all())
+    assert len(collections) <= 2, collections
+
+
 def test_compact_middleware_offloaded_build_joins_in_same_job(monkeypatch):
     """An offloaded compact + --middleware build is joined inside the same
     response-builder job: one builder trip, no join on the event loop."""

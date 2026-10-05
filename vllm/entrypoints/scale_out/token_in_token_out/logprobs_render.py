@@ -283,8 +283,11 @@ class _LeadTable:
             missing = np.unique(ids)
         # Format outside the lock (the expensive part), publish under it, so
         # a render on the event loop never waits for another thread's
-        # formatting; the lock only covers growth and a few stores.
-        formatted = [(i, self._format(i)) for i in missing.tolist()]
+        # formatting; the lock only covers growth and a few stores. Only
+        # bytes (not GC-tracked) per id: a first fill of ~10^5 ids as tuples
+        # triggered a full GC collection (~160 ms holding the GIL).
+        formatted = np.empty(missing.size, dtype=object)
+        formatted[:] = [self._format(i) for i in missing.tolist()]
         with self.lock:
             values, filled = self._table
             if hi >= len(values):
@@ -295,8 +298,7 @@ class _LeadTable:
                 grown_filled[: len(filled)] = filled
                 values, filled = grown, grown_filled
             # Values before flags: a reader that sees a flag sees its value.
-            for token_id, lead in formatted:
-                values[token_id] = lead
+            values[missing] = formatted
             filled[missing] = True
             self._table = (values, filled)
             return values[ids]
