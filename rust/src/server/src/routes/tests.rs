@@ -7405,3 +7405,139 @@ async fn raw_generate_returns_routed_experts_from_the_engine_wire() {
     assert_eq!(block["sampled_slot"], false);
     assert!(block.get("ranks").is_none());
 }
+
+/// A routed_experts value the frontend does not support (here `<f2`) fails
+/// only its own request: the engine-core client keeps running and the next
+/// request on the same engine succeeds.
+#[tokio::test]
+async fn raw_generate_bad_routed_experts_fail_only_their_request() {
+    use vllm_engine_core_client::protocol::routed_experts::{
+        MaybeWireRoutedExperts, RoutedExperts,
+    };
+
+    let ipc = IpcNamespace::new().expect("create ipc namespace");
+    let handshake_address = ipc.handshake_endpoint();
+    let engine_id = b"engine-raw-generate-bad-routed".to_vec();
+    let routed = |dtype: &str, bytes: usize| {
+        MaybeWireRoutedExperts::Direct(RoutedExperts {
+            dtype: dtype.to_string(),
+            shape: vec![1, 2, 4],
+            data: Bytes::from(vec![1_u8; bytes]),
+        })
+    };
+
+    let engine_task = MockEngineTask::new(spawn_mock_engine_task(
+        handshake_address.clone(),
+        engine_id.clone(),
+        move |dealer, push| {
+            boxed_test_future(async move {
+                let mut next_request = async || loop {
+                    let message = recv_engine_message(dealer).await;
+                    if let Ok(request) = rmp_serde::from_slice::<EngineCoreRequest>(&message[1]) {
+                        break request;
+                    }
+                };
+                let first = next_request().await;
+                let mut output = request_output_with_logprobs(
+                    &first.request_id,
+                    vec![33],
+                    Some(EngineCoreFinishReason::Abort),
+                    None,
+                    None,
+                    None,
+                );
+                output.routed_experts = Some(routed("<f2", 16));
+                send_outputs(
+                    push,
+                    RequestBatchOutputs {
+                        outputs: vec![output],
+                        ..Default::default()
+                    }
+                    .into(),
+                )
+                .await;
+
+                let second = next_request().await;
+                let mut output = request_output_with_logprobs(
+                    &second.request_id,
+                    vec![44],
+                    Some(EngineCoreFinishReason::Abort),
+                    None,
+                    None,
+                    None,
+                );
+                output.routed_experts = Some(routed("|u1", 8));
+                send_outputs(
+                    push,
+                    RequestBatchOutputs {
+                        outputs: vec![output],
+                        ..Default::default()
+                    }
+                    .into(),
+                )
+                .await;
+            })
+        },
+    ));
+
+    let client = EngineCoreClient::connect(
+        EngineCoreClientConfig::new_single(handshake_address)
+            .with_model_name("test-model")
+            .with_local_input_output_addresses(
+                Some(ipc.input_endpoint()),
+                Some(ipc.output_endpoint()),
+            ),
+    )
+    .await
+    .expect("connect client");
+    let chat = ChatLlm::from_shared_backend(Llm::new(client), Arc::new(FakeChatBackend::new()));
+    let mut app = build_router(Arc::new(
+        AppState::new(vec!["Qwen/Qwen1.5-0.5B-Chat".to_string()], chat).with_api_server_options(
+            ApiServerOptions {
+                enable_return_routed_experts: true,
+                ..Default::default()
+            },
+        ),
+    ));
+
+    let mut generate = async || {
+        let response = app
+            .call(
+                Request::builder()
+                    .method("POST")
+                    .uri("/inference/v1/generate")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "model": "Qwen/Qwen1.5-0.5B-Chat",
+                            "token_ids": [11, 22, 23],
+                            "sampling_params": {"max_tokens": 4}
+                        })
+                        .to_string(),
+                    ))
+                    .expect("build request"),
+            )
+            .await
+            .expect("call app");
+        let status = response.status();
+        let body = to_bytes(response.into_body(), usize::MAX).await.expect("read body");
+        (status, String::from_utf8_lossy(&body).into_owned())
+    };
+
+    // Bounded: with a batch-fatal decode the request never completes.
+    let bounded = std::time::Duration::from_secs(30);
+    let (status, body) = tokio::time::timeout(bounded, generate())
+        .await
+        .expect("first request completes");
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    let (status, body) = tokio::time::timeout(bounded, generate())
+        .await
+        .expect("second request completes");
+    // Before awaiting the mock engine: if the client died it never sees the
+    // second request.
+    assert_eq!(status, StatusCode::OK, "{body}");
+    engine_task.await.expect("mock engine task");
+    let json: serde_json::Value = serde_json::from_str(&body).expect("decode json");
+    assert_eq!(json["choices"][0]["token_ids"], json!([44]));
+    assert!(json["choices"][0]["routed_experts"].is_string());
+}

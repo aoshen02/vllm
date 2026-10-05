@@ -13,7 +13,7 @@ use serde_tuple::{Deserialize_tuple, Serialize_tuple};
 ///
 /// Original Python definition:
 /// <https://github.com/vllm-project/vllm/blob/5a0a8fc1ea7542394ff315138bd5677b7b53bca1/vllm/v1/serial_utils.py#L41-L43>
-const CUSTOM_TYPE_RAW_VIEW: i8 = 3;
+pub(crate) const CUSTOM_TYPE_RAW_VIEW: i8 = 3;
 
 #[derive(Serialize)]
 #[serde(rename = "_ExtStruct")]

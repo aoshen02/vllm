@@ -12,7 +12,7 @@ use futures::{Stream, StreamExt as _, pin_mut};
 use serde::{Deserialize, Serialize};
 use vllm_engine_core_client::protocol::logprobs::Logprobs;
 use vllm_engine_core_client::protocol::output::{EngineCoreFinishReason, StopReason};
-use vllm_engine_core_client::protocol::routed_experts::RoutedExperts;
+use vllm_engine_core_client::protocol::routed_experts::{MaybeWireRoutedExperts, RoutedExperts};
 use vllm_engine_core_client::{AbortCause, EngineCoreOutputStream};
 
 use crate::error::Result;
@@ -287,6 +287,18 @@ impl Stream for GenerateOutputStream {
             self.request_metrics.record_finished(received_at, finish_reason.clone());
         }
 
+        // A malformed routed_experts value fails only this request.
+        let routed_experts = match raw.routed_experts {
+            None => None,
+            Some(MaybeWireRoutedExperts::Invalid(message)) => {
+                return Poll::Ready(Some(Err(crate::Error::InvalidRoutedExperts {
+                    request_id: raw.request_id,
+                    message,
+                })));
+            }
+            Some(value) => Some(value.into_direct().unwrap()),
+        };
+
         let output = GenerateOutput {
             request_id: raw.request_id,
             prompt_info: self.pending_prompt_info.take(),
@@ -296,7 +308,7 @@ impl Stream for GenerateOutputStream {
             cached_token_count,
             kv_transfer_params: raw.kv_transfer_params,
             ec_transfer_params: raw.ec_transfer_params,
-            routed_experts: raw.routed_experts.map(|value| value.into_direct().unwrap()),
+            routed_experts,
         };
 
         Poll::Ready(Some(Ok(output)))

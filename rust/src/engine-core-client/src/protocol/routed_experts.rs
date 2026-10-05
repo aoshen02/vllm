@@ -12,10 +12,12 @@ use bytes::Bytes;
 use enum_as_inner::EnumAsInner;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::error::{Error, Result, bail_ext_value_decode};
-use crate::protocol::tensor::{ShapeExt as _, WireArrayData, WireNdArray};
+use rmpv::Value;
 
-/// Decoded routed experts of one engine output: the raw C-order bytes of a
+use crate::error::Result;
+use crate::protocol::tensor::{CUSTOM_TYPE_RAW_VIEW, ShapeExt as _, WireArrayData, WireNdArray};
+
+/// Decoded routed experts of one engine output: the raw C-order bytes of an
 /// integer array, in the byte order of `dtype` as sent by the engine.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RoutedExperts {
@@ -49,12 +51,18 @@ impl RoutedExperts {
 }
 
 /// Wire form until aux frames are resolved, then the decoded value.
+///
+/// A malformed value (not an ndarray, unsupported dtype, length mismatch,
+/// missing aux frame) never fails the decode of the whole output batch:
+/// it becomes [`Self::Invalid`] and only fails its own request.
 #[derive(Debug, Clone, PartialEq, EnumAsInner)]
 pub enum MaybeWireRoutedExperts {
     /// Still referencing an inline raw view or an aux frame.
     Wire(Box<WireNdArray>),
     /// Resolved array.
     Direct(RoutedExperts),
+    /// A value that is not a supported routed-experts array (the reason).
+    Invalid(String),
 }
 
 impl<'de> Deserialize<'de> for MaybeWireRoutedExperts {
@@ -62,7 +70,68 @@ impl<'de> Deserialize<'de> for MaybeWireRoutedExperts {
     where
         D: Deserializer<'de>,
     {
-        WireNdArray::deserialize(deserializer).map(|value| Self::Wire(Box::new(value)))
+        Ok(Self::from_value(Value::deserialize(deserializer)?))
+    }
+}
+
+/// msgpack type name for error messages (never the value: it can be huge).
+fn kind(value: &Value) -> &'static str {
+    match value {
+        Value::Nil => "nil",
+        Value::Boolean(_) => "bool",
+        Value::Integer(_) => "integer",
+        Value::F32(_) | Value::F64(_) => "float",
+        Value::String(_) => "string",
+        Value::Binary(_) => "binary",
+        Value::Array(_) => "array",
+        Value::Map(_) => "map",
+        Value::Ext(..) => "ext",
+    }
+}
+
+impl MaybeWireRoutedExperts {
+    /// Parse the ndarray tuple `(dtype, shape, data)`; anything else is
+    /// [`Self::Invalid`].
+    fn from_value(value: Value) -> Self {
+        let invalid = |reason: String| Self::Invalid(format!("routed_experts: {reason}"));
+        let Value::Array(items) = value else {
+            return invalid(format!("expected an ndarray tuple, got {}", kind(&value)));
+        };
+        let Ok([dtype, shape, data]) = <[Value; 3]>::try_from(items) else {
+            return invalid("expected an ndarray tuple (dtype, shape, data)".to_string());
+        };
+        let Value::String(dtype) = dtype else {
+            return invalid(format!("expected a dtype string, got {}", kind(&dtype)));
+        };
+        let Some(dtype) = dtype.into_str() else {
+            return invalid("dtype is not valid UTF-8".to_string());
+        };
+        let Value::Array(axes) = shape else {
+            return invalid(format!("expected a shape array, got {}", kind(&shape)));
+        };
+        let Some(shape) = axes
+            .iter()
+            .map(|axis| axis.as_u64().and_then(|axis| usize::try_from(axis).ok()))
+            .collect::<Option<Vec<usize>>>()
+        else {
+            return invalid("shape axes must be non-negative integers".to_string());
+        };
+        let data = match data {
+            Value::Ext(tag, bytes) if tag == CUSTOM_TYPE_RAW_VIEW => {
+                WireArrayData::RawView(Bytes::from(bytes))
+            }
+            Value::Integer(index) => match index.as_u64().and_then(|i| usize::try_from(i).ok()) {
+                Some(index) => WireArrayData::AuxIndex(index),
+                None => return invalid("aux frame index must be non-negative".to_string()),
+            },
+            other => {
+                return invalid(format!(
+                    "expected raw-view ext or aux frame index, got {}",
+                    kind(&other)
+                ));
+            }
+        };
+        Self::Wire(Box::new(WireNdArray { dtype, shape, data }))
     }
 }
 
@@ -73,6 +142,7 @@ impl Serialize for MaybeWireRoutedExperts {
     {
         match self {
             Self::Wire(value) => value.serialize(serializer),
+            Self::Invalid(_) => serializer.serialize_unit(),
             Self::Direct(value) => WireNdArray {
                 dtype: value.dtype.clone(),
                 shape: value.shape.clone(),
@@ -85,37 +155,42 @@ impl Serialize for MaybeWireRoutedExperts {
 
 impl MaybeWireRoutedExperts {
     /// Resolve aux-frame references and validate dtype, shape and length.
+    /// Never fails the batch: a bad value becomes [`Self::Invalid`].
     pub(super) fn resolve<Frame>(self, frames: &[Frame]) -> Result<Self>
     where
         Frame: AsRef<[u8]>,
     {
         let wire = match self {
-            Self::Direct(value) => return Ok(Self::Direct(value)),
             Self::Wire(wire) => *wire,
+            resolved => return Ok(resolved),
         };
+        let invalid = |reason: String| Ok(Self::Invalid(format!("routed_experts: {reason}")));
         let WireNdArray { dtype, shape, data } = wire;
         let Some(itemsize) = RoutedExperts::itemsize(&dtype) else {
-            bail_ext_value_decode!("routed_experts: unsupported dtype {dtype:?}");
+            return invalid(format!("unsupported dtype {dtype:?}"));
         };
         if shape.is_empty() {
-            bail_ext_value_decode!("routed_experts: expected an array with at least one axis");
+            return invalid("expected an array with at least one axis".to_string());
         }
         let data = match data {
             WireArrayData::RawView(bytes) => bytes,
             WireArrayData::AuxIndex(index) => match frames.get(index) {
                 Some(frame) => Bytes::copy_from_slice(frame.as_ref()),
-                None => bail_ext_value_decode!(
-                    "routed_experts: aux frame index {index} out of range for {} frames",
-                    frames.len()
-                ),
+                None => {
+                    return invalid(format!(
+                        "aux frame index {index} out of range for {} frames",
+                        frames.len()
+                    ));
+                }
             },
         };
         let expected = shape.checked_numel().and_then(|count| count.checked_mul(itemsize));
         if expected != Some(data.len()) {
-            bail_ext_value_decode!(
-                "routed_experts: byte length mismatch for shape {shape:?} dtype {dtype}: got {}",
-                data.len()
-            );
+            return invalid(format!(
+                "byte length {} does not match {} axes of dtype {dtype}",
+                data.len(),
+                shape.len()
+            ));
         }
         Ok(Self::Direct(RoutedExperts { dtype, shape, data }))
     }
@@ -153,17 +228,17 @@ mod tests {
         ])
     }
 
-    fn decode(frames: &[Bytes]) -> crate::error::Result<Option<RoutedExperts>> {
-        let EngineCoreOutputs::RequestBatch(batch) = decode_engine_core_outputs(frames)? else {
+    fn decode_value(frames: &[Bytes]) -> Option<MaybeWireRoutedExperts> {
+        let EngineCoreOutputs::RequestBatch(batch) =
+            decode_engine_core_outputs(frames).expect("batch decodes")
+        else {
             panic!("expected a request batch");
         };
-        Ok(batch
-            .outputs
-            .into_iter()
-            .next()
-            .unwrap()
-            .routed_experts
-            .map(|value| value.into_direct().unwrap()))
+        batch.outputs.into_iter().next().unwrap().routed_experts
+    }
+
+    fn decode(frames: &[Bytes]) -> crate::error::Result<Option<RoutedExperts>> {
+        Ok(decode_value(frames).map(|value| value.into_direct().unwrap()))
     }
 
     #[test]
@@ -190,10 +265,37 @@ mod tests {
         assert!(decode(&message(Value::Nil, vec![])).unwrap().is_none());
     }
 
+    /// A bad value only marks its own output invalid; the batch decodes.
     #[test]
-    fn rejects_bad_routed_experts_payloads() {
-        // Wrong byte length, unsupported dtype, missing aux frame, no axes.
+    fn bad_routed_experts_payloads_are_request_local() {
+        // Wrong byte length, unsupported dtypes, missing aux frame, no axes,
+        // not an ndarray at all, bad shape and data fields.
         let cases = [
+            message(
+                ndarray("<f2", &[1, 1, 1], Value::Ext(3, vec![0; 2])),
+                vec![],
+            ),
+            message(ndarray("|b1", &[1, 1, 1], Value::Ext(3, vec![1])), vec![]),
+            message(Value::from("not an array"), vec![]),
+            message(Value::Array(vec![Value::from("|u1")]), vec![]),
+            message(
+                Value::Array(vec![
+                    Value::from("|u1"),
+                    Value::from(3),
+                    Value::Ext(3, vec![0]),
+                ]),
+                vec![],
+            ),
+            message(
+                Value::Array(vec![
+                    Value::from("|u1"),
+                    Value::Array(vec![Value::from(-1)]),
+                    Value::Ext(3, vec![0]),
+                ]),
+                vec![],
+            ),
+            message(ndarray("|u1", &[1], Value::Ext(7, vec![0])), vec![]),
+            message(ndarray("|u1", &[1], Value::from("x")), vec![]),
             message(
                 ndarray("|u1", &[2, 3, 4], Value::Ext(3, vec![0; 23])),
                 vec![],
@@ -206,7 +308,9 @@ mod tests {
             message(ndarray("|u1", &[], Value::Ext(3, vec![0])), vec![]),
         ];
         for frames in cases {
-            assert!(decode(&frames).is_err());
+            let value = decode_value(&frames).expect("routed_experts present");
+            let reason = value.into_invalid().expect("invalid value");
+            assert!(reason.starts_with("routed_experts: "), "{reason}");
         }
     }
 }
