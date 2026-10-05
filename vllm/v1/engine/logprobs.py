@@ -10,6 +10,7 @@ from vllm.logprobs import (
     FlatLogprobs,
     PromptLogprobs,
     SampleLogprobs,
+    SampleLogprobsHandle,
     append_logprobs_for_next_position,
     create_prompt_logprobs,
     create_sample_logprobs,
@@ -55,7 +56,9 @@ class LogprobsProcessor:
             logprobs=(
                 None
                 if num_logprobs is None
-                else create_sample_logprobs(sampling_params.flat_logprobs)
+                else create_sample_logprobs(  # type: ignore[arg-type]
+                    sampling_params.flat_logprobs, sampling_params
+                )
             ),
             prompt_logprobs=(
                 None
@@ -82,6 +85,9 @@ class LogprobsProcessor:
         assert self.cumulative_logprob is not None
 
         token_ids_lst, logprobs_lst, ranks_lst, _ = logprobs_lists
+        if type(self.logprobs) is SampleLogprobsHandle:
+            self._append_rows(self.logprobs, token_ids_lst, logprobs_lst, ranks_lst)
+            return
 
         for rank_np, logprobs_np, token_ids_np in zip(
             ranks_lst, logprobs_lst, token_ids_lst
@@ -117,6 +123,21 @@ class LogprobsProcessor:
                 rank,
                 self.num_logprobs,
             )
+
+    def _append_rows(self, handle, token_ids, logprobs, ranks) -> None:
+        """Pass this request's k + 1 slots of the engine rows (padded to the
+        batch-wide width, like the zip truncation above) to the container."""
+        try:
+            if self.num_logprobs != -1:
+                num_slots = (self.num_logprobs or 0) + 1
+                token_ids, logprobs = token_ids[:, :num_slots], logprobs[:, :num_slots]
+            cumulative_logprob = self.cumulative_logprob or 0.0
+            for value in logprobs[: len(ranks), 0].tolist():  # same as the zip above
+                cumulative_logprob += value
+            self.cumulative_logprob = cumulative_logprob
+        except Exception:
+            logger.exception("Inconsistent logprob rows")  # the container rejects them
+        handle.append_rows(token_ids, logprobs, ranks)
 
     def _update_prompt_logprobs(
         self,

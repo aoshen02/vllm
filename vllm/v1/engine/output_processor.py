@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import asyncio
+import copy
 from collections import defaultdict, deque
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -10,6 +11,7 @@ from typing import Any, cast
 import numpy as np
 import torch
 
+from vllm.logprobs import SampleLogprobsHandle, sample_logprobs_skip_text
 from vllm.lora.request import LoRARequest
 from vllm.outputs import (
     STREAM_FINISHED,
@@ -239,7 +241,14 @@ class RequestState:
                 request=request,
             )
             detokenizer = IncrementalDetokenizer.from_new_request(
-                tokenizer=tokenizer,
+                # Containers for responses without text: sampled text is then
+                # only needed for stop-string checks.
+                tokenizer=(
+                    None
+                    if sample_logprobs_skip_text(sampling_params)
+                    and not sampling_params.stop
+                    else tokenizer
+                ),
                 request=request,
             )
             max_tokens_param = sampling_params.max_tokens
@@ -410,7 +419,7 @@ class RequestState:
 
         # Prepare logprobs, based on delta mode
         logprobs = self.logprobs_processor.logprobs
-        if delta and logprobs:
+        if delta and (logprobs or type(logprobs) is SampleLogprobsHandle):
             num_new_tokens = len(token_ids)
             # Avoid [-0:], which returns the full accumulated history when a
             # delta contains no new token IDs. [:0] preserves the concrete
@@ -552,6 +561,7 @@ class OutputProcessor:
         req_state = self.request_states.get(request_id)
         if req_state is not None:
             self._update_streaming_request_state(req_state, request, prompt)
+            self._strip_frontend_only_params(request)
             return
 
         req_state = RequestState.from_new_request(
@@ -570,6 +580,18 @@ class OutputProcessor:
 
         # Track the external_req_id -> [internal_req_id, ...] mapping
         self.external_req_ids[req_state.external_req_id].append(request_id)
+        self._strip_frontend_only_params(request)
+
+    @staticmethod
+    def _strip_frontend_only_params(request: EngineCoreRequest) -> None:
+        """Keep the frontend-only container choice off the EngineCore wire
+        (callers send ``request`` right after ``add_request``); a copy, as
+        the params object may be shared (e.g. with a parent request)."""
+        params = request.sampling_params
+        if params is not None and params._sample_logprobs_container is not None:
+            params = copy.copy(params)
+            params._sample_logprobs_container = None
+            request.sampling_params = params
 
     def _update_streaming_request_state(
         self, req_state: RequestState, request: EngineCoreRequest, prompt: str | None
