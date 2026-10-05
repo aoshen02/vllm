@@ -28,29 +28,6 @@ SEQLEN_K_PER_SPLIT = 640
 NUM_SPLITS = 32
 
 
-def fixed_split_unsupported_reason(
-    head_size: int,
-    kv_cache_dtype: str,
-    sliding_window: int | None,
-    max_model_len: int,
-) -> str | None:
-    """Why the fixed split-KV schedule cannot serve this attention layer."""
-    if not current_platform.is_device_capability_family(100):
-        return "requires an SM10x GPU"
-    params = inspect.signature(_flash_attn_fwd).parameters
-    if not {"seqlen_k_per_split", "disable_scheduler_metadata"} <= params.keys():
-        return "requires a vllm-flash-attn build with fixed split-KV scheduling"
-    if head_size != 128:
-        return f"requires head_size 128, got {head_size}"
-    if kv_cache_dtype not in ("fp8", "fp8_e4m3"):
-        return f"requires an FP8 E4M3 KV cache, got {kv_cache_dtype!r}"
-    if sliding_window is not None:
-        return "does not support sliding-window attention"
-    if max_model_len > MAX_SEQ_LEN:
-        return f"supports max_model_len <= {MAX_SEQ_LEN}, got {max_model_len}"
-    return None
-
-
 class FlashAttnFixedSplitImpl(FlashAttentionImpl):
     supports_quant_query_input = True
     supports_dcp = False
@@ -70,13 +47,22 @@ class FlashAttnFixedSplitImpl(FlashAttentionImpl):
         sinks: torch.Tensor | None = None,
     ) -> None:
         config = get_current_vllm_config()
-        reason = fixed_split_unsupported_reason(
-            head_size,
-            kv_cache_dtype,
-            sliding_window,
-            config.model_config.max_model_len,
-        )
-        if reason is None and (
+        max_model_len = config.model_config.max_model_len
+        params = inspect.signature(_flash_attn_fwd).parameters
+        reason = None
+        if not current_platform.is_device_capability_family(100):
+            reason = "requires an SM10x GPU"
+        elif not {"seqlen_k_per_split", "disable_scheduler_metadata"} <= params.keys():
+            reason = "requires a vllm-flash-attn build with fixed split-KV scheduling"
+        elif head_size != 128:
+            reason = f"requires head_size 128, got {head_size}"
+        elif kv_cache_dtype not in ("fp8", "fp8_e4m3"):
+            reason = f"requires an FP8 E4M3 KV cache, got {kv_cache_dtype!r}"
+        elif sliding_window is not None:
+            reason = "does not support sliding-window attention"
+        elif max_model_len > MAX_SEQ_LEN:
+            reason = f"supports max_model_len <= {MAX_SEQ_LEN}, got {max_model_len}"
+        elif (
             alibi_slopes is not None
             or logits_soft_cap is not None
             or sinks is not None

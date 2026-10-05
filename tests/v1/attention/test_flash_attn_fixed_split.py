@@ -13,10 +13,38 @@ BLOCK = 1024
 NUM_HEADS, NUM_KV_HEADS, HEAD = 32, 2, 128
 
 
+def _make_impl(
+    monkeypatch,
+    head_size=HEAD,
+    kv_cache_dtype="fp8_e4m3",
+    sliding_window=None,
+    max_model_len=None,
+):
+    from vllm.v1.attention.backends import flash_attn_fixed_split
+
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            max_model_len=max_model_len or flash_attn_fixed_split.MAX_SEQ_LEN
+        ),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=1),
+    )
+    monkeypatch.setattr(
+        flash_attn_fixed_split, "get_current_vllm_config", lambda: config
+    )
+    return flash_attn_fixed_split.FlashAttnFixedSplitImpl(
+        NUM_HEADS,
+        head_size,
+        HEAD**-0.5,
+        NUM_KV_HEADS,
+        None,
+        sliding_window,
+        kv_cache_dtype,
+    )
+
+
 @pytest.mark.parametrize(
     "head_size,kv_cache_dtype,sliding_window,max_model_len,reason",
     [
-        (128, "fp8_e4m3", None, 16384, None),
         (64, "fp8_e4m3", None, 16384, "head_size"),
         (128, "auto", None, 16384, "FP8 E4M3"),
         (128, "fp8_e4m3", 4096, 16384, "sliding-window"),
@@ -26,37 +54,17 @@ NUM_HEADS, NUM_KV_HEADS, HEAD = 32, 2, 128
 def test_fixed_schedule_rejects_what_it_cannot_serve(
     monkeypatch, head_size, kv_cache_dtype, sliding_window, max_model_len, reason
 ):
-    """Unsupported layers get a reason, so the model can fall back explicitly
-    instead of failing at construction or exceeding the schedule at runtime."""
-    from vllm.v1.attention.backends import flash_attn_fixed_split
-
+    """Layers the fixed schedule cannot serve fail at construction instead of
+    exceeding the schedule at runtime."""
     monkeypatch.setattr(
-        flash_attn_fixed_split.current_platform,
+        current_platform,
         "is_device_capability_family",
         lambda family, device_id=0: family == 100,
     )
-    actual = flash_attn_fixed_split.fixed_split_unsupported_reason(
-        head_size, kv_cache_dtype, sliding_window, max_model_len
-    )
-    if reason is None:
-        assert actual is None
-    else:
-        assert reason in actual
-
-
-def _make_impl(monkeypatch):
-    from vllm.v1.attention.backends import flash_attn_fixed_split
-
-    config = SimpleNamespace(
-        model_config=SimpleNamespace(max_model_len=flash_attn_fixed_split.MAX_SEQ_LEN),
-        parallel_config=SimpleNamespace(decode_context_parallel_size=1),
-    )
-    monkeypatch.setattr(
-        flash_attn_fixed_split, "get_current_vllm_config", lambda: config
-    )
-    return flash_attn_fixed_split.FlashAttnFixedSplitImpl(
-        NUM_HEADS, HEAD, HEAD**-0.5, NUM_KV_HEADS, None, None, "fp8_e4m3"
-    )
+    with pytest.raises(ValueError, match=reason):
+        _make_impl(
+            monkeypatch, head_size, kv_cache_dtype, sliding_window, max_model_len
+        )
 
 
 def _run(impl, layer, queries, cache, pages, seq_lens):
