@@ -159,9 +159,6 @@ class NemotronHMLP(nn.Module):
         ):
             return
         if get_tensor_model_parallel_world_size() != 1:
-            # Like the gated norm: with TP keep the generic BI selection
-            # (Humming W4A16), which is batch invariant but not the kernel the
-            # single-rank trainer replays.
             logger.warning_once(
                 "Nemotron-H shared experts keep the default batch-invariant "
                 "W4A16 kernel with TP > 1; training-replay alignment needs TP=1."
