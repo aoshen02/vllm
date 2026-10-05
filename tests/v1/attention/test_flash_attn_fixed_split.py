@@ -26,8 +26,8 @@ NUM_HEADS, NUM_KV_HEADS, HEAD = 32, 2, 128
 def test_fixed_schedule_rejects_what_it_cannot_serve(
     monkeypatch, head_size, kv_cache_dtype, sliding_window, max_model_len, reason
 ):
-    """Unsupported layers get a reason, so the model can fall back explicitly
-    instead of failing at construction or exceeding the schedule at runtime."""
+    """Unsupported layers get a reason, which FlashAttnFixedSplitImpl raises at
+    construction instead of exceeding the schedule at runtime."""
     from vllm.v1.attention.backends import flash_attn_fixed_split
 
     monkeypatch.setattr(

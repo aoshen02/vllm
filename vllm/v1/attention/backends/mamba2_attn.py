@@ -137,6 +137,11 @@ class Mamba2AttentionBackend(AttentionBackend):
             raise ValueError(f"{prefix} requires --mamba-backend triton")
         if parallel_config.pipeline_parallel_size > 1:
             raise ValueError(f"{prefix} currently requires PP=1")
+        if parallel_config.tensor_parallel_size > 1:
+            raise ValueError(
+                f"{prefix} currently requires TP=1: the gated norm matches the "
+                "training replay only at TP=1"
+            )
         if parallel_config.use_ubatching:
             raise ValueError(
                 f"{prefix} does not support micro-batching (--enable-dbo or "
