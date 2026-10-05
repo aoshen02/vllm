@@ -71,8 +71,8 @@ logger = init_logger(__name__)
 # ArrayLogprobs entries (positions x slots) from which the final
 # non-streaming response is built in a worker thread rather than on the event
 # loop. Inline cost just below the cutoffs (top-128, cn01): compact ~3-4 ms at
-# 1 << 20 entries; the default format ~0.2-0.25 us per entry, i.e. ~7 ms at
-# 1 << 15 entries (218-268 ms at 1 << 20).
+# 1 << 20 entries; the default format ~0.2 us per entry: 8-10 ms just below
+# 1 << 15 entries (212-268 ms just below 1 << 20).
 OFFLOAD_MIN_LOGPROB_ENTRIES = 1 << 20  # compact; also the large-build cutoff
 OFFLOAD_MIN_DEFAULT_LOGPROB_ENTRIES = 1 << 15  # default format
 # Large builds (>= OFFLOAD_MIN_LOGPROB_ENTRIES): one thread, sequential (peak
