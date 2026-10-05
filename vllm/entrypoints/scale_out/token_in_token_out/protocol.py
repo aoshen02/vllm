@@ -123,6 +123,13 @@ class GenerateRequest(BaseModel):
             raise ValueError(
                 "logprobs_format='compact' does not support sampling_params.logprobs=-1"
             )
+        if self.logprobs_format != "compact" and not (
+            self.compact_include_sampled and self.compact_include_ranks
+        ):
+            raise ValueError(
+                "compact_include_sampled / compact_include_ranks require "
+                "logprobs_format='compact'"
+            )
         return self
 
     sampling_params: SamplingParams
@@ -145,6 +152,20 @@ class GenerateRequest(BaseModel):
             "token, slots 1..k = top-k in engine order). Streaming emits one "
             "compact block per chunk covering that chunk's positions."
         ),
+    )
+    compact_include_sampled: bool = Field(
+        default=True,
+        exclude_if=lambda value: value is True,
+        description=(
+            "Compact only: include the sampled-token slot (engine slot 0). "
+            "False: arrays hold the k top-k slots, num_slots=k, and the block "
+            'carries "sampled_slot": false.'
+        ),
+    )
+    compact_include_ranks: bool = Field(
+        default=True,
+        exclude_if=lambda value: value is True,
+        description="Compact only: include `ranks`; False omits the key.",
     )
     cache_salt: str | None = Field(
         default=None,
@@ -233,9 +254,14 @@ class CompactLogprobs(BaseModel):
     dtype_token_ids: Literal["int32"] = "int32"
     dtype_logprobs: Literal["float32"] = "float32"
     byteorder: Literal["little"] = "little"
+    # Present (false) only with compact_include_sampled=false.
+    sampled_slot: Literal[False] | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     token_ids: str
     logprobs: str
-    ranks: str
+    # Omitted with compact_include_ranks=false.
+    ranks: str | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
 class GenerateResponseChoice(BaseModel):

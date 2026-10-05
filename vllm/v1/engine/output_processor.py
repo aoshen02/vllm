@@ -33,6 +33,7 @@ from vllm.v1.engine import EngineCoreOutput, EngineCoreRequest, FinishReason
 from vllm.v1.engine.detokenizer import IncrementalDetokenizer
 from vllm.v1.engine.logprobs import LogprobsProcessor
 from vllm.v1.engine.parallel_sampling import ParentRequest
+from vllm.v1.engine.routed_experts import RoutedExpertsNpyBase64
 from vllm.v1.metrics.stats import (
     IterationStats,
     LoRARequestStates,
@@ -183,8 +184,10 @@ class RequestState:
 
         self.stats = RequestStateStats(arrival_time=arrival_time) if log_stats else None
 
-        # Routed experts accumulation (prompt + sample chunks)
+        # Routed experts accumulation (prompt + sample chunks), either as
+        # chunks or encoded incrementally (see RoutedExpertsNpyBase64).
         self.routed_experts_chunks: list[np.ndarray] = []
+        self.routed_experts_encoder: RoutedExpertsNpyBase64 | None = None
         self.sampling_mask_chunks: list[SamplingMaskLists] = []
 
         # Stream Interval
@@ -250,6 +253,7 @@ class RequestState:
                 request=request,
             )
             max_tokens_param = sampling_params.max_tokens
+            routed_experts_base64 = sampling_params.routed_experts_base64
             top_p = sampling_params.top_p
             n = sampling_params.n
             temperature = sampling_params.temperature
@@ -257,6 +261,7 @@ class RequestState:
             logprobs_processor = None
             detokenizer = None
             max_tokens_param = None
+            routed_experts_base64 = False
             top_p = None
             n = None
             temperature = None
@@ -264,7 +269,7 @@ class RequestState:
             output_kind = request.pooling_params.output_kind
 
         assert request.external_req_id is not None
-        return cls(
+        state = cls(
             request_id=request.request_id,
             external_req_id=request.external_req_id,
             parent_req=parent_req,
@@ -286,6 +291,23 @@ class RequestState:
             stream_interval=stream_interval,
             stream_input=request.resumable,
         )
+        if routed_experts_base64:
+            state.routed_experts_encoder = RoutedExpertsNpyBase64(
+                max_rows_hint=state.prompt_len + (max_tokens_param or 0)
+            )
+        return state
+
+    def add_routed_experts(self, chunk: np.ndarray) -> None:
+        encoder = self.routed_experts_encoder
+        if encoder is not None:
+            if encoder.try_append(chunk):
+                return
+            # Not encodable incrementally (dtype or row shape changed):
+            # continue with plain chunks, as without the encoder.
+            if encoder.has_data:
+                self.routed_experts_chunks.append(encoder.array())
+            self.routed_experts_encoder = None
+        self.routed_experts_chunks.append(chunk)
 
     def make_request_output(
         self,
@@ -431,7 +453,13 @@ class RequestState:
 
         # Concatenate routed experts on finish
         routed_experts = None
-        if finished and self.routed_experts_chunks:
+        routed_experts_b64 = None
+        encoder = self.routed_experts_encoder
+        if finished and encoder is not None and encoder.has_data:
+            routed_experts_b64 = encoder.parts()
+            if routed_experts_b64 is None:
+                routed_experts = encoder.array()
+        elif finished and self.routed_experts_chunks:
             routed_experts = np.concatenate(self.routed_experts_chunks, axis=0)
 
         return CompletionOutput(
@@ -439,6 +467,7 @@ class RequestState:
             text=text,
             token_ids=token_ids,
             routed_experts=routed_experts,
+            routed_experts_b64=routed_experts_b64,
             sampling_mask=sampling_mask,
             logprobs=logprobs,
             cumulative_logprob=self.logprobs_processor.cumulative_logprob,
@@ -591,11 +620,16 @@ class OutputProcessor:
         """
         params = request.sampling_params
         if params is not None and (
-            params.array_logprobs or params.array_logprobs_base64
+            params.array_logprobs
+            or params.array_logprobs_base64
+            or params.array_logprobs_wire_topk_only
+            or params.routed_experts_base64
         ):
             params = copy.copy(params)
             params.array_logprobs = False
             params.array_logprobs_base64 = False
+            params.array_logprobs_wire_topk_only = False
+            params.routed_experts_base64 = False
             request.sampling_params = params
 
     def _update_streaming_request_state(
@@ -680,9 +714,7 @@ class OutputProcessor:
             kv_transfer_params = engine_core_output.kv_transfer_params
             ec_transfer_params = engine_core_output.ec_transfer_params
             if engine_core_output.routed_experts is not None:
-                req_state.routed_experts_chunks.append(
-                    engine_core_output.routed_experts
-                )
+                req_state.add_routed_experts(engine_core_output.routed_experts)
 
             if req_state.is_prefilling:
                 if engine_core_output.prefill_stats is not None:

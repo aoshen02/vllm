@@ -59,9 +59,18 @@ def _prompt_tensors(k: int) -> LogprobsTensors:
     return LogprobsTensors(ids, values, torch.tensor([3, 1, 2]))
 
 
+def _routed(step: int, rows: int, layers: int, dtype) -> np.ndarray:
+    rng = np.random.default_rng(500 + step)
+    high = 256 if dtype == np.uint8 else 300
+    return rng.integers(0, high, size=(rows, layers, 2)).astype(dtype)
+
+
 class _Feeder:
-    def __init__(self, chunks, finish, tokenizer):
+    def __init__(self, chunks, finish, tokenizer, routed=None):
         self.chunks, self.finish, self.tokenizer = chunks, finish, tokenizer
+        # (layers, dtype): prompt rows on the first step, then one row per
+        # token (P + N - 1 rows in total), as the scheduler emits them.
+        self.routed = routed
 
     def generate(self, engine_input, sampling_params, request_id, **kwargs):
         async def _gen():
@@ -82,10 +91,15 @@ class _Feeder:
             processor.add_request(request, None, queue=queue)
             k_prompt = sampling_params.prompt_logprobs
             for i, (ids, lps, ranks) in enumerate(self.chunks):
+                routed = None
+                if self.routed is not None:
+                    rows = len(ids) + (len(PROMPT) - 1 if i == 0 else 0)
+                    routed = _routed(i, rows, *self.routed)
                 processor.process_outputs(
                     [
                         EngineCoreOutput(
                             request_id=request.request_id,
+                            routed_experts=routed,
                             new_token_ids=ids[:, 0].tolist(),
                             new_logprobs=None
                             if sampling_params.logprobs is None
@@ -137,6 +151,36 @@ SCENARIOS: dict[str, dict[str, Any]] = {
         finish=FinishReason.ABORT,
         chunks=[(0, 2, 6), (2, 1, 2), (3, 2, 6)],
     ),
+    # R3: routed experts with logprobs, without logprobs, uint16, and an
+    # abort before any forward (null).
+    "r3_lp3_u8_abort": dict(
+        logprobs=3,
+        prompt_logprobs=None,
+        finish=FinishReason.ABORT,
+        chunks=[(0, 3, 4), (3, 1, 4), (4, 2, 4)],
+        routed=(4, np.uint8),
+    ),
+    "r3_nolp_u8_61layers": dict(
+        logprobs=None,
+        prompt_logprobs=None,
+        finish=FinishReason.ABORT,
+        chunks=[(0, 2, 3), (2, 2, 3)],
+        routed=(61, np.uint8),
+    ),
+    "r3_lp1_u16_length": dict(
+        logprobs=1,
+        prompt_logprobs=None,
+        finish=FinishReason.LENGTH,
+        chunks=[(0, 1, 3), (1, 3, 3)],
+        routed=(3, np.uint16),
+    ),
+    "r3_abort_before_forward": dict(
+        logprobs=2,
+        prompt_logprobs=None,
+        finish=FinishReason.ABORT,
+        chunks=[],
+        routed=(4, np.uint8),
+    ),
 }
 
 
@@ -146,7 +190,7 @@ async def render_body(name: str) -> bytes:
     chunks = [_rows(*c) for c in spec["chunks"]]
     tokenizer = get_tokenizer(MODEL_NAME)
     engine = _mock_engine()
-    feeder = _Feeder(chunks, spec["finish"], tokenizer)
+    feeder = _Feeder(chunks, spec["finish"], tokenizer, spec.get("routed"))
     engine.generate = MagicMock(side_effect=feeder.generate)
     serving = _build_serving_tokens(engine)
     sampling = {"max_tokens": 50, "logprobs": spec["logprobs"]}

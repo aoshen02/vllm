@@ -95,7 +95,9 @@ class _OutputProcessorEngine:
         chunks,
         finish: FinishReason | None = FinishReason.ABORT,
         tokenizer=None,
+        routed=None,
     ):
+        self.routed = routed
         self.chunks = chunks
         self.finish = finish
         self.tokenizer = tokenizer
@@ -130,6 +132,7 @@ class _OutputProcessorEngine:
                     [
                         EngineCoreOutput(
                             request_id=request.request_id,
+                            routed_experts=self.routed[i] if self.routed else None,
                             new_token_ids=token_ids[:, 0].tolist(),
                             new_logprobs=(
                                 None
@@ -915,7 +918,13 @@ def test_array_logprobs_self_extend_doubles(consolidate):
 def test_array_logprobs_flag_stays_off_engine_wire():
     """Audit #6: array_logprobs is frontend-only; the request sent to
     EngineCore after add_request does not carry it."""
-    params = SamplingParams(logprobs=2, array_logprobs=True, array_logprobs_base64=True)
+    params = SamplingParams(
+        logprobs=2,
+        array_logprobs=True,
+        array_logprobs_base64=True,
+        array_logprobs_wire_topk_only=True,
+        routed_experts_base64=True,
+    )
     request = EngineCoreRequest(
         request_id="r-int",
         external_req_id="r",
@@ -936,6 +945,9 @@ def test_array_logprobs_flag_stays_off_engine_wire():
     assert b"array_logprobs" not in MsgpackEncoder().encode(request)[0]
     assert request.sampling_params.array_logprobs is False
     assert request.sampling_params.array_logprobs_base64 is False
+    assert request.sampling_params.array_logprobs_wire_topk_only is False
+    assert request.sampling_params.routed_experts_base64 is False
+    assert state.routed_experts_encoder is not None
     # The caller's (possibly shared) params object is not mutated.
     assert params.array_logprobs is True
     assert params.array_logprobs_base64 is True
@@ -1132,6 +1144,18 @@ GOLDEN_SHA256 = {
     "lp0_abort": "cf982779105509e6f147eef4405361db959b3c0a4e629fb7227fc63794862d82",
     "lp5_narrow_rows": (
         "f4f2ff4bde6d73f2dc7eed672018c64c4a3025eb9c0250e795652a5ff251590a"
+    ),
+    "r3_lp3_u8_abort": (
+        "d3adb076e65ce213a76938c9b959d4fb0506b9753e8d72a1c94c50a63dde7476"
+    ),
+    "r3_nolp_u8_61layers": (
+        "3a00780860d635011eb1c28157eb69d2217e8f192dd6685b532487e76c696e25"
+    ),
+    "r3_lp1_u16_length": (
+        "19f224bf794e0bfd83e2b1346a97f7434bf864e73c17db0d06bbbe22ab67c5a3"
+    ),
+    "r3_abort_before_forward": (
+        "80412cf24f437b1f10fb4a32517fb0b3a681d91287c3179884fd70209792c4f6"
     ),
 }
 
@@ -1910,3 +1934,263 @@ def test_openai_render_allocates_few_gc_tracked_objects():
     finally:
         gc.callbacks.remove(callback)
     assert len(collections) <= 2, collections
+
+
+# ------------------------------------------------- round 5: SPEC v3 and R3
+
+
+def _decode_block(block: dict):
+    n, s = block["num_positions"], block["num_slots"]
+    ids = np.frombuffer(base64.b64decode(block["token_ids"]), "<i4")
+    lps = np.frombuffer(base64.b64decode(block["logprobs"]), "<f4")
+    return ids.reshape(n, s), lps.reshape(n, s)
+
+
+@pytest.mark.parametrize("field", ["compact_include_sampled", "compact_include_ranks"])
+def test_compact_switches_require_compact(field):
+    """SPEC v3: the switches are only valid with logprobs_format=compact."""
+    assert (
+        getattr(_request(logprobs_format="compact", **{field: False}), field) is False
+    )
+    assert getattr(_request(**{field: True}), field) is True  # default value ok
+    with pytest.raises(ValidationError, match="require"):
+        _request(**{field: False})
+    assert field not in _request().model_dump()
+    app = FastAPI()
+    app.state.args = Namespace(log_error_stack=False, tokens_only=False)
+    app.state.serving_tokens = MagicMock()
+    init_exception_handler(app)
+    api_router.attach_router(app)
+    with TestClient(app) as client:
+        result = client.post(
+            "/inference/v1/generate",
+            json={"token_ids": [1], "sampling_params": {"logprobs": 1}, field: False},
+        )
+    assert result.status_code == 400
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("sampled", [True, False])
+@pytest.mark.parametrize("ranks", [True, False])
+async def test_compact_include_switches(stream, sampled, ranks):
+    """SPEC v3: include_sampled=false -> top-k slots only, num_slots=k,
+    "sampled_slot": false; include_ranks=false -> no ranks key. Defaults keep
+    today's bytes (no new keys)."""
+    chunks = [_engine_rows(0, 3, 5), _engine_rows(3, 2, 5)]
+    chunks[0][1][1, 2] = np.float32(-np.inf)
+    feeder = _OutputProcessorEngine(chunks)
+    extra = {}
+    if not sampled:
+        extra["compact_include_sampled"] = False
+    if not ranks:
+        extra["compact_include_ranks"] = False
+    request = _request(logprobs=4, logprobs_format="compact", stream=stream, **extra)
+    serving = _serving(feeder)
+    result = await serving.serve_tokens(request)
+    if stream:
+        events = _parse_sse_chunks([chunk async for chunk in result])
+        blocks = [
+            e["choices"][0]["compact_logprobs"]
+            for e in events
+            if isinstance(e, dict) and e["choices"]
+        ]
+    else:
+        assert feeder.sampling_params.array_logprobs_wire_topk_only is (not sampled)
+        blocks = [json.loads(result.body)["choices"][0]["compact_logprobs"]]
+    ids = np.concatenate([_decode_block(b)[0] for b in blocks])
+    lps = np.concatenate([_decode_block(b)[1] for b in blocks])
+    all_ids, all_lps, all_ranks = _expected(chunks, 5)
+    first = 0 if sampled else 1
+    np.testing.assert_array_equal(ids, all_ids[:, first:])
+    assert lps.tobytes() == np.ascontiguousarray(all_lps[:, first:]).tobytes()
+    for block in blocks:
+        assert block["num_slots"] == (5 if sampled else 4)
+        if sampled:
+            assert "sampled_slot" not in block
+        else:
+            assert block["sampled_slot"] is False
+            assert list(block).index("sampled_slot") == 5
+        assert ("ranks" in block) is ranks
+    if ranks:
+        got = np.concatenate(
+            [np.frombuffer(base64.b64decode(b["ranks"]), "<i4") for b in blocks]
+        )
+        np.testing.assert_array_equal(got, all_ranks)
+
+
+@pytest.mark.parametrize("include_sampled", [True, False])
+def test_wire_topk_only_matches_array_render_and_decodes(include_sampled):
+    token_ids, logprobs, ranks = _engine_rows(0, 9, 5)
+    wire = ArrayLogprobs(wire_base64=True, wire_topk_only=True)
+    plain = ArrayLogprobs()
+    for i in range(0, 9, 2):
+        wire.append_rows(token_ids[i : i + 2], logprobs[i : i + 2], ranks[i : i + 2])
+        plain.append_rows(token_ids[i : i + 2], logprobs[i : i + 2], ranks[i : i + 2])
+    for include_ranks in (True, False):
+        assert render_compact_logprobs(
+            wire, 4, include_sampled=include_sampled, include_ranks=include_ranks
+        ) == render_compact_logprobs(
+            plain, 4, include_sampled=include_sampled, include_ranks=include_ranks
+        )
+    # Lossless decode of the top-k-only wire container (slot 0 side streams).
+    wire2 = ArrayLogprobs(wire_base64=True, wire_topk_only=True)
+    wire2.append_rows(token_ids, logprobs, ranks)
+    ids, values, rk = wire2.arrays()
+    np.testing.assert_array_equal(ids, token_ids)
+    assert values.tobytes() == logprobs.tobytes()
+    np.testing.assert_array_equal(rk, ranks)
+
+
+@pytest.mark.asyncio
+async def test_compact_topk_only_narrow_rows_still_500():
+    chunks = [_engine_rows(0, 3, 2)]
+    feeder = _OutputProcessorEngine(chunks)
+    with pytest.raises(GenerationError, match="2 slots, expected 6"):
+        await _serving(feeder).serve_tokens(
+            _request(
+                logprobs=5, logprobs_format="compact", compact_include_sampled=False
+            )
+        )
+
+
+def _r3_chunks(layers, topk, dtype, sizes, seed=0):
+    rng = np.random.default_rng(seed)
+    high = 256 if dtype == np.uint8 else 1000
+    return [rng.integers(0, high, size=(n, layers, topk)).astype(dtype) for n in sizes]
+
+
+@pytest.mark.parametrize("dtype", [np.uint8, np.uint16, np.int32])
+@pytest.mark.parametrize("layers", [1, 4, 61])
+@pytest.mark.parametrize(
+    "sizes", [[16384 % 97 + 5, 1, 1, 1, 3], [0], [1], [2, 0, 5], [40, 1024 % 13]]
+)
+@pytest.mark.parametrize("flush", [3, 64, 1 << 20])
+def test_routed_experts_encoder_matches_numpy2base64(
+    monkeypatch, dtype, layers, sizes, flush
+):
+    """R3: incremental .npy+base64 == numpy2base64(np.concatenate(chunks))."""
+    from vllm import logprobs as logprobs_mod
+    from vllm.utils.serial_utils import numpy2base64
+    from vllm.v1.engine.routed_experts import RoutedExpertsNpyBase64
+
+    monkeypatch.setattr(logprobs_mod._Base64Stream, "FLUSH_BYTES", flush)
+    chunks = _r3_chunks(layers, 8, dtype, sizes)
+    expected = numpy2base64(np.concatenate(chunks, axis=0)).encode()
+    for hint in (0, sum(sizes), 262143, 10**30):
+        encoder = RoutedExpertsNpyBase64(max_rows_hint=hint)
+        for chunk in chunks:
+            assert encoder.try_append(chunk)
+        parts = encoder.parts()
+        if parts is None:  # header length residue differs from the hint's
+            assert numpy2base64(encoder.array()).encode() == expected
+        else:
+            assert b"".join(parts) == expected
+        np.testing.assert_array_equal(encoder.array(), np.concatenate(chunks))
+    assert not encoder.try_append(chunks[0].astype(np.int64))
+
+
+def _r3_request_state(routed_base64: bool, layers: int = 4):
+    params = SamplingParams(
+        max_tokens=100, logprobs=2, routed_experts_base64=routed_base64
+    )
+    params.output_kind = RequestOutputKind.FINAL_ONLY
+    processor = OutputProcessor(tokenizer=None, log_stats=False)
+    request = EngineCoreRequest(
+        request_id="r",
+        external_req_id="r",
+        prompt_token_ids=[1, 2, 3],
+        mm_features=None,
+        arrival_time=0,
+        lora_request=None,
+        cache_salt=None,
+        data_parallel_rank=None,
+        sampling_params=params,
+        pooling_params=None,
+    )
+    queue = RequestOutputCollector(params.output_kind, "r")
+    processor.add_request(request, None, queue=queue)
+    return processor, queue
+
+
+@pytest.mark.parametrize("routed_base64", [True, False])
+@pytest.mark.parametrize("mixed_dtype", [False, True])
+def test_routed_experts_survive_abort(routed_base64, mixed_dtype):
+    """R3 is returned on abort (FINAL_ONLY), encoded or as an array."""
+    from vllm.utils.serial_utils import numpy2base64
+
+    processor, queue = _r3_request_state(routed_base64)
+    chunks = _r3_chunks(4, 8, np.uint8, [3, 1, 1])
+    if mixed_dtype:
+        chunks[2] = chunks[2].astype(np.uint16)
+    token_ids, logprobs, ranks = _engine_rows(0, 3, 3)
+    for i, chunk in enumerate(chunks):
+        processor.process_outputs(
+            [
+                EngineCoreOutput(
+                    request_id="r",
+                    new_token_ids=[int(token_ids[i, 0])],
+                    new_logprobs=LogprobsLists(
+                        token_ids[i : i + 1], logprobs[i : i + 1], ranks[i : i + 1]
+                    ),
+                    routed_experts=chunk,
+                )
+            ]
+        )
+    processor.abort_requests(["r"], internal=True)
+    output = queue.get_nowait().outputs[0]
+    expected = numpy2base64(np.concatenate(chunks, axis=0))
+    if routed_base64 and not mixed_dtype:
+        assert output.routed_experts is None
+        assert b"".join(output.routed_experts_b64).decode() == expected
+    else:
+        assert output.routed_experts_b64 is None
+        assert numpy2base64(output.routed_experts) == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fmt", ["openai", "compact"])
+async def test_routed_experts_in_full_responses(fmt):
+    """R3 is present in default and compact responses; null without any
+    forward; the encoded flag is set for non-streaming requests only."""
+    from vllm.utils.serial_utils import numpy2base64
+
+    chunks = [_engine_rows(0, 2, 4), _engine_rows(2, 1, 4)]
+    routed = _r3_chunks(5, 8, np.uint8, [4, 1])
+
+    feeder = _OutputProcessorEngine(chunks, routed=routed)
+    response = await _serving(feeder).serve_tokens(
+        _request(logprobs=3, logprobs_format=fmt)
+    )
+    assert feeder.sampling_params.routed_experts_base64 is True
+    choice = json.loads(response.body)["choices"][0]
+    assert choice["routed_experts"] == numpy2base64(np.concatenate(routed))
+    feeder = _OutputProcessorEngine([])
+    response = await _serving(feeder).serve_tokens(
+        _request(logprobs=3, logprobs_format=fmt)
+    )
+    body = response.body if hasattr(response, "parts") else None
+    dump = json.loads(body) if body else response.model_dump()
+    assert dump["choices"][0]["routed_experts"] is None
+    feeder = _OutputProcessorEngine(chunks)
+    generator = await _serving(feeder).serve_tokens(
+        _request(logprobs=3, logprobs_format=fmt, stream=True)
+    )
+    _ = [chunk async for chunk in generator]
+    assert feeder.sampling_params.routed_experts_base64 is False
+
+
+def test_fragments_spliced_in_document_order():
+    content = {"choices": [{"a": None, "b": None, "c": 1}]}
+    body = render_json_with_fragments(
+        content, {0: {"b": b'"B"', "a": [b'"', b"A", b'"']}}
+    )
+    assert body == b'{"choices":[{"a":"A","b":"B","c":1}]}'
+
+
+def test_wire_layout_defaults():
+    """The wire container encodes full rows unless asked for top-k only (a
+    property named like the InitVar once shadowed its default)."""
+    assert not ArrayLogprobs(wire_base64=True).is_wire_topk_only
+    assert ArrayLogprobs(wire_base64=True, wire_topk_only=True).is_wire_topk_only
+    assert not ArrayLogprobs().is_wire_topk_only

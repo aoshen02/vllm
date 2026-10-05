@@ -235,14 +235,22 @@ class _Base64Stream:
 class _WireEncoder:
     """Rows encoded at append time in the compact wire format: base64 of
     little-endian ``int32`` token ids, ``float32`` logprobs, ``int32``
-    ranks."""
+    ranks.
 
-    def __init__(self) -> None:
-        self.slots: int | None = None
+    With ``topk_only`` the id/logprob streams hold engine slots ``1..S-1``
+    only (``compact_include_sampled=false``); slot 0 is then kept in two
+    small side streams so the rows can still be decoded losslessly.
+    """
+
+    def __init__(self, topk_only: bool = False) -> None:
+        self.topk_only = topk_only
+        self.slots: int | None = None  # engine row width (incl. slot 0)
         self.num_rows = 0
         self.token_ids = _Base64Stream()
         self.logprobs = _Base64Stream()
         self.ranks = _Base64Stream()
+        self.sampled_ids = _Base64Stream()
+        self.sampled_logprobs = _Base64Stream()
 
     def try_write(
         self, token_ids: np.ndarray, logprobs: np.ndarray, ranks: np.ndarray
@@ -260,22 +268,35 @@ class _WireEncoder:
         ):
             return False
         self.slots = width
-        self.token_ids.write(np.ascontiguousarray(token_ids, dtype=_INT32))
-        self.logprobs.write(np.ascontiguousarray(logprobs, dtype=_FLOAT32))
+        if self.topk_only:
+            self.token_ids.write(np.ascontiguousarray(token_ids[:, 1:], dtype=_INT32))
+            self.logprobs.write(np.ascontiguousarray(logprobs[:, 1:], dtype=_FLOAT32))
+            self.sampled_ids.write(np.ascontiguousarray(token_ids[:, 0], dtype=_INT32))
+            self.sampled_logprobs.write(
+                np.ascontiguousarray(logprobs[:, 0], dtype=_FLOAT32)
+            )
+        else:
+            self.token_ids.write(np.ascontiguousarray(token_ids, dtype=_INT32))
+            self.logprobs.write(np.ascontiguousarray(logprobs, dtype=_FLOAT32))
         self.ranks.write(np.ascontiguousarray(ranks, dtype=_INT32))
         self.num_rows += len(ranks)
         return True
 
     def decode(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         slots = self.slots or 0
+        n = self.num_rows
+        stored = slots - 1 if self.topk_only and slots else slots
         token_ids = np.frombuffer(self.token_ids.decode(), dtype=_INT32)
         logprobs = np.frombuffer(self.logprobs.decode(), dtype=_FLOAT32)
         ranks = np.frombuffer(self.ranks.decode(), dtype=_INT32)
-        return (
-            token_ids.reshape(self.num_rows, slots),
-            logprobs.reshape(self.num_rows, slots),
-            ranks,
-        )
+        token_ids = token_ids.reshape(n, stored)
+        logprobs = logprobs.reshape(n, stored)
+        if self.topk_only and slots:
+            sampled_ids = np.frombuffer(self.sampled_ids.decode(), dtype=_INT32)
+            sampled = np.frombuffer(self.sampled_logprobs.decode(), dtype=_FLOAT32)
+            token_ids = np.column_stack((sampled_ids, token_ids))
+            logprobs = np.column_stack((sampled, logprobs))
+        return token_ids, logprobs, ranks
 
 
 @dataclass
@@ -336,6 +357,7 @@ class ArrayLogprobs(MutableSequence[LogprobsOnePosition | None]):
     # (DELTA outputs slice suffixes of the cumulative container).
     source_positions: int | None = None
     wire_base64: InitVar[bool] = False
+    wire_topk_only: InitVar[bool] = False
     # Fast path for appends into the tail block (see _tail_can_hold).
     _tail_block: np.ndarray | None = field(default=None, init=False, repr=False)
     _tail_dtypes: tuple[np.dtype, np.dtype, np.dtype] | None = field(
@@ -343,9 +365,9 @@ class ArrayLogprobs(MutableSequence[LogprobsOnePosition | None]):
     )
     _wire: _WireEncoder | None = field(default=None, init=False, repr=False)
 
-    def __post_init__(self, wire_base64: bool) -> None:
+    def __post_init__(self, wire_base64: bool, wire_topk_only: bool) -> None:
         if wire_base64:
-            self._wire = _WireEncoder()
+            self._wire = _WireEncoder(topk_only=wire_topk_only)
 
     def _unwire(self) -> None:
         """Leave wire mode: decode the encoded rows into an array block."""
@@ -365,7 +387,9 @@ class ArrayLogprobs(MutableSequence[LogprobsOnePosition | None]):
         self,
     ) -> tuple[int, int | None, list[bytes], list[bytes], list[bytes]] | None:
         """``(N, S, token_ids, logprobs, ranks)`` base64 parts, or None if the
-        container is not (or no longer) in wire mode."""
+        container is not (or no longer) in wire mode. ``S`` is the engine row
+        width; with :attr:`wire_topk_only` the id/logprob parts hold slots
+        ``1..S-1`` only."""
         wire = self._wire
         if wire is None:
             return None
@@ -376,6 +400,11 @@ class ArrayLogprobs(MutableSequence[LogprobsOnePosition | None]):
             wire.logprobs.parts(),
             wire.ranks.parts(),
         )
+
+    @property
+    def is_wire_topk_only(self) -> bool:
+        """Whether rows are wire-encoded with the top-k-only layout."""
+        return self._wire is not None and self._wire.topk_only
 
     @property
     def is_regular(self) -> bool:
@@ -666,11 +695,14 @@ def create_prompt_logprobs(flat_logprobs: bool) -> PromptLogprobs:
 
 
 def create_sample_logprobs(
-    flat_logprobs: bool, array_logprobs: bool = False, wire_base64: bool = False
+    flat_logprobs: bool,
+    array_logprobs: bool = False,
+    wire_base64: bool = False,
+    wire_topk_only: bool = False,
 ) -> SampleLogprobs:
     """Creates a container to store decode logprobs for a request"""
     if array_logprobs:
-        return ArrayLogprobs(wire_base64=wire_base64)
+        return ArrayLogprobs(wire_base64=wire_base64, wire_topk_only=wire_topk_only)
     return FlatLogprobs() if flat_logprobs else []
 
 

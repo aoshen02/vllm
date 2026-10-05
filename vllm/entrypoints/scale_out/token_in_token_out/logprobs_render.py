@@ -112,6 +112,7 @@ def compact_logprobs_fields(
     num_logprobs: int | None,
     expected_positions: int | None = None,
     expected_source_positions: int | None = None,
+    include_sampled: bool = True,
 ) -> tuple[int, int, bytes, bytes, bytes]:
     """Return ``(N, S, b64(token_ids), b64(logprobs), b64(ranks))``.
 
@@ -128,9 +129,14 @@ def compact_logprobs_fields(
     ranks = _as_wire_int32(ranks, "rank")
     if logprobs.dtype != np.dtype("<f4"):
         logprobs = logprobs.astype("<f4")
+    slots = compact_num_slots(container, num_logprobs)
+    if not include_sampled:
+        token_ids = np.ascontiguousarray(token_ids[:, 1:])
+        logprobs = np.ascontiguousarray(logprobs[:, 1:])
+        slots = max(slots - 1, 0)
     return (
         len(ranks),
-        compact_num_slots(container, num_logprobs),
+        slots,
         pybase64.b64encode(token_ids),
         pybase64.b64encode(logprobs),
         pybase64.b64encode(ranks),
@@ -141,6 +147,8 @@ def render_compact_logprobs_parts(
     container: ArrayLogprobs,
     num_logprobs: int | None,
     expected_positions: int | None = None,
+    include_sampled: bool = True,
+    include_ranks: bool = True,
 ) -> list[bytes]:
     """The ``compact_logprobs`` JSON object (see the generate SPEC) as parts
     whose concatenation is the JSON; avoids copying the large payloads."""
@@ -149,6 +157,10 @@ def render_compact_logprobs_parts(
     ranks: bytes | list[bytes]
     _check_compact_rows(container, num_logprobs, expected_positions)
     wire = container.wire_parts()
+    if wire is not None and container.is_wire_topk_only != (not include_sampled):
+        # Encoded with the other slot layout: re-encode from the arrays.
+        container.arrays()
+        wire = None
     if wire is not None:
         # Encoded while the rows arrived (ArrayLogprobs wire mode).
         n, stored_slots, token_ids, logprobs, ranks = wire
@@ -157,22 +169,30 @@ def render_compact_logprobs_parts(
             if stored_slots is not None
             else compact_num_slots(container, num_logprobs)
         )
+        if not include_sampled:
+            s = max(s - 1, 0)
     else:
         n, s, token_ids, logprobs, ranks = compact_logprobs_fields(
-            container, num_logprobs, expected_positions
+            container,
+            num_logprobs,
+            expected_positions,
+            include_sampled=include_sampled,
         )
+    sampled_flag = "" if include_sampled else '"sampled_slot":false,'
     head = (
         f'{{"num_positions":{n},"num_slots":{s},'
         f'"dtype_token_ids":"{COMPACT_DTYPE_TOKEN_IDS}",'
         f'"dtype_logprobs":"{COMPACT_DTYPE_LOGPROBS}",'
-        f'"byteorder":"{COMPACT_BYTEORDER}","token_ids":"'
+        f'"byteorder":"{COMPACT_BYTEORDER}",{sampled_flag}"token_ids":"'
     ).encode("ascii")
-    parts = [head]
-    for piece, tail in (
+    pieces: list[tuple[bytes | list[bytes], bytes]] = [
         (token_ids, b'","logprobs":"'),
-        (logprobs, b'","ranks":"'),
-        (ranks, b'"}'),
-    ):
+        (logprobs, b'","ranks":"' if include_ranks else b'"}'),
+    ]
+    if include_ranks:
+        pieces.append((ranks, b'"}'))
+    parts = [head]
+    for piece, tail in pieces:
         if isinstance(piece, bytes):
             parts.append(piece)
         else:
@@ -182,10 +202,20 @@ def render_compact_logprobs_parts(
 
 
 def render_compact_logprobs(
-    container: ArrayLogprobs, num_logprobs: int | None
+    container: ArrayLogprobs,
+    num_logprobs: int | None,
+    include_sampled: bool = True,
+    include_ranks: bool = True,
 ) -> bytes:
     """Render the ``compact_logprobs`` JSON object (see the generate SPEC)."""
-    return b"".join(render_compact_logprobs_parts(container, num_logprobs))
+    return b"".join(
+        render_compact_logprobs_parts(
+            container,
+            num_logprobs,
+            include_sampled=include_sampled,
+            include_ranks=include_ranks,
+        )
+    )
 
 
 _SEP_TOP_FIRST = b',"bytes":null,"top_logprobs":['
@@ -489,11 +519,17 @@ def render_json_with_fragments_parts(
     if len(pieces) != len(fragments) + 1:
         raise AssertionError("Fragment placeholder collision")
     out: list[bytes | memoryview] = [pieces[0]]
-    for i, piece in enumerate(pieces[1:]):
-        marker = f'{i}"'.encode()
-        if not piece.startswith(marker):
-            raise AssertionError("Fragment placeholder out of order")
-        fragment = fragments[i]
+    seen: set[int] = set()
+    for piece in pieces[1:]:
+        # Placeholders appear in document order, which need not be the order
+        # they were assigned in: each carries its fragment index.
+        end = piece.find(b'"')
+        index = int(piece[:end]) if end > 0 and piece[:end].isdigit() else -1
+        if not 0 <= index < len(fragments) or index in seen:
+            raise AssertionError("Fragment placeholder collision")
+        seen.add(index)
+        marker = piece[: end + 1]
+        fragment = fragments[index]
         if isinstance(fragment, bytes):
             out.append(fragment)
         else:

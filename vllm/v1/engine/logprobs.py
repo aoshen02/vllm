@@ -62,6 +62,7 @@ class LogprobsProcessor:
                     sampling_params.flat_logprobs,
                     sampling_params.array_logprobs,
                     sampling_params.array_logprobs_base64,
+                    sampling_params.array_logprobs_wire_topk_only,
                 )
             ),
             prompt_logprobs=(

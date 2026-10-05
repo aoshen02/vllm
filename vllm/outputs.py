@@ -61,6 +61,10 @@ class CompletionOutput:
     cumulative_logprob: float | None
     logprobs: SampleLogprobs | None
     routed_experts: np.ndarray | None = None  # [seq_len,layer_num,topk]
+    # Alternative to ``routed_experts`` (frontend-only
+    # ``SamplingParams.routed_experts_base64``): base64 text parts whose
+    # concatenation equals ``numpy2base64(routed_experts)``.
+    routed_experts_b64: list[bytes] | None = None
     finish_reason: str | None = None
     stop_reason: int | str | None = None
     lora_request: LoRARequest | None = None

@@ -329,6 +329,13 @@ class ServingTokens(GenerateBaseServing):
         sampling_params.array_logprobs_base64 = (
             request.logprobs_format == "compact" and not request.stream
         )
+        sampling_params.array_logprobs_wire_topk_only = (
+            sampling_params.array_logprobs_base64
+            and not request.compact_include_sampled
+        )
+        # Non-streaming responses also encode routed experts (R3) while they
+        # arrive (same bytes as numpy2base64 of the concatenated chunks).
+        sampling_params.routed_experts_base64 = not request.stream
 
     @staticmethod
     def _require_array_logprobs(logprobs: object) -> ArrayLogprobs:
@@ -461,13 +468,15 @@ class ServingTokens(GenerateBaseServing):
                 # (``logprobs`` and/or ``logprob_token_ids``).
                 if sampling_params.num_logprobs is not None:
                     assert out_logprobs is not None, "Did not output logprobs"
-                    fragments[len(choices)] = {
-                        "compact_logprobs": render_compact_logprobs_parts(
+                    fragments.setdefault(len(choices), {})["compact_logprobs"] = (
+                        render_compact_logprobs_parts(
                             self._require_array_logprobs(out_logprobs),
                             sampling_params.num_logprobs,
                             expected_positions=len(token_ids),
+                            include_sampled=request.compact_include_sampled,
+                            include_ranks=request.compact_include_ranks,
                         )
-                    }
+                    )
             elif sampling_params.logprobs is not None:
                 assert out_logprobs is not None, "Did not output logprobs"
                 if (
@@ -479,7 +488,7 @@ class ServingTokens(GenerateBaseServing):
                     )
                     is not None
                 ):
-                    fragments[len(choices)] = {"logprobs": rendered}
+                    fragments.setdefault(len(choices), {})["logprobs"] = rendered
                 else:
                     # Legacy containers or irregular rows (materialized in
                     # one pass, not by per-position indexing).
@@ -493,11 +502,22 @@ class ServingTokens(GenerateBaseServing):
                         num_output_top_logprobs=sampling_params.logprobs,
                     )
 
-            routed_experts_b64 = (
-                numpy2base64(output.routed_experts)
-                if output.routed_experts is not None
-                else None
-            )
+            # R3 is spliced in as a pre-rendered JSON string (base64 needs no
+            # escaping), skipping json.dumps / pydantic of a string that is
+            # ~170 MB at 61 layers.
+            routed_experts_b64 = None
+            if output.routed_experts_b64 is not None:
+                fragments.setdefault(len(choices), {})["routed_experts"] = [
+                    b'"',
+                    *output.routed_experts_b64,
+                    b'"',
+                ]
+            elif output.routed_experts is not None:
+                fragments.setdefault(len(choices), {})["routed_experts"] = [
+                    b'"',
+                    numpy2base64(output.routed_experts).encode("ascii"),
+                    b'"',
+                ]
 
             sampling_mask = None
             if output.sampling_mask is not None:
@@ -605,6 +625,8 @@ class ServingTokens(GenerateBaseServing):
                                 sampling_params.num_logprobs,
                                 expected_positions=len(delta_token_ids),
                                 expected_source_positions=num_generated_tokens[i],
+                                include_sampled=request.compact_include_sampled,
+                                include_ranks=request.compact_include_ranks,
                             )
                     elif sampling_params.logprobs is not None:
                         out_logprobs = output.logprobs
@@ -681,16 +703,23 @@ class ServingTokens(GenerateBaseServing):
         num_logprobs: int | None,
         expected_positions: int | None = None,
         expected_source_positions: int | None = None,
+        include_sampled: bool = True,
+        include_ranks: bool = True,
     ) -> CompactLogprobs:
         n, s, token_ids, values, ranks = compact_logprobs_fields(
-            logprobs, num_logprobs, expected_positions, expected_source_positions
+            logprobs,
+            num_logprobs,
+            expected_positions,
+            expected_source_positions,
+            include_sampled=include_sampled,
         )
         return CompactLogprobs(
             num_positions=n,
             num_slots=s,
+            sampled_slot=None if include_sampled else False,
             token_ids=token_ids.decode("ascii"),
             logprobs=values.decode("ascii"),
-            ranks=ranks.decode("ascii"),
+            ranks=ranks.decode("ascii") if include_ranks else None,
         )
 
     def _create_tokens_logprobs(
