@@ -48,6 +48,11 @@ def engine_client(request: Request) -> EngineClient:
 router = APIRouter()
 
 
+# Compact + --middleware: bodies up to this size are joined on the event loop
+# (a ~1 MiB memcpy is well under a millisecond), larger ones off-loop.
+INLINE_JOIN_MAX_BYTES = 1 << 20
+
+
 class _RenderedJSONResponse(JSONResponse):
     """``JSONResponse`` for an already-rendered body given as parts.
 
@@ -183,11 +188,16 @@ async def generate(request: GenerateRequest, raw_request: Request):
         args = getattr(raw_request.app.state, "args", None)
         user_middleware = bool(getattr(args, "middleware", None))
         if user_middleware and not generator.single_message:
-            # Compact under user middleware: one message as well, joined in
-            # the response-builder thread rather than on the event loop.
-            body = await asyncio.get_running_loop().run_in_executor(
-                serving_module._RESPONSE_BUILDER, join_parts, generator.parts
-            )
+            # Compact under user middleware: one message as well. A small
+            # body is joined inline (negligible GIL hold), so it never queues
+            # behind an unrelated large build in the single response-builder
+            # thread; only a large body is joined there.
+            if generator.content_length <= INLINE_JOIN_MAX_BYTES:
+                body = join_parts(generator.parts)
+            else:
+                body = await asyncio.get_running_loop().run_in_executor(
+                    serving_module._RESPONSE_BUILDER, join_parts, generator.parts
+                )
             generator = RenderedGenerateResponse([body], single_message=True)
         return _RenderedJSONResponse(generator, single_message=generator.single_message)
 

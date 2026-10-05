@@ -2714,8 +2714,8 @@ def test_second_failure_on_broken_container_keeps_counting(monkeypatch):
 
 
 def test_compact_with_user_middleware_joins_off_loop(monkeypatch):
-    """Claude r7 NIT 3: compact + --middleware is joined in the builder
-    thread, not on the event loop."""
+    """Claude r7 NIT 3: a large compact + --middleware body is joined in the
+    builder thread, not on the event loop."""
     threads: list[Any] = []
     real_join = logprobs_render.join_parts
 
@@ -2724,7 +2724,7 @@ def test_compact_with_user_middleware_joins_off_loop(monkeypatch):
         return real_join(parts)
 
     monkeypatch.setattr(api_router, "join_parts", recording_join)
-    parts = [b'{"a":"', b"x" * 10, b'"}']
+    parts = [b'{"a":"', b"x" * (api_router.INLINE_JOIN_MAX_BYTES + 1), b'"}']
     client = _gzip_client(parts)
     client.app.state.args.middleware = ["some.module.Middleware"]
     with client:
@@ -2736,6 +2736,32 @@ def test_compact_with_user_middleware_joins_off_loop(monkeypatch):
     assert int(result.headers["content-length"]) == len(result.content)
     assert len(threads) == 1
     assert threads[0].startswith("generate-response")
+
+
+def test_small_compact_with_user_middleware_skips_busy_builder():
+    """Claude r9 MINOR: a small compact + --middleware body is joined inline,
+    so it does not wait behind an unrelated build occupying the single
+    response-builder thread."""
+    release = threading.Event()
+    busy = api_router.serving_module._RESPONSE_BUILDER.submit(release.wait, 10)
+    try:
+        parts = [b'{"a":"', b"x" * 10, b'"}']
+        client = _gzip_client(parts)
+        client.app.state.args.middleware = ["some.module.Middleware"]
+        with client:
+            t0 = time.perf_counter()
+            result = client.post(
+                "/inference/v1/generate",
+                json={"token_ids": [1], "sampling_params": {}},
+            )
+            elapsed = time.perf_counter() - t0
+        assert not busy.done()
+        assert result.content == b"".join(parts)
+        assert int(result.headers["content-length"]) == len(result.content)
+        assert elapsed < 5
+    finally:
+        release.set()
+        busy.result(timeout=30)
 
 
 @pytest.mark.parametrize("broken_side", ["target", "source"])
