@@ -634,7 +634,6 @@ RUNTIME_STATE_ATTRS: dict[str, str] = {
 # Persistent tensors not registered yet, as regexes over the reported path.
 # Each entry is removed by the change that registers those tensors.
 KNOWN_UNREGISTERED: tuple[str, ...] = (
-    r"\.head\.projector\.",  # Sentence-Transformers projector
     r"\._[kv]_scale_cpu$",  # attention default k/v scales
     r"\.impl\.(alibi_slopes|sinks)$",  # attention impls
     r"\.quant_method\.(moe_quant_config|moe_kernel|_cache_permute_indices)\b",
