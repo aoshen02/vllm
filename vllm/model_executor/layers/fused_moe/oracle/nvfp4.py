@@ -355,8 +355,6 @@ def convert_to_nvfp4_moe_kernel_format(
             prepare_w4a16_scales,
         )
 
-        if is_act_and_mul:
-            raise ValueError("Experimental FlashInfer W4A16 requires non-gated ReLU2")
         for weight, scale in ((w13, w13_scale), (w2, w2_scale)):
             if tuple(scale.shape) != (*weight.shape[:2], weight.shape[2] // 8):
                 raise ValueError("W4A16 conversion requires fresh unswizzled scales")
