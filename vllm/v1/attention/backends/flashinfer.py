@@ -2124,7 +2124,7 @@ class FlashInferImpl(AttentionImpl):
 
             # Host copy of the o scale for the kernels that take host scalars,
             # read in an eager forward (warmup, or the first one after a weight
-            # reload resets it in BaseKVCacheMethod.process_weights_after_loading).
+            # reload resets it in Attention.process_weights_after_loading).
             if layer._o_scale_float is None:
                 layer._o_scale_float = output_scale.cpu().item()
                 if output.dtype == FP4_DTYPE:
