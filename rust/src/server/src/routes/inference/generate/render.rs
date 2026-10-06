@@ -11,6 +11,8 @@
 //! the response (the request runtime for the offloaded generate route) into a
 //! bounded channel that the HTTP body drains. The produced bytes are identical
 //! to serializing the previous `GenerateResponse` value with `serde_json`.
+//! The compact format hands its pre-encoded base64 segments to the body
+//! without copying.
 
 use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
@@ -27,6 +29,7 @@ use serde_json::Value;
 use tracing_futures::Instrument as _;
 use vllm_llm::PositionLogprobs;
 
+use super::compact::CompactLogprobs;
 use super::types::GenerateLogprob;
 use crate::routes::openai::utils::logprobs::clamp_logprob;
 
@@ -48,6 +51,8 @@ pub(super) enum ChoiceLogprobs {
     None,
     /// OpenAI chat-style `{"content": [...]}`. Positions must be non-empty.
     OpenAi(Vec<PositionLogprobs>),
+    /// `"logprobs": null` plus `"compact_logprobs"`.
+    Compact(CompactLogprobs),
 }
 
 /// Positions rendered per body chunk in the OpenAI format. At top-128 one
@@ -78,6 +83,14 @@ impl PartsWriter {
         if !self.current.is_empty() {
             self.parts.push(Bytes::from(std::mem::take(&mut self.current)));
         }
+    }
+
+    /// A JSON string made of pre-encoded base64 segments.
+    fn encoded(&mut self, segments: Vec<Bytes>) {
+        self.raw(b"\"");
+        self.flush();
+        self.parts.extend(segments);
+        self.raw(b"\"");
     }
 
     fn finish(mut self) -> Vec<Bytes> {
@@ -111,17 +124,37 @@ fn write_tail(out: &mut PartsWriter, envelope: &GenerateEnvelope) {
     out.raw(b"}");
 }
 
+fn write_compact(out: &mut PartsWriter, block: CompactLogprobs) {
+    out.raw(b",\"compact_logprobs\":{\"num_positions\":");
+    out.json(&block.num_positions);
+    out.raw(b",\"num_slots\":");
+    out.json(&block.num_slots);
+    out.raw(b",\"dtype_token_ids\":\"int32\",\"dtype_logprobs\":\"float32\",\"byteorder\":\"little\",\"token_ids\":");
+    out.encoded(block.token_ids);
+    out.raw(b",\"logprobs\":");
+    out.encoded(block.logprobs);
+    out.raw(b"}");
+}
+
+/// A body with `"logprobs": null` (plus the compact block, if any) and an
+/// exact `Content-Length`.
+fn parts_body(envelope: &GenerateEnvelope, compact: Option<CompactLogprobs>) -> Body {
+    let mut out = PartsWriter::default();
+    write_head(&mut out, envelope);
+    out.raw(b"null");
+    write_choice_fields(&mut out, envelope);
+    if let Some(block) = compact {
+        write_compact(&mut out, block);
+    }
+    write_tail(&mut out, envelope);
+    Body::new(PartsBody::new(out.finish()))
+}
+
 /// Build the HTTP response for one non-streaming generate request.
 pub(super) fn generate_response(envelope: GenerateEnvelope, logprobs: ChoiceLogprobs) -> Response {
     let body = match logprobs {
-        ChoiceLogprobs::None => {
-            let mut out = PartsWriter::default();
-            write_head(&mut out, &envelope);
-            out.raw(b"null");
-            write_choice_fields(&mut out, &envelope);
-            write_tail(&mut out, &envelope);
-            Body::new(PartsBody::new(out.finish()))
-        }
+        ChoiceLogprobs::None => parts_body(&envelope, None),
+        ChoiceLogprobs::Compact(block) => parts_body(&envelope, Some(block)),
         ChoiceLogprobs::OpenAi(positions) => {
             let mut head = PartsWriter::default();
             write_head(&mut head, &envelope);

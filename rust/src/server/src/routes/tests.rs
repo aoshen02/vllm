@@ -6730,6 +6730,32 @@ async fn profile_routes_are_hidden_when_profiling_is_disabled() {
     engine_task.abort_and_join().await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn raw_generate_rejects_unknown_logprobs_format() {
+    let mut app = test_app().await;
+    let response = app
+        .call(
+            Request::builder()
+                .method("POST")
+                .uri("/inference/v1/generate")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "Qwen/Qwen1.5-0.5B-Chat",
+                        "token_ids": [11, 22],
+                        "logprobs_format": "numpy",
+                        "sampling_params": {"logprobs": 1}
+                    })
+                    .to_string(),
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("call app");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
 /// Send one raw HTTP/1.1 POST and return (lower-cased header block, de-framed body).
 async fn raw_http_post(addr: std::net::SocketAddr, path: &str, body: String) -> (String, Vec<u8>) {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -6778,7 +6804,7 @@ async fn raw_generate_http_framing_through_production_serve_loop() {
             boxed_test_future(async move {
                 // 300 positions: several render chunks for the default format.
                 let tokens: Vec<u32> = (100..400).collect();
-                for _ in 0..2 {
+                for _ in 0..3 {
                     let add = recv_engine_message(dealer).await;
                     let request: EngineCoreRequest =
                         rmp_serde::from_slice(&add[1]).expect("decode request");
@@ -6863,6 +6889,24 @@ async fn raw_generate_http_framing_through_production_serve_loop() {
     );
     let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
     assert!(json["choices"][0]["logprobs"].is_null());
+
+    // Compact: exact Content-Length.
+    let (head, body) = post(request(json!({"logprobs_format": "compact"}))).await;
+    assert!(head.starts_with("http/1.1 200"), "{head}");
+    assert!(head.contains("content-type: application/json"), "{head}");
+    assert!(
+        head.contains(&format!("content-length: {}", body.len())),
+        "{head}"
+    );
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("compact json");
+    let block = &json["choices"][0]["compact_logprobs"];
+    assert_eq!(block["num_positions"], 300);
+    let ids = base64::Engine::decode(
+        &base64::engine::general_purpose::STANDARD,
+        block["token_ids"].as_str().expect("token_ids"),
+    )
+    .expect("base64");
+    assert_eq!(ids[..4], 101_i32.to_le_bytes());
 
     shutdown.cancel();
     server.await.expect("serve task").expect("serve_connections");

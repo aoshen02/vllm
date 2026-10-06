@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+mod compact;
 mod convert;
 mod render;
 mod types;
@@ -16,7 +17,7 @@ use axum::extract::State;
 use axum::http::HeaderMap;
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
-use futures::{Stream, StreamExt as _, pin_mut};
+use futures::{Stream, StreamExt as _, TryStreamExt as _, pin_mut};
 use thiserror_ext::AsReport as _;
 use tracing::{error, info, trace};
 use tracing_futures::Instrument as _;
@@ -25,6 +26,7 @@ use vllm_llm::{
     CollectedGenerateOutput, FinishReason, GenerateOutput, GenerateOutputStreamExt as _, TokenUsage,
 };
 
+use self::compact::CompactLogprobsAccumulator;
 use self::convert::{ResponseOptions, prepare_generate_request};
 use self::render::{ChoiceLogprobs, GenerateEnvelope, generate_response};
 use self::types::{GenerateLogprob, GenerateResponseStreamChoice, GenerateStreamResponse};
@@ -136,8 +138,27 @@ async fn collect_response(
     api_server_options: ApiServerOptions,
     options: ResponseOptions,
 ) -> vllm_llm::Result<Result<(GenerateEnvelope, ChoiceLogprobs), ApiError>> {
-    let mut collected = raw_stream.collect_output().await?;
-    let logprobs = openai_choice_logprobs(collected.logprobs.take(), options.include_logprobs);
+    let mut compact = options.compact_row_width.map(CompactLogprobsAccumulator::new);
+    let mut collected = match compact.as_mut() {
+        None => raw_stream.collect_output().await?,
+        // Compact: encode each step's logprobs as it arrives.
+        Some(accumulator) => {
+            raw_stream
+                .map_ok(|mut output| {
+                    accumulator.push(output.token_ids.len(), output.logprobs.take());
+                    output
+                })
+                .collect_output()
+                .await?
+        }
+    };
+    let logprobs = match compact {
+        None => openai_choice_logprobs(collected.logprobs.take(), options.include_logprobs),
+        Some(accumulator) => accumulator
+            .finish()
+            .map(ChoiceLogprobs::Compact)
+            .map_err(ApiError::server_error),
+    };
     Ok(logprobs.and_then(|logprobs| {
         let envelope = collect_generate(collected, request_id, api_server_options, options)?;
         Ok((envelope, logprobs))
@@ -185,6 +206,8 @@ async fn generate_chunk_stream(
         include_logprobs,
         // Ignored: raw generate streaming has no prompt-logprobs wire shape.
         include_prompt_logprobs: _,
+        // Compact is rejected for streaming at validation.
+        compact_row_width: _,
     }: ResponseOptions,
     mut y: TryYielder<GenerateStreamResponse, ApiError>,
 ) -> Result<(), ApiError> {
@@ -444,6 +467,7 @@ mod tests {
     use vllm_engine_core_client::protocol::logprobs::TokenLogprob;
     use vllm_llm::GeneratePromptInfo;
 
+    use super::compact::tests::{decode_compact, top_k};
     use super::types::{GenerateResponse, GenerateResponseChoice};
     use super::*;
 
@@ -778,5 +802,193 @@ mod tests {
         .try_collect()
         .await;
         assert!(streamed.is_err());
+    }
+
+    // ---- logprobs_format: "compact" ----
+
+    fn compact_options(width: usize) -> ResponseOptions {
+        ResponseOptions {
+            include_logprobs: true,
+            compact_row_width: Some(width),
+            ..Default::default()
+        }
+    }
+
+    /// Render a non-streaming response through the handler's path.
+    async fn response_body(
+        steps: Vec<vllm_llm::Result<GenerateOutput>>,
+        options: ResponseOptions,
+    ) -> Result<String, ApiError> {
+        let (envelope, logprobs) = collect_response(
+            stream::iter(steps),
+            "compact-1".to_string(),
+            ApiServerOptions::default(),
+            options,
+        )
+        .await
+        .expect("stream")?;
+        let response = generate_response(envelope, logprobs);
+        // Exact size, so the response carries a Content-Length.
+        let exact = http_body::Body::size_hint(response.body()).exact();
+        let body = to_bytes(response.into_body(), usize::MAX).await.expect("body");
+        assert_eq!(exact, Some(body.len() as u64));
+        Ok(String::from_utf8(body.to_vec()).unwrap())
+    }
+
+    async fn response_json(
+        steps: Vec<vllm_llm::Result<GenerateOutput>>,
+        options: ResponseOptions,
+    ) -> Result<serde_json::Value, ApiError> {
+        let body = response_body(steps, options).await?;
+        Ok(serde_json::from_str(&body).expect("valid json"))
+    }
+
+    #[tokio::test]
+    async fn compact_body_is_exact() {
+        let body = response_body(
+            vec![step(
+                vec![7],
+                Some(vec![position(&[(7, -0.5, 1), (3, -1.0, 2), (9, -2.0, 3)])]),
+                Some(FinishReason::Length),
+            )],
+            compact_options(2),
+        )
+        .await
+        .expect("compact response");
+        assert_eq!(
+            body,
+            concat!(
+                r#"{"request_id":"compact-1","choices":[{"index":0,"logprobs":null,"#,
+                r#""finish_reason":"length","token_ids":[7],"compact_logprobs":{"#,
+                r#""num_positions":1,"num_slots":1,"dtype_token_ids":"int32","#,
+                r#""dtype_logprobs":"float32","byteorder":"little","#,
+                r#""token_ids":"AwAAAA==","logprobs":"AACAvw=="}}],"#,
+                r#""prompt_logprobs":null,"kv_transfer_params":null,"ec_transfer_params":null}"#
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_abort_with_partial_output_decodes_engine_rows() {
+        let rows = tricky_positions()[..3].to_vec();
+        let json = response_json(
+            vec![
+                step(vec![0, 151_935], Some(rows[..2].to_vec()), None),
+                step(vec![42], Some(rows[2..].to_vec()), None),
+                // Abort: terminal output with no new tokens or logprobs.
+                step(vec![], None, Some(FinishReason::Abort)),
+            ],
+            compact_options(3),
+        )
+        .await
+        .expect("compact response");
+
+        let choice = &json["choices"][0];
+        assert_eq!(choice["finish_reason"], "abort");
+        assert_eq!(choice["token_ids"], json!([0, 151_935, 42]));
+        assert!(choice["logprobs"].is_null());
+        let block = &choice["compact_logprobs"];
+        assert_eq!(block["num_positions"], 3);
+        assert_eq!(block["num_slots"], 2);
+        let (token_ids, bits) = decode_compact(block);
+        assert_eq!((token_ids, bits.clone()), top_k(&rows, 3));
+        // Raw, unclamped non-finite logprobs survive.
+        assert!(f32::from_bits(bits[2]).is_nan());
+        assert_eq!(f32::from_bits(bits[5]), f32::INFINITY);
+    }
+
+    #[tokio::test]
+    async fn compact_zero_token_abort_returns_empty_block() {
+        // An abort before any token carries no tokens and `logprobs: None`;
+        // the engine may also attach an empty payload.
+        for payload in [None, Some(Vec::new())] {
+            let json = response_json(
+                vec![step(vec![], payload, Some(FinishReason::Abort))],
+                compact_options(3),
+            )
+            .await
+            .expect("zero-token abort is a 200 with an empty block");
+            let block = &json["choices"][0]["compact_logprobs"];
+            assert_eq!(block["num_positions"], 0);
+            assert_eq!(block["num_slots"], 2);
+            assert_eq!(block["token_ids"], "");
+            assert_eq!(block["logprobs"], "");
+        }
+    }
+
+    /// Outputs the layout cannot represent fail the request with a 500; rows
+    /// wider than k + 1 (engine padding) are truncated.
+    #[tokio::test]
+    async fn compact_malformed_outputs_fail_the_request() {
+        let row = |id: u32, width: u32| {
+            position(
+                &(0..width)
+                    .map(|slot| (id + slot, -0.25 * slot as f32, slot.max(1)))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let cases = [
+            (
+                "token without payload",
+                vec![
+                    step(vec![1], None, None),
+                    step(vec![2], Some(vec![row(2, 3)]), Some(FinishReason::Length)),
+                ],
+            ),
+            (
+                "counts shifted across steps",
+                vec![
+                    step(vec![1], Some(Vec::new()), None),
+                    step(
+                        vec![2],
+                        Some(vec![row(1, 3), row(2, 3)]),
+                        Some(FinishReason::Abort),
+                    ),
+                ],
+            ),
+            (
+                "rows on a zero-token output",
+                vec![
+                    step(vec![1], Some(vec![row(1, 3)]), None),
+                    step(vec![], Some(vec![row(9, 3)]), Some(FinishReason::Abort)),
+                ],
+            ),
+            (
+                "row narrower than k + 1",
+                vec![step(
+                    vec![1],
+                    Some(vec![row(1, 2)]),
+                    Some(FinishReason::Length),
+                )],
+            ),
+            (
+                "empty row",
+                vec![step(
+                    vec![1],
+                    Some(vec![PositionLogprobs { entries: vec![] }]),
+                    Some(FinishReason::Length),
+                )],
+            ),
+        ];
+        for (name, steps) in cases {
+            let error = response_body(steps, compact_options(3)).await.expect_err(name);
+            assert_eq!(
+                error.into_response().status(),
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "{name}"
+            );
+        }
+        let json = response_json(
+            vec![
+                step(vec![1], Some(vec![row(1, 3)]), None),
+                step(vec![2], Some(vec![row(2, 5)]), Some(FinishReason::Length)),
+            ],
+            compact_options(3),
+        )
+        .await
+        .expect("valid");
+        let block = &json["choices"][0]["compact_logprobs"];
+        assert_eq!(block["num_positions"], 2);
+        assert_eq!(decode_compact(block).0, vec![2, 3, 3, 4]);
     }
 }

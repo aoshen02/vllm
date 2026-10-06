@@ -4,7 +4,7 @@
 use vllm_engine_core_client::protocol::multimodal::MmFeatures;
 use vllm_text::{Prompt, TextDecodeOptions, TextRequest};
 
-use super::types::GenerateRequest;
+use super::types::{GenerateRequest, LogprobsFormat};
 use super::validate;
 use crate::error::ApiError;
 use crate::lora::LoraModelResolution;
@@ -30,6 +30,9 @@ pub(super) struct ResponseOptions {
     pub include_logprobs: bool,
     /// Whether the caller requested top-level prompt logprobs.
     pub include_prompt_logprobs: bool,
+    /// For `logprobs_format: "compact"` with `logprobs` set: the engine row
+    /// width `logprobs + 1`.
+    pub compact_row_width: Option<usize>,
 }
 
 /// Validate and lower one raw generate request into the internal
@@ -56,6 +59,13 @@ pub(super) fn prepare_generate_request(
             .unwrap_or(false);
     let include_logprobs = request.sampling_params.inner.logprobs.is_some();
     let include_prompt_logprobs = request.sampling_params.inner.prompt_logprobs.is_some();
+    let compact_row_width = request
+        .sampling_params
+        .inner
+        .logprobs
+        .filter(|_| request.logprobs_format == Some(LogprobsFormat::Compact))
+        .and_then(|k| usize::try_from(k).ok())
+        .map(|k| k + 1);
     let mut sampling_params = request.sampling_params.inner;
     sampling_params.vllm_xargs = merge_kv_transfer_params(
         sampling_params.vllm_xargs,
@@ -92,6 +102,7 @@ pub(super) fn prepare_generate_request(
             include_continuous_usage,
             include_logprobs,
             include_prompt_logprobs,
+            compact_row_width,
         },
     })
 }
@@ -189,6 +200,27 @@ mod tests {
             prepared.text_request.sampling_params.thinking_token_budget,
             Some(64)
         );
+    }
+
+    #[test]
+    fn prepare_generate_request_sets_compact_row_width_from_logprobs() {
+        let width = |body: serde_json::Value| {
+            let request: GenerateRequest = serde_json::from_value(body).expect("parse request");
+            prepare_generate_request(
+                request,
+                &served(&["Qwen/Qwen1.5-0.5B-Chat"]),
+                ResolvedRequestContext::default(),
+                None,
+            )
+            .expect("prepare")
+            .options
+            .compact_row_width
+        };
+        let body = |format: &str, sampling_params: serde_json::Value| json!({"token_ids": [11], "logprobs_format": format, "sampling_params": sampling_params});
+        assert_eq!(width(body("compact", json!({"logprobs": 5}))), Some(6));
+        // Without `logprobs` the compact block is omitted, like `logprobs`.
+        assert_eq!(width(body("compact", json!({}))), None);
+        assert_eq!(width(body("openai", json!({"logprobs": 5}))), None);
     }
 
     #[test]
