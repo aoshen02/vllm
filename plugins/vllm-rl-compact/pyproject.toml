@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vllm-rl-compact"
+version = "0.1.0"
+description = "RL compact logprobs for /inference/v1/generate (vLLM endpoint plugin)"
+requires-python = ">=3.10"
+# Needs a vLLM with the sample-logprobs container hook
+# (vllm.logprobs.register_sample_logprobs_container), ServingTokens.start_generate
+# and vllm.plugins.endpoint_plugins.routing.replace_route; there is no
+# released version with them yet, so no lower bound can be given. See README.
+dependencies = ["vllm", "pybase64", "numpy"]
+
+[project.entry-points."vllm.endpoint_plugins"]
+rl_compact = "vllm_rl_compact:RLCompactPlugin"
+
+[tool.setuptools]
+packages = ["vllm_rl_compact"]
