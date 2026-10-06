@@ -92,6 +92,25 @@ def test_nemotron_h_batch_invariant_uses_cuda_fp8_quant(
 
 
 @pytest.mark.parametrize("batch_invariant", [False, True])
+def test_nemotron_h_batch_invariant_requires_tp1(monkeypatch, batch_invariant):
+    """Only TP=1 matches the training replay, so batch-invariant Nemotron-H
+    rejects TP>1 at config time instead of in every worker."""
+    from vllm.model_executor.models import config
+
+    monkeypatch.setattr(config.envs, "VLLM_BATCH_INVARIANT", batch_invariant)
+    vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(mamba_ssm_cache_dtype="float32"),
+        model_config=SimpleNamespace(hf_config=SimpleNamespace()),
+        parallel_config=SimpleNamespace(tensor_parallel_size=2),
+    )
+    if batch_invariant:
+        with pytest.raises(ValueError, match="TP=1"):
+            config.NemotronHForCausalLMConfig.verify_and_update_config(vllm_config)
+    else:
+        config.NemotronHForCausalLMConfig.verify_and_update_config(vllm_config)
+
+
+@pytest.mark.parametrize("batch_invariant", [False, True])
 def test_gate_skips_small_m_cute_gemm_under_bi(monkeypatch, batch_invariant):
     """The small-M CuTe router GEMM reduces differently from the large-M path,
     so batch invariance must not select it."""

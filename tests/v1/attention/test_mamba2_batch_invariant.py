@@ -101,10 +101,6 @@ def test_decode_positions_ignore_cudagraph_padding_rows():
             lambda c: setattr(c.parallel_config, "pipeline_parallel_size", 2),
             "PP=1",
         ),
-        (
-            lambda c: setattr(c.parallel_config, "tensor_parallel_size", 2),
-            "TP=1",
-        ),
     ],
 )
 def test_check_rejects_unsupported_settings(mutate, message):
