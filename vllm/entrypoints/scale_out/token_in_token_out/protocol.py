@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from dataclasses import dataclass
 from typing import Any, Literal, TypeAlias
 
 from pydantic import (
@@ -267,6 +268,14 @@ class GenerateResponse(BaseModel):
             "ECTransfer parameters used for encoder-cache disaggregated serving."
         ),
     )
+
+
+@dataclass
+class RenderedGenerateResponse:
+    """A non-streaming generate response already rendered to its JSON body
+    (the bytes ``GenerateResponse`` gives through ``JSONResponse``)."""
+
+    body: bytes
 
 
 class DerenderChatRequest(BaseModel):
