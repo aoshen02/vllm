@@ -91,6 +91,25 @@ def test_nemotron_h_batch_invariant_uses_cuda_fp8_quant(
     assert pass_config.fuse_act_quant is False
 
 
+@pytest.mark.parametrize("batch_invariant", [False, True])
+def test_nemotron_h_batch_invariant_requires_tp1(monkeypatch, batch_invariant):
+    """Only TP=1 matches the training replay, so batch-invariant Nemotron-H
+    rejects TP>1 at config time instead of in every worker."""
+    from vllm.model_executor.models import config
+
+    monkeypatch.setattr(config.envs, "VLLM_BATCH_INVARIANT", batch_invariant)
+    vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(mamba_ssm_cache_dtype="float32"),
+        model_config=SimpleNamespace(hf_config=SimpleNamespace()),
+        parallel_config=SimpleNamespace(tensor_parallel_size=2),
+    )
+    if batch_invariant:
+        with pytest.raises(ValueError, match="TP=1"):
+            config.NemotronHForCausalLMConfig.verify_and_update_config(vllm_config)
+    else:
+        config.NemotronHForCausalLMConfig.verify_and_update_config(vllm_config)
+
+
 @pytest.mark.parametrize("tp_size", [1, 2])
 def test_grouped_gated_norm_only_at_tp1(monkeypatch, tp_size):
     """The grouped gated-norm kernel normalizes whole groups on one rank; with

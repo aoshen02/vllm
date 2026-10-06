@@ -694,6 +694,12 @@ class NemotronHForCausalLMConfig(VerifyAndUpdateConfig):
             hf_config=vllm_config.model_config.hf_config,
         )
         if envs.VLLM_BATCH_INVARIANT:
+            if vllm_config.parallel_config.tensor_parallel_size > 1:
+                raise ValueError(
+                    "VLLM_BATCH_INVARIANT=1 with Nemotron-H currently requires "
+                    "TP=1: the grouped gated norm and the shared-expert kernel "
+                    "match the training replay only at TP=1"
+                )
             cls.use_cuda_fp8_quant(vllm_config)
 
     @staticmethod
