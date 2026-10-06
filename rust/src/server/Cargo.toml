@@ -9,6 +9,7 @@ anyhow.workspace = true
 asynk-strim-attr.workspace = true
 auto_enums.workspace = true
 axum.workspace = true
+bytes.workspace = true
 educe.workspace = true
 futures.workspace = true
 http-body.workspace = true
@@ -60,7 +61,6 @@ tonic-prost-build.workspace = true
 [dev-dependencies]
 anyhow.workspace = true
 async-openai = { workspace = true, features = ["full"] }
-bytes.workspace = true
 clap.workspace = true
 expect-test.workspace = true
 rmp-serde.workspace = true
