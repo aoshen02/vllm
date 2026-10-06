@@ -605,14 +605,12 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
         if self._workspace_buffer is None:
             self._workspace_buffer = _get_workspace_buffer(device)
 
-        if self.bmm1_scale is None:
-            self.bmm1_scale = self.scale
-            if is_quantized_kv_cache(self.kv_cache_dtype):
-                self.bmm1_scale *= layer._q_scale_float * layer._k_scale_float
-        if self.bmm2_scale is None:
-            self.bmm2_scale = 1.0
-            if is_quantized_kv_cache(self.kv_cache_dtype):
-                self.bmm2_scale *= layer._k_scale_float
+        # Recomputed every call: a weight reload can change the KV scales.
+        self.bmm1_scale = self.scale
+        self.bmm2_scale = 1.0
+        if is_quantized_kv_cache(self.kv_cache_dtype):
+            self.bmm1_scale *= layer._q_scale_float * layer._k_scale_float
+            self.bmm2_scale *= layer._k_scale_float
 
     def autotune_hisparse_decode(self, layer: AttentionLayer) -> None:
         """Autotune the largest legal HiSparse decode batch."""

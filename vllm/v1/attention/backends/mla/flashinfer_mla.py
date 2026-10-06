@@ -368,15 +368,12 @@ class FlashInferMLAImpl(MLACommonImpl[FlashInferMLAMetadata]):
         else:
             q = q.view(attn_metadata.num_decodes, -1, q.shape[-2], q.shape[-1])
 
-        if self.bmm1_scale is None:
-            self.bmm1_scale = self.scale
-            if is_quantized_kv_cache(self.kv_cache_dtype):
-                self.bmm1_scale *= layer._q_scale_float * layer._k_scale_float
-
-        if self.bmm2_scale is None:
-            self.bmm2_scale = 1.0
-            if is_quantized_kv_cache(self.kv_cache_dtype):
-                self.bmm2_scale *= layer._k_scale_float
+        # Recomputed every call: a weight reload can change the KV scales.
+        self.bmm1_scale = self.scale
+        self.bmm2_scale = 1.0
+        if is_quantized_kv_cache(self.kv_cache_dtype):
+            self.bmm1_scale *= layer._q_scale_float * layer._k_scale_float
+            self.bmm2_scale *= layer._k_scale_float
 
         return_lse = self.need_to_return_lse_for_decode
         workspace_buffer = _get_workspace_buffer(return_lse)

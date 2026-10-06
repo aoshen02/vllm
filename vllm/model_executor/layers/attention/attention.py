@@ -588,6 +588,9 @@ class Attention(nn.Module, AttentionLayerBase):
 
     def process_weights_after_loading(self, act_dtype: torch.dtype):
         self.impl.process_weights_after_loading(act_dtype)
+        # A weight reload can change the next quant op's input scale; the next
+        # forward re-reads it.
+        self._o_scale_float = None
 
         # If we should not load quant weights, we initialize the scales to 1.0
         # as the default value. See [Note: Register q/k/v/prob scales in state dict]
