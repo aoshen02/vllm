@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from typing import TYPE_CHECKING
 
+from vllm import envs
 from vllm.logger import init_logger
 from vllm.utils.math_utils import round_up
 
@@ -692,6 +693,27 @@ class NemotronHForCausalLMConfig(VerifyAndUpdateConfig):
             cache_config=vllm_config.cache_config,
             hf_config=vllm_config.model_config.hf_config,
         )
+        if envs.VLLM_BATCH_INVARIANT:
+            if vllm_config.parallel_config.tensor_parallel_size > 1:
+                raise ValueError(
+                    "VLLM_BATCH_INVARIANT=1 with Nemotron-H currently requires "
+                    "TP=1: the grouped gated norm and the shared-expert kernel "
+                    "match the training replay only at TP=1"
+                )
+            cls.use_cuda_fp8_quant(vllm_config)
+
+    @staticmethod
+    def use_cuda_fp8_quant(vllm_config: "VllmConfig") -> None:
+        """Quantize FP8 activations with the standalone CUDA kernel; the
+        norm/activation + quant fusions round differently."""
+        compilation_config = vllm_config.compilation_config
+        pass_config = compilation_config.pass_config
+        if pass_config.fuse_norm_quant is None:
+            pass_config.fuse_norm_quant = False
+        if pass_config.fuse_act_quant is None:
+            pass_config.fuse_act_quant = False
+        if "-quant_fp8" not in compilation_config.custom_ops:
+            compilation_config.custom_ops.append("+quant_fp8")
 
 
 class NemotronHNanoVLV2Config(VerifyAndUpdateConfig):
