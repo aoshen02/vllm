@@ -3229,3 +3229,123 @@ async fn bootstrapped_external_coordinator_running_state_suppresses_wakeup() {
 
     client.shutdown().await.unwrap();
 }
+
+/// `EngineCoreClient::shutdown` returns only once no output decode is
+/// running: a decode started on the client's tracker and held behind a gate
+/// keeps `shutdown()` pending until it is released.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn client_shutdown_waits_for_inflight_output_decodes() {
+    use std::sync::{Arc, Condvar, Mutex};
+
+    /// Opens the gate when dropped (also when an assertion unwinds), so the
+    /// gated blocking task never outlives the test.
+    struct Gate(Arc<(Mutex<bool>, Condvar)>);
+    impl Gate {
+        fn open(&self) {
+            *self.0.0.lock().unwrap_or_else(|e| e.into_inner()) = true;
+            self.0.1.notify_all();
+        }
+    }
+    impl Drop for Gate {
+        fn drop(&mut self) {
+            self.open();
+        }
+    }
+
+    init_tracing();
+    let ipc = IpcNamespace::new().unwrap();
+    let handshake_address = ipc.handshake_endpoint();
+    let (shutdown_tx, engine_task) = spawn_mock_engine_task(
+        handshake_address.clone(),
+        b"engine-gated-decode".to_vec(),
+        |_dealer, _push| Box::pin(async move {}),
+    );
+    let client = connect_client_with_ipc(
+        handshake_test_config(
+            handshake_address,
+            1,
+            "test-model",
+            Duration::from_secs(5),
+            0,
+            None,
+        ),
+        &ipc,
+    )
+    .await;
+
+    // A decode running on the client's tracker, held until the gate opens.
+    let gate = Gate(Arc::new((Mutex::new(false), Condvar::new())));
+    let held = gate.0.clone();
+    let (started_tx, started_rx) = oneshot::channel();
+    let decode_tasks = client.decode_tasks_for_test();
+    let decode = decode_tasks.spawn_blocking(move || {
+        let _ = started_tx.send(());
+        let open = held.0.lock().unwrap_or_else(|e| e.into_inner());
+        drop(held.1.wait_while(open, |open| !*open).unwrap_or_else(|e| e.into_inner()));
+    });
+    timeout(Duration::from_secs(5), started_rx)
+        .await
+        .expect("gated decode did not start")
+        .unwrap();
+
+    // Shutdown runs on its own task, so it keeps making progress while the
+    // test observes it.
+    let mut shutdown = tokio::spawn(client.shutdown());
+    // `shutdown()` closes the tracker after joining the client tasks and
+    // right before waiting for it: from here on it can only be pending in
+    // that wait (not in the joins).
+    timeout(Duration::from_secs(10), async {
+        while !decode_tasks.is_closed() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("shutdown never reached the decode tracker");
+    assert!(
+        timeout(Duration::from_millis(500), &mut shutdown).await.is_err(),
+        "shutdown returned while an output decode was still running"
+    );
+    assert!(!decode.is_finished());
+    gate.open();
+    timeout(Duration::from_secs(10), shutdown)
+        .await
+        .expect("shutdown did not finish after the decode was released")
+        .expect("shutdown task panicked")
+        .unwrap();
+    assert!(decode.is_finished());
+    assert!(decode_tasks.is_empty() && decode_tasks.is_closed());
+    let _ = shutdown_tx.send(());
+    let _ = timeout(Duration::from_secs(5), engine_task).await;
+}
+
+/// Dropping a client without `shutdown()` closes its decode tracker (the
+/// cheap part of shutdown; running decodes finish detached).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dropping_the_client_closes_the_decode_tracker() {
+    init_tracing();
+    let ipc = IpcNamespace::new().unwrap();
+    let handshake_address = ipc.handshake_endpoint();
+    let (shutdown_tx, engine_task) = spawn_mock_engine_task(
+        handshake_address.clone(),
+        b"engine-drop".to_vec(),
+        |_dealer, _push| Box::pin(async move {}),
+    );
+    let client = connect_client_with_ipc(
+        handshake_test_config(
+            handshake_address,
+            1,
+            "test-model",
+            Duration::from_secs(5),
+            0,
+            None,
+        ),
+        &ipc,
+    )
+    .await;
+    let decode_tasks = client.decode_tasks_for_test();
+    assert!(!decode_tasks.is_closed());
+    drop(client);
+    assert!(decode_tasks.is_closed());
+    let _ = shutdown_tx.send(());
+    let _ = timeout(Duration::from_secs(5), engine_task).await;
+}

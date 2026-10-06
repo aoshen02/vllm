@@ -10,7 +10,7 @@ use itertools::Itertools;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
 use tokio::sync::mpsc;
-use tokio_util::task::AbortOnDropHandle;
+use tokio_util::task::{AbortOnDropHandle, TaskTracker};
 use tracing::{debug, info, trace};
 
 use crate::client::imp::{ClientInner, run_abort_loop, run_output_dispatcher_loop};
@@ -261,8 +261,30 @@ pub(crate) struct AbortRequest {
     cause: AbortCause,
 }
 
+/// Closes the output-decode tracker when dropped, so a client dropped
+/// without [`EngineCoreClient::shutdown`] at least stops admitting decodes;
+/// decodes already running finish on their own (detached).
+struct DecodeTasks(TaskTracker);
+
+impl Drop for DecodeTasks {
+    fn drop(&mut self) {
+        self.0.close();
+    }
+}
+
 /// Default ZMQ-based implementation that talks directly to a Python
 /// `EngineCoreProc`.
+///
+/// Call [`Self::shutdown`] to stop it: shutdown returns only once no output
+/// decode is running. A client that is merely dropped aborts its tasks and
+/// cancels queued decodes, but up to `P` started decodes (`2P` with the
+/// in-process coordinator output loop; `P` is
+/// `VLLM_RS_OUTPUT_DECODE_PARALLELISM`) finish detached on the blocking pool,
+/// like the inline decode of an aborted output task before decoding was
+/// parallel. In this workspace the server (`AppState::shutdown` -> chat ->
+/// text -> llm -> client) and all examples await `shutdown()` on the normal
+/// exit path; error paths after `connect()` and an elapsed server shutdown
+/// deadline drop the client instead.
 pub struct EngineCoreClient {
     config: EngineCoreClientConfig,
     input_address: String,
@@ -280,6 +302,8 @@ pub struct EngineCoreClient {
     abort_task: AbortOnDropHandle<()>,
     coordinator_output_task: Option<AbortOnDropHandle<()>>,
     coordinator_task: Option<AbortOnDropHandle<()>>,
+    /// Blocking-pool decodes started by the output loops; awaited on shutdown.
+    decode_tasks: DecodeTasks,
 }
 
 impl EngineCoreClient {
@@ -363,9 +387,11 @@ impl EngineCoreClient {
             config.model_name.clone(),
             &engines,
         ));
+        let decode_tasks = TaskTracker::new();
         let output_task = AbortOnDropHandle::new(runtime.spawn(transport::run_output_loop(
             connected.output_socket,
             output_tx,
+            decode_tasks.clone(),
         )));
         let dispatcher_task = AbortOnDropHandle::new(
             runtime.spawn(run_output_dispatcher_loop(inner.clone(), output_rx)),
@@ -387,6 +413,7 @@ impl EngineCoreClient {
                     AbortOnDropHandle::new(runtime.spawn(transport::run_output_loop(
                         coordinator_transport.output_socket,
                         coordinator_output_tx,
+                        decode_tasks.clone(),
                     )));
                 let coordinator_task = AbortOnDropHandle::new(
                     runtime.spawn(runner.run(coordinator_output_rx, inner.clone())),
@@ -424,6 +451,7 @@ impl EngineCoreClient {
             abort_task,
             coordinator_output_task,
             coordinator_task,
+            decode_tasks: DecodeTasks(decode_tasks),
         })
     }
 
@@ -938,6 +966,12 @@ impl EngineCoreClient {
         Ok(())
     }
 
+    /// Decode tracker of the output loops (tests observe shutdown with it).
+    #[cfg(test)]
+    pub(crate) fn decode_tasks_for_test(&self) -> TaskTracker {
+        self.decode_tasks.0.clone()
+    }
+
     /// Shut down local client tasks and close transport state.
     pub async fn shutdown(self) -> Result<()> {
         let Self {
@@ -949,6 +983,7 @@ impl EngineCoreClient {
             abort_task,
             coordinator_output_task,
             coordinator_task,
+            decode_tasks,
             ..
         } = self;
 
@@ -964,6 +999,12 @@ impl EngineCoreClient {
 
         tasks.iter().for_each(|t| t.abort());
         join_all(tasks).await;
+        // Aborting the output loops cancels decodes that had not started;
+        // wait for the running ones, as shutdown used to wait for the inline
+        // decode of the aborted output task. Like that join, the wait has no
+        // timeout: decodes are bounded CPU work that awaits nothing.
+        decode_tasks.0.close();
+        decode_tasks.0.wait().await;
         drop(inner);
         drop(runtime);
 
