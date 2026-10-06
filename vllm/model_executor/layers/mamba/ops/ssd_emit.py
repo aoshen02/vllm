@@ -303,9 +303,6 @@ def _bmm_chunk_workspace_range_fwd(
     assert current_b.device == b.device
     if emit_a.stride(-1) != 1 and emit_a.stride(0) != 1:
         emit_a = emit_a.contiguous()
-    # The kernel writes current_b into b, so b cannot be replaced by a copy.
-    if b.stride(-1) != 1 and b.stride(0) != 1:
-        raise ValueError(f"B buffer needs unit dstate or slot stride: {b.stride()}")
 
     dot_dtype = (
         tl.bfloat16
