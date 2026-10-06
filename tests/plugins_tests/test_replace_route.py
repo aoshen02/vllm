@@ -119,7 +119,7 @@ def test_no_route_or_another_method_is_a_conflict():
 
 
 def test_partial_method_sets_are_a_conflict():
-    """Stack audit: replacing POST of a POST + PUT route would drop PUT."""
+    """Replacing POST of a POST + PUT route would drop PUT."""
     app = FastAPI()
     app.add_api_route(PATH, core, methods=["POST", "PUT"])
     assert "would drop" in _unchanged(app, lambda: _replace(app))
@@ -137,7 +137,7 @@ def test_invalid_methods_are_rejected(methods):
 
 
 def test_router_prefix_is_applied_once():
-    """Stack audit: a prefixed router must not end up at /api/api/..."""
+    """A prefixed router must not end up at /api/api/..."""
     app = FastAPI()
     app.router.prefix = "/api"
     app.router.add_api_route("/x", core, methods=["POST"])
@@ -146,25 +146,10 @@ def test_router_prefix_is_applied_once():
     assert "/api/x" in paths and "/api/api/x" not in paths
 
 
-def test_failure_after_the_route_was_added_restores_the_routes(monkeypatch):
-    """Kimi stack audit: the post-add section is atomic."""
-    app = _app()
-    routes = list(app.router.routes)
-
-    class Failing(list):
-        def append(self, item):
-            raise OSError("late failure")
-
-    monkeypatch.setattr(routing, "_REPLACEMENTS", Failing())
-    with pytest.raises(OSError):
-        _replace(app)
-    assert all(a is b for a, b in zip(app.router.routes, routes, strict=True))
-
-
-def test_inherited_app_dependencies_and_tags_are_not_added_twice():
-    """Stack v2 audit: the app router's own dependencies and tags are part of
-    the replaced route's and are added again by add_api_route: inherited
-    once, an uncached nested dependency runs once, as before."""
+@pytest.mark.parametrize("given_tags", [None, ["plugin"]])
+def test_app_router_settings_changed_later_are_not_added(given_tags):
+    """The new route gets the dependencies and tags the
+    replaced route got, even if app.router's changed after it was added."""
     calls = []
 
     def inner():
@@ -173,36 +158,55 @@ def test_inherited_app_dependencies_and_tags_are_not_added_twice():
     def outer(_: None = Depends(inner, use_cache=False)):
         calls.append("outer")
 
+    def extra():
+        calls.append("extra")
+
     app = FastAPI(dependencies=[Depends(outer)])
     app.router.tags = ["app"]
     app.add_api_route(PATH, core, methods=["POST"])
+    app.router.dependencies.insert(0, Depends(extra))
+    app.router.tags = ["new", "app"]
     client = TestClient(app)
     client.post(PATH)
     before, calls[:] = list(calls), []
-    _replace(app)
+    kwargs = {} if given_tags is None else {"tags": given_tags}
+    replace_route(app, PATH, _plugin([]), **kwargs)
     client.post(PATH)
     assert calls == before == ["inner", "outer"]
     new = next(r for r in app.router.routes if getattr(r, "path", None) == PATH)
-    assert new.tags == ["app"] and len(new.dependencies) == 1
+    assert new.tags == (["app"] if given_tags is None else ["new", "app", "plugin"])
+    # The router's own settings are as they were.
+    assert app.router.tags == ["new", "app"] and len(app.router.dependencies) == 2
 
 
-def test_rollback_keeps_the_cached_openapi_schema(monkeypatch):
-    """Stack v2 audit: a late failure leaves the cached schema as it was."""
+def test_a_late_failure_leaves_everything_unchanged(monkeypatch):
+    """A failure while recording the new route leaves the
+    record of replaced routes as it was (dead entries included)."""
     app = _app()
+    routes = list(app.router.routes)
     schema = app.openapi()
+    dead = routing.weakref.ref(_app().router.routes[-1])
+    gc.collect()
+    assert dead() is None
 
     class Failing(list):
         def append(self, item):
+            super().append(item)
             raise OSError("late failure")
 
-    monkeypatch.setattr(routing, "_REPLACEMENTS", Failing())
+    registry = Failing([dead])
+    monkeypatch.setattr(routing, "_REPLACEMENTS", registry)
     with pytest.raises(OSError):
         _replace(app)
-    assert app.openapi_schema is schema
+    assert list(registry) == [dead] and app.openapi_schema is schema
+    assert all(a is b for a, b in zip(app.router.routes, routes, strict=True))
+    # The rolled-back route is not recorded as replaced: replacing works.
+    monkeypatch.setattr(routing, "_REPLACEMENTS", list(registry))
+    assert _replace(app) is core
 
 
 def test_replacement_registry_forgets_collected_routes(monkeypatch):
-    """Kimi stack v2 audit: the registry does not grow with every app."""
+    """The registry does not grow with every app."""
     monkeypatch.setattr(routing, "_REPLACEMENTS", [])
     for _ in range(3):
         _replace(_app())
@@ -213,7 +217,7 @@ def test_replacement_registry_forgets_collected_routes(monkeypatch):
 
 
 def test_given_dependencies_are_added_to_the_inherited_ones():
-    """Claude stack v2 audit: passing dependencies must not drop the core
+    """Passing dependencies must not drop the core
     route's (e.g. its router's validation or auth)."""
     calls = []
 
@@ -235,7 +239,7 @@ def test_given_dependencies_are_added_to_the_inherited_ones():
 
 
 def test_replaced_route_settings_are_inherited():
-    """Stack audit: the replaced route's (and its router's) dependencies,
+    """The replaced route's (and its router's) dependencies,
     response class, tags and schema visibility carry over unless given."""
     calls = []
 

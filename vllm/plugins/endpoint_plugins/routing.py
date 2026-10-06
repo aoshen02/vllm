@@ -15,7 +15,9 @@ from starlette.routing import Host, Match
 _REPLACEMENTS: list[weakref.ref[APIRoute]] = []
 
 # Settings of the replaced route that the new route takes unless given
-# (dependencies: always, given ones are added after them).
+# (dependencies: always, given ones are added after them). Dependencies and
+# tags are the replaced route's effective ones, `app.router`'s included as
+# they were when it was added.
 _INHERITED = (
     "dependencies",
     "response_class",
@@ -43,14 +45,15 @@ def replace_route(
     and app-level dependencies apply, and takes the replaced route's place:
     precedence relative to every other route is unchanged and OpenAPI shows
     one operation. `route_kwargs` are those of `APIRouter.add_api_route`.
-    The new route keeps the replaced route's effective dependencies (its
-    router's included; those of `app.router` itself are added once, by
-    `add_api_route`, as for any route); given `dependencies` run after them,
+    The new route keeps exactly the dependencies the replaced route got (its
+    routers' and those `app.router` had when it was added; `app.router`'s
+    current ones are not added again); given `dependencies` run after them,
     so a core dependency (e.g. validation or auth) cannot be dropped by
     accident. `response_class`, `tags`, `include_in_schema`, `name` (so
     `url_path_for` keeps working) and `responses` default to the replaced
-    route's; given values replace them. Nothing else is inherited (e.g.
-    `operation_id`, `summary`, `status_code`, `response_model`).
+    route's; given values replace them (given `tags` follow `app.router`'s,
+    as for any route). Nothing else is inherited (e.g. `operation_id`,
+    `summary`, `status_code`, `response_model`).
     The returned endpoint is the plain function: calling it does not run the
     replaced route's dependencies again (the new route's ran for the request).
     `methods` is the route's exact method set (Starlette routes that serve GET
@@ -58,8 +61,8 @@ def replace_route(
 
     Raises `ValueError` for invalid `methods` and `RuntimeError` if the
     replacement is not safe; errors from `add_api_route` itself (e.g. a
-    `TypeError` for invalid `route_kwargs`) propagate. In every case `app` is
-    left unchanged (routes and cached OpenAPI schema). Not safe:
+    `TypeError` for invalid `route_kwargs`) propagate. In every case `app` and
+    the record of replaced routes are left unchanged. Not safe:
 
     - for some method, the first route matching the request is not an API
       route registered at exactly `path` (e.g. a catch-all or a `Mount`);
@@ -73,8 +76,6 @@ def replace_route(
     Meant for app construction (before serving): any failure after the new
     route was added restores the previous route list.
     """
-    # Forget routes that no longer exist (e.g. apps built in tests).
-    _REPLACEMENTS[:] = [ref for ref in _REPLACEMENTS if ref() is not None]
     if (
         isinstance(methods, (str, bytes))
         or not methods
@@ -106,20 +107,32 @@ def replace_route(
     prefix = app.router.prefix
     if not path.startswith(prefix):
         raise RuntimeError(f"{path} does not start with the router prefix {prefix!r}")
+    router = app.router
     for name in _INHERITED:
-        inherited = _inherited(app, replaced, name)
+        inherited = getattr(replaced, name)
         if name == "dependencies":
-            route_kwargs[name] = inherited + list(route_kwargs.get(name) or [])
+            route_kwargs[name] = [*inherited, *(route_kwargs.get(name) or [])]
+        elif name == "tags":
+            given = route_kwargs.get(name)
+            route_kwargs[name] = list(inherited if given is None else router.tags)
+            route_kwargs[name] += given or []
         elif name not in route_kwargs:
             route_kwargs[name] = inherited
 
-    routes = app.router.routes
+    routes = router.routes
     before = list(routes)
+    registry = list(_REPLACEMENTS)
     schema = app.openapi_schema
+    own = router.dependencies, router.tags
     try:
-        app.router.add_api_route(
-            path[len(prefix) :], endpoint, methods=sorted(wanted), **route_kwargs
-        )
+        # The lists are complete: add_api_route must not prepend the router's.
+        router.dependencies, router.tags = [], []
+        try:
+            router.add_api_route(
+                path[len(prefix) :], endpoint, methods=sorted(wanted), **route_kwargs
+            )
+        finally:
+            router.dependencies, router.tags = own
         new_route = routes[-1]
         if (
             len(routes) != len(before) + 1
@@ -130,34 +143,16 @@ def replace_route(
             raise RuntimeError(f"The replacement of {path} was not added at {path}")
         routes.pop()
         routes[next(i for i, r in enumerate(routes) if r is replaced)] = new_route
+        # Forget routes that no longer exist (e.g. apps built in tests).
+        _REPLACEMENTS[:] = [ref for ref in registry if ref() is not None]
         _REPLACEMENTS.append(weakref.ref(new_route))
         app.openapi_schema = None
     except BaseException:
         routes[:] = before
+        _REPLACEMENTS[:] = registry
         app.openapi_schema = schema
         raise
     return replaced.endpoint
-
-
-def _inherited(app: FastAPI, route: APIRoute, name: str) -> Any:
-    """The replaced route's setting `name`, as `app.router.add_api_route` takes
-    it. A route's dependencies and tags start with those `app.router` had when
-    the route was added, and `add_api_route` prepends them again: that leading
-    part is left out (dependencies matched by identity, tags by equality), so
-    they are neither repeated (an uncached sub-dependency would run twice) nor
-    reordered."""
-    value = getattr(route, name)
-    if name not in ("dependencies", "tags"):
-        return value
-    own = list(getattr(app.router, name))
-    value = list(value)
-    if name == "dependencies":
-        prefix = all(a is b for a, b in zip(value, own))
-    else:
-        prefix = all(a == b for a, b in zip(value, own))
-    if len(value) >= len(own) and prefix:
-        return value[len(own) :]
-    return value
 
 
 def _first_full_match(app: FastAPI, path: str, method: str) -> Any:
