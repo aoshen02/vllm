@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 
 from vllm.compilation.backends import set_model_tag
-from vllm.config import VllmConfig, replace
+from vllm.config import AuxOutputConfig, VllmConfig, replace
 from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
@@ -102,6 +102,7 @@ class PlainDraftModelSpeculator(DraftModelSpeculator):
         draft_vllm_config = replace(
             self.vllm_config,
             model_config=self.draft_model_config,
+            aux_output_config=AuxOutputConfig(),
             quant_config=None,
             parallel_config=replace(
                 spec.draft_parallel_config,

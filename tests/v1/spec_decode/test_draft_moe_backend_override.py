@@ -14,7 +14,10 @@ from unittest.mock import patch
 
 import pytest
 
-from vllm.config import LoadConfig, SpeculativeConfig
+from vllm.config import AuxOutputConfig, LoadConfig, ParallelConfig, SpeculativeConfig
+from vllm.v1.worker.gpu.spec_decode.draft_model.speculator import (
+    PlainDraftModelSpeculator,
+)
 from vllm.v1.worker.gpu.spec_decode.eagle.utils import load_eagle_model
 
 
@@ -35,6 +38,7 @@ class _SpeculativeConfig:
     kv_cache_dtype: str | None = None
     draft_model_config: object = None
     draft_load_config: object = None
+    draft_parallel_config: ParallelConfig = field(default_factory=ParallelConfig)
 
     apply_draft_overrides = SpeculativeConfig.apply_draft_overrides
 
@@ -45,6 +49,10 @@ class _VllmConfig:
     cache_config: _CacheConfig
     speculative_config: _SpeculativeConfig
     load_config: LoadConfig = field(default_factory=LoadConfig)
+    model_config: object = None
+    quant_config: object = None
+    parallel_config: ParallelConfig = field(default_factory=ParallelConfig)
+    aux_output_config: AuxOutputConfig = field(default_factory=AuxOutputConfig)
 
 
 def _config(target_moe: str, draft_moe: str | None) -> _VllmConfig:
@@ -95,3 +103,30 @@ def test_override_does_not_mutate_the_target_config():
     cfg = _config("flashinfer_b12x", "flashinfer_cutlass")
     _capture_draft_config(cfg)
     assert cfg.kernel_config.moe_backend == "flashinfer_b12x"
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_plain_draft_does_not_inherit_target_aux_outputs(enabled):
+    """Only the target produces auxiliary outputs, including when using a draft."""
+    cfg = _config("auto", None)
+    target_aux = AuxOutputConfig(enable_return_routed_experts=enabled, max_bytes=1024)
+    cfg.aux_output_config = target_aux
+    speculator = object.__new__(PlainDraftModelSpeculator)
+    speculator.vllm_config = cfg
+    speculator.speculative_config = cfg.speculative_config
+    speculator.draft_model_config = cfg.speculative_config.draft_model_config
+
+    def capture(*, vllm_config, prefix):
+        raise _Captured(vllm_config)
+
+    with (
+        patch(
+            "vllm.v1.worker.gpu.spec_decode.draft_model.speculator.get_model", capture
+        ),
+        pytest.raises(_Captured) as exc,
+    ):
+        speculator.load_draft_model(object(), set())
+
+    assert not exc.value.vllm_config.aux_output_config.enabled
+    assert cfg.aux_output_config is target_aux
+    assert cfg.aux_output_config.enable_return_routed_experts == enabled
