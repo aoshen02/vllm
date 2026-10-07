@@ -10,6 +10,8 @@ from vllm.logprobs import (
     FlatLogprobs,
     PromptLogprobs,
     SampleLogprobs,
+    SampleLogprobsHandle,
+    SampleLogprobsStorage,
     append_logprobs_for_next_position,
     create_prompt_logprobs,
     create_sample_logprobs,
@@ -33,7 +35,7 @@ class LogprobsProcessor:
     tokenizer: TokenizerLike | None
 
     # Logprobs for this request
-    logprobs: SampleLogprobs | None
+    logprobs: SampleLogprobsStorage | None
     prompt_logprobs: PromptLogprobs | None
     cumulative_logprob: float | None
     num_logprobs: int | None
@@ -55,7 +57,9 @@ class LogprobsProcessor:
             logprobs=(
                 None
                 if num_logprobs is None
-                else create_sample_logprobs(sampling_params.flat_logprobs)
+                else create_sample_logprobs(
+                    sampling_params.flat_logprobs, sampling_params
+                )
             ),
             prompt_logprobs=(
                 None
@@ -82,6 +86,16 @@ class LogprobsProcessor:
         assert self.cumulative_logprob is not None
 
         token_ids_lst, logprobs_lst, ranks_lst, _ = logprobs_lists
+        if type(self.logprobs) is SampleLogprobsHandle:
+            num_slots = None if self.num_logprobs == -1 else self.num_logprobs + 1
+            self.cumulative_logprob = self.logprobs.append_engine_rows(
+                token_ids_lst,
+                logprobs_lst,
+                ranks_lst,
+                num_slots,
+                self.cumulative_logprob,
+            )
+            return
 
         for rank_np, logprobs_np, token_ids_np in zip(
             ranks_lst, logprobs_lst, token_ids_lst
@@ -327,7 +341,10 @@ class LogprobsProcessor:
                 self.logprobs.
         """
         if context_token_ids is None:
-            context_token_ids = self._get_sampled_context_ids(self.logprobs)
+            sample = self.logprobs  # (a handle is never detokenized: no context)
+            context_token_ids = self._get_sampled_context_ids(
+                None if type(sample) is SampleLogprobsHandle else sample
+            )
 
         corrected_decoded_token_map = dict()
         for idx, text in enumerate(decoded_tokens_list):
