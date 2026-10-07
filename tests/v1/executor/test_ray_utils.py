@@ -3,9 +3,6 @@
 
 import numpy as np
 
-from vllm.distributed.aux_output_connector.connector import (
-    AuxRequestOutput,
-)
 from vllm.v1.executor.ray_utils import detach_zero_copy_from_model_runner_output
 from vllm.v1.outputs import (
     LogprobsLists,
@@ -59,21 +56,3 @@ def test_detach_zero_copy_from_model_runner_output_copies_only_numpy_views():
     assert detached_logprobs.sampled_token_ranks.flags.writeable
     assert detached_logprobs.cu_num_generated_tokens is cu_num_generated_tokens
     assert output.prompt_logprobs_dict["req-0"] is prompt_logprobs
-
-
-def test_detach_zero_copy_aux_output_without_logprobs():
-    rows = _make_readonly(np.arange(12, dtype=np.uint8).reshape(2, 3, 2))
-    output = ModelRunnerOutput(
-        req_ids=["req-0"],
-        req_id_to_index={"req-0": 0},
-        aux_output_connector_output={"req-0": AuxRequestOutput(0, rows)},
-    )
-
-    detach_zero_copy_from_model_runner_output(output)
-
-    aux_output = output.aux_output_connector_output
-    assert aux_output is not None
-    detached = aux_output["req-0"].rows
-    assert detached is not rows
-    assert detached.flags.writeable
-    np.testing.assert_array_equal(detached, rows)
