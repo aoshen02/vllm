@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 mod convert;
+mod render;
 mod types;
 mod validate;
 
@@ -11,7 +12,6 @@ use std::result::Result;
 use std::sync::Arc;
 
 use asynk_strim_attr::{TryYielder, try_stream};
-use axum::Json;
 use axum::extract::State;
 use axum::http::HeaderMap;
 use axum::response::sse::{Event, Sse};
@@ -26,10 +26,8 @@ use vllm_llm::{
 };
 
 use self::convert::{ResponseOptions, prepare_generate_request};
-use self::types::{
-    GenerateLogprob, GenerateResponse, GenerateResponseChoice, GenerateResponseStreamChoice,
-    GenerateStreamResponse,
-};
+use self::render::{ChoiceLogprobs, GenerateEnvelope, generate_response};
+use self::types::{GenerateLogprob, GenerateResponseStreamChoice, GenerateStreamResponse};
 pub(crate) use self::types::{GenerateRequest, GenerateSamplingParams};
 pub(crate) use self::validate::validate_request_compat;
 use crate::config::ApiServerOptions;
@@ -104,8 +102,16 @@ pub async fn generate(
         return Sse::new(sse_stream).into_response();
     }
 
-    let collected = match raw_stream.collect_output().instrument(request_span.clone()).await {
-        Ok(collected) => collected,
+    let result = match collect_response(
+        raw_stream,
+        prepared.request_id,
+        api_server_options,
+        prepared.options,
+    )
+    .instrument(request_span.clone())
+    .await
+    {
+        Ok(result) => result,
         Err(error) => {
             return server_error!(
                 "failed to collect raw generate response: {}",
@@ -115,17 +121,53 @@ pub async fn generate(
         }
     };
 
-    let response = match collect_generate(
-        collected,
-        prepared.request_id,
-        api_server_options,
-        prepared.options,
-    ) {
-        Ok(response) => response,
-        Err(error) => return error.into_response(),
-    };
+    match result {
+        // In the request span so the body render task inherits it.
+        Ok((envelope, logprobs)) => request_span.in_scope(|| generate_response(envelope, logprobs)),
+        Err(error) => error.into_response(),
+    }
+}
 
-    Json(response).into_response()
+/// Collect a non-streaming raw generate request and build the response
+/// envelope and output logprobs (outer error: the engine stream failed).
+async fn collect_response(
+    raw_stream: impl Stream<Item = vllm_llm::Result<GenerateOutput>> + Send,
+    request_id: String,
+    api_server_options: ApiServerOptions,
+    options: ResponseOptions,
+) -> vllm_llm::Result<Result<(GenerateEnvelope, ChoiceLogprobs), ApiError>> {
+    let mut collected = raw_stream.collect_output().await?;
+    let logprobs = openai_choice_logprobs(collected.logprobs.take(), options.include_logprobs);
+    Ok(logprobs.and_then(|logprobs| {
+        let envelope = collect_generate(collected, request_id, api_server_options, options)?;
+        Ok((envelope, logprobs))
+    }))
+}
+
+/// Validate collected output logprobs for the default OpenAI rendering.
+fn openai_choice_logprobs(
+    logprobs: Option<Logprobs>,
+    include_logprobs: bool,
+) -> Result<ChoiceLogprobs, ApiError> {
+    if !include_logprobs {
+        return Ok(ChoiceLogprobs::None);
+    }
+    let logprobs = logprobs.ok_or_else(|| {
+        ApiError::server_error(
+            "raw generate response requested logprobs but generation returned none".to_string(),
+        )
+    })?;
+    // The body is rendered after the status line, so reject empty rows here.
+    if logprobs.positions.iter().any(|position| position.entries.is_empty()) {
+        return Err(empty_position_error());
+    }
+    Ok(ChoiceLogprobs::OpenAi(logprobs.positions))
+}
+
+fn empty_position_error() -> ApiError {
+    ApiError::server_error(
+        "raw generate logprobs position unexpectedly had no token candidates".to_string(),
+    )
 }
 
 #[try_stream]
@@ -230,6 +272,8 @@ async fn generate_chunk_stream(
     Ok(())
 }
 
+/// Build everything in the non-streaming response except the output logprobs
+/// (which the caller takes out of `collected` beforehand).
 fn collect_generate(
     collected: CollectedGenerateOutput,
     request_id: String,
@@ -238,24 +282,10 @@ fn collect_generate(
         ..
     }: ApiServerOptions,
     ResponseOptions {
-        // Ignored: non-streaming raw generate responses do not include usage.
-        include_usage: _,
-        // Ignored: continuous usage is a streaming-only option.
-        include_continuous_usage: _,
-        include_logprobs,
         include_prompt_logprobs,
+        ..
     }: ResponseOptions,
-) -> Result<GenerateResponse, ApiError> {
-    let logprobs = if include_logprobs {
-        let logprobs = collected.logprobs.as_ref().ok_or_else(|| {
-            ApiError::server_error(
-                "raw generate response requested logprobs but generation returned none".to_string(),
-            )
-        })?;
-        Some(raw_logprobs_to_openai_chat(logprobs)?)
-    } else {
-        None
-    };
+) -> Result<GenerateEnvelope, ApiError> {
     let prompt_logprobs = if include_prompt_logprobs {
         match collected.prompt_logprobs.as_ref() {
             Some(prompt_logprobs) => Some(raw_prompt_logprobs_to_maps(prompt_logprobs)),
@@ -283,14 +313,10 @@ fn collect_generate(
         );
     }
 
-    Ok(GenerateResponse {
+    Ok(GenerateEnvelope {
         request_id,
-        choices: vec![GenerateResponseChoice {
-            index: 0,
-            logprobs,
-            finish_reason: Some(finish_reason),
-            token_ids: collected.token_ids,
-        }],
+        finish_reason,
+        token_ids: collected.token_ids,
         prompt_logprobs,
         kv_transfer_params: collected.kv_transfer_params,
         ec_transfer_params: collected.ec_transfer_params,
@@ -325,11 +351,7 @@ fn raw_prompt_logprobs_to_maps(
 fn position_to_chat_logprobs_content(
     position: &PositionLogprobs,
 ) -> Result<ChatLogProbsContent, ApiError> {
-    let chosen = position.entries.first().ok_or_else(|| {
-        ApiError::server_error(
-            "raw generate logprobs position unexpectedly had no token candidates".to_string(),
-        )
-    })?;
+    let chosen = position.entries.first().ok_or_else(empty_position_error)?;
     let token = format_token_id(chosen.token_id);
 
     Ok(ChatLogProbsContent {
@@ -416,9 +438,13 @@ fn done_sse_event() -> Event {
 mod tests {
     use std::sync::Arc;
 
+    use axum::body::to_bytes;
     use futures::{TryStreamExt as _, stream};
+    use serde_json::json;
+    use vllm_engine_core_client::protocol::logprobs::TokenLogprob;
     use vllm_llm::GeneratePromptInfo;
 
+    use super::types::{GenerateResponse, GenerateResponseChoice};
     use super::*;
 
     #[tokio::test]
@@ -539,5 +565,218 @@ mod tests {
             },
         )
         .expect_err("multi-token prompt without payload is an engine failure");
+    }
+
+    pub(super) fn position(entries: &[(u32, f32, u32)]) -> PositionLogprobs {
+        PositionLogprobs {
+            entries: entries
+                .iter()
+                .map(|&(token_id, logprob, rank)| TokenLogprob {
+                    token_id,
+                    logprob,
+                    rank,
+                })
+                .collect(),
+        }
+    }
+
+    fn tricky_positions() -> Vec<PositionLogprobs> {
+        vec![
+            position(&[(0, -0.0, 1), (0, -0.0, 1), (9, -1e-7, 2)]),
+            position(&[
+                (151_935, f32::NEG_INFINITY, 77),
+                (3, f32::NAN, 1),
+                (i32::MAX as u32, -1e30, 2),
+            ]),
+            position(&[
+                (42, f32::INFINITY, 2),
+                (7, -12.345_678, 1),
+                (42, f32::INFINITY, 2),
+            ]),
+            position(&[
+                (1, f32::MIN_POSITIVE / 8.0, 1),
+                (100, -9999.0, 1),
+                (1000, -10000.5, 2),
+            ]),
+            position(&[(8, -0.5, 1)]),
+        ]
+    }
+
+    fn collected_output(
+        logprobs: Option<Vec<PositionLogprobs>>,
+        kv: Option<serde_json::Value>,
+    ) -> CollectedGenerateOutput {
+        let token_ids = logprobs
+            .as_ref()
+            .map(|positions| positions.iter().map(|p| p.entries[0].token_id).collect())
+            .unwrap_or_else(|| vec![5, 6]);
+        CollectedGenerateOutput {
+            request_id: "raw-1".to_string(),
+            prompt_logprobs: Some(Logprobs {
+                positions: vec![position(&[(22, -0.5, 1)])],
+            }),
+            token_ids,
+            logprobs: logprobs.map(|positions| Logprobs { positions }),
+            finish_reason: FinishReason::Abort,
+            usage: vllm_llm::TokenUsage::default(),
+            kv_transfer_params: kv,
+            ec_transfer_params: None,
+            prompt_token_ids: vec![11, 22],
+        }
+    }
+
+    /// Reference bytes: the eager `ChatLogProbs` conversion + serde_json.
+    fn reference_bytes(collected: &CollectedGenerateOutput, request_id: &str) -> Vec<u8> {
+        let response = GenerateResponse {
+            request_id: request_id.to_string(),
+            choices: vec![GenerateResponseChoice {
+                index: 0,
+                logprobs: collected
+                    .logprobs
+                    .as_ref()
+                    .map(|logprobs| raw_logprobs_to_openai_chat(logprobs).expect("convert")),
+                finish_reason: Some(collected.finish_reason.as_str().to_string()),
+                token_ids: collected.token_ids.clone(),
+            }],
+            prompt_logprobs: collected.prompt_logprobs.as_ref().map(raw_prompt_logprobs_to_maps),
+            kv_transfer_params: collected.kv_transfer_params.clone(),
+            ec_transfer_params: collected.ec_transfer_params.clone(),
+        };
+        serde_json::to_vec(&response).expect("serialize reference")
+    }
+
+    async fn render_openai(mut collected: CollectedGenerateOutput, request_id: &str) -> Vec<u8> {
+        let include_logprobs = collected.logprobs.is_some();
+        let logprobs = openai_choice_logprobs(collected.logprobs.take(), include_logprobs)
+            .unwrap_or_else(|_| panic!("valid logprobs"));
+        let envelope = collect_generate(
+            collected,
+            request_id.to_string(),
+            ApiServerOptions::default(),
+            ResponseOptions {
+                include_logprobs,
+                include_prompt_logprobs: true,
+                ..Default::default()
+            },
+        )
+        .expect("envelope");
+        let response = generate_response(envelope, logprobs);
+        assert_eq!(
+            response.headers().get("content-type").unwrap(),
+            "application/json"
+        );
+        to_bytes(response.into_body(), usize::MAX).await.expect("body").to_vec()
+    }
+
+    #[tokio::test]
+    async fn direct_openai_render_is_byte_identical_to_serde_reference() {
+        let many: Vec<PositionLogprobs> = (0..1000_u32)
+            .map(|i| PositionLogprobs {
+                entries: (0..9_u32)
+                    .map(|j| TokenLogprob {
+                        token_id: i * 131 + j * 7919,
+                        logprob: -(i as f32) * 0.037 - j as f32 * 1.25e-3,
+                        rank: j.max(1),
+                    })
+                    .collect(),
+            })
+            .collect();
+        let mut with_max_id = tricky_positions();
+        with_max_id.push(position(&[(u32::MAX, -2.5, 1), (u32::MAX, -2.5, 1)]));
+        let cases = [
+            (collected_output(Some(tricky_positions()), None), "raw-1"),
+            (collected_output(Some(with_max_id), None), "max-id"),
+            (
+                collected_output(
+                    Some(tricky_positions()),
+                    Some(json!({"a": [1, "x"], "b": null})),
+                ),
+                "quote\"back\\slash\u{1}\u{e9}",
+            ),
+            (collected_output(Some(many), None), "many"),
+            (collected_output(Some(Vec::new()), None), "empty-positions"),
+            (collected_output(None, None), "no-logprobs"),
+        ];
+        for (collected, request_id) in cases {
+            let expected = reference_bytes(&collected, request_id);
+            let actual = render_openai(collected, request_id).await;
+            assert_eq!(
+                String::from_utf8(actual).unwrap(),
+                String::from_utf8(expected).unwrap(),
+                "request_id={request_id}"
+            );
+        }
+    }
+
+    fn step(
+        token_ids: Vec<u32>,
+        positions: Option<Vec<PositionLogprobs>>,
+        finish_reason: Option<FinishReason>,
+    ) -> vllm_llm::Result<GenerateOutput> {
+        Ok(GenerateOutput {
+            request_id: "engine-1".to_string(),
+            prompt_info: None,
+            token_ids,
+            logprobs: positions.map(|positions| Logprobs { positions }),
+            finish_reason,
+            cached_token_count: 0,
+            kv_transfer_params: None,
+            ec_transfer_params: None,
+        })
+    }
+
+    async fn openai_body_bytes(
+        steps: Vec<vllm_llm::Result<GenerateOutput>>,
+    ) -> Result<Vec<u8>, ApiError> {
+        let (envelope, logprobs) = collect_response(
+            stream::iter(steps),
+            "probe".to_string(),
+            ApiServerOptions::default(),
+            ResponseOptions {
+                include_logprobs: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("stream")?;
+        Ok(to_bytes(
+            generate_response(envelope, logprobs).into_body(),
+            usize::MAX,
+        )
+        .await
+        .expect("body")
+        .to_vec())
+    }
+
+    /// An empty row fails the request with a 500 (non-streaming and streaming).
+    #[tokio::test]
+    async fn openai_empty_row_fails_the_request() {
+        let empty_row = || {
+            vec![
+                step(vec![1], Some(vec![position(&[(1, -0.1, 1)])]), None),
+                step(
+                    vec![2],
+                    Some(vec![PositionLogprobs { entries: vec![] }]),
+                    Some(FinishReason::Length),
+                ),
+            ]
+        };
+        let error = openai_body_bytes(empty_row()).await.expect_err("empty row");
+        assert_eq!(
+            error.into_response().status(),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
+        let streamed: Result<Vec<_>, _> = generate_chunk_stream(
+            stream::iter(empty_row()),
+            "probe".to_string(),
+            ApiServerOptions::default(),
+            ResponseOptions {
+                include_logprobs: true,
+                ..Default::default()
+            },
+        )
+        .try_collect()
+        .await;
+        assert!(streamed.is_err());
     }
 }

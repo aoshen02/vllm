@@ -56,6 +56,10 @@ impl Normalizable for GenerateRequest {}
 ///
 /// Do not skip serializing `None` fields here: non-streaming response types
 /// should serialize `None` as explicit `null`.
+///
+/// Production responses are rendered directly by `render.rs`; this type is the
+/// serde reference those bytes are tested against.
+#[cfg(test)]
 #[derive(Debug, Clone, Serialize)]
 pub(super) struct GenerateResponseChoice {
     pub index: u32,
@@ -83,7 +87,9 @@ pub(super) struct GenerateStreamResponse {
     pub usage: Option<Usage>,
 }
 
-/// Mirrors the Python vLLM `GenerateResponse` class.
+/// Mirrors the Python vLLM `GenerateResponse` class (serde reference for the
+/// direct renderer in `render.rs`).
+#[cfg(test)]
 #[derive(Debug, Clone, Serialize)]
 pub(super) struct GenerateResponse {
     pub request_id: String,
