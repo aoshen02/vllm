@@ -40,7 +40,9 @@ class CompletionOutput:
         cumulative_logprob: The cumulative log probability of the generated
             output text.
         logprobs: The log probabilities of the top probability words at each
-            position if the logprobs are requested.
+            position if the logprobs are requested; a SampleLogprobsHandle
+            for a request whose endpoint selected a registered container
+            (vllm.logprobs.set_sample_logprobs_container).
         sampling_mask: The post-processing token support set for each generated
             token, if requested.
         finish_reason: The reason why the sequence is finished.

@@ -1,9 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
-from collections.abc import Iterable, Iterator, MutableSequence
+from collections.abc import Callable, Iterable, Iterator, MutableSequence
 from dataclasses import dataclass, field
-from typing import overload
+from typing import TYPE_CHECKING, Any, final, overload
+
+from vllm.logger import init_logger
+
+if TYPE_CHECKING:
+    import numpy as np
+
+    from vllm.sampling_params import SamplingParams
+
+logger = init_logger(__name__)
 
 
 # We use dataclass for now because it is used for
@@ -157,11 +166,98 @@ class FlatLogprobs(MutableSequence[LogprobsOnePosition | None]):
             yield self.__getitem__(i)
 
 
+# name -> (factory, skip_sampled_text)
+_SAMPLE_LOGPROBS_CONTAINERS: dict[str, tuple[Callable[..., Any], bool]] = {}
+
+
+def register_sample_logprobs_container(
+    name: str, factory: Callable[["SamplingParams"], Any], *, skip_sampled_text: bool
+) -> None:
+    """Register a frontend-only sample-logprobs container (API server process),
+    selected per request with :func:`set_sample_logprobs_container`, for
+    ``FINAL_ONLY`` requests. ``factory(sampling_params)`` returns the request's
+    container, which receives ``append_rows(token_ids [n, k + 1], logprobs
+    [n, k + 1], ranks [n])`` (slot 0 = sampled token). A failing factory or
+    container fails its request only. ``skip_sampled_text``: responses carry
+    no sampled text (it is detokenized only for stop strings)."""
+    current = _SAMPLE_LOGPROBS_CONTAINERS.get(name)
+    if current is not None and current[0] is not factory:
+        raise ValueError(f"Sample logprobs container {name!r} already registered")
+    _SAMPLE_LOGPROBS_CONTAINERS[name] = (factory, skip_sampled_text)
+
+
+def set_sample_logprobs_container(params: "SamplingParams", name: str | None) -> None:
+    """Select a registered container for this request (server-side only: the
+    selector is private, so clients and the EngineCore wire never see it)."""
+    if name is not None and name not in _SAMPLE_LOGPROBS_CONTAINERS:
+        raise ValueError(f"Unknown sample logprobs container {name!r}")
+    params._sample_logprobs_container = name
+
+
+def sample_logprobs_skip_text(params: "SamplingParams") -> bool:
+    """Whether the selected container's responses carry no sampled text."""
+    entry = _SAMPLE_LOGPROBS_CONTAINERS.get(params._sample_logprobs_container or "")
+    return entry is not None and entry[1]
+
+
+@final  # (lets type checkers narrow on `type(x) is SampleLogprobsHandle`)
+class SampleLogprobsHandle:
+    """Core-owned holder of a registered container: a failure of the container
+    turns the handle broken and fails its request only (the endpoint checks
+    :attr:`broken` and calls :meth:`unwrap`). ``len()`` counts the positions
+    the engine emitted."""
+
+    def __init__(self, container: Any) -> None:
+        self._container = container  # None: broken
+        self._count = 0
+
+    @property
+    def broken(self) -> bool:
+        return self._container is None
+
+    def unwrap(self) -> Any:
+        if self._container is None:
+            raise ValueError("Sample logprobs are unavailable for this request")
+        return self._container
+
+    def append_engine_rows(
+        self,
+        token_ids: "np.ndarray",
+        logprobs: "np.ndarray",
+        ranks: "np.ndarray",
+        num_slots: int | None,
+        cumulative_logprob: float,
+    ) -> float:
+        """Append this request's rows of an engine step, ``num_slots`` (k + 1)
+        columns or all if None; returns the cumulative logprob plus the
+        sampled tokens' logprobs, added row by row like the default path."""
+        try:
+            self._count += len(ranks)
+            if self._container is None:
+                return cumulative_logprob
+            if not len(token_ids) == len(logprobs) == len(ranks):
+                raise ValueError("Engine logprob rows of different lengths")
+            if num_slots is not None:
+                token_ids, logprobs = token_ids[:, :num_slots], logprobs[:, :num_slots]
+            for value in logprobs[:, 0].tolist():
+                cumulative_logprob += value
+            self._container.append_rows(token_ids, logprobs, ranks)
+        except Exception:
+            logger.exception("Storing sample logprobs failed; failing the request")
+            self._container = None
+        return cumulative_logprob
+
+    def __len__(self) -> int:
+        return self._count
+
+
 # {token_id -> logprob} per each sequence group. None if the corresponding
 # sequence group doesn't require prompt logprob.
 PromptLogprobs = FlatLogprobs | list[LogprobsOnePosition | None]
 # {token_id -> logprob} for each sequence group.
 SampleLogprobs = FlatLogprobs | list[LogprobsOnePosition]
+# What the frontend stores per request (a handle: for a registered container).
+SampleLogprobsStorage = SampleLogprobs | SampleLogprobsHandle
 
 
 def create_prompt_logprobs(flat_logprobs: bool) -> PromptLogprobs:
@@ -172,8 +268,23 @@ def create_prompt_logprobs(flat_logprobs: bool) -> PromptLogprobs:
     return logprobs
 
 
-def create_sample_logprobs(flat_logprobs: bool) -> SampleLogprobs:
+def create_sample_logprobs(
+    flat_logprobs: bool, sampling_params: "SamplingParams | None" = None
+) -> SampleLogprobsStorage:
     """Creates a container to store decode logprobs for a request"""
+    from vllm.sampling_params import RequestOutputKind
+
+    params = sampling_params
+    name = params._sample_logprobs_container if params else None
+    if params is not None and name is not None:
+        if params.output_kind == RequestOutputKind.FINAL_ONLY:
+            handle = SampleLogprobsHandle(None)
+            try:
+                handle._container = _SAMPLE_LOGPROBS_CONTAINERS[name][0](params)
+            except Exception:
+                logger.exception("Sample logprobs container %r failed", name)
+            return handle
+        logger.error("Sample logprobs container %r ignored: not FINAL_ONLY", name)
     return FlatLogprobs() if flat_logprobs else []
 
 
