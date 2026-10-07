@@ -46,11 +46,24 @@ pub struct GenerateRequest {
     pub ec_transfer_params: Option<HashMap<String, Value>>,
     /// Raw multimodal input; server resolves media. Mutually exclusive with `features`.
     pub content_parts: Option<Vec<MediaContentPart>>,
+    /// Output logprobs wire format; absent means `"openai"`.
+    pub logprobs_format: Option<LogprobsFormat>,
     #[serde(flatten)]
     pub other: Map<String, Value>,
 }
 
 impl Normalizable for GenerateRequest {}
+
+/// Wire format of raw generate output logprobs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LogprobsFormat {
+    /// OpenAI chat-style `choices[0].logprobs` (the default).
+    Openai,
+    /// Packed base64 arrays in `choices[0].compact_logprobs`; non-streaming
+    /// only.
+    Compact,
+}
 
 /// Mirrors the Python vLLM `GenerateResponseChoice` class.
 ///
