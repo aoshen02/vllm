@@ -16,6 +16,7 @@ from tests.entrypoints.scale_out.token_in_token_out.test_generate_stream import 
 from vllm.entrypoints.openai.engine.protocol import ErrorResponse
 from vllm.entrypoints.scale_out.token_in_token_out.protocol import GenerateRequest
 from vllm.entrypoints.scale_out.token_in_token_out.serving import GenerateStart
+from vllm.logprobs import SampleLogprobsHandle, create_sample_logprobs
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 
 
@@ -69,3 +70,23 @@ async def test_start_generate_returns_validation_errors():
     assert isinstance(await serving.start_generate(request), ErrorResponse)
     assert isinstance(await serving.serve_tokens(request), ErrorResponse)
     engine.generate.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_start_generate_keeps_per_entry_logprobs():
+    """The core's array storage is chosen by serve_tokens, so
+    callers of start_generate (e.g. a plugin rendering its own response) get
+    the iterable per-entry logprobs, as before."""
+    engine, serving = _serving()
+    request = GenerateRequest(
+        token_ids=[1, 2, 3],
+        sampling_params=SamplingParams(max_tokens=1, logprobs=3),
+        model=MODEL_NAME,
+    )
+    start = await serving.start_generate(request)
+    assert isinstance(start, GenerateStart)
+    params = engine.generate.call_args.args[1]
+    assert params._sample_logprobs_container is None
+    logprobs = create_sample_logprobs(False, params)
+    assert not isinstance(logprobs, SampleLogprobsHandle) and list(logprobs) == []
+    [out async for out in start.result_generator]
