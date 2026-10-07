@@ -179,7 +179,10 @@ def test_routed_experts_prompt_start_at_prompt_end(max_tokens):
 
     output = outputs[request.client_index].outputs[0]
     assert output.new_token_ids == [0]
-    assert output.routed_experts.shape == (0, 1, 1)
+    if max_tokens == 1:
+        assert output.routed_experts.shape == (0, 1, 1)
+    else:
+        assert output.routed_experts is None
 
 
 def test_finish_request():

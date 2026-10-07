@@ -15,6 +15,7 @@ from vllm.distributed.aux_output_connector.connector import (
     AuxOutputConnectorMetadata,
     AuxOutputSchedulerConnector,
     AuxRequestOutput,
+    AuxStepOutput,
     PackedBlockHashes,
 )
 from vllm.distributed.aux_output_connector.routed_experts import (
@@ -33,7 +34,9 @@ from vllm.distributed.aux_output_connector.worker import (
     AuxOutputWorkerConnector,
 )
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
+from vllm.v1.engine import EngineCoreOutput, EngineCoreOutputs
 from vllm.v1.outputs import ModelRunnerOutput
+from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 from vllm.v1.worker.gpu import async_utils
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 
@@ -93,7 +96,7 @@ class _SchedulerRequest:
     num_in_flight_tokens: int = 0
     finished: bool = False
     sampling_params: SimpleNamespace = field(
-        default_factory=lambda: SimpleNamespace(routed_experts_prompt_start=0)
+        default_factory=lambda: SimpleNamespace(routed_experts_prompt_start=0, stop=[])
     )
 
     def is_finished(self) -> bool:
@@ -1373,6 +1376,7 @@ def _scheduler_request(
     num_tokens: int = 10,
     num_output_tokens: int = 1,
     prompt_start: int = 0,
+    stop: list[str] | None = None,
 ):
     return _SchedulerRequest(
         request_id=request_id,
@@ -1380,7 +1384,9 @@ def _scheduler_request(
         num_tokens=num_tokens,
         num_output_tokens=num_output_tokens,
         num_computed_tokens=num_tokens,
-        sampling_params=SimpleNamespace(routed_experts_prompt_start=prompt_start),
+        sampling_params=SimpleNamespace(
+            routed_experts_prompt_start=prompt_start, stop=stop or []
+        ),
     )
 
 
@@ -1419,6 +1425,7 @@ def test_scheduler_connector_builds_worker_metadata_and_forwards_output():
     routing = np.arange(4 * 3 * 2, dtype=np.uint8).reshape(4, 3, 2)
     output = {"request": AuxRequestOutput(0, routing)}
     request.num_computed_tokens = 4
+    request.finished = True
     np.testing.assert_array_equal(connector.take_output(request, output), routing)
 
 
@@ -1664,10 +1671,12 @@ def test_scheduler_consumes_ordered_stale_aux_outputs():
     connector.request_finished(request)
 
     request.num_tokens = 5
-    np.testing.assert_array_equal(connector.take_output(request, first), first_rows)
+    assert connector.take_output(request, first) is None
     request.num_tokens = 6
+    request.finished = True
     np.testing.assert_array_equal(
-        connector.take_output(request, second), second_rows[:1]
+        connector.take_output(request, second),
+        np.concatenate((first_rows, second_rows[:1])),
     )
 
 
@@ -1759,7 +1768,10 @@ def test_prompt_end_offset_through_worker_and_scheduler(chunk_size, max_tokens):
         request.num_output_tokens = 1
         request.finished = max_tokens == 1
         result = connector.take_output(request, output)
-        np.testing.assert_array_equal(result, rows[:0])
+        if max_tokens == 1:
+            np.testing.assert_array_equal(result, rows[:0])
+        else:
+            assert result is None
 
         if max_tokens == 2:
             metadata = connector.build_connector_meta(
@@ -1782,6 +1794,111 @@ def test_prompt_end_offset_through_worker_and_scheduler(chunk_size, max_tokens):
             )
     finally:
         worker.close()
+
+
+def _take_steps(connector, request, steps, interrupt=None):
+    results = []
+    for i, (token_start, rows, num_tokens) in enumerate(steps):
+        if interrupt is not None and i == len(steps) // 2:
+            interrupt(connector, request)
+        request.num_tokens = num_tokens
+        request.finished = i == len(steps) - 1
+        output = AuxStepOutput(
+            rows, {request.request_id: (token_start, 0, len(rows))}, {}
+        )
+        results.append(connector.take_output(request, output))
+    return results
+
+
+def _preempt_and_reset(connector, request):
+    connector.request_finished(request)
+    connector.reset()
+
+
+@pytest.mark.parametrize("interrupt", [None, _preempt_and_reset])
+def test_scheduler_finish_output_matches_per_step_concatenation(interrupt):
+    """Rows returned once at finish equal the frontend's old concatenation."""
+    rng = np.random.default_rng(0)
+    rows = rng.integers(0, 256, (1300, *_SHAPE), dtype=_DTYPE)
+    # (token_start, worker rows, num_tokens after the step); the third step
+    # carries a rejected speculative row and the fourth outgrows the buffer.
+    steps = [
+        (0, rows[:300], 301),
+        (300, rows[300:301], 302),
+        (301, rows[301:304], 304),
+        (303, rows[303:1003], 1004),
+        (1003, rows[1003:1004], 1005),
+    ]
+
+    streamed = _scheduler_request("request", [], stop=["</s>"])
+    streamed_chunks = _take_steps(_make_connector(), streamed, steps, interrupt)
+    expected = np.concatenate([c for c in streamed_chunks if c is not None])
+
+    held = _scheduler_request("request", [])
+    held_chunks = _take_steps(_make_connector(), held, steps, interrupt)
+
+    assert all(chunk is None for chunk in held_chunks[:-1])
+    result = held_chunks[-1]
+    assert result.dtype == expected.dtype and result.shape == expected.shape
+    np.testing.assert_array_equal(result, expected)
+    np.testing.assert_array_equal(result, rows[:1004])
+
+
+def test_scheduler_aborted_request_drops_held_rows():
+    """An aborted request's held rows do not leak into a reused request ID."""
+    connector = _make_connector()
+    rows = np.arange(4 * 3 * 2, dtype=_DTYPE).reshape(4, *_SHAPE)
+    aborted = _scheduler_request("request", [], num_tokens=4)
+    assert (
+        connector.take_output(aborted, {"request": AuxRequestOutput(0, rows)}) is None
+    )
+    aborted.finished = True
+    connector.request_finished(aborted)
+
+    reused = _scheduler_request("request", [], num_tokens=3)
+    reused.finished = True
+    output = {"request": AuxRequestOutput(0, rows[:2] + 100)}
+    np.testing.assert_array_equal(connector.take_output(reused, output), rows[:2] + 100)
+
+
+def test_worker_packs_step_rows_into_one_array():
+    """One step's rows travel as one array; finished rows survive msgpack."""
+    worker = _make_worker(2)
+    logical = np.arange(5 * 3 * 2, dtype=_DTYPE).reshape(5, *_SHAPE)
+    metadata = _metadata(
+        0,
+        [
+            _request_metadata("first", 0, 3, 0, []),
+            _request_metadata("second", 0, 2, 0, []),
+        ],
+        {},
+    )
+    try:
+        output = _process_output(
+            worker, metadata, logical, ["first", "second"], np.zeros(2, np.int32)
+        )
+    finally:
+        worker.close()
+
+    assert isinstance(output, AuxStepOutput)
+    np.testing.assert_array_equal(output.rows, logical)
+    assert output.spans == {"first": (0, 0, 3), "second": (0, 3, 5)}
+
+    for request_id, (lo, hi) in (("first", (0, 3)), ("second", (3, 5))):
+        assert output[request_id].token_start == 0
+        np.testing.assert_array_equal(output[request_id].rows, logical[lo:hi])
+
+    request = _scheduler_request("first", [], num_tokens=4)
+    request.finished = True
+    routed_experts = _make_connector().take_output(request, output)
+    encoded = MsgpackEncoder().encode(
+        EngineCoreOutputs(
+            outputs=[EngineCoreOutput("first", [0], routed_experts=routed_experts)]
+        )
+    )
+    decoded = MsgpackDecoder(EngineCoreOutputs).decode(encoded).outputs[0]
+    assert decoded.routed_experts.dtype == _DTYPE
+    np.testing.assert_array_equal(decoded.routed_experts, logical[:3])
 
 
 def test_scheduler_connector_sends_each_block_hash_once():

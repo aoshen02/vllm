@@ -235,7 +235,8 @@ def detach_zero_copy_from_model_runner_output(output: "ModelRunnerOutput") -> No
 
     aux_output = output.aux_output_connector_output
     if aux_output is not None:
-        for request_output in aux_output.values():
+        aux_output.rows = _copy_if_readonly(aux_output.rows)
+        for request_output in aux_output.materialized.values():
             request_output.rows = _copy_if_readonly(request_output.rows)
 
 
