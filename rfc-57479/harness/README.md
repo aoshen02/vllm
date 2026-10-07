@@ -17,7 +17,7 @@ It is published as measurement tooling, not product code. The scripts are as the
 | `genopt-dp/dp-coordinator.py` | Starts the real `vllm.v1.engine.coordinator.DPCoordinatorProc` from the vLLM tree under test |
 | `genopt-dp/dp-python-server.py`, `dp-rust-server.py` | Frontend launchers: 32 Python API servers per node, or one Rust process |
 | `genopt-dp/dp-client.py` | Python RL-workflow driver for `wf-paced`: submit, pause(abort), sleep, resume, resubmit the partials, validate. The cohort and n32 cells use client v3 |
-| `genopt-dp/dp-run.py` | Runs one cell end to end (engines, coordinator, frontends, monitor, client) and writes `run.json` / `result.json` |
+| `genopt-dp/dp-run.py` | Runs one cell end to end (engines, coordinator, frontends, monitor, client) and writes `run.json` / `result.json`. Request assignment: shared socket (default), per-worker `SO_REUSEPORT` listeners (`--listeners`; `final-validation.sh` turns them on for the Python candidate unless `--no-listeners`), or round-robin over per-server ports (`--round-robin-ports`, used with `dp-python-server.py --per-server-ports`; dp-round12) |
 | `genopt-dp/final-validation.sh`, `final-summary.py` | The DP8 cell chain used for RFC §5, and its summary (`final-summary.{json,md}`) |
 | `genopt-dp/dp-analyze.py`, `r3-pytimeline.py`, `r8-rates.py`, `r11-real-output-routing.py`, `r13-*.py` | Analysis helpers used in the dp rounds |
 | `genopt/genopt-run.py`, `genopt-engine.py`, `genopt-*-server.py`, `genopt-monitor.py`, `genopt-summarize.py`, `frontend-mock-payload.py` | The earlier single-engine harness (n = 32 two-node cells). The DP harness reuses its monitor and payload code |

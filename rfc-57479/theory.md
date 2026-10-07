@@ -181,36 +181,66 @@ Python compact reaches server ready at 0.06–0.10 s and all parsed at 1.72–1.
 DP8 n32-rl it is 1.80 s [S7].
 
 ## 4. Distribution model
-**Shared accept queue (base).**
-- One listening socket is shared by all workers. A connection goes to whichever worker's event
-  loop accepts first.
-- A worker blocked in a CPU-bound build or consumption does not accept, so connections pile onto
-  free workers. This is a skew that follows load, not chance.
-- **Worst case:** the old 2,000-request GPU run gave one worker 1,492 requests (history file).
-- **Best case:** when all connections arrive before any worker is busy, the spread can be perfect.
-  The n = 16 base run A1 gave 16 × 1, and A2 gave 3, 2, 2, 2, 1 × 7 [S21].
+With serial per-server builds, a cell ends roughly when its busiest server B finishes:
+`T ≈ a + c × B`. The assignment policy decides B.
 
-**`SO_REUSEPORT` hashing (#58278).**
-- Each worker has its own socket, and the kernel hashes the 4-tuple, so the spread is uniform
-  random.
-- For n balls in m bins the busiest bin follows the balls-into-bins maximum. For n = m = 32
-  [S11]:
+| Policy | Mechanism | B |
+|---|---|---|
+| S, shared accept socket (today) | One listening socket, inherited by all servers; whichever event loop accepts first wins | **Below** the random expectation with one connection per request, because idle servers win the accept race |
+| R, `SO_REUSEPORT` (#58278) | The kernel hashes each new connection to a server uniformly at random | The balls-into-bins maximum |
+| RR, round-robin | One port per server; the client sends request i to server i mod k | Exactly m = n / k |
 
-  | B | 2 | 3 | 4 | 5 | 6+ |
-  |---|---|---|---|---|---|
-  | P(busiest = B) | 0.03 | 0.52 | 0.36 | 0.08 | 0.01 |
+**Balls into bins** (busiest of k servers when n = m·k requests are assigned uniformly at random)
+[S24]:
 
-- **Cost.** With serial per-server rendering, the expected extra tail is `c × (E[B] − n/m)`. It is
-  large in base (c ≈ 120–135 s) and small after P3 (c ≈ 4.6 s).
+| Load | m | k | Monte Carlo mean [5th / 50th / 95th pct] | m + sqrt(2 m ln k) | Round-robin |
+|---|---|---|---|---|---|
+| L1 | 1 | 32 | 3.53 [3 / 3 / 5] | 3.63 | 1 |
+| L4 | 4 | 64 | 9.31 [8 / 9 / 11] | 9.77 | 4 |
+| L16 | 16 | 16 | 23.1 [20 / 23 / 27] | 25.4 | 16 |
 
-**Observed at n = 32 over 64 servers (the two-node harness):**
-- Listeners gave B = 2–3, against 1–2 for the shared queue [S12][S16].
-- With P3-equivalent code, listeners took 19.05 / 20.21 s against 18.17 / 18.42 s without them
-  [S16].
-- The bs = 256 cohort cells without listeners had B = 7–13 [S9].
+For n = m = 32 the distribution of B is P(2) = 0.03, P(3) = 0.52, P(4) = 0.36, P(5) = 0.08 and
+P(6+) = 0.01 (reports/`dp-round3.md`).
 
-{{TBD:dp-round12 — #58278 at DP8: B distribution and all-parsed with and without listeners, in
-the default and compact cells; conclusion on when it helps}}
+**Measured busiest counts** (dp-round12, DP8, one connection per request) [S24]:
+
+| Policy | L1 | L4 | L16 |
+|---|---|---|---|
+| R | 3.5 | 10 | 23 |
+| S | 2 | 8 | 18.5 |
+| RR | 1 | 4 | 16 |
+
+- R matches the random expectation: its per-server sd at L4 is 1.95, against 1.97 for the binomial.
+- S is tighter than random, with sd 1.46.
+- No S run showed a greedy worker.
+- The greedy-worker case that #58278 fixes needs many requests over a few long-lived keep-alive
+  connections. That is #58278's own benchmark, and also the old RFC's two-process client. The
+  measurement client here opens a new connection for every request.
+
+**Cost of imbalance.**
+- **dp-round11 fit** (dp-round10 tip, builds on an executor): `T = 30.7 + 4.62 × B` (R² 0.958) [S9].
+- **Re-fit on the round-24 P3**, 14 L4 runs across all three policies: `T = 40.9 + 2.65 × B`
+  (R² 0.92) [S24]. The old model over-predicts L4 by 6–11 s.
+- **Weaker at the other loads:** R² is 0.53 at L1, where other costs dominate, and 0.60 at L16,
+  where run-to-run variation is large even for RR.
+
+**Consequences:**
+
+| Load | R vs S | RR vs S |
+|---|---|---|
+| L4 | +8% | **−17%** |
+| L16 | +15% | equal median |
+
+- RL-lean is unaffected (4.1–4.3 s in every arm), because that cell is bound by the client and the
+  network.
+- **Recommendations:**
+  - Make #58278 opt-in, for deployments whose clients reuse connections.
+  - Treat deterministic assignment (round-robin over per-worker ports, or a least-loaded router) as
+    the open item.
+
+**Earlier n = 32, two-node runs agree.**
+- Base code: listeners gave B = 2–3 against 1–2 [S12].
+- In-tree fast render: 19.05 / 20.21 s with listeners against 18.17 / 18.42 s without [S16].
 
 ## 5. Ingest model (pre-pause)
 **What the frontend must sustain.** The real engine emits one token per request per step. At 25–50

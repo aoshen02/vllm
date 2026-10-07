@@ -159,10 +159,40 @@ DP8, n = 256, fixed 16,384 tokens, wide client, 2 runs per arm.
 | Python RL-lean | 0.282 | 0.277 | 1,150 k | 77 k |
 | Python default | 4.44 | 4.39 | 1,140 k | 73 k |
 
-## 8. Listeners (#58278)
+## 8. Request distribution: shared socket vs `SO_REUSEPORT` (#58278) vs round-robin (dp-round12) [S24]
 
-**n = 32, two-node harness:**
-- With the P3-equivalent in-tree code (r15) [S16]: with listeners 19.05 / 20.21 s, without 18.17 / 18.42 s. RL-lean is equal (1.83–1.89 s).
+**Tree:** the Python round-24 tip `7e533ad05d` plus #58278's listener lines (35 +/− lines, identical to
+`gh pr diff 58278`), with the plugin allowlisted in every arm.
+
+**Environment:**
+- DP8 mock engines;
+- client v3.1, one connection per request;
+- wide client for L4, L16 and RL.
+
+**Arms:**
+- S: shared socket (`--no-listeners`).
+- R: per-server `SO_REUSEPORT` listeners.
+- RR: one port per server, with request i sent to server i mod k (harness options `--round-robin-ports` / `--per-server-ports`).
+
+All 49 runs PASS.
+
+| Load | Arm | Runs | Busiest per run | Busiest median | Per-server sd | All parsed, s, median [min–max] | Peak memory per process, GiB |
+|---|---|---|---|---|---|---|---|
+| L1: 32 requests, 32 servers, default | S | 6 | 2,2,2,2,2,2 | 2 | 0.46 | 21.2 [20.5–21.6] | 6.13 |
+| | R | 6 | 5,3,4,3,5,3 | 3.5 | 1.06 | 22.2 [20.0–30.6] | 6.47 |
+| | RR | 3 | 1,1,1 | 1 | 0 | 22.0 [21.8–22.0] | 5.78 |
+| L4: 256 requests, 64 servers, default | S | 6 | 7,8,8,8,8,7 | 8 | 1.46 | 61.6 [59.6–64.4] | 7.38 |
+| | R | 6 | 8,10,10,10,8,10 | 10 | 1.95 | 66.2 [59.8–69.0] | 7.86 |
+| | RR | 2 | 4,4 | 4 | 0 | 51.0 [50.2–51.8] | 6.85 |
+| L16: 256 requests, 16 servers, default | S | 2 | 19,18 | 18.5 | 1.41 | 101.8 [99.9–103.7] | 10.58 |
+| | R | 2 | 21,25 | 23 | 3.37 | 117.1 [110.0–124.2] | 11.25 |
+| | RR | 2 | 16,16 | 16 | 0 | 102.1 [92.6–111.7] | 9.62 |
+| RL-lean: 256 requests, 64 servers | S | 6 | 8,9,9,10,7,8 | 8.5 | 1.50 | 4.23 [4.17–4.35] | 4.02 |
+| | R | 6 | 9,9,8,10,12,9 | 9 | 1.99 | 4.14 [4.13–4.29] | 4.17 |
+| | RR | 2 | 4,4 | 4 | 0 | 4.29 [4.27–4.30] | 3.02 |
+
+The balls-into-bins table and the re-fit are in [theory.md §4](theory.md).
+
+**Earlier n = 32 results, two-node harness:**
+- With the in-tree fast render (r15) [S16]: 19.05 / 20.21 s with listeners against 18.17 / 18.42 s without. RL-lean is equal (1.83–1.89 s).
 - With base code, see §4 (T1).
-
-**DP8:** {{TBD: dp-round12}}
