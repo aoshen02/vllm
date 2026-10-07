@@ -359,14 +359,14 @@ def engine_outputs_wire(output):
     return [0, [output], None, 0.0, None, ["req-1"]]
 
 
+# Mirrors `LogprobsWire`: sample logprobs as plain lists.
 inline_logprobs = engine_outputs_wire(
     engine_output_wire(
         "req-1",
         new_logprobs=(
-            np.array([[1, 2, 3], [4, 5, 6]], dtype=np.int64),
-            np.array([[1, 2, 3], [4, 5, 6]], dtype=np.float32),
-            np.array([1, 2], dtype=np.int64),
-            None,
+            [[1, 2, 3], [4, 5, 6]],
+            np.array([[1, 2, 3], [4, 5, 6]], dtype=np.float32).tolist(),
+            [1, 2],
         ),
     )
 )

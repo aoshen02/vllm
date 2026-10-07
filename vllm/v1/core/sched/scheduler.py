@@ -53,7 +53,12 @@ from vllm.v1.core.sched.request_queue import (
     create_request_queue,
 )
 from vllm.v1.core.sched.utils import check_stop, remove_all
-from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
+from vllm.v1.engine import (
+    EngineCoreEventType,
+    EngineCoreOutput,
+    EngineCoreOutputs,
+    LogprobsWire,
+)
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     MambaSpec,
@@ -2006,6 +2011,8 @@ class Scheduler(SchedulerInterface):
     ) -> dict[int, EngineCoreOutputs]:
         sampled_token_ids = model_runner_output.sampled_token_ids
         logprobs = model_runner_output.logprobs
+        # The step's logprobs as Python lists, converted once on first use.
+        logprobs_wire: LogprobsWire | None = None
         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
         prompt_token_id_logprobs_dict = (
             model_runner_output.prompt_token_id_logprobs_dict
@@ -2194,7 +2201,20 @@ class Scheduler(SchedulerInterface):
                 and request.sampling_params.num_logprobs is not None
                 and logprobs
             ):
-                new_logprobs = logprobs.slice_request(req_index, len(new_token_ids))
+                if logprobs_wire is None:
+                    logprobs_wire = LogprobsWire(
+                        logprobs.logprob_token_ids.tolist(),
+                        logprobs.logprobs.tolist(),
+                        logprobs.sampled_token_ranks.tolist(),
+                    )
+                cu = logprobs.cu_num_generated_tokens
+                start = req_index if cu is None else cu[req_index]
+                end = start + len(new_token_ids)
+                new_logprobs = LogprobsWire(
+                    logprobs_wire.logprob_token_ids[start:end],
+                    logprobs_wire.logprobs[start:end],
+                    logprobs_wire.sampled_token_ranks[start:end],
+                )
 
             finish_reason = None
             if stopped:

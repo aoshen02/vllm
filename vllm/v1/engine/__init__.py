@@ -22,7 +22,7 @@ from vllm.v1.metrics.stats import (
     RequestSpecDecodeMetrics,
     SchedulerStats,
 )
-from vllm.v1.outputs import LogprobsLists, LogprobsTensors, SamplingMaskLists
+from vllm.v1.outputs import LogprobsTensors, SamplingMaskLists
 from vllm.v1.serial_utils import UtilityResult
 
 # Type for pause_generation mode parameter.
@@ -196,6 +196,25 @@ class EngineCoreEvent(msgspec.Struct):
         return cls(event_type, timestamp)
 
 
+class LogprobsWire(
+    msgspec.Struct,
+    array_like=True,  # type: ignore[call-arg]
+    gc=False,
+):  # type: ignore[call-arg]
+    """New sample logprobs as plain lists.
+
+    Same content as `LogprobsLists.slice_request(...)`, but msgpack-native so
+    the frontend does not decode three small ndarrays per token.
+    """
+
+    # [num_generated_tokens, max_num_logprobs + 1]
+    logprob_token_ids: list[list[int]]
+    # [num_generated_tokens, max_num_logprobs + 1]
+    logprobs: list[list[float]]
+    # [num_generated_tokens]
+    sampled_token_ranks: list[int]
+
+
 class EngineCoreOutput(
     msgspec.Struct,
     array_like=True,  # type: ignore[call-arg]
@@ -205,7 +224,7 @@ class EngineCoreOutput(
     request_id: str
     new_token_ids: list[int]
 
-    new_logprobs: LogprobsLists | None = None
+    new_logprobs: LogprobsWire | None = None
     new_prompt_logprobs_tensors: LogprobsTensors | None = None
 
     pooling_output: torch.Tensor | None = None

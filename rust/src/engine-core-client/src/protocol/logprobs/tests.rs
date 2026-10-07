@@ -197,6 +197,107 @@ fn decodes_inline_new_logprobs() {
     );
 }
 
+fn list_logprobs_value(ids: &[&[i64]], probs: &[&[f64]], ranks: &[i64]) -> Value {
+    Value::Array(vec![
+        Value::Array(
+            ids.iter()
+                .map(|row| Value::Array(row.iter().copied().map(Value::from).collect()))
+                .collect(),
+        ),
+        Value::Array(
+            probs
+                .iter()
+                .map(|row| Value::Array(row.iter().copied().map(Value::from).collect()))
+                .collect(),
+        ),
+        Value::Array(ranks.iter().copied().map(Value::from).collect()),
+    ])
+}
+
+#[test]
+fn decodes_list_new_logprobs() {
+    let frames = vec![Bytes::from(encode_value(&output_wire_with_custom_fields(
+        Some(list_logprobs_value(
+            &[&[1, 2, 3], &[4, 5, 6]],
+            &[&[1.0, 2.0, 3.0], &[4.0, 5.0, 6.0]],
+            &[1, 2],
+        )),
+        None,
+    )))];
+    let decoded = decode_engine_core_outputs(&frames).unwrap().into_request_batch().unwrap();
+
+    let logprobs = decoded.outputs[0].new_logprobs.clone().unwrap().into_direct().unwrap();
+    assert_eq!(logprobs, expected_sample_logprobs());
+}
+
+#[test]
+fn decodes_list_new_logprobs_preserving_float32_values() {
+    let values = [f32::NAN, f32::NEG_INFINITY, -1e-30, -88.7];
+    let frames = vec![Bytes::from(encode_value(&output_wire_with_custom_fields(
+        Some(list_logprobs_value(
+            &[&[1, 2], &[3, 4]],
+            &[
+                &[f64::from(values[0]), f64::from(values[1])],
+                &[f64::from(values[2]), f64::from(values[3])],
+            ],
+            &[0, 5],
+        )),
+        None,
+    )))];
+    let decoded = decode_engine_core_outputs(&frames).unwrap().into_request_batch().unwrap();
+
+    let logprobs = decoded.outputs[0].new_logprobs.clone().unwrap().into_direct().unwrap();
+    let decoded_bits: Vec<u32> = logprobs
+        .positions
+        .iter()
+        .flat_map(|position| position.entries.iter().map(|entry| entry.logprob.to_bits()))
+        .collect();
+    let expected_bits: Vec<u32> = values.iter().map(|value| value.to_bits()).collect();
+    assert_eq!(decoded_bits, expected_bits);
+    assert_eq!(logprobs.positions[0].entries[0].rank, 0);
+    assert_eq!(logprobs.positions[1].entries[0].rank, 5);
+}
+
+#[test]
+fn decodes_empty_list_new_logprobs() {
+    let frames = vec![Bytes::from(encode_value(&output_wire_with_custom_fields(
+        Some(list_logprobs_value(&[], &[], &[])),
+        None,
+    )))];
+    let decoded = decode_engine_core_outputs(&frames).unwrap().into_request_batch().unwrap();
+
+    let logprobs = decoded.outputs[0].new_logprobs.clone().unwrap().into_direct().unwrap();
+    assert!(logprobs.is_empty());
+}
+
+#[test]
+fn rejects_malformed_list_new_logprobs() {
+    for (value, expected) in [
+        (
+            list_logprobs_value(&[&[1]], &[&[-1.0]], &[1, 2]),
+            "new_logprobs: row count mismatch: logprob_token_ids=1, logprobs=1, token_ranks=2",
+        ),
+        (
+            list_logprobs_value(&[&[], &[]], &[&[], &[]], &[1, 1]),
+            "new_logprobs: zero-column logprobs payload with 2 rows",
+        ),
+        (
+            list_logprobs_value(&[&[1, 2]], &[&[-1.0]], &[1]),
+            "logprobs row length mismatch: token_ids=2, logprobs=1",
+        ),
+    ] {
+        let frames = vec![Bytes::from(encode_value(&output_wire_with_custom_fields(
+            Some(value),
+            None,
+        )))];
+        let error = decode_engine_core_outputs(&frames).unwrap_err();
+        let crate::error::Error::ExtValueDecode { message } = error else {
+            panic!("expected ExtValueDecode");
+        };
+        assert_eq!(message, expected);
+    }
+}
+
 #[test]
 fn decodes_multipart_new_logprobs() {
     let frames = vec![

@@ -75,7 +75,7 @@ class FlatLogprobs(MutableSequence[LogprobsOnePosition | None]):
         self,
         token_ids: list[int],
         logprobs: list[float],
-        ranks: itertools.chain[int],
+        ranks: Iterable[int],
         decoded_tokens: Iterable[str | None],
     ) -> None:
         """Appends logprobs for the next position without creating

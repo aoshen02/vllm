@@ -10,6 +10,7 @@ import numpy as np
 from vllm.logger import init_logger
 from vllm.logprobs import (
     FlatLogprobs,
+    Logprob,
     PromptLogprobs,
     SampleLogprobs,
     append_logprobs_for_next_position,
@@ -20,8 +21,8 @@ from vllm.tokenizers.detokenizer_utils import (
     TokenizerLike,
     convert_ids_list_to_tokens,
 )
-from vllm.v1.engine import EngineCoreOutput, EngineCoreRequest
-from vllm.v1.outputs import LogprobsLists, LogprobsTensors
+from vllm.v1.engine import EngineCoreOutput, EngineCoreRequest, LogprobsWire
+from vllm.v1.outputs import LogprobsTensors
 
 logger = init_logger(__name__)
 
@@ -70,7 +71,7 @@ class LogprobsProcessor:
             num_logprobs=num_logprobs,
         )
 
-    def _update_sample_logprobs(self, logprobs_lists: LogprobsLists) -> None:
+    def _update_sample_logprobs(self, logprobs_lists: LogprobsWire) -> None:
         """Update with sample logprobs from EngineCore.
 
         Outer lists are only of len > 1 if EngineCore made
@@ -84,14 +85,22 @@ class LogprobsProcessor:
         assert self.logprobs is not None
         assert self.cumulative_logprob is not None
 
-        token_ids_lst, logprobs_lst, ranks_lst, _ = logprobs_lists
-
-        for rank_np, logprobs_np, token_ids_np in zip(
-            ranks_lst, logprobs_lst, token_ids_lst
+        sampled_only = self.tokenizer is None and self.num_logprobs == 0
+        for rank, logprobs, token_ids in zip(
+            logprobs_lists.sampled_token_ranks,
+            logprobs_lists.logprobs,
+            logprobs_lists.logprob_token_ids,
         ):
-            rank = rank_np.tolist()
-            logprobs = logprobs_np.tolist()
-            token_ids = token_ids_np.tolist()
+            if sampled_only:
+                # Same entry append_logprobs_for_next_position builds.
+                self.cumulative_logprob += logprobs[0]
+                if isinstance(self.logprobs, FlatLogprobs):
+                    self.logprobs.append_fast(token_ids, logprobs, (rank,), NONES)
+                else:
+                    self.logprobs.append(
+                        {token_ids[0]: Logprob(logprob=logprobs[0], rank=rank)}
+                    )
+                continue
             # Detokenize (non-incrementally).
             decoded_tokens: list[str] | Iterable[None]
             if self.tokenizer is None:
