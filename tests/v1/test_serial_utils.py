@@ -423,6 +423,39 @@ def test_multiple_senders_single_receiver_ipc():
         )
 
 
+def test_sample_logprobs_round_trip_as_lists():
+    """Sample logprobs travel as plain msgpack lists in the payload frame, and
+    float32 values (including non-finite ones) survive bit for bit."""
+    from vllm.v1.engine import EngineCoreOutput, EngineCoreOutputs, LogprobsWire
+
+    logprobs = np.array(
+        [[-0.1, -np.inf, np.nan], [-1e-30, -3.25, -88.7]], dtype=np.float32
+    )
+    wire = LogprobsWire(
+        logprob_token_ids=[[1, 2, 3], [4, 5, 6]],
+        logprobs=logprobs.tolist(),
+        sampled_token_ranks=[1, 7],
+    )
+    outputs = EngineCoreOutputs(
+        outputs=[
+            EngineCoreOutput(request_id="r", new_token_ids=[1, 4], new_logprobs=wire)
+        ]
+    )
+
+    frames = MsgpackEncoder(size_threshold=0).encode(outputs)
+    assert len(frames) == 1
+
+    decoded = MsgpackDecoder(EngineCoreOutputs).decode(frames)
+    new_logprobs = decoded.outputs[0].new_logprobs
+    assert isinstance(new_logprobs, LogprobsWire)
+    assert new_logprobs.logprob_token_ids == wire.logprob_token_ids
+    assert new_logprobs.sampled_token_ranks == wire.sampled_token_ranks
+    np.testing.assert_array_equal(
+        np.array(new_logprobs.logprobs, dtype=np.float32).view(np.uint32),
+        logprobs.view(np.uint32),
+    )
+
+
 def _logprobs_outputs(num_reqs: int, num_prompt_tokens: int):
     """An EngineCoreOutputs carrying prompt logprobs, as the engine core sends
     it: many requests, each with per-token tensors small enough that pyzmq

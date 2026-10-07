@@ -136,16 +136,9 @@ class TestStreamingScheduler(unittest.TestCase):
                     "The finishing chunk requested logprobs; the continuation's "
                     "settings must not suppress them"
                 )
-                np.testing.assert_array_equal(
-                    output.new_logprobs.logprob_token_ids, logprobs.logprob_token_ids
-                )
-                np.testing.assert_array_equal(
-                    output.new_logprobs.logprobs, logprobs.logprobs
-                )
-                np.testing.assert_array_equal(
-                    output.new_logprobs.sampled_token_ranks,
-                    logprobs.sampled_token_ranks,
-                )
+                assert output.new_logprobs.logprob_token_ids == [[STOP_TOKEN]]
+                assert output.new_logprobs.logprobs == [[-0.25]]
+                assert output.new_logprobs.sampled_token_ranks == [1]
 
     def test_add_request(self):
         scheduler = create_scheduler()

@@ -49,3 +49,18 @@ pub struct WireLogprobs {
     #[serde(default)]
     pub cu_num_generated_tokens_tensor: Option<OpaqueValue>,
 }
+
+/// Python wire representation of `LogprobsWire`: one request's new sample
+/// logprobs as plain nested lists.
+///
+/// Original Python definition: `LogprobsWire` in `vllm/v1/engine/__init__.py`.
+#[derive(Debug, Clone, PartialEq, Serialize_tuple, Deserialize_tuple)]
+pub struct WireLogprobLists {
+    /// Shape `[num_positions, max_num_logprobs + 1]`.
+    pub logprob_token_ids: Vec<Vec<u32>>,
+    /// Shape `[num_positions, max_num_logprobs + 1]`. Python sends float64
+    /// values that are exact float32 values.
+    pub logprobs: Vec<Vec<f32>>,
+    /// Shape `[num_positions]`.
+    pub token_ranks: Vec<u32>,
+}

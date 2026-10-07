@@ -80,9 +80,9 @@ impl PositionLogprobs {
 /// sampled/selected token plus any returned top-k alternatives for that same
 /// position.
 ///
-/// The Python engine still sends logprobs as ndarray/tensor-shaped wire tuples.
-/// Rust resolves that lower-level representation during decode and exposes only
-/// this per-position form to callers.
+/// The Python engine sends sample logprobs as plain nested lists and prompt
+/// logprobs as ndarray/tensor-shaped wire tuples. Rust resolves both during
+/// decode and exposes only this per-position form to callers.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Logprobs {
     /// One decoded logprobs record per scored position in this engine-core
@@ -111,6 +111,9 @@ pub enum MaybeWireLogprobs {
     /// looking up aux frames and decoding raw views. Should only be used
     /// internally during deserialization.
     Wire(Box<WireLogprobs>),
+    /// Sample logprobs sent as plain nested lists. Should only be used
+    /// internally during deserialization.
+    Lists(Box<WireLogprobLists>),
     /// The actual decoded logprobs value,
     Direct(Logprobs),
 }
@@ -120,7 +123,7 @@ impl Deref for MaybeWireLogprobs {
 
     fn deref(&self) -> &Self::Target {
         match self {
-            Self::Wire(_) => panic!("Logprobs is still in wire format"),
+            Self::Wire(_) | Self::Lists(_) => panic!("Logprobs is still in wire format"),
             Self::Direct(value) => value,
         }
     }
@@ -129,7 +132,7 @@ impl Deref for MaybeWireLogprobs {
 impl DerefMut for MaybeWireLogprobs {
     fn deref_mut(&mut self) -> &mut Self::Target {
         match self {
-            Self::Wire(_) => panic!("Logprobs is still in wire format"),
+            Self::Wire(_) | Self::Lists(_) => panic!("Logprobs is still in wire format"),
             Self::Direct(value) => value,
         }
     }
@@ -140,8 +143,21 @@ impl<'de> Deserialize<'de> for MaybeWireLogprobs {
     where
         D: Deserializer<'de>,
     {
-        // When deserializing, it's always in the wire form.
-        WireLogprobs::deserialize(deserializer).map(|v| Self::Wire(Box::new(v)))
+        // When deserializing, it's always in a wire form: ndarray tuples start
+        // with a `(dtype, shape, data)` triple, list payloads with a row list.
+        let value = rmpv::Value::deserialize(deserializer)?;
+        let is_ndarray = value
+            .as_array()
+            .and_then(|fields| fields.first())
+            .and_then(rmpv::Value::as_array)
+            .and_then(|first| first.first())
+            .is_some_and(rmpv::Value::is_str);
+        let decoded = if is_ndarray {
+            rmpv::ext::from_value(value).map(|v| Self::Wire(Box::new(v)))
+        } else {
+            rmpv::ext::from_value(value).map(|v| Self::Lists(Box::new(v)))
+        };
+        decoded.map_err(serde::de::Error::custom)
     }
 }
 
@@ -153,6 +169,7 @@ impl Serialize for MaybeWireLogprobs {
         // For testing purposes only. We don't actually serialize it into aux frames.
         match self {
             Self::Wire(value) => value.serialize(serializer),
+            Self::Lists(value) => value.serialize(serializer),
             Self::Direct(value) => WireLogprobs::from_direct(value)
                 .map_err(serde::ser::Error::custom)?
                 .serialize(serializer),
@@ -167,7 +184,39 @@ impl MaybeWireLogprobs {
         match self {
             Self::Direct(value) => Ok(Self::Direct(value)),
             Self::Wire(value) => value.resolve(frames, field_prefix).map(Self::Direct),
+            Self::Lists(value) => value.resolve(field_prefix).map(Self::Direct),
         }
+    }
+}
+
+impl WireLogprobLists {
+    /// Group each list row into one [`PositionLogprobs`].
+    fn resolve(self, field_prefix: &str) -> Result<Logprobs> {
+        let rows = self.token_ranks.len();
+        if self.logprob_token_ids.len() != rows || self.logprobs.len() != rows {
+            bail_ext_value_decode!(
+                "{field_prefix}: row count mismatch: logprob_token_ids={}, logprobs={}, \
+                 token_ranks={rows}",
+                self.logprob_token_ids.len(),
+                self.logprobs.len()
+            );
+        }
+        let mut positions = Vec::with_capacity(rows);
+        for ((token_ids, logprobs), sampled_rank) in
+            self.logprob_token_ids.iter().zip(&self.logprobs).zip(self.token_ranks)
+        {
+            if token_ids.is_empty() {
+                bail_ext_value_decode!(
+                    "{field_prefix}: zero-column logprobs payload with {rows} rows"
+                );
+            }
+            positions.push(PositionLogprobs::from_decoded_row(
+                token_ids,
+                logprobs,
+                sampled_rank,
+            )?);
+        }
+        Ok(Logprobs { positions })
     }
 }
 

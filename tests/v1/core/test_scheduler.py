@@ -65,6 +65,7 @@ from vllm.v1.outputs import (
     DraftTokenIds,
     ECConnectorOutput,
     KVConnectorOutput,
+    LogprobsLists,
     ModelRunnerOutput,
     SamplingMaskLists,
     make_empty_encoder_model_runner_output,
@@ -978,6 +979,69 @@ def test_update_from_output_routes_multi_position_sampling_masks():
         [[1, 6], [2]],
         [[3, 7, 8], [4], [5, 9]],
     ]
+
+
+@pytest.mark.parametrize("multi_position", [False, True])
+def test_update_from_output_routes_logprobs_as_lists(multi_position: bool):
+    """Per-request logprobs are plain-list slices of the step's batch arrays,
+    with the same rows as `LogprobsLists.slice_request`."""
+    scheduler = create_scheduler()
+    requests = create_requests(num_requests=3, max_tokens=10)
+    for i, req in enumerate(requests):
+        req.num_computed_tokens = req.num_tokens
+        # The middle request did not ask for logprobs.
+        req.sampling_params = req.sampling_params.clone()
+        req.sampling_params.logprobs = None if i == 1 else 2
+        scheduler.requests[req.request_id] = req
+        scheduler.running.append(req)
+        req.status = RequestStatus.RUNNING
+
+    if multi_position:
+        sampled_token_ids = [[1, 2], [3], [4, 5, 6]]
+        cu_num_generated_tokens: list[int] | None = [0, 2, 3, 6]
+    else:
+        sampled_token_ids = [[1], [3], [4]]
+        cu_num_generated_tokens = None
+    num_rows = sum(len(ids) for ids in sampled_token_ids)
+    rng = np.random.default_rng(0)
+    logprobs = LogprobsLists(
+        logprob_token_ids=rng.integers(0, 1000, (num_rows, 3), dtype=np.int32),
+        logprobs=-rng.random((num_rows, 3), dtype=np.float32) * 10,
+        sampled_token_ranks=rng.integers(1, 1000, num_rows, dtype=np.int32),
+        cu_num_generated_tokens=cu_num_generated_tokens,
+    )
+    scheduler_output = SchedulerOutput(
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        num_scheduled_tokens={req.request_id: 1 for req in requests},
+        total_num_scheduled_tokens=3,
+        scheduled_encoder_inputs={},
+        scheduled_spec_decode_tokens={},
+        num_common_prefix_blocks=[],
+        finished_req_ids=set(),
+        free_encoder_mm_hashes=[],
+    )
+    model_output = ModelRunnerOutput(
+        req_ids=[req.request_id for req in requests],
+        req_id_to_index={req.request_id: i for i, req in enumerate(requests)},
+        sampled_token_ids=sampled_token_ids,
+        logprobs=logprobs,
+        prompt_logprobs_dict={},
+        pooler_output=[],
+    )
+
+    outputs = scheduler.update_from_output(scheduler_output, model_output)[0].outputs
+
+    assert outputs[1].new_logprobs is None
+    for i in (0, 2):
+        expected = logprobs.slice_request(i, len(sampled_token_ids[i]))
+        new_logprobs = outputs[i].new_logprobs
+        assert new_logprobs is not None
+        assert new_logprobs.logprob_token_ids == expected.logprob_token_ids.tolist()
+        assert new_logprobs.logprobs == expected.logprobs.tolist()
+        assert new_logprobs.sampled_token_ranks == (
+            expected.sampled_token_ranks.tolist()
+        )
 
 
 def test_stop_via_update_from_output():

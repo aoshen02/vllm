@@ -5,14 +5,13 @@ import random
 from dataclasses import dataclass
 from typing import TypeAlias
 
-import numpy as np
 import torch
 from transformers import PythonBackend, TokenizersBackend
 
 from vllm.engine.arg_utils import EngineArgs
-from vllm.v1.engine import EngineCoreOutput, FinishReason
+from vllm.v1.engine import EngineCoreOutput, FinishReason, LogprobsWire
 from vllm.v1.metrics.stats import PrefillStats
-from vllm.v1.outputs import LogprobsLists, LogprobsTensors
+from vllm.v1.outputs import LogprobsTensors
 
 GeneralTokenizerType: TypeAlias = PythonBackend | TokenizersBackend
 
@@ -371,10 +370,10 @@ class MockEngineCore:
                     (logprobs_token_ids_, logprobs_, sampled_token_ranks_) = (
                         self.generated_logprobs_raw[req_idx][token_idx]
                     )
-                    logprobs = LogprobsLists(
-                        np.array([logprobs_token_ids_]),
-                        np.array([logprobs_]),
-                        np.array([sampled_token_ranks_]),
+                    logprobs = LogprobsWire(
+                        [logprobs_token_ids_],
+                        [logprobs_],
+                        [sampled_token_ranks_],
                     )
                 else:
                     logprobs = None
