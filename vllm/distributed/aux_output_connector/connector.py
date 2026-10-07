@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -41,6 +41,40 @@ class AuxRequestOutput:
     rows: np.ndarray
 
 
+@dataclass(eq=False)
+class AuxStepOutput(Mapping[str, AuxRequestOutput]):
+    """One worker step's R3 rows for all requests, keyed by request ID.
+
+    Rows captured in this step are packed into one array so the worker-to-engine
+    IPC carries a single buffer instead of one array per request.
+
+    Attributes:
+        rows: Packed rows captured in this step.
+        spans: Request ID to ``(token_start, lo, hi)``, where ``rows[lo:hi]``
+            are the request's rows starting at token ``token_start``.
+        materialized: Outputs rebuilt from the store or capture buffer.
+
+    """
+
+    rows: np.ndarray
+    spans: dict[str, tuple[int, int, int]]
+    materialized: dict[str, AuxRequestOutput]
+
+    def __getitem__(self, request_id: str) -> AuxRequestOutput:
+        span = self.spans.get(request_id)
+        if span is None:
+            return self.materialized[request_id]
+        token_start, lo, hi = span
+        return AuxRequestOutput(token_start, self.rows[lo:hi])
+
+    def __iter__(self) -> Iterator[str]:
+        yield from self.spans
+        yield from self.materialized
+
+    def __len__(self) -> int:
+        return len(self.spans) + len(self.materialized)
+
+
 class AuxOutputSchedulerConnector:
     """Build worker metadata without owning auxiliary output payloads or stores."""
 
@@ -49,6 +83,8 @@ class AuxOutputSchedulerConnector:
         self._sent_hash_counts: dict[str, int] = {}
         # Terminal events are delivered with the next connector metadata.
         self._finished_requests: dict[str, PackedBlockHashes | None] = {}
+        # Accepted rows held until request finish: (buffer, num_rows).
+        self._held_rows: dict[str, tuple[np.ndarray, int]] = {}
         self._generation = 0
 
     def build_connector_meta(
@@ -101,14 +137,20 @@ class AuxOutputSchedulerConnector:
     def take_output(
         self,
         request: Request,
-        output: dict[str, AuxRequestOutput] | None,
+        output: Mapping[str, AuxRequestOutput] | None,
     ) -> np.ndarray | None:
-        """Return the accepted R3 rows for one scheduled request."""
+        """Return the accepted R3 rows for one scheduled request.
+
+        The frontend only exposes routed experts on the final output, so rows
+        are held here and returned once when the request finishes. Requests
+        with stop strings may be finished by the frontend and get their rows
+        every step instead.
+        """
         request_id = request.request_id
-        assert output is not None and request_id in output, (
+        request_output = output.get(request_id) if output is not None else None
+        assert request_output is not None, (
             f"auxiliary output worker output is missing {request_id}"
         )
-        request_output = output[request_id]
         token_end = request.num_tokens - 1
         local_end = token_end - request_output.token_start
         if local_end < 0:
@@ -126,11 +168,40 @@ class AuxOutputSchedulerConnector:
             f"output_start={request_output.token_start}, "
             f"output_end={request_output.token_start + len(request_output.rows)}"
         )
-        return request_output.rows[:local_end]
+        rows = request_output.rows[:local_end]
+        assert request.sampling_params is not None
+        if request.sampling_params.stop:
+            return rows
+        return self._hold_rows(request, rows)
+
+    def _hold_rows(self, request: Request, rows: np.ndarray) -> np.ndarray | None:
+        held = self._held_rows.pop(request.request_id, None)
+        if held is None:
+            if request.is_finished():
+                return rows
+            if len(rows) == 0:
+                return None
+            held = (np.empty((max(512, 2 * len(rows)), *rows.shape[1:]), rows.dtype), 0)
+        buffer, num_rows = held
+        end = num_rows + len(rows)
+        if end > len(buffer):
+            grown = np.empty(
+                (max(end, 2 * len(buffer)), *buffer.shape[1:]), buffer.dtype
+            )
+            grown[:num_rows] = buffer[:num_rows]
+            buffer = grown
+        buffer[num_rows:end] = rows
+        if request.is_finished():
+            return buffer[:end]
+        self._held_rows[request.request_id] = (buffer, end)
+        return None
 
     def request_finished(self, request: Request) -> None:
         """Queue a request's terminal event and final block hashes."""
         request_id = request.request_id
+        if request.is_finished():
+            # Preemption also calls this; a preempted request keeps its rows.
+            self._held_rows.pop(request_id, None)
         num_sent = self._sent_hash_counts.pop(request_id, None)
         if num_sent is None:
             return

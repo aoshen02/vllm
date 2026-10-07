@@ -5,6 +5,7 @@ import numpy as np
 
 from vllm.distributed.aux_output_connector.connector import (
     AuxRequestOutput,
+    AuxStepOutput,
 )
 from vllm.v1.executor.ray_utils import detach_zero_copy_from_model_runner_output
 from vllm.v1.outputs import (
@@ -63,17 +64,23 @@ def test_detach_zero_copy_from_model_runner_output_copies_only_numpy_views():
 
 def test_detach_zero_copy_aux_output_without_logprobs():
     rows = _make_readonly(np.arange(12, dtype=np.uint8).reshape(2, 3, 2))
+    materialized_rows = _make_readonly(rows[:1].copy())
     output = ModelRunnerOutput(
-        req_ids=["req-0"],
-        req_id_to_index={"req-0": 0},
-        aux_output_connector_output={"req-0": AuxRequestOutput(0, rows)},
+        req_ids=["req-0", "req-1"],
+        req_id_to_index={"req-0": 0, "req-1": 1},
+        aux_output_connector_output=AuxStepOutput(
+            rows,
+            {"req-0": (0, 0, 2)},
+            {"req-1": AuxRequestOutput(0, materialized_rows)},
+        ),
     )
 
     detach_zero_copy_from_model_runner_output(output)
 
     aux_output = output.aux_output_connector_output
     assert aux_output is not None
-    detached = aux_output["req-0"].rows
-    assert detached is not rows
-    assert detached.flags.writeable
-    np.testing.assert_array_equal(detached, rows)
+    for request_id, original in (("req-0", rows), ("req-1", materialized_rows)):
+        detached = aux_output[request_id].rows
+        assert not np.shares_memory(detached, original)
+        assert detached.flags.writeable
+        np.testing.assert_array_equal(detached, original)
