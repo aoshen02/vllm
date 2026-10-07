@@ -113,6 +113,11 @@ async def build_async_engine_client_from_engine_args(
             async_llm.shutdown(timeout=vllm_config.shutdown_timeout)
 
 
+def shares_socket(args: Namespace) -> bool:
+    """Whether several API worker processes serve one shared listening socket."""
+    return (getattr(args, "api_server_count", None) or 1) > 1
+
+
 async def build_and_serve(
     engine_client: EngineClient,
     listen_address: str,
@@ -142,6 +147,7 @@ async def build_and_serve(
         app,
         sock=sock,
         enable_ssl_refresh=args.enable_ssl_refresh,
+        spread_accepts=shares_socket(args),
         host=args.host,
         port=args.port,
         log_level=args.uvicorn_log_level,

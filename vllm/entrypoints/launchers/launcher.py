@@ -3,8 +3,10 @@
 
 import asyncio
 import contextlib
+import errno
 import signal
 import socket
+import sys
 from collections.abc import Generator
 from functools import partial
 from typing import Any
@@ -35,22 +37,150 @@ from .utils.constants import (
 logger = init_logger(__name__)
 
 
+# Pause after each accept on a shared socket (caps one worker at 1000/s).
+_ACCEPT_PAUSE_S = 0.001
+# Pause after accept() fails for lack of resources (as asyncio servers do).
+_ACCEPT_RETRY_DELAY_S = 1.0
+_ACCEPT_RETRY_ERRNOS = (errno.EMFILE, errno.ENFILE, errno.ENOBUFS, errno.ENOMEM)
+# How long shutdown waits for connections still being set up (TLS handshakes).
+_CONNECTING_DRAIN_S = 5.0
+
+
 class NoSignalServer(uvicorn.Server):
     """Uvicorn server that never installs its own SIGINT/SIGTERM handlers.
 
     Callers register their own handlers on the event loop for graceful
     shutdown; uvicorn's would race with and override them (see #49668).
+
+    With ``spread_accepts`` (several API workers on one shared socket), it
+    accepts one connection at a time and then pauses its accepts briefly.
+    The event loop's own server drains every queued connection per wakeup,
+    so the worker that wakes first would take a whole burst.
     """
+
+    def __init__(self, config: uvicorn.Config, spread_accepts: bool = False):
+        super().__init__(config)
+        self.spread_accepts = spread_accepts and sys.platform != "win32"
+        self._accept_sockets: list[socket.socket] = []
+        # At most one pending re-arm per socket (its reader is off meanwhile).
+        self._accept_resume: dict[int, asyncio.TimerHandle] = {}
+        self._accepting = False
+        self._connecting: set[asyncio.Task] = set()
 
     @contextlib.contextmanager
     def capture_signals(self) -> Generator[None, None, None]:
         yield
+
+    async def startup(self, sockets: list[socket.socket] | None = None) -> None:
+        if not (self.spread_accepts and sockets):
+            return await super().startup(sockets)
+        # Lifespan and server state as usual. With an empty socket list,
+        # uvicorn (0.45: Server.startup) creates no asyncio server; the
+        # sockets are served by _accept_one with uvicorn's own protocol.
+        await super().startup(sockets=[])
+        if self.servers:
+            raise RuntimeError("uvicorn started a server for spread_accepts")
+        if self.should_exit:
+            return
+        loop = asyncio.get_running_loop()
+        self._accept_sockets = list(sockets)
+        self._accepting = True
+        for sock in self._accept_sockets:
+            sock.listen(self.config.backlog)
+            sock.setblocking(False)
+            loop.add_reader(sock.fileno(), self._accept_one, loop, sock)
+
+    def _resume_accepts(
+        self, loop: asyncio.AbstractEventLoop, sock: socket.socket
+    ) -> None:
+        self._accept_resume.pop(sock.fileno(), None)
+        if self._accepting:
+            loop.add_reader(sock.fileno(), self._accept_one, loop, sock)
+
+    def _pause_accepts(
+        self, loop: asyncio.AbstractEventLoop, sock: socket.socket, delay: float
+    ) -> None:
+        loop.remove_reader(sock.fileno())
+        self._accept_resume[sock.fileno()] = loop.call_later(
+            delay, self._resume_accepts, loop, sock
+        )
+
+    def _accept_one(self, loop: asyncio.AbstractEventLoop, sock: socket.socket) -> None:
+        try:
+            conn, _ = sock.accept()
+        except (BlockingIOError, InterruptedError, ConnectionAbortedError):
+            return
+        except OSError as exc:
+            if exc.errno not in _ACCEPT_RETRY_ERRNOS:
+                raise  # as asyncio's accept loop does
+            logger.exception("Error accepting a connection; retrying in 1 s")
+            self._pause_accepts(loop, sock, _ACCEPT_RETRY_DELAY_S)
+            return
+        try:
+            conn.setblocking(False)
+            config = self.config
+            protocol = config.http_protocol_class(  # type: ignore[call-arg]
+                config=config,
+                server_state=self.server_state,
+                app_state=self.lifespan.state,
+                _loop=loop,
+            )
+            task = loop.create_task(self._connect(loop, protocol, conn))
+        except Exception:
+            logger.exception("Error setting up an accepted connection")
+            conn.close()
+        else:
+            self._connecting.add(task)
+            task.add_done_callback(self._connecting.discard)
+        finally:
+            self._pause_accepts(loop, sock, _ACCEPT_PAUSE_S)
+
+    async def _connect(
+        self,
+        loop: asyncio.AbstractEventLoop,
+        protocol: asyncio.Protocol,
+        conn: socket.socket,
+    ) -> None:
+        try:
+            await loop.connect_accepted_socket(
+                lambda: protocol, conn, ssl=self.config.ssl
+            )
+        except asyncio.CancelledError:
+            conn.close()  # cancelled by shutdown before the transport took it
+            raise
+        except (ValueError, TypeError):
+            logger.exception("Accepted connection failed to start")
+            conn.close()
+        except Exception:
+            # e.g. a failed TLS handshake; the transport closed the socket
+            logger.debug("Accepted connection failed to start", exc_info=True)
+
+    async def shutdown(self, sockets: list[socket.socket] | None = None) -> None:
+        if self._accept_sockets:
+            # Stop accepting and close this worker's listener, as uvicorn does
+            # with its own servers; other workers keep their descriptors.
+            self._accepting = False
+            loop = asyncio.get_running_loop()
+            for handle in self._accept_resume.values():
+                handle.cancel()
+            self._accept_resume.clear()
+            for sock in self._accept_sockets:
+                loop.remove_reader(sock.fileno())
+                sock.close()
+            # Connections still being set up: let them finish, then cancel.
+            if self._connecting:
+                await asyncio.wait(self._connecting, timeout=_CONNECTING_DRAIN_S)
+                for task in list(self._connecting):
+                    task.cancel()
+                await asyncio.gather(*self._connecting, return_exceptions=True)
+        await super().shutdown(sockets)
 
 
 async def serve_http(
     app: FastAPI,
     sock: socket.socket | None,
     enable_ssl_refresh: bool = False,
+    spread_accepts: bool = False,
     **uvicorn_kwargs: Any,
 ):
     """Start a FastAPI app using Uvicorn, with support for custom Uvicorn config
@@ -96,7 +226,7 @@ async def serve_http(
     config.h11_max_incomplete_event_size = h11_max_incomplete_event_size
     config.h11_max_header_count = h11_max_header_count
     config.load()
-    server = NoSignalServer(config)
+    server = NoSignalServer(config, spread_accepts=spread_accepts)
     app.state.server = server
 
     loop = asyncio.get_running_loop()
