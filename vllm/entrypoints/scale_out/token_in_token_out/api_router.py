@@ -5,6 +5,7 @@
 import asyncio
 import json
 from http import HTTPStatus
+from typing import Any
 
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -22,6 +23,7 @@ from vllm.logger import init_logger
 from .protocol import (
     GenerateRequest,
     GenerateResponse,
+    RenderedGenerateResponse,
 )
 from .serving import ServingTokens
 
@@ -41,6 +43,14 @@ def engine_client(request: Request) -> EngineClient:
 
 
 router = APIRouter()
+
+
+class _RenderedJSONResponse(JSONResponse):
+    """A body already rendered to JSON: headers and ``load_aware_call``
+    bookkeeping as for ``JSONResponse``."""
+
+    def render(self, content: Any) -> bytes:
+        return content
 
 
 @router.post(
@@ -66,6 +76,9 @@ async def generate(request: GenerateRequest, raw_request: Request):
         return JSONResponse(
             content=generator.model_dump(), status_code=generator.error.code
         )
+
+    elif isinstance(generator, RenderedGenerateResponse):
+        return _RenderedJSONResponse(content=generator.body)
 
     elif isinstance(generator, GenerateResponse):
         return JSONResponse(content=generator.model_dump())
