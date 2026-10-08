@@ -339,6 +339,7 @@ async fn collect_output_aggregates_raw_tokens_logprobs_and_terminal_metadata() {
                                 new_sampling_mask: Some(MaybeWireSamplingMask::Direct(
                                     SamplingMask {
                                         rows: vec![vec![1, 33, 99]],
+                                        logprobs: Some(vec![vec![-0.1, -0.2, -0.3]]),
                                     },
                                 )),
                                 ..request_output_with_logprobs(
@@ -353,6 +354,7 @@ async fn collect_output_aggregates_raw_tokens_logprobs_and_terminal_metadata() {
                                 new_sampling_mask: Some(MaybeWireSamplingMask::Direct(
                                     SamplingMask {
                                         rows: vec![vec![2, 44, 88]],
+                                        logprobs: Some(vec![vec![-0.4, -0.5, -0.6]]),
                                     },
                                 )),
                                 ..request_output_with_logprobs_and_kv(
@@ -401,6 +403,7 @@ async fn collect_output_aggregates_raw_tokens_logprobs_and_terminal_metadata() {
         collected.sampling_mask,
         Some(SamplingMask {
             rows: vec![vec![1, 33, 99], vec![2, 44, 88]],
+            logprobs: Some(vec![vec![-0.1, -0.2, -0.3], vec![-0.4, -0.5, -0.6]]),
         })
     );
 }
@@ -422,6 +425,7 @@ async fn collect_output_rejects_partial_sampling_mask() {
         ec_transfer_params: None,
         sampling_mask: Some(SamplingMask {
             rows: vec![vec![1, 33, 99]],
+            ..Default::default()
         }),
         spec_decode_metrics: None,
     };

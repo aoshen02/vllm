@@ -444,13 +444,21 @@ class RequestState:
             logprobs = logprobs[-num_new_tokens:] if num_new_tokens else logprobs[:0]
 
         sampling_mask = None
-        if (delta or finished) and self.sampling_mask_chunks:
+        if self.sampling_mask_chunks and (delta or finished):
+            chunks = self.sampling_mask_chunks
             sampling_mask = SamplingMask(
-                [
-                    position
-                    for chunk in self.sampling_mask_chunks
-                    for position in chunk.to_nested_list()
-                ]
+                [mask for chunk in chunks for mask in chunk.to_nested_list()][
+                    : len(token_ids)
+                ],
+                (
+                    [
+                        scores
+                        for chunk in chunks
+                        for scores in chunk.to_nested_logprobs()
+                    ][: len(token_ids)]
+                    if chunks[0].logprobs is not None
+                    else None
+                ),
             )
             if delta:
                 self.sampling_mask_chunks.clear()

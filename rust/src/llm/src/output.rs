@@ -400,8 +400,8 @@ impl<T: Stream<Item = Result<GenerateOutput>> + Send> T {
                             existing.logprobs = Some(step_logprobs);
                         }
                     }
-                    if let Some(mut mask) = sampling_mask {
-                        existing.sampling_mask.get_or_insert_default().rows.append(&mut mask.rows);
+                    if let Some(mask) = sampling_mask {
+                        existing.sampling_mask.get_or_insert_default().append(mask);
                     }
                 } else {
                     collected = Some(CollectedGenerateOutput {
