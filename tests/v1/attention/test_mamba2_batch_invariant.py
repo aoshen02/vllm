@@ -84,10 +84,10 @@ def test_decode_positions_ignore_cudagraph_padding_rows():
     # just past a boundary, and two padding rows (length 0) as the runner pads
     seq_lens = torch.tensor([301, 512, 513, 0, 0], dtype=torch.int32)
     pos = exact_replay_decode_positions(seq_lens, 256)
-    assert pos.tolist() == [44, 255, 0, 0, 0]
-    out = torch.full((5,), -1, dtype=torch.int32)
+    assert pos.tolist() == [44, 255, 0, -1, -1]
+    out = torch.full((5,), 7, dtype=torch.int32)
     assert exact_replay_decode_positions(seq_lens, 256, out=out) is out
-    assert out.tolist() == [44, 255, 0, 0, 0]
+    assert out.tolist() == [44, 255, 0, -1, -1]
 
 
 @pytest.mark.parametrize(

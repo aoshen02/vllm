@@ -242,8 +242,9 @@ def test_emit_decode_schedule_matches_single_shot_prefill(chunk_size, seed):
     ``exact_replay_ssd`` (which also zeroes the state of sequences still in
     their first chunk) and then decoded one token per step with
     ``exact_replay_emit`` while the batch shrinks as sequences finish and a
-    padding row pointing at the null block rides along. Every produced row must
-    equal the single-shot scan of the whole sequence.
+    padding row (null block, position -1) rides along. Every produced row must
+    equal the single-shot scan of the whole sequence, and the padding row must
+    leave the null block untouched and output zeros.
     """
     from vllm.model_executor.layers.mamba.exact_replay import (
         ExactReplayBuffers,
@@ -329,7 +330,7 @@ def test_emit_decode_schedule_matches_single_shot_prefill(chunk_size, seed):
             [all_slots[torch.tensor(active, device=device)], all_slots.new_zeros(1)]
         )
         pos = torch.tensor(
-            [computed[i] % chunk_size for i in active] + [0],
+            [computed[i] % chunk_size for i in active] + [-1],
             dtype=torch.int32,
             device=device,
         )
@@ -349,6 +350,7 @@ def test_emit_decode_schedule_matches_single_shot_prefill(chunk_size, seed):
             chunk_size=chunk_size,
             buffers=buffers,
         )
+        assert not out[-1].any()
         return out[:-1]
 
     def record(active, lens, out):
@@ -367,3 +369,5 @@ def test_emit_decode_schedule_matches_single_shot_prefill(chunk_size, seed):
         assert torch.equal(outs[i].view(torch.int16), refs[i].view(torch.int16)), (
             f"sequence {i}: emit decode diverged from single-shot prefill"
         )
+    assert not any(buf[0].any() for buf in buffers)
+    assert ssm_state[0].isnan().all()

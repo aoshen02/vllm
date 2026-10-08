@@ -1067,8 +1067,8 @@ class MambaMixer2(MambaBase, PluggableLayer):
                 assert replay_bufs is not None
                 # One token per row without speculative decoding: compute only
                 # that row from the buffered chunk instead of re-running the
-                # scan over the partial chunk. Rows may include CUDA graph
-                # padding, which points at the null block.
+                # scan over the partial chunk. CUDA graph padding rows have
+                # position -1 and are skipped.
                 assert num_decode_tokens == num_decodes
                 n_groups = self.n_groups // self.tp_size
                 slots_d = state_indices_tensor_d

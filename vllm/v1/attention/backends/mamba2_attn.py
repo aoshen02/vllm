@@ -154,10 +154,10 @@ def exact_replay_decode_positions(
     A decode row has one token, so its computed token count is the sequence
     length minus one (exact without speculative decoding, which batch-invariant
     mode rejects). CUDA graph padding rows have sequence length 0 and get
-    position 0 so that they never look like a completed chunk.
+    position -1, which the decode kernels skip.
     """
     pos = torch.remainder(seq_lens - 1, chunk_size, out=out)
-    return pos.masked_fill_(seq_lens <= 0, 0)
+    return pos.masked_fill_(seq_lens <= 0, -1)
 
 
 @dataclass
@@ -197,8 +197,8 @@ class Mamba2AttentionMetadataBuilder(
         if self.exact_replay:
             # Decode rows run fixed-shape kernels, so decode-only full CUDA
             # graphs work as usual; this buffer feeds them each row's position.
-            self.exact_replay_pos_d: torch.Tensor = torch.zeros(
-                (self.decode_cudagraph_max_bs,), dtype=torch.int32, device=device
+            self.exact_replay_pos_d: torch.Tensor = torch.full(
+                (self.decode_cudagraph_max_bs,), -1, dtype=torch.int32, device=device
             )
 
     def _exact_replay_decode_positions(
@@ -209,8 +209,9 @@ class Mamba2AttentionMetadataBuilder(
         """Positions for the rows that ``state_indices_tensor_d`` covers.
 
         For full CUDA graphs the runner pads the batch and the base builder
-        pads the state indices; padded rows have sequence length 0 and point
-        at the null block, so they get position 0 and never fold.
+        pads the state indices with the null block, which other backends rely
+        on; padded rows get position -1 instead, so the decode kernels skip
+        them and never touch the null block's buffers or state.
         """
         num_decodes = common.num_decodes
         assert common.state_indices_tensor_d is not None
@@ -220,7 +221,7 @@ class Mamba2AttentionMetadataBuilder(
             return exact_replay_decode_positions(seq_lens, self.chunk_size)
         pos = self.exact_replay_pos_d[:num_rows]
         exact_replay_decode_positions(seq_lens, self.chunk_size, out=pos[:num_decodes])
-        pos[num_decodes:].zero_()
+        pos[num_decodes:].fill_(-1)
         return pos
 
     def update_block_table(

@@ -14,9 +14,10 @@ The buffers are addressed as ``buf[slot, pos]`` through explicit strides, so
 views into the paged Mamba KV cache work directly. Each program handles one
 batch row: the row's token is this step's input, which the kernels store into
 the buffers themselves, and ``pos`` is its position inside the partial chunk.
-Every kernel skips rows whose slot is negative and otherwise processes each
-row independently, so a launch over a padded batch computes the same bits for
-the real rows.
+Every kernel skips rows whose slot or position is negative (CUDA graph
+padding rows have position -1) and otherwise processes each row
+independently, so a launch over a padded batch computes the same bits for the
+real rows and padding rows touch no buffer or state; their output rows are 0.
 """
 
 import torch
@@ -64,7 +65,7 @@ def _workspace_chunk_cumsum_fwd_kernel(
 
     slot = tl.load(slot_indices_ptr + row)
     pos = tl.load(positions_ptr + row)
-    valid_row = slot >= 0
+    valid_row = (slot >= 0) & (pos >= 0)
     chunk_size_limit = pos + 1
 
     offs_h = pid_h * BLOCK_SIZE_H + tl.arange(0, BLOCK_SIZE_H)
@@ -414,9 +415,11 @@ def _chunk_scan_workspace_range_fwd_kernel(
     slot = tl.load(slot_indices_ptr + row)
     pos = tl.load(positions_ptr + row)
     valid_emit = (slot >= 0) & (pos >= 0) & (pos < chunk_size)
+    # Skipped rows write a zero output row, through tile row 0.
+    out_m = tl.where(valid_emit, pos, 0)
     chunk_size_limit = pos + 1
     group = pid_h // nheads_ngroups_ratio
-    pid_m = pos // BLOCK_SIZE_M
+    pid_m = out_m // BLOCK_SIZE_M
 
     offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
@@ -583,8 +586,8 @@ def _chunk_scan_workspace_range_fwd_kernel(
     out_ptrs = out_ptr + offs_m[:, None] * 0 + offs_n[None, :] * stride_out_hdim
     tl.store(
         out_ptrs,
-        acc,
-        mask=valid_emit & (offs_m[:, None] == pos) & (offs_n[None, :] < hdim),
+        tl.where(valid_emit, acc, 0.0),
+        mask=(offs_m[:, None] == out_m) & (offs_n[None, :] < hdim),
     )
 
 
@@ -803,8 +806,9 @@ def _fold_chunk_fwd(x, b, dt, dA_cumsum, states, slot_indices, chunk_offsets):
     """Fold every completed chunk into its slot's boundary state, in place.
 
     A row completes a chunk when its offset is the chunk's last position; all
-    other rows and rows with a negative slot return immediately. ``dt`` and
-    ``dA_cumsum`` are the ``(nheads, num_rows, chunk_size)`` outputs of
+    other rows (padding rows have offset -1) and rows with a negative slot
+    return immediately. ``dt`` and ``dA_cumsum`` are the
+    ``(nheads, num_rows, chunk_size)`` outputs of
     :func:`_workspace_chunk_cumsum_fwd` for the same rows.
     """
     num_slots, chunk_size, nheads, headdim = x.shape

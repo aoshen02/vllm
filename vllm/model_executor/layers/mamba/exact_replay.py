@@ -338,8 +338,9 @@ def exact_replay_emit(
     prefill kernels, so the bits match a single-shot prefill exactly.
 
     Every kernel runs over all rows with shapes that depend only on the batch
-    size and skips rows with a negative slot, so the step can be captured in
-    a CUDA graph and padded rows are harmless.
+    size and skips rows with a negative slot or position, so the step can be
+    captured in a CUDA graph and padding rows (position -1) touch no buffer
+    or state; their output rows are zero.
 
     Args:
         x: ``(num_rows, nheads, head_dim)`` inputs of this step's tokens.
@@ -353,7 +354,8 @@ def exact_replay_emit(
         ssm_state: the fp32 SSM cache.
         slots: ``(num_rows,)`` int32 state slot of each row.
         pos: ``(num_rows,)`` int32 position of each row's token inside its
-            partial chunk, i.e. its computed token count modulo ``chunk_size``.
+            partial chunk, i.e. its computed token count modulo ``chunk_size``;
+            -1 for padding rows.
         chunk_size: the model's SSD chunk size.
         buffers: the partial-chunk input buffers.
 
