@@ -700,6 +700,13 @@ class NemotronHForCausalLMConfig(VerifyAndUpdateConfig):
                     "TP=1: the grouped gated norm and the shared-expert kernel "
                     "match the training replay only at TP=1"
                 )
+            kv_cache_dtype = vllm_config.cache_config.cache_dtype
+            if kv_cache_dtype not in ("auto", "bfloat16", "fp8", "fp8_e4m3"):
+                raise ValueError(
+                    "VLLM_BATCH_INVARIANT=1 with Nemotron-H runs attention on "
+                    "the fixed split-KV FA4 backend, which needs a BF16 or FP8 "
+                    f"E4M3 KV cache; got --kv-cache-dtype {kv_cache_dtype}"
+                )
             cls.use_cuda_fp8_quant(vllm_config)
 
     @staticmethod

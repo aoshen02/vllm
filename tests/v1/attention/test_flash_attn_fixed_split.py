@@ -18,7 +18,9 @@ NUM_HEADS, NUM_KV_HEADS, HEAD = 32, 2, 128
     [
         (128, "fp8_e4m3", None, 16384, None),
         (64, "fp8_e4m3", None, 16384, "head_size"),
-        (128, "auto", None, 16384, "FP8 E4M3"),
+        (128, "auto", None, 16384, None),
+        (128, "bfloat16", None, 16384, None),
+        (128, "fp8_e5m2", None, 16384, "FP8 E4M3 or BF16"),
         (128, "fp8_e4m3", 4096, 16384, "sliding-window"),
         (128, "fp8_e4m3", None, 16385, "max_model_len"),
     ],
@@ -44,7 +46,7 @@ def test_fixed_schedule_rejects_what_it_cannot_serve(
         assert reason in actual
 
 
-def _make_impl(monkeypatch):
+def _make_impl(monkeypatch, kv_cache_dtype):
     from vllm.v1.attention.backends import flash_attn_fixed_split
 
     config = SimpleNamespace(
@@ -55,7 +57,7 @@ def _make_impl(monkeypatch):
         flash_attn_fixed_split, "get_current_vllm_config", lambda: config
     )
     return flash_attn_fixed_split.FlashAttnFixedSplitImpl(
-        NUM_HEADS, HEAD, HEAD**-0.5, NUM_KV_HEADS, None, None, "fp8_e4m3"
+        NUM_HEADS, HEAD, HEAD**-0.5, NUM_KV_HEADS, None, None, kv_cache_dtype
     )
 
 
@@ -89,26 +91,28 @@ def _run(impl, layer, queries, cache, pages, seq_lens):
     not current_platform.is_device_capability_family(100),
     reason="Fixed-schedule FA4 attention requires SM10x",
 )
+@pytest.mark.parametrize(
+    "kv_cache_dtype,dtype",
+    [("fp8_e4m3", torch.float8_e4m3fn), ("bfloat16", torch.bfloat16)],
+)
 @torch.inference_mode()
-def test_fixed_schedule_rows_ignore_batch_and_phase(monkeypatch):
+def test_fixed_schedule_rows_ignore_batch_and_phase(monkeypatch, kv_cache_dtype, dtype):
     """A sequence's output rows are bitwise the same alone, next to other
     sequences, and as a one-token decode after its prefill."""
-    impl = _make_impl(monkeypatch)
+    impl = _make_impl(monkeypatch, kv_cache_dtype)
     gen = torch.Generator(device="cuda").manual_seed(0)
     lengths = [2000, 700, 3100]
     first_page = [0, 2, 3]
-    cache = torch.zeros(
-        7, BLOCK, NUM_KV_HEADS, 2 * HEAD, dtype=torch.float8_e4m3fn, device="cuda"
-    )
+    cache = torch.zeros(7, BLOCK, NUM_KV_HEADS, 2 * HEAD, dtype=dtype, device="cuda")
     queries, pages = [], []
     for length, start in zip(lengths, first_page):
         kv = torch.randn(length, NUM_KV_HEADS, 2 * HEAD, generator=gen, device="cuda")
         row_pages = list(range(start, start + -(-length // BLOCK)))
         for j, page in enumerate(row_pages):
             chunk = kv[j * BLOCK : (j + 1) * BLOCK]
-            cache[page, : chunk.shape[0]] = chunk.to(torch.float8_e4m3fn)
+            cache[page, : chunk.shape[0]] = chunk.to(dtype)
         q = torch.randn(length, NUM_HEADS, HEAD, generator=gen, device="cuda")
-        queries.append(q.to(torch.float8_e4m3fn))
+        queries.append(q.to(dtype))
         pages.append(row_pages)
     layer = SimpleNamespace(
         **{

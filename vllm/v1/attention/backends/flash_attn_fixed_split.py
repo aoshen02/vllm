@@ -42,8 +42,8 @@ def fixed_split_unsupported_reason(
         return "requires a vllm-flash-attn build with fixed split-KV scheduling"
     if head_size != 128:
         return f"requires head_size 128, got {head_size}"
-    if kv_cache_dtype not in ("fp8", "fp8_e4m3"):
-        return f"requires an FP8 E4M3 KV cache, got {kv_cache_dtype!r}"
+    if kv_cache_dtype not in ("fp8", "fp8_e4m3", "auto", "bfloat16"):
+        return f"requires an FP8 E4M3 or BF16 KV cache, got {kv_cache_dtype!r}"
     if sliding_window is not None:
         return "does not support sliding-window attention"
     if max_model_len > MAX_SEQ_LEN:
@@ -129,14 +129,23 @@ class FlashAttnFixedSplitImpl(FlashAttentionImpl):
             raise ValueError("Unsupported fixed split-KV FA4 metadata")
 
         key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_size, dim=-1)
-        key_cache = canonicalize_singleton_dim_strides(key_cache).view(
-            current_platform.fp8_dtype()
-        )
-        value_cache = canonicalize_singleton_dim_strides(value_cache).view(
-            current_platform.fp8_dtype()
-        )
+        key_cache = canonicalize_singleton_dim_strides(key_cache)
+        value_cache = canonicalize_singleton_dim_strides(value_cache)
+        fp8 = self.kv_cache_dtype.startswith("fp8")
+        if fp8:
+            key_cache = key_cache.view(current_platform.fp8_dtype())
+            value_cache = value_cache.view(current_platform.fp8_dtype())
         num_tokens = attn_metadata.num_actual_tokens
         scale_shape = (attn_metadata.query_start_loc.shape[0] - 1, self.num_kv_heads)
+        descale = (
+            dict(
+                q_descale=layer._q_scale.expand(scale_shape),
+                k_descale=layer._k_scale.expand(scale_shape),
+                v_descale=layer._v_scale.expand(scale_shape),
+            )
+            if fp8
+            else {}
+        )
         _flash_attn_fwd(
             query[:num_tokens],
             key_cache,
@@ -148,9 +157,7 @@ class FlashAttnFixedSplitImpl(FlashAttentionImpl):
             page_table=attn_metadata.block_table,
             softmax_scale=self.scale,
             causal=True,
-            q_descale=layer._q_scale.expand(scale_shape),
-            k_descale=layer._k_scale.expand(scale_shape),
-            v_descale=layer._v_scale.expand(scale_shape),
+            **descale,
             tile_mn=(128, 128),
             pack_gqa=True,
             num_splits=NUM_SPLITS,

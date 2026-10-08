@@ -115,6 +115,34 @@ def test_nemotron_h_batch_invariant_requires_tp1(monkeypatch, batch_invariant):
         config.NemotronHForCausalLMConfig.verify_and_update_config(vllm_config)
 
 
+@pytest.mark.parametrize(
+    "kv_cache_dtype,error",
+    [("auto", False), ("bfloat16", False), ("fp8", False), ("fp8_e5m2", True)],
+)
+def test_nemotron_h_batch_invariant_kv_cache_dtype(monkeypatch, kv_cache_dtype, error):
+    """The fixed split-KV FA4 backend serves BF16 and FP8 E4M3 KV caches; any
+    other dtype is rejected at config time instead of when building layers."""
+    from vllm.model_executor.models import config
+
+    monkeypatch.setattr(config.envs, "VLLM_BATCH_INVARIANT", True)
+    vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(
+            mamba_ssm_cache_dtype="float32", cache_dtype=kv_cache_dtype
+        ),
+        model_config=SimpleNamespace(hf_config=SimpleNamespace()),
+        parallel_config=SimpleNamespace(tensor_parallel_size=1),
+        compilation_config=SimpleNamespace(
+            custom_ops=[],
+            pass_config=SimpleNamespace(fuse_norm_quant=None, fuse_act_quant=None),
+        ),
+    )
+    if error:
+        with pytest.raises(ValueError, match="KV cache"):
+            config.NemotronHForCausalLMConfig.verify_and_update_config(vllm_config)
+    else:
+        config.NemotronHForCausalLMConfig.verify_and_update_config(vllm_config)
+
+
 @pytest.mark.parametrize("batch_invariant", [False, True])
 def test_gate_skips_small_m_cute_gemm_under_bi(monkeypatch, batch_invariant):
     """The small-M CuTe router GEMM reduces differently from the large-M path,
