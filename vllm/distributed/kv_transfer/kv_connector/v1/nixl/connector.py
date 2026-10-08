@@ -363,6 +363,18 @@ class NixlPullConnector(NixlBaseConnector):
                 vllm_config, self.engine_id, kv_cache_config
             )
 
+    def get_idle_timeout(self) -> float | None:
+        interval = float(
+            self.kv_transfer_config.get_from_extra_config(
+                "engine_heartbeat_interval", 5.0
+            )
+        )
+        return interval if interval > 0 else None
+
+    def on_idle(self) -> None:
+        assert self.connector_worker is not None
+        self.connector_worker._release_unreachable_remote_engines()
+
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
         assert self.connector_worker is not None
         assert isinstance(self.connector_worker, NixlPullConnectorWorker)

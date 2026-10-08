@@ -1116,6 +1116,7 @@ class EngineCoreProc(EngineCore):
         engine_index: int = 0,
     ):
         self.input_queue = queue.Queue[tuple[EngineCoreRequestType, Any]]()
+        self._kv_idle_deadline = 0.0
         self.output_queue = queue.Queue[tuple[int, EngineCoreOutputs] | bytes]()
         executor_fail_callback = lambda: self.input_queue.put_nowait(
             (EngineCoreRequestType.EXECUTOR_FAILED, b"")
@@ -1507,10 +1508,24 @@ class EngineCoreProc(EngineCore):
             )
             self.output_queue.put_nowait((-1, EngineCoreOutputs(scheduler_stats=stats)))
 
+    def _progress_idle_kv_connector(self, interval: float | None) -> None:
+        if (
+            interval is not None
+            and not self.batch_queue
+            and time.monotonic() >= self._kv_idle_deadline
+        ):
+            self.model_executor.collective_rpc("on_kv_connector_idle")
+            self._kv_idle_deadline = time.monotonic() + interval
+
     def _process_input_queue(self):
         """Exits when an engine step needs to be performed."""
+        connector = self.scheduler.get_kv_connector()
+        idle_timeout = connector.get_idle_timeout() if connector is not None else None
+        if self.scheduler.pause_state == PauseState.PAUSED_ALL:
+            self._progress_idle_kv_connector(idle_timeout)
         waited = False
         while not self.has_work() and self.is_running():
+            self._progress_idle_kv_connector(idle_timeout)
             # Notify callbacks waiting for engine to become idle.
             self._notify_idle_state_callbacks()
             if self.input_queue.empty():
@@ -1522,9 +1537,16 @@ class EngineCoreProc(EngineCore):
                     waited = True
             block = self.process_input_queue_block
             try:
-                req = self.input_queue.get(block=block)
+                timeout = (
+                    max(0.0, self._kv_idle_deadline - time.monotonic())
+                    if block and idle_timeout is not None
+                    else None
+                )
+                req = self.input_queue.get(block=block, timeout=timeout)
                 self._handle_client_request(*req)
             except queue.Empty:
+                if block and idle_timeout is not None:
+                    continue
                 break
             if not block:
                 break

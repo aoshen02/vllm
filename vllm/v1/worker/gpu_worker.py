@@ -773,6 +773,10 @@ class Worker(WorkerBase):
             getattr(self.parallel_config, "_api_process_count", 1),
         )
 
+    def on_kv_connector_idle(self) -> None:
+        if has_kv_transfer_group():
+            get_kv_transfer_group().on_idle()
+
     def get_kv_connector_handshake_metadata(
         self,
     ) -> dict[tuple[int, int], KVConnectorHandshakeMetadata] | None:
