@@ -13,6 +13,7 @@ completes. Every emitted row and every boundary state must equal the reference.
 import pytest
 import torch
 
+import vllm.envs as envs
 from tests.kernels.mamba.utils import carve_paged_states, single_shot_scan
 from vllm.model_executor.layers.mamba.ops import (
     ssd_bmm,
@@ -38,9 +39,10 @@ pytestmark = pytest.mark.skipif(
 
 @pytest.fixture(autouse=True, scope="module")
 def _reference_on_batch_invariant_tiles():
-    """The emit kernels always run the batch-invariant tiles, while the reference
-    scan autotunes unless VLLM_BATCH_INVARIANT is set at import. The cumsum head
-    tile changes the bits, so pin the reference to the same tiles."""
+    """The emit kernels always run the batch-invariant tiles and state update,
+    while the reference scan autotunes unless VLLM_BATCH_INVARIANT is set at
+    import and only uses the fused state update under it. Both change the bits,
+    so run the reference the batch-invariant way."""
     pinned = [
         (ssd_bmm._bmm_chunk_fwd_kernel, ssd_bmm._BATCH_INVARIANT_CONFIG),
         (
@@ -61,7 +63,9 @@ def _reference_on_batch_invariant_tiles():
     for kernel, config in pinned:
         kernel.configs = [config]
         kernel.cache.clear()
-    yield
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(envs, "VLLM_BATCH_INVARIANT", True)
+        yield
     for kernel, configs in saved:
         kernel.configs = configs
         kernel.cache.clear()

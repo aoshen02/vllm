@@ -8,6 +8,7 @@
 
 import torch
 
+import vllm.envs as envs
 from vllm.model_executor.layers.mamba.ops.triton_helpers import (
     fast_exp,
     pin_autotune_config,
@@ -54,6 +55,7 @@ def _state_passing_fwd_kernel(
     stride_initstates_dim: tl.constexpr,
     # Meta-parameters
     HAS_INITSTATES: tl.constexpr,
+    BATCH_INVARIANT: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     pid_m = tl.program_id(axis=0)
@@ -96,9 +98,13 @@ def _state_passing_fwd_kernel(
     for _ in range(nchunks_this_seq):
         new_states = tl.load(states_ptrs, mask=offs_m < dim, other=0.0).to(tl.float32)
         dA_cs = tl.load(dA_cs_ptr).to(tl.float32)
-        # Explicit fused multiply-add: the batch-invariant decode path folds
-        # completed chunks with the same update and must round identically.
-        states = tl.fma(fast_exp(dA_cs), states, new_states)
+        if BATCH_INVARIANT:
+            # Explicit fused multiply-add: the batch-invariant decode path
+            # folds completed chunks with the same update and must round
+            # identically.
+            states = tl.fma(fast_exp(dA_cs), states, new_states)
+        else:
+            states = fast_exp(dA_cs) * states + new_states
         tl.store(out_ptrs, states, mask=offs_m < dim)
 
         states_ptrs += stride_states_chunk
@@ -152,5 +158,6 @@ def _state_passing_fwd(
             stride_initstates_head=initial_states_strides[1],
             stride_initstates_dim=initial_states_strides[2],
             HAS_INITSTATES=initial_states is not None,
+            BATCH_INVARIANT=envs.VLLM_BATCH_INVARIANT,
         )
     return out
