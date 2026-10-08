@@ -226,13 +226,13 @@ pub async fn decoded_text_event_stream(
                 logprobs.positions.truncate(num_tokens);
             }
             if let Some(mask) = &mut new_sampling_mask {
-                mask.rows.truncate(num_tokens);
+                mask.truncate(num_tokens);
             }
         }
 
         output_token_count += new_token_ids.len();
-        if let Some(mut mask) = new_sampling_mask {
-            sampling_mask.get_or_insert_default().rows.append(&mut mask.rows);
+        if let Some(mask) = new_sampling_mask {
+            sampling_mask.get_or_insert_default().append(mask);
         }
 
         let decoded_logprobs = new_logprobs
@@ -413,11 +413,13 @@ mod tests {
         let mut first = GenerateOutput::for_test(Some(prompt), vec![b'a' as u32], None);
         first.sampling_mask = Some(SamplingMask {
             rows: vec![vec![1, b'a' as u32]],
+            logprobs: Some(vec![vec![-0.1, -0.2]]),
         });
         let mut terminal =
             GenerateOutput::for_test(None, vec![b'b' as u32], Some(FinishReason::Length));
         terminal.sampling_mask = Some(SamplingMask {
             rows: vec![vec![2, b'b' as u32]],
+            logprobs: Some(vec![vec![-0.3, -0.4]]),
         });
         let tokenizer: DynTokenizer = Arc::new(TestTokenizer::new());
 
@@ -436,6 +438,7 @@ mod tests {
             collected.sampling_mask,
             Some(SamplingMask {
                 rows: vec![vec![1, b'a' as u32], vec![2, b'b' as u32]],
+                logprobs: Some(vec![vec![-0.1, -0.2], vec![-0.3, -0.4]]),
             })
         );
     }
@@ -450,6 +453,7 @@ mod tests {
         );
         terminal.sampling_mask = Some(SamplingMask {
             rows: vec![vec![1, b'a' as u32]],
+            ..Default::default()
         });
         let tokenizer: DynTokenizer = Arc::new(TestTokenizer::new());
 
@@ -690,6 +694,7 @@ mod tests {
         });
         raw.sampling_mask = Some(SamplingMask {
             rows: token_ids.iter().map(|&token_id| vec![token_id, token_id + 100]).collect(),
+            ..Default::default()
         });
         let tokenizer: DynTokenizer = Arc::new(TestTokenizer::new());
 
@@ -717,6 +722,7 @@ mod tests {
                     vec![b'c' as u32, b'c' as u32 + 100],
                     vec![b'x' as u32, b'x' as u32 + 100],
                 ],
+                ..Default::default()
             })
         );
         assert_eq!(output.usage.output_token_count, 4);

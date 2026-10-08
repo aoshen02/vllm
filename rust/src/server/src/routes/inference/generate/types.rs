@@ -65,6 +65,7 @@ pub(super) struct GenerateResponseChoice {
     pub finish_reason: Option<String>,
     pub token_ids: Vec<u32>,
     pub sampling_mask: Option<Vec<Vec<u32>>>,
+    pub sampling_mask_logprobs: Option<Vec<Vec<f32>>>,
 }
 
 /// Mirrors the Python vLLM `GenerateResponseStreamChoice` class.
@@ -76,6 +77,7 @@ pub(super) struct GenerateResponseStreamChoice {
     pub finish_reason: Option<String>,
     pub token_ids: Vec<u32>,
     pub sampling_mask: Option<Vec<Vec<u32>>>,
+    pub sampling_mask_logprobs: Option<Vec<Vec<f32>>>,
 }
 
 /// Mirrors the Python vLLM `GenerateStreamResponse` class.

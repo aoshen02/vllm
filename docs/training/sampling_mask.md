@@ -128,10 +128,10 @@ Each position then carries the sampled token's logprob and the top-128
 `(token_id, logprob)` pairs, normalized over the post-truncation support:
 
 ```json
-{"token": "token_id:11", "logprob": -0.757,
- "top_logprobs": [{"token": "token_id:11", "logprob": -0.757},
-                  {"token": "token_id:13", "logprob": -0.632},
-                  {"token": "token_id:0",  "logprob": -9999.0}, ...]}
+{"token_id": 11, "logprob": -0.757,
+ "top_logprobs": [{"token_id": 11, "logprob": -0.757},
+                  {"token_id": 13, "logprob": -0.632},
+                  {"token_id": 0,  "logprob": -9999.0}, ...]}
 ```
 
 - `--max-logprobs` defaults to 20; raise it to the requested `k`.
@@ -139,8 +139,23 @@ Each position then carries the sampled token's logprob and the top-128
   drop them. The finite entries are the sampling mask when it has at most `k`
   tokens.
 - The sampled token is always the first entry and may repeat inside the top-k.
-- `/inference/v1/generate` encodes IDs as `token_id:<id>`; the OpenAI
-  endpoints need `return_tokens_as_token_ids`.
+- `/inference/v1/generate` defaults to token mode with integer `token_id`
+  fields. Text mode uses decoded strings; `return_tokens_as_token_ids` selects
+  `token_id:<id>` placeholders on text/OpenAI surfaces.
+
+## Optional sampling-support logprobs
+
+With `--return-sampling-mask --return-sampling-mask-logprobs`, token-generation
+choices also expose `sampling_mask_logprobs`, aligned element-for-element with
+`sampling_mask`. Scores are normalized over each committed token's actual
+post-processing support. This includes accepted speculative positions and
+streaming responses. Ordinary mask-only behavior remains unchanged.
+
+Pure top-p (`top_k=-1`) and support beyond the compact ID buffer are supported
+without truncation. Enabling scores allocates vocabulary-width ID/score buffers,
+so memory and transport costs grow with vocabulary size and active output rows.
+This optional exact-support feature is not required for ordinary top-k score
+centering.
 
 ## Limitations
 
