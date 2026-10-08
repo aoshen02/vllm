@@ -16,13 +16,13 @@ NUM_HEADS, NUM_KV_HEADS, HEAD = 32, 2, 128
 @pytest.mark.parametrize(
     "head_size,kv_cache_dtype,sliding_window,max_model_len,reason",
     [
-        (128, "fp8_e4m3", None, 16384, None),
-        (64, "fp8_e4m3", None, 16384, "head_size"),
-        (128, "auto", None, 16384, None),
-        (128, "bfloat16", None, 16384, None),
-        (128, "fp8_e5m2", None, 16384, "FP8 E4M3 or BF16"),
-        (128, "fp8_e4m3", 4096, 16384, "sliding-window"),
-        (128, "fp8_e4m3", None, 16385, "max_model_len"),
+        (128, "fp8_e4m3", None, 65536, None),
+        (64, "fp8_e4m3", None, 65536, "head_size"),
+        (128, "auto", None, 65536, None),
+        (128, "bfloat16", None, 65536, None),
+        (128, "fp8_e5m2", None, 65536, "FP8 E4M3 or BF16"),
+        (128, "fp8_e4m3", 4096, 65536, "sliding-window"),
+        (128, "fp8_e4m3", None, 65537, "max_model_len"),
     ],
 )
 def test_fixed_schedule_rejects_what_it_cannot_serve(
