@@ -705,14 +705,30 @@ class NemotronHForCausalLMConfig(VerifyAndUpdateConfig):
     @staticmethod
     def use_cuda_fp8_quant(vllm_config: "VllmConfig") -> None:
         """Quantize FP8 activations with the standalone CUDA kernel; the
-        norm/activation + quant fusions round differently."""
+        norm/activation + quant fusions and the native op round differently.
+
+        Raises:
+            ValueError: if a quant fusion or ``-quant_fp8`` is requested.
+
+        """
         compilation_config = vllm_config.compilation_config
         pass_config = compilation_config.pass_config
-        if pass_config.fuse_norm_quant is None:
-            pass_config.fuse_norm_quant = False
-        if pass_config.fuse_act_quant is None:
-            pass_config.fuse_act_quant = False
-        if "-quant_fp8" not in compilation_config.custom_ops:
+        conflicts = [
+            f"{name}=True"
+            for name in ("fuse_norm_quant", "fuse_act_quant")
+            if getattr(pass_config, name)
+        ]
+        if "-quant_fp8" in compilation_config.custom_ops:
+            conflicts.append("custom_ops -quant_fp8")
+        if conflicts:
+            raise ValueError(
+                "VLLM_BATCH_INVARIANT=1 with Nemotron-H quantizes FP8 "
+                "activations with the standalone CUDA kernel the training "
+                f"replay uses; drop {', '.join(conflicts)}"
+            )
+        pass_config.fuse_norm_quant = False
+        pass_config.fuse_act_quant = False
+        if "+quant_fp8" not in compilation_config.custom_ops:
             compilation_config.custom_ops.append("+quant_fp8")
 
 

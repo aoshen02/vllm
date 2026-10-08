@@ -64,19 +64,20 @@ def test_relu2_fp8_fusion_uses_registry():
 
 
 @pytest.mark.parametrize(
-    "custom_ops,fuse_norm_quant,expected_ops,expected_fuse",
+    "custom_ops,fuse_norm_quant,expected_ops,error",
     [
-        (["none"], None, ["none", "+quant_fp8"], False),
-        (["none"], True, ["none", "+quant_fp8"], True),
-        (["-quant_fp8"], None, ["-quant_fp8"], False),
+        (["none"], None, ["none", "+quant_fp8"], None),
+        (["none", "+quant_fp8"], False, ["none", "+quant_fp8"], None),
+        (["none"], True, None, "fuse_norm_quant=True"),
+        (["-quant_fp8"], None, None, "-quant_fp8"),
     ],
 )
 def test_nemotron_h_batch_invariant_uses_cuda_fp8_quant(
-    custom_ops, fuse_norm_quant, expected_ops, expected_fuse
+    custom_ops, fuse_norm_quant, expected_ops, error
 ):
     """Batch-invariant Nemotron-H quantizes FP8 activations with the standalone
-    CUDA kernel that training replays, without enabling quant fusions by
-    default, and leaves an explicit user choice of op or fusion alone."""
+    CUDA kernel that training replays and rejects a quant fusion or the native
+    op instead of silently rounding differently."""
     from vllm.model_executor.models.config import NemotronHForCausalLMConfig
 
     pass_config = SimpleNamespace(fuse_norm_quant=fuse_norm_quant, fuse_act_quant=None)
@@ -85,9 +86,13 @@ def test_nemotron_h_batch_invariant_uses_cuda_fp8_quant(
             custom_ops=list(custom_ops), pass_config=pass_config
         )
     )
+    if error is not None:
+        with pytest.raises(ValueError, match=error):
+            NemotronHForCausalLMConfig.use_cuda_fp8_quant(vllm_config)
+        return
     NemotronHForCausalLMConfig.use_cuda_fp8_quant(vllm_config)
     assert vllm_config.compilation_config.custom_ops == expected_ops
-    assert pass_config.fuse_norm_quant == expected_fuse
+    assert pass_config.fuse_norm_quant is False
     assert pass_config.fuse_act_quant is False
 
 
