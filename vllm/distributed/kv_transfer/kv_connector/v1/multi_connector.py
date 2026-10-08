@@ -734,6 +734,18 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
             prom_metrics,
         )
 
+    def get_idle_timeout(self) -> float | None:
+        intervals = [
+            interval
+            for connector in self._connectors
+            if (interval := connector.get_idle_timeout()) is not None
+        ]
+        return min(intervals, default=None)
+
+    def on_idle(self) -> None:
+        for connector in self._connectors:
+            connector.on_idle()
+
     def reset_cache(self) -> bool:
         results = [c.reset_cache() is not False for c in self._connectors]
         return all(results)

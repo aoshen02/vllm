@@ -771,6 +771,12 @@ class KVConnectorBase_V1(ABC):
         """
         return None
 
+    def get_idle_timeout(self) -> float | None:
+        return None
+
+    def on_idle(self) -> None:
+        return
+
     def reset_cache(self) -> bool | None:
         """Reset the connector's internal cache.
 
