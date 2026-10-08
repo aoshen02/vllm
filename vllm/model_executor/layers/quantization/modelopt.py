@@ -159,12 +159,11 @@ class ModelOptKVCacheMethod(BaseKVCacheMethod):
         super().__init__(quant_config)
 
 
-# Weight-only (W4A16, or FP8 served as W8A16) layers ignore an input_scale: a
-# layerwise reload neither waits for it (weight_loader_numel = 0) nor rejects a
-# late copy. The
+# W4A16 checkpoints carry no (or a deprecated) input_scale: a layerwise reload
+# neither waits for it (weight_loader_numel = 0) nor rejects a late copy. The
 # suffixes apply to the whole config, so in a mixed-precision checkpoint an
 # input_scale matching no parameter (e.g. a misnamed FP8 one) is dropped too.
-_A16_IGNORE_UNEXPECTED_SUFFIXES = (
+_W4A16_IGNORE_UNEXPECTED_SUFFIXES = (
     *QuantizationConfig._ignore_unexpected_suffixes,
     ".input_scale",
 )
@@ -764,7 +763,7 @@ class ModelOptNvFp4Config(ModelOptQuantConfigBase):
                 f"Supported: {' / '.join(supported)}."
             )
         if quant_method == "W4A16_NVFP4":
-            self._ignore_unexpected_suffixes = _A16_IGNORE_UNEXPECTED_SUFFIXES
+            self._ignore_unexpected_suffixes = _W4A16_IGNORE_UNEXPECTED_SUFFIXES
 
     def get_name(self) -> QuantizationMethods:
         return "modelopt_fp4"
@@ -1554,7 +1553,7 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
             info.get("quant_algo", "").upper() == "W4A16_NVFP4"
             for info in quantized_layers.values()
         ):
-            self._ignore_unexpected_suffixes = _A16_IGNORE_UNEXPECTED_SUFFIXES
+            self._ignore_unexpected_suffixes = _W4A16_IGNORE_UNEXPECTED_SUFFIXES
 
         block_sizes = {
             int(layer_info.get("group_size", 128))
@@ -2616,15 +2615,17 @@ class ModelOptLinearMethod(LinearMethodBase):
 class ModelOptFp8W8A16LinearMethod(LinearMethodBase):
     """Per-tensor static FP8 (``FP8``) linear served as W8A16.
 
-    Loads the checkpoint's FP8 ``weight`` and per-tensor ``weight_scale`` like
-    the W8A8 method and ignores ``input_scale``: activations stay unquantized.
-    After loading, `dequantize` turns the weight into the activation dtype once
-    and `UnquantizedLinearMethod` runs it, so under batch invariance the layer
-    computes ``linear_batch_invariant(x, W, bias)``, i.e. ``x @ W.T + bias``.
+    Loads the checkpoint's FP8 ``weight``, per-tensor ``weight_scale`` and
+    ``input_scale`` like the W8A8 method, then drops ``input_scale``:
+    activations stay unquantized. After loading, `dequantize` turns the weight
+    into the activation dtype once and `UnquantizedLinearMethod` runs it, so
+    under batch invariance the layer computes
+    ``linear_batch_invariant(x, W, bias)``, i.e. ``x @ W.T + bias``.
 
-    A layerwise reload restores the FP8 parameters, so the FP8 ``weight`` and
-    ``weight_scale`` are sent as in the checkpoint and dequantized again once
-    both have arrived.
+    A layerwise reload restores the FP8 parameters, so a weight update sends
+    the same tensors as for W8A8. The layer is dequantized again once all three
+    have arrived; until then none of its names is missing, which a linear's own
+    ``load_weights`` would not tolerate.
     """
 
     def __init__(self) -> None:
@@ -2676,12 +2677,9 @@ class ModelOptFp8W8A16LinearMethod(LinearMethodBase):
         SCHEME_FOR[kFp8StaticTensorSym].create_weights(
             layer, WEIGHT, CkptCtx(), shapes, weight_loader
         )
-        input_scale = PerTensorScaleParameter(
-            data=torch.full((shapes.num_partitions,), torch.nan),
-            weight_loader=weight_loader,
+        SCHEME_FOR[kFp8StaticTensorSym].create_weights(
+            layer, ACT, CkptCtx(), shapes, weight_loader
         )
-        input_scale.weight_loader_numel = 0
-        layer.register_parameter("input_scale", input_scale)
 
     def process_weights_after_loading(self, layer) -> None:
         weight = self.dequantize(
@@ -2699,7 +2697,7 @@ def use_fp8_w8a16(quant_config: QuantizationConfig | None) -> None:
     """Serve a ModelOpt config's per-tensor FP8 linears as W8A16.
 
     Call before the model is built. A no-op for a config without ModelOpt FP8
-    linears. Their input scales are ignored, also when a reload sends them.
+    linears.
     """
     if isinstance(quant_config, ModelOptMixedPrecisionConfig):
         fp8_config = quant_config.fp8_config
@@ -2708,7 +2706,6 @@ def use_fp8_w8a16(quant_config: QuantizationConfig | None) -> None:
     else:
         return
     fp8_config.w8a16 = True
-    quant_config._ignore_unexpected_suffixes = _A16_IGNORE_UNEXPECTED_SUFFIXES
 
 
 def resolve(algo: str, subcfg, prefix: str):

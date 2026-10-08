@@ -1016,20 +1016,17 @@ def test_modelopt_w4a16_reload_ignores_legacy_input_scale(dist_init, late):
 
 
 def test_modelopt_fp8_w8a16_dispatch():
-    """With W8A16 on, per-tensor FP8 linears get the W8A16 method and ignore a
-    late input_scale; FP8 experts are refused rather than left quantizing
-    activations."""
+    """With W8A16 on, per-tensor FP8 linears get the W8A16 method; FP8 experts
+    are refused rather than left quantizing activations."""
     from vllm.model_executor.layers.linear import LinearBase
 
     config = _mixed_precision_config(
         {"proj": {"quant_algo": "FP8"}, "moe.experts.0.up_proj": {"quant_algo": "FP8"}}
     )
-    assert ".input_scale" not in config._ignore_unexpected_suffixes
     use_fp8_w8a16(config)
 
     method = config.get_quant_method(MagicMock(spec=LinearBase), "proj")
     assert isinstance(method, ModelOptFp8W8A16LinearMethod)
-    assert ".input_scale" in config._ignore_unexpected_suffixes
     experts = MagicMock(spec=RoutedExperts)
     experts.moe_config = MagicMock()
     with pytest.raises(NotImplementedError, match="linear layers only"):
@@ -1107,13 +1104,14 @@ def test_modelopt_fp8_w8a16_runs_batch_invariant_bf16_linear(dist_init, monkeypa
         torch.testing.assert_close(out, torch.nn.functional.linear(x, expected))
 
 
-@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA only")
-def test_modelopt_fp8_w8a16_reload_dequantizes_again(dist_init):
-    """A layerwise reload sends the FP8 weight and scale as in the checkpoint;
-    once both arrive they are dequantized into the served weight's storage
-    (kept for CUDA graphs). An input_scale is neither waited for nor rejected
-    when it arrives late."""
-    from vllm.model_executor.layers.linear import ReplicatedLinear
+@pytest.mark.skipif(current_platform.is_cpu(), reason="CPU repacks unquantized weights")
+def test_modelopt_fp8_w8a16_reload_dequantizes_again():
+    """A weight update calls model.load_weights with the W8A8 tensors after the
+    layer was processed. For a fused projection (like the Mamba in_proj, whose
+    own load_weights has no fallback for unknown names) the layer waits for
+    all of them, then dequantizes into the served weight's storage, which
+    CUDA graphs keep referencing."""
+    from vllm.model_executor.layers.linear import MergedColumnParallelLinear
     from vllm.model_executor.model_loader.reload import (
         finalize_layerwise_processing,
         initialize_layerwise_reload,
@@ -1122,49 +1120,61 @@ def test_modelopt_fp8_w8a16_reload_dequantizes_again(dist_init):
     from vllm.model_executor.model_loader.reload.layerwise import LAYERWISE_INFO
     from vllm.model_executor.models.utils import AutoWeightsLoader
 
-    k, n = 128, 64
+    k = 64
 
     class Toy(torch.nn.Module):
         def __init__(self, quant_config):
             super().__init__()
             self.quant_config = quant_config
-            self.fp8 = ReplicatedLinear(
+            self.proj = MergedColumnParallelLinear(
                 k,
-                n,
+                [32, 16],
                 bias=False,
                 params_dtype=torch.bfloat16,
                 quant_config=quant_config,
-                prefix="fp8",
+                prefix="proj",
+                disable_tp=True,
             )
 
         def load_weights(self, weights):
             return AutoWeightsLoader(self).load_weights(weights)
 
-    config = _mixed_precision_config({"fp8": {"quant_algo": "FP8"}})
+    def checkpoint(scale: float) -> list[tuple[str, torch.Tensor]]:
+        return [
+            ("proj.weight", torch.randn(48, k).to(torch.float8_e4m3fn)),
+            ("proj.weight_scale", torch.tensor(scale)),
+            ("proj.input_scale", torch.tensor(0.05)),
+        ]
+
+    config = _mixed_precision_config({"proj": {"quant_algo": "FP8"}})
     use_fp8_w8a16(config)
-    input_scale = [("fp8.input_scale", torch.tensor(0.05))]
-    with set_current_vllm_config(VllmConfig()), torch.device("cuda"):
+    with (
+        patch(
+            "vllm.model_executor.parameter.get_tensor_model_parallel_rank",
+            return_value=0,
+        ),
+        patch(
+            "vllm.model_executor.parameter.get_tensor_model_parallel_world_size",
+            return_value=1,
+        ),
+        set_current_vllm_config(VllmConfig()),
+    ):
         model = Toy(config)
         record_metadata_for_reloading(model)
-        model.load_weights(
-            [
-                ("fp8.weight", torch.randn(n, k).to(torch.float8_e4m3fn)),
-                ("fp8.weight_scale", torch.tensor(0.02)),
-                *input_scale,
-            ]
-        )
-        model.fp8.quant_method.process_weights_after_loading(model.fp8)
-        served = model.fp8.weight
+        model.load_weights(checkpoint(0.02))
+        model.proj.quant_method.process_weights_after_loading(model.proj)
+        served = model.proj.weight
 
-        weight = torch.randn(n, k).to(torch.float8_e4m3fn)
-        scale = torch.tensor(0.03)
+        update = checkpoint(0.03)
         initialize_layerwise_reload(model)
-        model.load_weights([("fp8.weight", weight), ("fp8.weight_scale", scale)])
-        assert not LAYERWISE_INFO[model.fp8].can_load()
-        model.load_weights(input_scale)
+        model.load_weights(update[:2])
+        assert LAYERWISE_INFO[model.proj].can_load()
+        model.load_weights(update[2:])
+        assert not LAYERWISE_INFO[model.proj].can_load()
         finalize_layerwise_processing(model, None)
 
+    (_, weight), (_, scale), _ = update
     expected = (weight.to(torch.float32) * scale).to(torch.bfloat16)
-    assert model.fp8.weight is served
-    assert model.state_dict().keys() == {"fp8.weight"}
-    assert torch.equal(_bits(model.fp8.weight), _bits(expected))
+    assert model.proj.weight is served
+    assert model.state_dict().keys() == {"proj.weight"}
+    assert torch.equal(_bits(model.proj.weight), _bits(expected))
