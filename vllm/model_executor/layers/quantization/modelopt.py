@@ -160,7 +160,9 @@ class ModelOptKVCacheMethod(BaseKVCacheMethod):
 
 
 # W4A16 checkpoints carry no (or a deprecated) input_scale: a layerwise reload
-# neither waits for it (weight_loader_numel = 0) nor rejects a late copy.
+# neither waits for it (weight_loader_numel = 0) nor rejects a late copy. The
+# suffixes apply to the whole config, so in a mixed-precision checkpoint an
+# input_scale matching no parameter (e.g. a misnamed FP8 one) is dropped too.
 _W4A16_IGNORE_UNEXPECTED_SUFFIXES = (
     *QuantizationConfig._ignore_unexpected_suffixes,
     ".input_scale",

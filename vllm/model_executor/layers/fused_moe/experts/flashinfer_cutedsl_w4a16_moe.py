@@ -159,6 +159,9 @@ class FlashInferCuteDSLW4A16Experts(FlashInferCuteDSLExperts):
     def w2_scale(self):
         return self._registered_scale("w2_weight_scale", super().w2_scale)
 
+    # The alphas are the checkpoint's weight_scale_2 as is, without the
+    # 1/(1/s) round trip of the shared experts (NemotronSharedNvFp4LinearKernel);
+    # the trainer passes the same raw alphas to this kernel.
     @property
     def g1_alphas(self):
         return self._registered_scale("w13_weight_scale_2", super().g1_alphas)
