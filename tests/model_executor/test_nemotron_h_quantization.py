@@ -234,8 +234,8 @@ def test_gate_skips_small_m_cute_gemm_under_bi(monkeypatch, batch_invariant):
     gate.out_dtype = None
     gate.set_out_dtype(torch.float32)
     assert gate.allow_ll_bf16_gemm is not batch_invariant
-    # cuBLAS bf16 -> fp32 stays: row invariance is covered by
-    # tests/v1/determinism/test_nemotron_h_batch_invariance.py.
+    # The bf16 -> fp32 tier stays; under BI it runs the persistent matmul,
+    # see tests/v1/determinism/test_nemotron_h_batch_invariance.py.
     assert gate.allow_cublas_router_gemm
 
 

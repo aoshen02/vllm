@@ -6,6 +6,7 @@ from torch.nn.parameter import Parameter
 import vllm._custom_ops as ops
 from vllm import envs
 from vllm.model_executor.custom_op import PluggableLayer
+from vllm.model_executor.determinism.batch_invariant import mm_batch_invariant
 from vllm.model_executor.layers.linear import (
     ReplicatedLinear,
     UnquantizedLinearMethod,
@@ -233,7 +234,11 @@ class GateLinear(ReplicatedLinear):
 
         # Tier 4: cuBLAS bf16→fp32
         if self.allow_cublas_router_gemm and x.dtype == torch.bfloat16:
-            output = torch.mm(x, self.weight.T, out_dtype=torch.float32)
+            if envs.VLLM_BATCH_INVARIANT:
+                # cuBLAS may pick its kernel by M; this K order is fixed.
+                output = mm_batch_invariant(x, self.weight.T, out_dtype=torch.float32)
+            else:
+                output = torch.mm(x, self.weight.T, out_dtype=torch.float32)
             return self._return(output)
 
         # Tier 5: F.linear (ReplicatedLinear)

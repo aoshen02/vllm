@@ -66,36 +66,51 @@ def test_nemotron_h_norms_are_row_invariant():
     )
 
 
-_ROUTER_CHECK = """
-import torch
-from vllm.model_executor.determinism.batch_invariant import init_batch_invariance
-init_batch_invariance()
-torch.manual_seed(0)
-# Trainer micro-batches reach 8K-16K packed tokens.
-x = torch.randn(16384, 2688, device="cuda", dtype=torch.bfloat16)
-w = torch.randn(128, 2688, device="cuda", dtype=torch.bfloat16) / 50
-full = torch.mm(x, w.T, out_dtype=torch.float32)
-for m in (1, 2, 7, 16, 33, 64, 256, 1024, 4096, 8192):
-    part = torch.mm(x[:m].contiguous(), w.T, out_dtype=torch.float32)
-    assert torch.equal(part, full[:m]), m
-"""
+def _nemotron_gate(monkeypatch):
+    for module in ("layers.linear", "parameter"):
+        prefix = f"vllm.model_executor.{module}.get_tensor_model_parallel"
+        monkeypatch.setattr(f"{prefix}_rank", lambda: 0)
+        monkeypatch.setattr(f"{prefix}_world_size", lambda: 1)
+    from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
+
+    # As nemotron_h.py builds it: 128 experts, BF16 weight, FP32 logits.
+    gate = GateLinear(
+        HIDDEN,
+        128,
+        out_dtype=torch.float32,
+        params_dtype=torch.bfloat16,
+        force_fp32_compute=True,
+    ).cuda()
+    with torch.no_grad():
+        gate.weight.normal_(generator=torch.Generator("cuda").manual_seed(1))
+        gate.weight.div_(50)
+    return gate
 
 
 @requires_sm100
-def test_nemotron_h_router_gemm_is_row_invariant():
-    """The router keeps GateLinear's cuBLAS bf16 x bf16 -> fp32 GEMM, and the
-    trainer issues the same call. On SM10x batch-invariant mode does not
-    override cuBLAS GEMMs; init_batch_invariance() makes them row invariant
-    (cuBLASLt, no reduced-precision reductions, no split-K workspace). Without
-    those settings this GEMM does vary with M, so run in a fresh process that
-    initializes batch invariance before its first cuBLAS call, as the engine
-    and the trainer do."""
-    import os
-    import subprocess
-    import sys
+def test_nemotron_h_router_logits_are_row_invariant(monkeypatch):
+    """Under batch invariance the router GEMM is the persistent Triton matmul
+    with an FP32 output, whose K reduction order does not depend on M; cuBLAS,
+    which serves it otherwise, gives no such guarantee. The trainer must call
+    mm_batch_invariant(x, weight.T, out_dtype=torch.float32) too."""
+    from vllm.model_executor.determinism.batch_invariant import mm_batch_invariant
 
-    env = dict(os.environ, VLLM_BATCH_INVARIANT="1")
-    subprocess.run([sys.executable, "-c", _ROUTER_CHECK], env=env, check=True)
+    gate = _nemotron_gate(monkeypatch)
+    torch.manual_seed(0)
+    # Trainer micro-batches reach 8K-16K packed tokens.
+    x = torch.randn(16384, HIDDEN, device="cuda", dtype=torch.bfloat16)
+    with torch.inference_mode():
+        full, _ = gate(x)
+        assert full.dtype == torch.float32
+        expected = mm_batch_invariant(x, gate.weight.T, out_dtype=torch.float32)
+        assert torch.equal(full, expected)
+        for m in (1, 7, 128, 4096, 8192):
+            head, _ = gate(x[:m].contiguous())
+            tail, _ = gate(x[-m:].contiguous())
+            assert torch.equal(head, full[:m]), m
+            assert torch.equal(tail, full[-m:]), m
+        reference = x.float() @ gate.weight.float().T
+    torch.testing.assert_close(full, reference, rtol=1e-4, atol=1e-4)
 
 
 @requires_sm100
