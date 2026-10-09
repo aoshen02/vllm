@@ -100,6 +100,8 @@ if HAS_TRITON:
         CutlassExpertsW4A8Fp8,
     )
     from vllm.model_executor.layers.fused_moe.experts.deep_gemm_moe import (
+        DeepGemmBf16BatchedExperts,
+        DeepGemmBf16Experts,
         DeepGemmExperts,
     )
     from vllm.model_executor.layers.fused_moe.experts.fused_batched_moe import (
@@ -144,6 +146,8 @@ if HAS_TRITON:
         "TritonWNA16Experts",
         "BatchedTritonExperts",
         "DeepGemmExperts",
+        "DeepGemmBf16Experts",
+        "DeepGemmBf16BatchedExperts",
         "BatchedDeepGemmExperts",
         "TritonOrDeepGemmExperts",
         "XPUExperts",
