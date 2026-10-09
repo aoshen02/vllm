@@ -23,8 +23,8 @@ from vllm.v1.attention.backends.flash_attn import (
 from vllm.vllm_flash_attn.cute.interface import _flash_attn_fwd
 
 # Every split covers SEQLEN_K_PER_SPLIT keys, for any batch or sequence length.
-MAX_SEQ_LEN = 65536
-SEQLEN_K_PER_SPLIT = 2048
+MAX_SEQ_LEN = 262144
+SEQLEN_K_PER_SPLIT = 8192
 NUM_SPLITS = 32
 
 

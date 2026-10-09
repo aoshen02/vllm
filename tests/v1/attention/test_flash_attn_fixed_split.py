@@ -16,13 +16,13 @@ NUM_HEADS, NUM_KV_HEADS, HEAD = 32, 2, 128
 @pytest.mark.parametrize(
     "head_size,kv_cache_dtype,sliding_window,max_model_len,reason",
     [
-        (128, "fp8_e4m3", None, 65536, None),
-        (64, "fp8_e4m3", None, 65536, "head_size"),
-        (128, "auto", None, 65536, None),
-        (128, "bfloat16", None, 65536, None),
-        (128, "fp8_e5m2", None, 65536, "FP8 E4M3 or BF16"),
-        (128, "fp8_e4m3", 4096, 65536, "sliding-window"),
-        (128, "fp8_e4m3", None, 65537, "max_model_len"),
+        (128, "fp8_e4m3", None, 262144, None),
+        (64, "fp8_e4m3", None, 262144, "head_size"),
+        (128, "auto", None, 262144, None),
+        (128, "bfloat16", None, 262144, None),
+        (128, "fp8_e5m2", None, 262144, "FP8 E4M3 or BF16"),
+        (128, "fp8_e4m3", 4096, 262144, "sliding-window"),
+        (128, "fp8_e4m3", None, 262145, "max_model_len"),
     ],
 )
 def test_fixed_schedule_rejects_what_it_cannot_serve(
@@ -101,9 +101,10 @@ def test_fixed_schedule_rows_ignore_batch_and_phase(monkeypatch, kv_cache_dtype,
     sequences, and as a one-token decode after its prefill."""
     impl = _make_impl(monkeypatch, kv_cache_dtype)
     gen = torch.Generator(device="cuda").manual_seed(0)
-    lengths = [2000, 700, 3100]
-    first_page = [0, 2, 3]
-    cache = torch.zeros(7, BLOCK, NUM_KV_HEADS, 2 * HEAD, dtype=dtype, device="cuda")
+    # The first sequence spans three 8192-key splits.
+    lengths = [17000, 700, 3100]
+    first_page = [0, 17, 18]
+    cache = torch.zeros(22, BLOCK, NUM_KV_HEADS, 2 * HEAD, dtype=dtype, device="cuda")
     queries, pages = [], []
     for length, start in zip(lengths, first_page):
         kv = torch.randn(length, NUM_KV_HEADS, 2 * HEAD, generator=gen, device="cuda")
