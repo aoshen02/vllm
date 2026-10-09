@@ -30,6 +30,7 @@ from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.model_executor.layers.mamba.exact_replay import (
     ExactReplayBuffers,
     exact_replay_emit,
+    exact_replay_emit_spec,
     exact_replay_ssd,
 )
 from vllm.model_executor.layers.mamba.mamba_utils import (
@@ -1065,34 +1066,59 @@ class MambaMixer2(MambaBase, PluggableLayer):
                 assert exact_replay_pos_d is not None
                 assert preallocated_ssm_out_d is not None
                 assert replay_bufs is not None
-                # One token per row without speculative decoding: compute only
-                # that row from the buffered chunk instead of re-running the
-                # scan over the partial chunk. CUDA graph padding rows have
-                # position -1 and are skipped.
-                assert num_decode_tokens == num_decodes
+                # Compute only each token's row from the buffered chunk instead
+                # of re-running the scan over the partial chunk. CUDA graph
+                # padding rows have position -1 and are skipped. With
+                # speculative decoding the state still lives in the first
+                # block column: accepted tokens never leave a chunk boundary
+                # uncommitted (see exact_replay_spec_decode_layout).
                 n_groups = self.n_groups // self.tp_size
                 slots_d = state_indices_tensor_d
                 if slots_d.dim() == 2:
                     slots_d = slots_d[:, 0]
-                exact_replay_emit(
-                    hidden_states_d.view(
-                        -1, self.num_heads // self.tp_size, self.head_dim
-                    ),
-                    dt_d,
-                    B_d.view(-1, n_groups, B_d.shape[1] // n_groups),
-                    C_d.view(-1, n_groups, C_d.shape[1] // n_groups),
-                    A=self.A,
-                    D=self.D,
-                    dt_bias=self.dt_bias,
-                    out=preallocated_ssm_out_d.view(
-                        num_decode_tokens, -1, self.head_dim
-                    ),
-                    ssm_state=ssm_state,
-                    slots=slots_d,
-                    pos=exact_replay_pos_d,
-                    chunk_size=chunk_size,
-                    buffers=replay_bufs,
+                x_d = hidden_states_d.view(
+                    -1, self.num_heads // self.tp_size, self.head_dim
                 )
+                B_d = B_d.view(-1, n_groups, B_d.shape[1] // n_groups)
+                C_d = C_d.view(-1, n_groups, C_d.shape[1] // n_groups)
+                out_d = preallocated_ssm_out_d.view(
+                    num_decode_tokens, -1, self.head_dim
+                )
+                token_idx_d = attn_metadata.exact_replay_token_idx_d
+                if token_idx_d is None:
+                    assert num_decode_tokens == num_decodes
+                    exact_replay_emit(
+                        x_d,
+                        dt_d,
+                        B_d,
+                        C_d,
+                        A=self.A,
+                        D=self.D,
+                        dt_bias=self.dt_bias,
+                        out=out_d,
+                        ssm_state=ssm_state,
+                        slots=slots_d,
+                        pos=exact_replay_pos_d,
+                        chunk_size=chunk_size,
+                        buffers=replay_bufs,
+                    )
+                else:
+                    exact_replay_emit_spec(
+                        x_d,
+                        dt_d,
+                        B_d,
+                        C_d,
+                        A=self.A,
+                        D=self.D,
+                        dt_bias=self.dt_bias,
+                        out=out_d,
+                        ssm_state=ssm_state,
+                        slots=slots_d,
+                        pos=exact_replay_pos_d,
+                        token_idx=token_idx_d,
+                        chunk_size=chunk_size,
+                        buffers=replay_bufs,
+                    )
             else:
                 # 3. State Space Model sequence transformation
                 n_groups = self.n_groups // self.tp_size

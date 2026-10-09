@@ -375,3 +375,202 @@ def test_emit_decode_schedule_matches_single_shot_prefill(chunk_size, seed):
         )
     assert not any(buf[0].any() for buf in buffers)
     assert ssm_state[0].isnan().all()
+
+
+@pytest.mark.parametrize("chunk_size", [64, 128])
+@pytest.mark.parametrize("num_spec", [1, 2])
+@pytest.mark.parametrize("seed", [0, 1])
+def test_emit_spec_decode_matches_single_shot_and_plain_decode(
+    chunk_size, num_spec, seed
+):
+    """Speculative decode through emit keeps outputs and state exact.
+
+    Each step a row carries its last sampled token and ``num_spec`` drafts;
+    a draft is the true next token or a garbage one, and acceptance stops at
+    the first garbage draft or at a draft on a chunk's last position, as the
+    rejection sampler does in batch-invariant mode. The windows cross chunk
+    boundaries at every offset. Every accepted row must equal the single-shot
+    scan, and after every step the boundary state and the valid buffer prefix
+    must equal those of plain one-token decode up to the same length.
+    """
+    from vllm.model_executor.layers.mamba.exact_replay import (
+        ExactReplayBuffers,
+        build_exact_replay_metadata,
+        exact_replay_emit,
+        exact_replay_emit_spec,
+        exact_replay_spec_decode_layout,
+        exact_replay_ssd,
+    )
+
+    torch.manual_seed(seed)
+    gen = torch.Generator().manual_seed(seed)
+    device = torch.device(DEVICE)
+    nheads, head_dim, ngroups, dstate = 8, 64, 1, 64
+    dtype = torch.bfloat16
+    A = -(torch.rand(nheads, device=device) * 15 + 1)
+    dt_target = torch.exp(
+        torch.rand(nheads, device=device)
+        * (torch.log(torch.tensor(0.1)) - torch.log(torch.tensor(1e-3)))
+        + torch.log(torch.tensor(1e-3))
+    )
+    dt_bias = dt_target + torch.log(-torch.expm1(-dt_target))
+    D = torch.ones(nheads, device=device)
+    kw = dict(A=A, D=D, dt_bias=dt_bias, chunk_size=chunk_size)
+
+    total_lens = [2 * chunk_size + 41, 3 * chunk_size + 2, chunk_size - 3]
+    prompt_lens = [chunk_size - 5, chunk_size + 1, 7]
+    n = len(total_lens)
+
+    def rand_inputs(L):
+        return (
+            torch.randn(L, nheads, head_dim, device=device).to(dtype),
+            (0.5 * torch.randn(L, nheads, device=device)).to(dtype),
+            torch.randn(L, ngroups, dstate, device=device).to(dtype),
+            torch.randn(L, ngroups, dstate, device=device).to(dtype),
+        )
+
+    seqs = [rand_inputs(L) for L in total_lens]
+    refs = [
+        single_shot_scan(x, dt, A, B, C, D, dt_bias, chunk_size)[0]
+        for x, dt, B, C in seqs
+    ]
+
+    # slot 0 is the null block; spec run in slots 1..n, plain run in n+1..2n
+    num_slots = 2 * n + 1
+    buffers = ExactReplayBuffers(
+        _paged(num_slots, (chunk_size, nheads, head_dim), dtype, device),
+        _paged(num_slots, (chunk_size, nheads), dtype, device),
+        _paged(num_slots, (chunk_size, ngroups, dstate), dtype, device),
+    )
+    ssm_state = torch.full(
+        (num_slots, nheads, head_dim, dstate), float("nan"), device=device
+    )
+    spec_slots = torch.arange(1, n + 1, dtype=torch.int32, device=device)
+    plain_slots = spec_slots + n
+    outs = [torch.empty_like(s[0]) for s in seqs]
+    computed = [0] * n
+    plain_computed = [0] * n
+
+    def take(i, start, k):
+        return [t[start : start + k] for t in seqs[i]]
+
+    # prefill both runs
+    for slots in (spec_slots, plain_slots):
+        x, dt, B, C = (
+            torch.cat(parts)
+            for parts in zip(*(take(i, 0, prompt_lens[i]) for i in range(n)))
+        )
+        out = torch.empty_like(x)
+        exact_replay_ssd(
+            x,
+            dt,
+            B,
+            C,
+            out=out,
+            ssm_state=ssm_state,
+            slots=slots,
+            meta=build_exact_replay_metadata([0] * n, prompt_lens, chunk_size, device),
+            buffers=buffers,
+            **kw,
+        )
+    for i in range(n):
+        computed[i] = plain_computed[i] = prompt_lens[i]
+        outs[i][: prompt_lens[i]] = refs[i][: prompt_lens[i]]
+
+    def plain_step(i):
+        x, dt, B, C = take(i, plain_computed[i], 1)
+        out = torch.empty_like(x)
+        exact_replay_emit(
+            x,
+            dt,
+            B,
+            C,
+            out=out,
+            ssm_state=ssm_state,
+            slots=plain_slots[i : i + 1],
+            pos=torch.tensor(
+                [plain_computed[i] % chunk_size], dtype=torch.int32, device=device
+            ),
+            buffers=buffers,
+            **kw,
+        )
+        plain_computed[i] += 1
+
+    crossed_with_drafts = 0
+    while any(computed[i] < total_lens[i] for i in range(n)):
+        active = [i for i in range(n) if computed[i] < total_lens[i]]
+        lens = [min(1 + num_spec, total_lens[i] - computed[i]) for i in active]
+        good = []
+        parts = []
+        for i, q in zip(active, lens):
+            true = take(i, computed[i], q)
+            is_good = torch.rand(q, generator=gen) < 0.7
+            is_good[0] = True
+            garbage = rand_inputs(q)
+            parts.append(
+                [torch.where(_bcast(is_good, t), t, g) for t, g in zip(true, garbage)]
+            )
+            good.append(is_good)
+        # one CUDA graph padding row with a full window of junk tokens
+        parts.append(list(rand_inputs(1 + num_spec)))
+        x, dt, B, C = (torch.cat(p) for p in zip(*parts))
+        qsl = torch.tensor([0, *lens, 1 + num_spec], device=device).cumsum(0)
+        seq_lens = torch.tensor(
+            [computed[i] + q for i, q in zip(active, lens)] + [0], device=device
+        )
+        pos, token_idx = exact_replay_spec_decode_layout(
+            seq_lens, qsl, num_spec, chunk_size
+        )
+        out = torch.empty_like(x)
+        exact_replay_emit_spec(
+            x,
+            dt,
+            B,
+            C,
+            out=out,
+            ssm_state=ssm_state,
+            slots=torch.cat([spec_slots[active], spec_slots.new_zeros(1)]),
+            pos=pos,
+            token_idx=token_idx,
+            buffers=buffers,
+            **kw,
+        )
+        assert not out[int(qsl[-2]) :].any()
+        for row, (i, q) in enumerate(zip(active, lens)):
+            accepted = 1
+            while (
+                accepted < q
+                and good[row][accepted]
+                and (computed[i] + accepted) % chunk_size != chunk_size - 1
+            ):
+                accepted += 1
+            start = int(qsl[row])
+            if (computed[i] + accepted - 1) // chunk_size != computed[i] // chunk_size:
+                crossed_with_drafts += accepted > 1
+            outs[i][computed[i] : computed[i] + accepted] = out[
+                start : start + accepted
+            ]
+            computed[i] += accepted
+            while plain_computed[i] < computed[i]:
+                plain_step(i)
+            s, p = int(spec_slots[i]), int(plain_slots[i])
+            assert torch.equal(ssm_state[s], ssm_state[p]), (
+                f"sequence {i}: boundary state differs at {computed[i]}"
+            )
+            tail = computed[i] % chunk_size
+            for buf in buffers:
+                assert torch.equal(buf[s, :tail], buf[p, :tail]), (
+                    f"sequence {i}: partial chunk differs at {computed[i]}"
+                )
+
+    assert crossed_with_drafts > 0
+    for i in range(n):
+        assert torch.equal(outs[i].view(torch.int16), refs[i].view(torch.int16)), (
+            f"sequence {i}: speculative emit decode diverged from single-shot"
+        )
+    assert not any(buf[0].any() for buf in buffers)
+    assert ssm_state[0].isnan().all()
+
+
+def _bcast(mask: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+    return mask.to(t.device).view(-1, *([1] * (t.dim() - 1)))

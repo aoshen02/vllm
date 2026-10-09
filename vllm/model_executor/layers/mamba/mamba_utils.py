@@ -472,6 +472,24 @@ def get_temporal_copy_spec(
     )
 
 
+def get_running_state_copy_spec(
+    state: torch.Tensor,
+    block_ids: list[int],
+    cur_block_idx: int,
+    num_accepted_tokens: int,
+) -> MambaCopySpec:
+    """Return a MambaCopySpec for a state kept in the running block only.
+
+    Unlike :func:`get_temporal_copy_spec`, the state is not spread over the
+    speculative block columns by accepted-token count, so the copy always
+    reads the running (first) column.
+    """
+    src_state = state[block_ids[cur_block_idx]]
+    return MambaCopySpec(
+        start_addr=src_state.data_ptr(), num_elements=src_state.numel()
+    )
+
+
 class MambaStateCopyFuncCalculator:
     @classmethod
     def linear_attention_state_copy_func(cls):
@@ -485,8 +503,10 @@ class MambaStateCopyFuncCalculator:
     def mamba2_state_copy_func(cls):
         if envs.VLLM_BATCH_INVARIANT:
             # The partial-chunk buffers (x, dt, B) are per-slot state like the
-            # SSM state, so an align-mode block copy must carry them too.
-            return (get_conv_copy_spec, *(get_temporal_copy_spec,) * 4)
+            # SSM state, so an align-mode block copy must carry them too. Exact
+            # replay keeps SSM state and buffers in the running block column
+            # also with speculative decoding.
+            return (get_conv_copy_spec, *(get_running_state_copy_spec,) * 4)
         return get_conv_copy_spec, get_temporal_copy_spec
 
     @classmethod

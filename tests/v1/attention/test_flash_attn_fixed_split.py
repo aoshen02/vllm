@@ -98,7 +98,8 @@ def _run(impl, layer, queries, cache, pages, seq_lens):
 @torch.inference_mode()
 def test_fixed_schedule_rows_ignore_batch_and_phase(monkeypatch, kv_cache_dtype, dtype):
     """A sequence's output rows are bitwise the same alone, next to other
-    sequences, and as a one-token decode after its prefill."""
+    sequences, as a one-token decode after its prefill, and as a speculative
+    decode verify row of 2 or 3 query tokens."""
     impl = _make_impl(monkeypatch, kv_cache_dtype)
     gen = torch.Generator(device="cuda").manual_seed(0)
     # The first sequence spans three 8192-key splits.
@@ -134,3 +135,11 @@ def test_fixed_schedule_rows_ignore_batch_and_phase(monkeypatch, kv_cache_dtype,
     decode = _run(impl, layer, last_rows, cache, pages, lengths)
     ends = torch.tensor(lengths).cumsum(0) - 1
     assert torch.equal(decode, batched[ends.cuda()])
+
+    for query_len in (2, 3):
+        verify_rows = [q[-query_len:] for q in queries]
+        verify = _run(impl, layer, verify_rows, cache, pages, lengths)
+        rows = torch.cat(
+            [torch.arange(end - query_len + 1, end + 1) for end in ends.tolist()]
+        )
+        assert torch.equal(verify, batched[rows.cuda()]), query_len

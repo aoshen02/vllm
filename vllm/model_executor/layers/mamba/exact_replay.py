@@ -397,3 +397,131 @@ def exact_replay_emit(
         current_x=x,
     )
     _fold_chunk_fwd(buffers.x, buffers.B, dt_out, dA_cumsum, ssm_state, slots, pos)
+
+
+def exact_replay_spec_decode_layout(
+    seq_lens: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    num_spec: int,
+    chunk_size: int,
+    pos_out: torch.Tensor | None = None,
+    token_idx_out: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-token emit positions of speculative decode rows.
+
+    A speculative decode row holds the last sampled token followed by up to
+    ``num_spec`` drafts. Its first token is always accepted, so when it
+    completes a chunk the boundary state may be folded at once. A draft that
+    completes a chunk would fold not-yet-verified inputs into the boundary
+    state, which a rejection could not undo; the rejection sampler therefore
+    rejects any draft at a chunk's last position (``draft_chunk_size`` of the
+    model runner V2 ``RejectionSampler``), and this layout skips it and every
+    later token of the row. Accepted tokens thus never cross an uncommitted
+    chunk boundary and the state stays exactly that of non-speculative decode.
+
+    Args:
+        seq_lens: ``(num_rows,)`` sequence lengths including this step's
+            tokens; 0 for CUDA graph padding rows.
+        query_start_loc: ``(num_rows + 1,)`` token offsets of the rows.
+        num_spec: the number of speculative tokens per step.
+        chunk_size: the model's SSD chunk size.
+        pos_out: optional ``(num_rows, 1 + num_spec)`` int32 output buffer.
+        token_idx_out: optional ``(num_rows, 1 + num_spec)`` int64 output
+            buffer.
+
+    Returns:
+        ``(pos, token_idx)``, each ``(num_rows, 1 + num_spec)``: the position
+        of the row's j-th token inside its partial chunk and that token's
+        index in the decode tokens, or -1 for both where the token is skipped.
+
+    """
+    query_lens = query_start_loc[1:] - query_start_loc[:-1]
+    num_computed = seq_lens - query_lens
+    j = torch.arange(1 + num_spec, device=seq_lens.device)
+    # Steps from the first token to the next chunk-final position; a draft
+    # landing there is rejected, so only the drafts before it are evaluated.
+    to_chunk_end = chunk_size - 1 - torch.remainder(num_computed, chunk_size)
+    draft_limit = torch.where(to_chunk_end == 0, chunk_size, to_chunk_end)
+    valid = (
+        (j < query_lens[:, None])
+        & ((j == 0) | (j < draft_limit[:, None]))
+        & (seq_lens[:, None] > 0)
+    )
+    pos = torch.where(valid, torch.remainder(num_computed[:, None] + j, chunk_size), -1)
+    token_idx = torch.where(valid, query_start_loc[:-1, None] + j, -1)
+    if pos_out is None:
+        return pos.to(torch.int32), token_idx.to(torch.int64)
+    assert token_idx_out is not None
+    pos_out.copy_(pos)
+    token_idx_out.copy_(token_idx)
+    return pos_out, token_idx_out
+
+
+def exact_replay_emit_spec(
+    x: torch.Tensor,
+    dt: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+    *,
+    A: torch.Tensor,
+    D: torch.Tensor,
+    dt_bias: torch.Tensor,
+    out: torch.Tensor,
+    ssm_state: torch.Tensor,
+    slots: torch.Tensor,
+    pos: torch.Tensor,
+    token_idx: torch.Tensor,
+    chunk_size: int,
+    buffers: ExactReplayBuffers,
+) -> None:
+    """Speculative decode: :func:`exact_replay_emit` once per token slot.
+
+    Call ``j`` runs the j-th token of every row, after calls ``0..j-1`` have
+    written the row's earlier tokens into the buffers, so each token sees
+    exactly the buffers and boundary state of non-speculative decode. Skipped
+    tokens (``pos == -1``, see :func:`exact_replay_spec_decode_layout`) touch
+    no buffer or state and get zero output.
+
+    Args:
+        x: ``(num_tokens, nheads, head_dim)`` inputs of the decode tokens.
+        dt: ``(num_tokens, nheads)`` raw dt.
+        B: ``(num_tokens, ngroups, dstate)``.
+        C: ``(num_tokens, ngroups, dstate)``.
+        A: per-head parameter as in :func:`exact_replay_ssd`.
+        D: per-head parameter as in :func:`exact_replay_ssd`.
+        dt_bias: per-head parameter as in :func:`exact_replay_ssd`.
+        out: ``(num_tokens, nheads, head_dim)`` preallocated output.
+        ssm_state: the fp32 SSM cache.
+        slots: ``(num_rows,)`` int32 state slot of each row.
+        pos: ``(num_rows, 1 + num_spec)`` int32 token positions.
+        token_idx: ``(num_rows, 1 + num_spec)`` int64 token indices.
+        chunk_size: the model's SSD chunk size.
+        buffers: the partial-chunk input buffers.
+
+    """
+    num_tokens = x.shape[0]
+    gather_idx = token_idx.clamp(min=0)
+    # Skipped tokens scatter into a trailing scratch row.
+    scatter_idx = torch.where(token_idx < 0, num_tokens, token_idx)
+    out_ext = out.new_zeros((num_tokens + 1, *out.shape[1:]))
+    slots = slots.contiguous()
+    for j in range(pos.shape[1]):
+        rows = gather_idx[:, j]
+        out_j = out.new_empty((rows.shape[0], *out.shape[1:]))
+        exact_replay_emit(
+            x[rows],
+            dt[rows],
+            B[rows],
+            C[rows],
+            A=A,
+            D=D,
+            dt_bias=dt_bias,
+            out=out_j,
+            ssm_state=ssm_state,
+            slots=slots,
+            pos=pos[:, j].contiguous(),
+            chunk_size=chunk_size,
+            buffers=buffers,
+        )
+        out_ext[scatter_idx[:, j]] = out_j
+    out.copy_(out_ext[:num_tokens])

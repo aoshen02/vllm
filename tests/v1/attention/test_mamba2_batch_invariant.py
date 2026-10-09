@@ -7,6 +7,9 @@ import torch
 
 import vllm.envs as envs
 from vllm.config import CacheConfig, SchedulerConfig, VllmConfig
+from vllm.model_executor.layers.mamba.exact_replay import (
+    exact_replay_spec_decode_layout,
+)
 from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateCopyFuncCalculator,
     MambaStateDtypeCalculator,
@@ -104,6 +107,40 @@ def test_decode_positions_ignore_cudagraph_padding_rows():
     out = torch.full((5,), 7, dtype=torch.int32)
     assert exact_replay_decode_positions(seq_lens, 256, out=out) is out
     assert out.tolist() == [44, 255, 0, -1, -1]
+
+
+def test_spec_decode_layout_stops_at_chunk_final_drafts():
+    """Drafts on a chunk's last position, and everything after them, are
+    skipped; a first token completing a chunk lets its drafts start the next
+    one. Rows: mid chunk, a draft lands on the chunk end, the first token
+    completes the chunk, a trimmed one-token row, a CUDA graph padding row."""
+    num_computed = [44, 254, 255, 100]
+    query_lens = [3, 3, 3, 1, 3]
+    seq_lens = torch.tensor([n + q for n, q in zip(num_computed, query_lens)] + [0])
+    qsl = torch.tensor([0, *query_lens]).cumsum(0)
+    pos, token_idx = exact_replay_spec_decode_layout(seq_lens, qsl, 2, 256)
+    assert pos.tolist() == [
+        [44, 45, 46],
+        [254, -1, -1],
+        [255, 0, 1],
+        [100, -1, -1],
+        [-1, -1, -1],
+    ]
+    assert token_idx.tolist() == [
+        [0, 1, 2],
+        [3, -1, -1],
+        [6, 7, 8],
+        [9, -1, -1],
+        [-1, -1, -1],
+    ]
+
+
+def test_check_rejects_spec_decode_without_model_runner_v2(monkeypatch):
+    monkeypatch.setattr(envs, "VLLM_USE_V2_MODEL_RUNNER", False)
+    cfg = _config()
+    monkeypatch.setattr(VllmConfig, "num_speculative_tokens", property(lambda _: 1))
+    with pytest.raises(ValueError, match="VLLM_USE_V2_MODEL_RUNNER"):
+        Mamba2AttentionBackend.check_batch_invariant_config(cfg)
 
 
 @pytest.mark.parametrize(

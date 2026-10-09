@@ -12,6 +12,7 @@ from vllm.config.mamba import MambaBackendEnum
 from vllm.model_executor.layers.mamba.exact_replay import (
     ExactReplayMetadata,
     build_exact_replay_metadata,
+    exact_replay_spec_decode_layout,
 )
 from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.attention.backend import (
@@ -126,8 +127,21 @@ class Mamba2AttentionBackend(AttentionBackend):
         prefix = "VLLM_BATCH_INVARIANT=1 with Mamba2 layers"
         if cache_config.use_replayssm:
             raise ValueError(f"{prefix} is not supported together with --use-replayssm")
-        if vllm_config.num_speculative_tokens > 0:
-            raise ValueError(f"{prefix} does not support speculative decoding")
+        num_spec = vllm_config.num_speculative_tokens
+        if num_spec > 0:
+            if not envs.VLLM_USE_V2_MODEL_RUNNER:
+                # Exactness needs the rejection sampler to reject drafts at a
+                # chunk's last position, which only model runner V2 does.
+                raise ValueError(
+                    f"{prefix} supports speculative decoding only with "
+                    "VLLM_USE_V2_MODEL_RUNNER=1"
+                )
+            chunk_size = vllm_config.model_config.get_mamba_chunk_size()
+            if chunk_size is not None and num_spec >= chunk_size:
+                raise ValueError(
+                    f"{prefix} needs fewer speculative tokens than the SSD "
+                    f"chunk size {chunk_size}, got {num_spec}"
+                )
         if vllm_config.mamba_config.backend != MambaBackendEnum.TRITON:
             raise ValueError(f"{prefix} requires --mamba-backend triton")
         if parallel_config.pipeline_parallel_size > 1:
@@ -141,15 +155,33 @@ class Mamba2AttentionBackend(AttentionBackend):
             raise ValueError(f"{prefix} does not support KV connectors")
 
 
+def exact_replay_draft_chunk_size(vllm_config: VllmConfig) -> int | None:
+    """Chunk size whose last positions drafts must never be accepted at.
+
+    In batch-invariant mode a Mamba2 boundary state is folded as soon as a
+    chunk's last token is processed. For speculative decoding that token must
+    be one that is certain to be kept, so the rejection sampler rejects every
+    draft at position ``chunk_size - 1`` modulo ``chunk_size`` (see
+    ``exact_replay_spec_decode_layout``). None when this does not apply.
+    """
+    model_config = vllm_config.model_config
+    if (
+        not envs.VLLM_BATCH_INVARIANT
+        or vllm_config.num_speculative_tokens == 0
+        or not model_config.is_hybrid
+    ):
+        return None
+    return model_config.get_mamba_chunk_size()
+
+
 def exact_replay_decode_positions(
     seq_lens: torch.Tensor, chunk_size: int, out: torch.Tensor | None = None
 ) -> torch.Tensor:
     """Position of each decode row's token inside its partial chunk.
 
-    A decode row has one token, so its computed token count is the sequence
-    length minus one (exact without speculative decoding, which batch-invariant
-    mode rejects). CUDA graph padding rows have sequence length 0 and get
-    position -1, which the decode kernels skip.
+    A decode row has one token without speculative decoding, so its computed
+    token count is the sequence length minus one. CUDA graph padding rows
+    have sequence length 0 and get position -1, which the decode kernels skip.
     """
     pos = torch.remainder(seq_lens - 1, chunk_size, out=out)
     return pos.masked_fill_(seq_lens <= 0, -1)
@@ -168,6 +200,10 @@ class Mamba2AttentionMetadata(BaseMambaAttentionMetadata):
     # rows included, and lives in a persistent buffer for CUDA graphs.
     exact_replay_p: ExactReplayMetadata | None = None
     exact_replay_pos_d: torch.Tensor | None = None
+    # With speculative decoding, `exact_replay_pos_d` is (rows, 1 + num_spec)
+    # and this holds each of those tokens' index among the decode tokens
+    # (see exact_replay_spec_decode_layout).
+    exact_replay_token_idx_d: torch.Tensor | None = None
 
 
 class Mamba2AttentionMetadataBuilder(
@@ -192,9 +228,21 @@ class Mamba2AttentionMetadataBuilder(
         if self.exact_replay:
             # Decode rows run fixed-shape kernels, so decode-only full CUDA
             # graphs work as usual; this buffer feeds them each row's position.
-            self.exact_replay_pos_d: torch.Tensor = torch.full(
-                (self.decode_cudagraph_max_bs,), -1, dtype=torch.int32, device=device
-            )
+            if self.num_spec_tokens == 0:
+                self.exact_replay_pos_d: torch.Tensor = torch.full(
+                    (self.decode_cudagraph_max_bs,),
+                    -1,
+                    dtype=torch.int32,
+                    device=device,
+                )
+            else:
+                shape = (self.decode_cudagraph_max_bs, 1 + self.num_spec_tokens)
+                self.exact_replay_pos_d = torch.full(
+                    shape, -1, dtype=torch.int32, device=device
+                )
+                self.exact_replay_token_idx_d: torch.Tensor = torch.full(
+                    shape, -1, dtype=torch.int64, device=device
+                )
 
     def _exact_replay_decode_positions(
         self,
@@ -218,6 +266,35 @@ class Mamba2AttentionMetadataBuilder(
         exact_replay_decode_positions(seq_lens, self.chunk_size, out=pos[:num_decodes])
         pos[num_decodes:].fill_(-1)
         return pos
+
+    def _exact_replay_spec_decode_layout(
+        self,
+        common: Mamba2AttentionMetadata,
+        common_attn_metadata: CommonAttentionMetadata,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Spec-decode counterpart of ``_exact_replay_decode_positions``."""
+        num_decodes = common.num_decodes
+        assert common.state_indices_tensor_d is not None
+        num_rows = common.state_indices_tensor_d.shape[0]
+        seq_lens = common_attn_metadata.seq_lens[:num_decodes]
+        query_start_loc = common_attn_metadata.query_start_loc[: num_decodes + 1]
+        if num_rows > self.decode_cudagraph_max_bs:
+            return exact_replay_spec_decode_layout(
+                seq_lens, query_start_loc, self.num_spec_tokens, self.chunk_size
+            )
+        pos = self.exact_replay_pos_d[:num_rows]
+        token_idx = self.exact_replay_token_idx_d[:num_rows]
+        exact_replay_spec_decode_layout(
+            seq_lens,
+            query_start_loc,
+            self.num_spec_tokens,
+            self.chunk_size,
+            pos_out=pos[:num_decodes],
+            token_idx_out=token_idx[:num_decodes],
+        )
+        pos[num_decodes:].fill_(-1)
+        token_idx[num_decodes:].fill_(-1)
+        return pos, token_idx
 
     def update_block_table(
         self,
@@ -280,16 +357,21 @@ class Mamba2AttentionMetadataBuilder(
 
         exact_replay_p = None
         exact_replay_pos_d = None
+        exact_replay_token_idx_d = None
         if self.exact_replay:
-            if common.num_decodes > 0:
+            if common.num_decodes > 0 and self.num_spec_tokens > 0:
+                exact_replay_pos_d, exact_replay_token_idx_d = (
+                    self._exact_replay_spec_decode_layout(common, common_attn_metadata)
+                )
+            elif common.num_decodes > 0:
                 exact_replay_pos_d = self._exact_replay_decode_positions(
                     common, common_attn_metadata
                 )
             if common.num_prefills > 0:
                 # Derive per-row computed-token counts from CPU metadata only:
-                # `seq_lens_cpu_upper_bound` is exact for every row without
-                # speculative decoding, which this mode rejects, and it avoids
-                # the D2H sync of the deprecated `num_computed_tokens_cpu`.
+                # `seq_lens_cpu_upper_bound` is exact for prefill rows, also
+                # with async speculative decoding, and it avoids the D2H sync
+                # of the deprecated `num_computed_tokens_cpu`.
                 seq_lens_cpu = common_attn_metadata.seq_lens_cpu_upper_bound
                 if seq_lens_cpu is None:
                     raise ValueError(
@@ -319,4 +401,5 @@ class Mamba2AttentionMetadataBuilder(
             last_chunk_indices_p=last_chunk_indices_p,
             exact_replay_p=exact_replay_p,
             exact_replay_pos_d=exact_replay_pos_d,
+            exact_replay_token_idx_d=exact_replay_token_idx_d,
         )
