@@ -69,6 +69,22 @@ vllm serve <model> \
   }'
 ```
 
+### Relative capacity with SimpleCPUOffloadConnector
+
+The alternative `SimpleCPUOffloadConnector` accepts `cpu_to_gpu_ratio` in
+`kv_connector_extra_config`. A ratio of `2` budgets each worker's host cache
+at twice its resolved GPU KV backing allocation. The ratio must be finite
+and positive; `cpu_bytes_to_use` or `cpu_bytes_to_use_per_rank` takes
+precedence when supplied. Usable capacity is rounded to whole cache blocks.
+Prefix caching must be enabled:
+
+```bash
+vllm serve <model> --enable-prefix-caching \
+  --kv-transfer-config '{"kv_connector":"SimpleCPUOffloadConnector","kv_role":"kv_both","kv_connector_extra_config":{"cpu_to_gpu_ratio":2}}'
+```
+
+This option is specific to `SimpleCPUOffloadConnector`, not `OffloadingConnector`.
+
 ## Multi-Tier Setup
 
 Set `spec_name` to `"TieringOffloadingSpec"` and supply a `secondary_tiers` list. Each entry is a dict with a required `type` key plus tier-specific fields (and an optional `module_path` for out-of-tree tiers). The list is ordered: tier 0 is consulted before tier 1, and so on. See [Secondary Tiers](#secondary-tiers) for tier-specific keys.

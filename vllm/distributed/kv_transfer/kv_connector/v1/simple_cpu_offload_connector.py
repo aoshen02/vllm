@@ -3,6 +3,7 @@
 """SimpleCPUOffloadConnector: minimal CPU KV cache offloading."""
 
 from collections.abc import Iterable
+from math import isfinite
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -149,6 +150,17 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
                 "since it requires prefix caching."
             )
             return
+
+        if "cpu_to_gpu_ratio" in extra_config and not any(
+            key in extra_config
+            for key in ("cpu_bytes_to_use", "cpu_bytes_to_use_per_rank")
+        ):
+            ratio = float(extra_config["cpu_to_gpu_ratio"])
+            if not isfinite(ratio) or ratio <= 0:
+                raise ValueError("cpu_to_gpu_ratio must be finite and positive")
+            cpu_capacity_per_rank = int(
+                ratio * kv_cache_config.kv_cache_tensors[0].size
+            )
 
         logger.info(
             "SimpleCPUOffloadConnector: role=%s, "

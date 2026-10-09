@@ -93,6 +93,55 @@ def test_disk_mode_rejects_non_positive_capacity() -> None:
         )
 
 
+@pytest.mark.parametrize("ratio", [0.5, 1, 2, 2.5])
+@pytest.mark.parametrize("tensor_parallel_size", [1, 2])
+def test_relative_cpu_capacity_matches_scheduler_and_worker(
+    ratio: float, tensor_parallel_size: int
+) -> None:
+    cache = _make_kv_cache_config()
+    config = create_vllm_config(
+        kv_connector="SimpleCPUOffloadConnector",
+        kv_role="kv_both",
+        kv_connector_extra_config={"cpu_to_gpu_ratio": ratio},
+    )
+    config.parallel_config.tensor_parallel_size = tensor_parallel_size
+    scheduler = SimpleCPUOffloadConnector(config, KVConnectorRole.SCHEDULER, cache)
+    worker = SimpleCPUOffloadConnector(config, KVConnectorRole.WORKER, cache)
+    expected_bytes = int(cache.kv_cache_tensors[0].size * ratio)
+    assert worker.worker_handler.cpu_capacity_bytes == expected_bytes
+    assert scheduler.scheduler_manager.num_cpu_blocks == int(cache.num_blocks * ratio)
+
+
+@pytest.mark.parametrize("ratio", [0, -1, float("nan"), float("inf")])
+def test_relative_cpu_capacity_rejects_invalid_ratio(ratio: float) -> None:
+    config = create_vllm_config(
+        kv_connector="SimpleCPUOffloadConnector",
+        kv_role="kv_both",
+        kv_connector_extra_config={"cpu_to_gpu_ratio": ratio},
+    )
+    with pytest.raises(ValueError, match="finite and positive"):
+        SimpleCPUOffloadConnector(
+            config, KVConnectorRole.SCHEDULER, _make_kv_cache_config()
+        )
+
+
+def test_absolute_cpu_capacity_takes_precedence_over_ratio() -> None:
+    connector = _make_connector(extra_config={"cpu_to_gpu_ratio": 2})
+    assert connector.scheduler_manager.num_cpu_blocks == 8
+
+
+def test_relative_capacity_preserves_disabled_prefix_caching() -> None:
+    config = create_vllm_config(
+        kv_connector="SimpleCPUOffloadConnector",
+        kv_role="kv_both",
+        kv_connector_extra_config={"cpu_to_gpu_ratio": 2},
+    )
+    config.cache_config.enable_prefix_caching = False
+    connector = SimpleCPUOffloadConnector(config, KVConnectorRole.WORKER, None)
+    assert connector.worker_handler is None
+    assert connector.scheduler_manager is None
+
+
 def _make_ring_kv_cache_config(num_blocks: int = 16) -> KVCacheConfig:
     """A paged full-attention group beside a per-request ring group."""
     full = FullAttentionSpec(
