@@ -297,7 +297,7 @@ class KernelConfig:
     - "triton": Use Triton-based fused MoE kernels
     - "batched_triton": Use batched Triton experts (moe_mmk) on the batched
       activation format ([E_local, max_num_tokens, K])
-    - "deep_gemm": Use DeepGEMM kernels (FP8 block-quantized only)
+    - "deep_gemm": Use DeepGEMM kernels (FP8 block-quantized or unquantized BF16)
     - "deep_gemm_mega_moe": Use DeepGEMM mega MoE kernels
     - "cutlass": Use vLLM CUTLASS kernels
     - "flashinfer_trtllm": Use FlashInfer with TRTLLM-GEN kernels
