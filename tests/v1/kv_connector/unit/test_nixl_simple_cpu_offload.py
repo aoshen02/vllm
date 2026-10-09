@@ -186,7 +186,7 @@ def _make_kv_cache_config(
     )
 
 
-def _multi_connector_config(swa_enabled: bool = False):
+def _multi_connector_config(swa_enabled: bool = False, relative_capacity: bool = False):
     """Return (vllm_config, kv_cache_config) for a MultiConnector test."""
     kv_cache_config = _make_kv_cache_config(swa_enabled=swa_enabled)
     vllm_config = create_vllm_config(
@@ -200,9 +200,11 @@ def _multi_connector_config(swa_enabled: bool = False):
                 {
                     "kv_connector": "SimpleCPUOffloadConnector",
                     "kv_role": "kv_both",
-                    "kv_connector_extra_config": {
-                        "cpu_bytes_to_use": 1 << 30,
-                    },
+                    "kv_connector_extra_config": (
+                        {"cpu_to_gpu_ratio": 2}
+                        if relative_capacity
+                        else {"cpu_bytes_to_use": 1 << 30}
+                    ),
                 },
             ],
         },
@@ -211,11 +213,14 @@ def _multi_connector_config(swa_enabled: bool = False):
 
 
 @patch(NIXL_WRAPPER_PATCH, FakeNixlWrapper)
-def test_nixl_wins_load_over_cpu_offload():
+@pytest.mark.parametrize("relative_capacity", [False, True])
+def test_nixl_wins_load_over_cpu_offload(relative_capacity: bool):
     """When NixlConnector (index 0) has matched tokens from a remote prefill, it should
     win the load: Nixl metadata tracks the recv while CPU offload metadata has no load
     scheduled."""
-    vllm_config, kv_cache_config = _multi_connector_config()
+    vllm_config, kv_cache_config = _multi_connector_config(
+        relative_capacity=relative_capacity
+    )
     scheduler = create_scheduler(vllm_config, kv_cache_config=kv_cache_config)
     mc = scheduler.connector
     assert isinstance(mc, MultiConnector)
@@ -252,10 +257,13 @@ def test_nixl_wins_load_over_cpu_offload():
 
 
 @patch(NIXL_WRAPPER_PATCH, FakeNixlWrapper)
-def test_cpu_offload_wins_when_nixl_has_no_match():
+@pytest.mark.parametrize("relative_capacity", [False, True])
+def test_cpu_offload_wins_when_nixl_has_no_match(relative_capacity: bool):
     """When NixlConnector returns 0 matched tokens and SimpleCPUOffloadConnector has a
     CPU cache hit, the CPU offload connector (index 1) wins the load."""
-    vllm_config, kv_cache_config = _multi_connector_config()
+    vllm_config, kv_cache_config = _multi_connector_config(
+        relative_capacity=relative_capacity
+    )
     scheduler = create_scheduler(vllm_config, kv_cache_config=kv_cache_config)
     mc = scheduler.connector
     assert isinstance(mc, MultiConnector)
@@ -313,13 +321,16 @@ def test_cpu_offload_wins_when_nixl_has_no_match():
 
 @pytest.mark.parametrize("swa_enabled", [False, True], ids=["fa_only", "fa_sw"])
 @patch(NIXL_WRAPPER_PATCH, FakeNixlWrapper)
-def test_request_finished_no_async_save(swa_enabled: bool):
+@pytest.mark.parametrize("relative_capacity", [False, True])
+def test_request_finished_no_async_save(swa_enabled: bool, relative_capacity: bool):
     """A normal request (no P/D) produces no async save from either connector.
     MultiConnector returns (False, None) via both request_finished and
     request_finished_all_groups, and cleans up _requests_to_connector."""
     from vllm.v1.request import RequestStatus
 
-    vllm_config, kv_cache_config = _multi_connector_config(swa_enabled=swa_enabled)
+    vllm_config, kv_cache_config = _multi_connector_config(
+        swa_enabled=swa_enabled, relative_capacity=relative_capacity
+    )
     scheduler = create_scheduler(vllm_config, kv_cache_config=kv_cache_config)
     mc = scheduler.connector
     assert isinstance(mc, MultiConnector)
