@@ -128,11 +128,13 @@ def test_nemotron_h_batch_invariant_requires_tp1(monkeypatch, batch_invariant):
 
 @pytest.mark.parametrize(
     "kv_cache_dtype,error",
-    [("auto", False), ("bfloat16", False), ("fp8", False), ("fp8_e5m2", True)],
+    [("auto", False), ("bfloat16", True), ("fp8", False), ("fp8_e5m2", True)],
 )
 def test_nemotron_h_batch_invariant_kv_cache_dtype(monkeypatch, kv_cache_dtype, error):
     """The fixed split-KV FA4 backend serves BF16 and FP8 E4M3 KV caches; any
-    other dtype is rejected at config time instead of when building layers."""
+    other dtype is rejected at config time instead of when building layers.
+    Without bf16_activations the training replay runs the FP8 KV cache, so a
+    BF16 one would silently diverge."""
     from vllm.model_executor.models import config
 
     monkeypatch.setattr(config.envs, "VLLM_BATCH_INVARIANT", True)

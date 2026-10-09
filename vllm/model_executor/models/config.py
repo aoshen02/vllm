@@ -711,6 +711,13 @@ class NemotronHForCausalLMConfig(VerifyAndUpdateConfig):
                     f"E4M3 KV cache; got --kv-cache-dtype {kv_cache_dtype}"
                 )
             if not bf16_activations:
+                if kv_cache_dtype == "bfloat16":
+                    # The training replay pairs a BF16 KV cache with BF16
+                    # activations only; otherwise it runs the FP8 KV cache.
+                    raise ValueError(
+                        "VLLM_BATCH_INVARIANT=1 with Nemotron-H serves a BF16 "
+                        "KV cache only with hf_overrides bf16_activations=True"
+                    )
                 cls.use_cuda_fp8_quant(vllm_config)
 
     @staticmethod
