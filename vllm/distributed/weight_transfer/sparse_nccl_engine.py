@@ -187,6 +187,7 @@ class SparseNCCLWeightTransferEngine(
 
     def shutdown(self) -> None:
         if self.model_update_group is not None:
+            self.model_update_group.destroy()
             self.model_update_group = None
 
 
@@ -372,4 +373,6 @@ class SparseNCCLTrainerWeightTransferEngine(
             torch.cuda.current_stream().synchronize()
 
     def shutdown(self) -> None:
-        self.model_update_group = None
+        if self.model_update_group is not None:
+            self.model_update_group.destroy()
+            self.model_update_group = None
