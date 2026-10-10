@@ -549,3 +549,107 @@ def test_flashinfer_cutedsl_w4a16_moe_batch_invariant(workspace_init):
     full = run(torch.arange(pool, device="cuda"))
     perm = torch.randperm(pool, device="cuda")
     assert torch.equal(run(perm), full[perm])
+
+
+def _ep4_one_sided_combine(parts, ids):
+    """FlashInfer one-sided EP4 combine of per-rank BF16 partials."""
+    owners = ids.long() // (128 // len(parts))
+    stacked = torch.stack(parts)
+    rows = torch.arange(ids.shape[0], device=ids.device)
+    slots = []
+    for slot in range(ids.shape[1]):
+        rank = owners[:, slot]
+        duplicate = (owners[:, :slot] == rank[:, None]).any(dim=1)
+        slots.append(torch.where(duplicate[:, None], 0, stacked[rank, rows]).float())
+    s = slots
+    return (((s[0] + s[1]) + (s[2] + s[3])) + (s[4] + s[5])).to(torch.bfloat16)
+
+
+@pytest.mark.parametrize("m", [1, 37, 300])
+@torch.inference_mode()
+def test_flashinfer_cutedsl_w4a16_moe_ep1_matches_ep4(m, workspace_init, monkeypatch):
+    """Under batch invariance EP1 gives the EP4 deployment's bits.
+
+    The reference runs the four EP4 ranks' runners over their 32 experts and
+    combines their BF16 partials as the one-sided all-to-all does.
+    """
+    pytest.importorskip("flashinfer.fused_moe.cute_dsl.tuner")
+    from flashinfer.fused_moe.cute_dsl.tuner import CuteDslFusedMoEW4A16Runner
+    from flashinfer.tllm_enums import ActivationType
+
+    from vllm import envs
+    from vllm.model_executor.layers.fused_moe.experts.flashinfer_cutedsl_w4a16_moe import (  # noqa: E501
+        BATCH_INVARIANT_TACTIC,
+        FlashInferCuteDSLW4A16Experts,
+        prepare_w4a16_scales,
+    )
+
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
+    n, k, e, topk, ranks = 1856, 2688, 128, 6, 4
+    set_random_seed(13)
+    w1_q, w1_scale, w1_global = _quantize_nvfp4_linear(
+        torch.randn((e, n, k), device="cuda", dtype=torch.bfloat16) / 15
+    )
+    w2_q, w2_scale, w2_global = _quantize_nvfp4_linear(
+        torch.randn((e, k, n), device="cuda", dtype=torch.bfloat16) / 15
+    )
+    w1_sf, w2_sf = prepare_w4a16_scales(w1_scale), prepare_w4a16_scales(w2_scale)
+    w1_alpha, w2_alpha = (1.0 / w1_global).float(), (1.0 / w2_global).float()
+    x = torch.randn((m, k), device="cuda", dtype=torch.bfloat16) / 10
+    ids = torch.stack([torch.randperm(e, device="cuda")[:topk] for _ in range(m)])
+    ids = ids.to(torch.int32)
+    routes = torch.softmax(torch.randn((m, topk), device="cuda"), -1)
+
+    with set_current_vllm_config(
+        VllmConfig(parallel_config=ParallelConfig(pipeline_parallel_size=1))
+    ):
+        moe_config = FusedMoEConfig(
+            num_experts=e,
+            experts_per_token=topk,
+            hidden_dim=k,
+            intermediate_size=n,
+            num_local_experts=e,
+            num_logical_experts=e,
+            activation=MoEActivation.RELU2_NO_MUL,
+            device="cuda",
+            moe_parallel_config=FusedMoEParallelConfig.make_no_parallel(),
+            in_dtype=torch.bfloat16,
+            routing_method=RoutingMethodType.TopK,
+            max_num_tokens=next_power_of_2(m),
+        )
+        quant_config = make_nvfp4_moe_quant_config(
+            backend=NvFp4MoeBackend.FLASHINFER_CUTEDSL,
+            w13_scale=w1_sf,
+            w2_scale=w2_sf,
+            w13_scale_2=w1_alpha,
+            w2_scale_2=w2_alpha,
+            a13_scale=None,
+            a2_scale=None,
+            use_a16=True,
+        )
+        experts = FlashInferCuteDSLW4A16Experts(moe_config, quant_config)
+    output = torch.empty((m, k), device="cuda", dtype=torch.bfloat16)
+    experts.apply(
+        output, x, w1_q, w2_q, routes, ids, MoEActivation.RELU2_NO_MUL, e,
+        None, None, None, None, None, None, False,
+    )  # fmt: skip
+
+    parts = []
+    local = e // ranks
+    for rank in range(ranks):
+        experts_r = slice(rank * local, (rank + 1) * local)
+        runner = CuteDslFusedMoEW4A16Runner(
+            num_experts=e,
+            top_k=topk,
+            num_local_experts=local,
+            local_expert_offset=rank * local,
+            use_fused_finalize=False,
+            activation_type=ActivationType.Relu2.value,
+        )
+        part = torch.empty((m, k), device="cuda", dtype=torch.bfloat16)
+        inputs = [x, ids, routes]
+        for q, sf, alpha in ((w1_q, w1_sf, w1_alpha), (w2_q, w2_sf, w2_alpha)):
+            inputs += [q[experts_r], sf[experts_r], alpha[experts_r]]
+        runner.forward([*inputs, part], tactic=(BATCH_INVARIANT_TACTIC,) * 2)
+        parts.append(part)
+    assert torch.equal(output, _ep4_one_sided_combine(parts, ids))
