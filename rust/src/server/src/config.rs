@@ -242,6 +242,7 @@ pub struct Config {
     /// Disable frontend-side multimodal preprocessing and render the model as
     /// language-only.
     pub language_model_only: bool,
+    pub enable_mm_embeds: bool,
     /// Server-default chat template override, as a file path or inline
     /// template.
     pub chat_template: Option<String>,

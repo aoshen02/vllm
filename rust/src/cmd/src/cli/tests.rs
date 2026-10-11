@@ -188,6 +188,7 @@ fn serve_args_forward_python_flags_with_separator() {
                         tool_strict_level: Auto,
                         renderer: Auto,
                         language_model_only: false,
+                        enable_mm_embeds: false,
                         max_logprobs: None,
                         shutdown_timeout: 0,
                         http_timeout_keep_alive: None,
@@ -1029,6 +1030,7 @@ fn frontend_args_accept_json() {
                         tool_strict_level: Auto,
                         renderer: Auto,
                         language_model_only: false,
+                        enable_mm_embeds: false,
                         max_logprobs: None,
                         shutdown_timeout: 0,
                         http_timeout_keep_alive: None,
@@ -1209,7 +1211,7 @@ fn frontend_args_json_accepts_supported_non_default_fields() {
         "--output-address",
         "ipc:///tmp/output.sock",
         "--args-json",
-        r#"{"model_tag":"Qwen/Qwen3-0.6B","generation_config":"vllm","revision":"release","engine_ready_timeout_secs":42,"tool_call_parser":"hermes","reasoning_parser":"qwen3_thinking","tokenizer_mode":"deepseek_v32","language_model_only":true,"max_logprobs":-1,"shutdown_timeout":3}"#,
+        r#"{"model_tag":"Qwen/Qwen3-0.6B","generation_config":"vllm","revision":"release","engine_ready_timeout_secs":42,"tool_call_parser":"hermes","reasoning_parser":"qwen3_thinking","tokenizer_mode":"deepseek_v32","language_model_only":true,"enable_mm_embeds":true,"max_logprobs":-1,"shutdown_timeout":3}"#,
     ])
     .unwrap();
 
@@ -1229,8 +1231,10 @@ fn frontend_args_json_accepts_supported_non_default_fields() {
     );
     assert_eq!(args.runtime.renderer, RendererSelection::DeepSeekV32);
     assert!(args.runtime.language_model_only);
+    assert!(args.runtime.enable_mm_embeds);
     assert_eq!(args.runtime.max_logprobs, Some(-1));
     assert_eq!(args.runtime.shutdown_timeout, 3);
+    assert!(args.into_config().enable_mm_embeds);
 }
 
 #[test]
@@ -1241,6 +1245,7 @@ fn serve_args_forward_auto_max_model_len_to_managed_engine() {
         "Qwen/Qwen3-0.6B",
         "--max-model-len",
         "auto",
+        "--enable-mm-embeds",
     ])
     .unwrap();
 
@@ -1256,6 +1261,7 @@ fn serve_args_forward_auto_max_model_len_to_managed_engine() {
             "auto",
             "--reasoning-parser",
             "qwen3",
+            "--enable-mm-embeds",
         ]
     "#]]
     .assert_debug_eq(&config.python_args);
@@ -1701,6 +1707,7 @@ fn serve_args_accept_handshake_aliases() {
                         tool_strict_level: Auto,
                         renderer: Auto,
                         language_model_only: false,
+                        enable_mm_embeds: false,
                         max_logprobs: None,
                         shutdown_timeout: 0,
                         http_timeout_keep_alive: None,
@@ -1860,6 +1867,7 @@ fn serve_frontend_config_uses_dp_address_as_advertised_host() {
             tool_strict_level: Auto,
             renderer: Auto,
             language_model_only: false,
+            enable_mm_embeds: false,
             chat_template: None,
             default_chat_template_kwargs: None,
             limit_mm_per_prompt: {},
@@ -1955,6 +1963,7 @@ fn serve_frontend_config_keeps_tcp_transport_for_non_local_only_topology() {
             tool_strict_level: Auto,
             renderer: Auto,
             language_model_only: false,
+            enable_mm_embeds: false,
             chat_template: None,
             default_chat_template_kwargs: None,
             limit_mm_per_prompt: {},
@@ -2094,6 +2103,7 @@ fn frontend_config_uses_external_coordinator_when_coordinator_address_is_present
             tool_strict_level: Auto,
             renderer: Auto,
             language_model_only: false,
+            enable_mm_embeds: false,
             chat_template: None,
             default_chat_template_kwargs: None,
             limit_mm_per_prompt: {},

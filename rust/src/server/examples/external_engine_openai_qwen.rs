@@ -75,6 +75,7 @@ async fn main() -> Result<()> {
         tool_strict_level: ToolStrictLevel::Auto,
         renderer: RendererSelection::Auto,
         language_model_only: false,
+        enable_mm_embeds: false,
         chat_template: None,
         default_chat_template_kwargs: None,
         limit_mm_per_prompt: HashMap::new(),

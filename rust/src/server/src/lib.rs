@@ -90,7 +90,7 @@ async fn build_state(config: &Config) -> Result<Arc<AppState>> {
             hf_overrides: config.hf_overrides.clone(),
             generation_config: config.generation_config,
             renderer: config.renderer,
-            language_model_only: config.language_model_only,
+            language_model_only: config.language_model_only && !config.enable_mm_embeds,
             chat_template: config.chat_template.clone(),
             chat_template_content_format: config.chat_template_content_format,
             default_chat_template_kwargs: config
