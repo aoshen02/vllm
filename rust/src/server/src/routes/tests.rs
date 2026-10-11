@@ -1535,6 +1535,58 @@ async fn render_chat_response_can_be_submitted_to_generate_unchanged() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
+async fn combined_render_multimodal_response_can_be_submitted_to_generate_unchanged() {
+    let (chat, engine_task) = test_models_with_engine_outputs_and_backend(
+        b"engine-combined-render-multimodal",
+        default_stream_output_specs(),
+        Arc::new(FakeChatBackend::with_multimodal_model_info(
+            qwen_multimodal_model_info(),
+        )),
+    )
+    .await;
+    let mut app = build_router_with_scale_out_endpoints(
+        Arc::new(AppState::new(vec!["render-model".into()], chat)),
+        true,
+    );
+    let response = app.call(Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions/render")
+        .header("content-type", "application/json")
+        .body(Body::from(json!({
+            "model": "render-model",
+            "messages": [{"role": "user", "content": [{
+                "type": "image_url",
+                "image_url": {"url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="}
+            }]}],
+            "max_completion_tokens": 8
+        }).to_string())).unwrap()).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let mut payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        payload["features"]["mm_hashes"]["image"].as_array().unwrap().len(),
+        1
+    );
+    assert!(payload["features"]["kwargs_data"]["image"][0].is_string());
+    payload["content_parts"] = json!([]);
+    let response = app
+        .call(
+            Request::builder()
+                .method("POST")
+                .uri("/inference/v1/generate")
+                .header("content-type", "application/json")
+                .body(Body::from(payload.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    engine_task.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
 async fn list_models_returns_configured_model() {
     let mut app = test_app().await;
     let response = app
