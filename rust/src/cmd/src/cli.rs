@@ -263,6 +263,9 @@ pub struct SharedRuntimeArgs {
     #[arg(long)]
     #[serde(default)]
     pub language_model_only: bool,
+    #[arg(long)]
+    #[serde(default)]
+    pub enable_mm_embeds: bool,
     /// Maximum number of log probabilities to return when `logprobs` is
     /// specified in sampling parameters. `-1` means no cap.
     #[arg(long, value_parser = clap::value_parser!(i32).range(-1..), allow_negative_numbers = true)]
@@ -541,6 +544,7 @@ impl SharedRuntimeArgs {
             tool_strict_level: self.tool_strict_level,
             renderer: self.renderer,
             language_model_only: self.language_model_only,
+            enable_mm_embeds: self.enable_mm_embeds,
             chat_template: self.chat_template,
             default_chat_template_kwargs: self.default_chat_template_kwargs,
             limit_mm_per_prompt: self.limit_mm_per_prompt,
@@ -603,6 +607,7 @@ impl SharedRuntimeArgs {
             tool_strict_level: self.tool_strict_level,
             renderer: self.renderer,
             language_model_only: self.language_model_only,
+            enable_mm_embeds: self.enable_mm_embeds,
             chat_template: self.chat_template,
             default_chat_template_kwargs: self.default_chat_template_kwargs,
             limit_mm_per_prompt: self.limit_mm_per_prompt,
@@ -836,6 +841,7 @@ impl ServeArgs {
             profiler_config,
             reasoning_parser.as_deref(),
             self.runtime.language_model_only,
+            self.runtime.enable_mm_embeds,
             self.runtime.disable_log_stats,
             self.runtime.shutdown_timeout,
             handshake_port,

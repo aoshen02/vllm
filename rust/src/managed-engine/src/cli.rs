@@ -89,6 +89,7 @@ impl ManagedEngineArgs {
         profiler_config: Option<String>,
         reasoning_parser: Option<&str>,
         language_model_only: bool,
+        enable_mm_embeds: bool,
         disable_log_stats: bool,
         shutdown_timeout: u64,
         handshake_port: u16,
@@ -119,6 +120,9 @@ impl ManagedEngineArgs {
         }
         if language_model_only {
             python_args.push("--language-model-only".to_string());
+        }
+        if enable_mm_embeds {
+            python_args.push("--enable-mm-embeds".to_string());
         }
         if disable_log_stats {
             python_args.push("--disable-log-stats".to_string());
