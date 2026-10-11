@@ -2995,6 +2995,8 @@ class VllmConfig:
             raise ValueError(
                 "An EC producer-only instance requires a multimodal model."
             )
+        if mm_config.mm_decoder_only:
+            raise ValueError("An EC producer-only instance cannot use mm_decoder_only.")
         mm_config.mm_encoder_only = True
 
     def _resolve_mm_processor_device(self) -> None:

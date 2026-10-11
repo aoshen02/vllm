@@ -76,13 +76,14 @@ class MultiModalBudget:
             tower_modalities = {
                 modality
                 for modality in supported_mm_limits
-                if mm_limits.get(modality, 0) > 0
+                if not mm_config.mm_decoder_only and mm_limits.get(modality, 0) > 0
             }
             # Modalities that bypass the tower (pre-computed embeddings only)
             embed_only_modalities = {
                 modality
                 for modality in supported_mm_limits
-                if enable_mm_embeds and mm_limits.get(modality, 0) == 0
+                if mm_config.mm_decoder_only
+                or (enable_mm_embeds and mm_limits.get(modality, 0) == 0)
             }
 
             active_modalities = tower_modalities | embed_only_modalities
@@ -95,7 +96,7 @@ class MultiModalBudget:
 
         if embed_only_modalities:
             logger.info_once(
-                "enable_mm_embeds is True; modalities handled as embedding-only: %s",
+                "Modalities handled without local encoder towers: %s",
                 tuple(embed_only_modalities),
             )
 
