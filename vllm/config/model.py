@@ -370,6 +370,9 @@ class ModelConfig:
     enable_sleep_mode: bool = False
     """Enable sleep mode for the engine (only cuda and
     hip platforms are supported)."""
+    enable_draft_weights_cpu_backup: bool = False
+    """Preserve draft-private weights on CPU during level-2 sleep.
+    Parameters shared with the target remain owned by the target updater."""
     sleep_preserve_parameter_names: list[str] = field(default_factory=list)
     """Parameter-name globs to preserve across level-2 sleep.
     The sender must omit these parameters; loaders must preserve their storage."""
