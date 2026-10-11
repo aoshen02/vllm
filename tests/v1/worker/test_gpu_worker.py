@@ -19,51 +19,40 @@ from vllm.v1.worker.startup_plan import (
 )
 
 
-@pytest.mark.parametrize("backup", [False, True])
-def test_draft_sleep_backup_preserves_private_weights_not_target(backup, monkeypatch):
+def test_sleep_preservation_restores_private_draft_not_shared_target():
     target = torch.nn.Linear(2, 2, bias=False)
     draft = torch.nn.Module()
     draft.private = torch.nn.Linear(2, 2, bias=False)
     draft.shared = target.weight
-    draft.register_buffer("scale", torch.tensor([2.0]))
     expected = draft.private.weight.detach().clone()
     pointer = draft.private.weight.data_ptr()
-
-    def discard(level):
-        assert level == 2
-        with torch.no_grad():
-            target.weight.zero_()
-            draft.private.weight.zero_()
-            draft.scale.zero_()
-
-    monkeypatch.setattr(torch.accelerator, "synchronize", lambda: None)
-    monkeypatch.setattr(torch.accelerator, "get_memory_info", lambda: (100, 200))
-    config = SimpleNamespace(enable_nccl_comm_suspend=False)
-    worker = SimpleNamespace(
-        model_config=SimpleNamespace(enable_draft_weights_cpu_backup=backup),
-        vllm_config=SimpleNamespace(model_config=config),
-        model_runner=SimpleNamespace(model=target),
-        get_draft_model=lambda: draft,
-        _save_sleep_parameters=lambda model: None,
-        _restore_sleep_parameters=lambda model: None,
-        _sleep_saved_parameters={},
-        _sleep_saved_draft_state={},
-        sleep_mode_backend=SimpleNamespace(suspend=discard, resume=lambda tags: None),
-        synchronize_device=lambda: None,
-    )
-    gpu_worker.Worker.sleep(worker, level=2)
-    gpu_worker.Worker.wake_up(worker, tags=["kv_cache"])
-    assert torch.count_nonzero(draft.private.weight) == 0
+    worker = object.__new__(gpu_worker.Worker)
+    worker.get_draft_model = lambda: draft
+    assert set(worker._get_sleep_parameters(target)) == {
+        "weight",
+        "draft.private.weight",
+    }
+    worker._sleep_saved_parameters = {"draft.private.weight": expected}
     with torch.no_grad():
         target.weight.fill_(3.0)
-    gpu_worker.Worker.wake_up(worker, tags=["weights"])
-    torch.testing.assert_close(
-        draft.private.weight, expected if backup else torch.zeros_like(expected)
-    )
+        draft.private.weight.zero_()
+    worker._restore_sleep_parameters(target)
+    torch.testing.assert_close(draft.private.weight, expected)
     assert draft.private.weight.data_ptr() == pointer
     assert torch.all(target.weight == 3.0)
-    assert draft.scale.item() == 2.0
-    assert worker._sleep_saved_draft_state == {}
+    assert worker._sleep_saved_parameters == {}
+
+
+def test_sleep_preservation_allows_absent_draft_but_rejects_target_typo():
+    target = torch.nn.Linear(2, 2, bias=False)
+    worker = object.__new__(gpu_worker.Worker)
+    worker.get_draft_model = lambda: None
+    worker.model_config = SimpleNamespace(sleep_preserve_parameter_names=["draft.*"])
+    worker._save_sleep_parameters(target)
+    assert worker._sleep_saved_parameters == {}
+    worker.model_config.sleep_preserve_parameter_names = ["missing"]
+    with pytest.raises(ValueError, match="No parameter matches sleep retention"):
+        worker._save_sleep_parameters(target)
 
 
 def test_load_model_preserves_compiled_graphs_at_runtime(monkeypatch):

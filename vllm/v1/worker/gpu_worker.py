@@ -215,7 +215,7 @@ class Worker(WorkerBase):
         # Buffers saved before sleep
         self._sleep_saved_buffers: dict[str, torch.Tensor] = {}
         self._sleep_saved_parameters: dict[str, torch.Tensor] = {}
-        self._sleep_saved_draft_state: dict[str, torch.Tensor] = {}
+        self._sleep_saved_draft_buffers: dict[str, torch.Tensor] = {}
 
         # Weight transfer engine is created in `load_model` once the model
         # is available, since the engine needs a reference to the model.
@@ -250,15 +250,29 @@ class Worker(WorkerBase):
             )
         return self._sleep_mode_backend
 
+    def _get_sleep_parameters(self, model: nn.Module) -> dict[str, nn.Parameter]:
+        parameters = dict(model.named_parameters())
+        draft = self.get_draft_model()
+        if draft is not None:
+            shared = {id(parameter) for parameter in parameters.values()}
+            parameters.update(
+                (f"draft.{name}", parameter)
+                for name, parameter in draft.named_parameters()
+                if id(parameter) not in shared
+            )
+        return parameters
+
     def _save_sleep_parameters(self, model: nn.Module) -> None:
         patterns = self.model_config.sleep_preserve_parameter_names
         if not patterns:
             self._sleep_saved_parameters = {}
             return
-        parameters = dict(model.named_parameters())
+        parameters = self._get_sleep_parameters(model)
         names: set[str] = set()
         for pattern in patterns:
             matches = fnmatch_filter(parameters, pattern)
+            if not matches and pattern == "draft.*" and self.get_draft_model() is None:
+                continue
             if not matches:
                 raise ValueError(f"No parameter matches sleep retention: {pattern}")
             names.update(matches)
@@ -270,8 +284,9 @@ class Worker(WorkerBase):
 
     @torch.no_grad()
     def _restore_sleep_parameters(self, model: nn.Module) -> None:
+        parameters = self._get_sleep_parameters(model)
         for name, value in self._sleep_saved_parameters.items():
-            model.get_parameter(name).copy_(value)
+            parameters[name].copy_(value)
         self._sleep_saved_parameters.clear()
 
     def sleep(self, level: int = 1) -> None:
@@ -287,17 +302,8 @@ class Worker(WorkerBase):
             }
             draft = self.get_draft_model()
             if draft is not None:
-                state = dict(draft.named_buffers())
-                if self.model_config.enable_draft_weights_cpu_backup:
-                    shared = {id(parameter) for parameter in model.parameters()}
-                    state.update(
-                        (name, parameter)
-                        for name, parameter in draft.named_parameters()
-                        if id(parameter) not in shared
-                    )
-                self._sleep_saved_draft_state = {
-                    name: tensor.detach().cpu().clone()
-                    for name, tensor in state.items()
+                self._sleep_saved_draft_buffers = {
+                    name: buffer.cpu().clone() for name, buffer in draft.named_buffers()
                 }
 
         self.sleep_mode_backend.suspend(level)
@@ -321,7 +327,6 @@ class Worker(WorkerBase):
             format_gib(used_bytes),
         )
 
-    @torch.no_grad()
     def wake_up(self, tags: list[str] | None = None) -> None:
         self.sleep_mode_backend.resume(tags)
         if self.vllm_config.model_config.enable_nccl_comm_suspend:
@@ -338,13 +343,13 @@ class Worker(WorkerBase):
                     buffer.data.copy_(self._sleep_saved_buffers[name].data)
             self._sleep_saved_buffers = {}
 
-        if wake_weights and len(self._sleep_saved_draft_state):
+        if wake_weights and len(self._sleep_saved_draft_buffers):
             draft = self.get_draft_model()
             if draft is not None:
-                state = dict(draft.named_buffers()) | dict(draft.named_parameters())
-                for name, tensor in self._sleep_saved_draft_state.items():
-                    state[name].copy_(tensor)
-            self._sleep_saved_draft_state.clear()
+                for name, buffer in draft.named_buffers():
+                    if name in self._sleep_saved_draft_buffers:
+                        buffer.data.copy_(self._sleep_saved_draft_buffers[name].data)
+            self._sleep_saved_draft_buffers = {}
 
         self.synchronize_device()
 
