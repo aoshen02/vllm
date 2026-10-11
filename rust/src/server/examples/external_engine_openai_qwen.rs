@@ -51,6 +51,7 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let port = unique_local_port()?;
     let config = Config {
+        vllm_config: None,
         transport_mode: TransportMode::HandshakeOwner {
             handshake_address: args.handshake_address,
             advertised_host: args.host,

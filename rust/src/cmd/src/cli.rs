@@ -205,6 +205,10 @@ pub struct JsonStringList(pub Vec<String>);
 #[derive(Educe, Clone, Args, PartialEq, Eq, Deserialize)]
 #[educe(Debug)]
 pub struct SharedRuntimeArgs {
+    #[arg(skip)]
+    #[serde(default)]
+    #[educe(Debug(ignore))]
+    pub vllm_config: Option<Value>,
     #[serde(rename = "model_tag")]
     /// Model identifier or local model directory used for backend loading and
     /// public model ID.
@@ -529,6 +533,7 @@ impl SharedRuntimeArgs {
                 Some(address) => CoordinatorMode::External { address },
                 None => CoordinatorMode::None,
             },
+            vllm_config: self.vllm_config,
             model: self.model,
             revision: self.revision,
             hf_overrides: self.hf_overrides,
@@ -591,6 +596,7 @@ impl SharedRuntimeArgs {
                 local_output_address,
             },
             coordinator_mode: CoordinatorMode::MaybeInProc,
+            vllm_config: self.vllm_config,
             model: self.model,
             revision: self.revision,
             hf_overrides: self.hf_overrides,

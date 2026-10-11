@@ -1105,7 +1105,43 @@ fn frontend_args_json_applies_defaults() {
     assert_eq!(args.runtime.renderer, RendererSelection::Auto);
     assert_eq!(args.runtime.max_logprobs, None);
     assert_eq!(args.runtime.shutdown_timeout, 0);
+    assert_eq!(args.runtime.vllm_config, None);
     assert_eq!(args.into_config().transport_mode.data_parallel_size(), 4);
+}
+
+#[test]
+fn frontend_args_json_preserves_resolved_engine_config() {
+    let resolved = serde_json::json!({
+        "ec_transfer_config": {
+            "ec_connector": "ECCPUConnector",
+            "ec_role": "ec_producer",
+        },
+        "kv_transfer_config": null,
+    });
+    let payload = serde_json::json!({
+        "model_tag": "test-model",
+        "vllm_config": resolved,
+    });
+    let cli = Cli::try_parse_from([
+        "vllm-rs",
+        "frontend",
+        "--listen-fd",
+        "3",
+        "--input-address",
+        "ipc:///tmp/input.sock",
+        "--output-address",
+        "ipc:///tmp/output.sock",
+        "--args-json",
+        &payload.to_string(),
+    ])
+    .unwrap();
+    let Command::Frontend(args) = cli.command else {
+        panic!("expected frontend args");
+    };
+    let config = args.into_config();
+    assert_eq!(config.vllm_config, Some(resolved));
+    assert!(serde_json::to_value(&config).unwrap().get("vllm_config").is_none());
+    assert!(!format!("{config:?}").contains("ec_producer"));
 }
 
 #[test]

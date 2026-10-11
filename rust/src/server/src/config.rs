@@ -211,6 +211,9 @@ impl FromStr for LoraModulePath {
 #[derive(Educe, Clone, PartialEq, Eq, Serialize)]
 #[educe(Debug)]
 pub struct Config {
+    #[serde(skip_serializing)]
+    #[educe(Debug(ignore))]
+    pub vllm_config: Option<Value>,
     /// Frontend-to-engine transport setup.
     pub transport_mode: TransportMode,
     /// Requested frontend-side coordinator behavior.

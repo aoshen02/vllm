@@ -446,8 +446,10 @@ def test_gather_actual_addresses_child_crash_before_report():
 def test_rust_frontend_launch_log_redacts_credentials(monkeypatch, caplog):
     """The Rust frontend command carries every non-default arg as JSON.
     Credentials must not reach the log line."""
+    import json
     import subprocess as subprocess_mod
 
+    from vllm.config import ECTransferConfig, VllmConfig
     from vllm.entrypoints.launchers.cli_args import make_arg_parser
     from vllm.utils.argparse_utils import FlexibleArgumentParser
     from vllm.v1.utils import RustFrontendProcessManager
@@ -457,6 +459,13 @@ def test_rust_frontend_launch_log_redacts_credentials(monkeypatch, caplog):
     args = make_arg_parser(FlexibleArgumentParser()).parse_args(
         ["--model", "org/model", "--hf-token", hf_token, "--api-key", api_key]
     )
+    vllm_config = VllmConfig(
+        ec_transfer_config=ECTransferConfig(
+            ec_connector="ECCPUConnector", ec_role="ec_consumer"
+        ),
+        additional_config={"hf_token": hf_token},
+    )
+    commands = []
 
     class _FakeProc:
         pid = 4321
@@ -470,7 +479,11 @@ def test_rust_frontend_launch_log_redacts_credentials(monkeypatch, caplog):
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
-        monkeypatch.setattr(subprocess_mod, "Popen", lambda *a, **kw: _FakeProc())
+        monkeypatch.setattr(
+            subprocess_mod,
+            "Popen",
+            lambda cmd, **kw: commands.append(cmd) or _FakeProc(),
+        )
         with caplog.at_level("INFO", logger="vllm.v1.utils"):
             RustFrontendProcessManager(
                 binary_path="/nonexistent/vllm-rs",
@@ -481,6 +494,7 @@ def test_rust_frontend_launch_log_redacts_credentials(monkeypatch, caplog):
                 engine_start_index=0,
                 engine_count=1,
                 data_parallel_size=1,
+                vllm_config=vllm_config,
             )
     finally:
         sock.close()
@@ -490,6 +504,10 @@ def test_rust_frontend_launch_log_redacts_credentials(monkeypatch, caplog):
     assert hf_token not in message
     assert api_key not in message
     assert '"hf_token": "***"' in message
+    payload = json.loads(commands[0][-1])["vllm_config"]
+    assert payload["ec_transfer_config"]["ec_role"] == "ec_consumer"
+    assert payload["additional_config"]["hf_token"] == hf_token
+    assert "ec_consumer" not in message
 
 
 def test_rust_frontend_uses_config_model_as_model_tag(monkeypatch, caplog, tmp_path):

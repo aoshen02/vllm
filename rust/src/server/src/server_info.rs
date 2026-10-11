@@ -28,8 +28,9 @@ pub(crate) struct ServerInfoSnapshot {
 impl ServerInfoSnapshot {
     /// Capture the runtime configuration fields available to the Rust frontend.
     pub(crate) fn from_config(config: &Config) -> Self {
-        let vllm_config_json =
-            serde_json::to_value(config).expect("server info value must serialize");
+        let vllm_config_json = config.vllm_config.clone().unwrap_or_else(|| {
+            serde_json::to_value(config).expect("server info value must serialize")
+        });
 
         Self {
             vllm_config_text: render_config_text(&vllm_config_json),
