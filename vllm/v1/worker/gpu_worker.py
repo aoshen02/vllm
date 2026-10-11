@@ -271,9 +271,7 @@ class Worker(WorkerBase):
         names: set[str] = set()
         for pattern in patterns:
             matches = fnmatch_filter(parameters, pattern)
-            if not matches and pattern == "draft.*" and self.get_draft_model() is None:
-                continue
-            if not matches:
+            if not matches and pattern != "draft.*":
                 raise ValueError(f"No parameter matches sleep retention: {pattern}")
             names.update(matches)
         self._sleep_saved_parameters = {

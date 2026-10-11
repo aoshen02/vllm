@@ -43,10 +43,16 @@ def test_sleep_preservation_restores_private_draft_not_shared_target():
     assert worker._sleep_saved_parameters == {}
 
 
-def test_sleep_preservation_allows_absent_draft_but_rejects_target_typo():
+@pytest.mark.parametrize("has_shared_draft", [False, True])
+def test_sleep_preservation_allows_empty_draft_but_rejects_target_typo(
+    has_shared_draft,
+):
     target = torch.nn.Linear(2, 2, bias=False)
+    draft = torch.nn.Module() if has_shared_draft else None
+    if draft is not None:
+        draft.shared = target.weight
     worker = object.__new__(gpu_worker.Worker)
-    worker.get_draft_model = lambda: None
+    worker.get_draft_model = lambda: draft
     worker.model_config = SimpleNamespace(sleep_preserve_parameter_names=["draft.*"])
     worker._save_sleep_parameters(target)
     assert worker._sleep_saved_parameters == {}
