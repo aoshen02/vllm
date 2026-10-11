@@ -12,6 +12,7 @@ from vllm.distributed.ec_transfer.ec_connector.cpu.ec_shared_region import (
 )
 from vllm.distributed.ec_transfer.ec_connector.cpu.scheduler import ECCPUScheduler
 from vllm.distributed.nixl_utils import NixlWrapper
+from vllm.utils.network_utils import get_open_port
 
 _N = 16
 _BS = 64
@@ -58,13 +59,14 @@ def test_string_false_in_extra_config_leaves_nixl_off(monkeypatch):
 
 
 @pytest.mark.skipif(NixlWrapper is None, reason="Requires NIXL package")
-def test_gate_on_wires_data_transport_and_producer_session(monkeypatch):
-    # Port 0 lets the OS pick an ephemeral port so the real ZMQ ROUTER bind
-    # in ProducerSession.start() cannot collide with another test/process.
+@pytest.mark.parametrize("dp_index", [0, 1])
+def test_gate_on_wires_data_transport_and_producer_session(monkeypatch, dp_index):
+    target_port = get_open_port()
     monkeypatch.setenv("VLLM_EC_SIDE_CHANNEL_HOST", "127.0.0.1")
-    monkeypatch.setenv("VLLM_EC_SIDE_CHANNEL_PORT", "0")
+    monkeypatch.setenv("VLLM_EC_SIDE_CHANNEL_PORT", str(target_port - dp_index))
     monkeypatch.setattr(sched_mod, "create_ec_shared_region", lambda cfg: _region())
     cfg = create_ec_vllm_config(ec_role="ec_both")
+    cfg.parallel_config.data_parallel_index = dp_index
     cfg.ec_transfer_config.ec_connector_extra_config["ec_enable_nixl"] = True
     s = ECCPUScheduler(cfg)
     try:
@@ -73,6 +75,7 @@ def test_gate_on_wires_data_transport_and_producer_session(monkeypatch):
         assert s._compat_hash is not None
         assert s._producer_session is not None
         assert s._peer_host == "127.0.0.1"
+        assert s._peer_port == target_port
         assert s._transport is not None  # is_ec_consumer is also True
     finally:
         s.shutdown()
