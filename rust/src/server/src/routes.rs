@@ -10,6 +10,7 @@ mod kv_event_sources;
 mod load;
 mod lora;
 mod metrics;
+mod multimodal_features;
 pub(crate) mod openai;
 mod pause;
 mod profile;
@@ -103,7 +104,16 @@ fn build_router_with_options(
         .route("/detokenize", post(tokenize::detokenize));
 
     if scale_out_endpoints_enabled {
-        router = router.route("/inference/v1/generate", post(inference::generate));
+        router = router
+            .route("/inference/v1/generate", post(inference::generate))
+            .route(
+                "/v1/chat/completions/render",
+                post(render::serve_render_chat),
+            )
+            .route(
+                "/v1/completions/render",
+                post(render::serve_render_completion),
+            );
     } else {
         info!("scale-out endpoints are disabled; pass --enable-scale-out to enable them");
     }
