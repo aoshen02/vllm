@@ -345,8 +345,8 @@ class SupportsMultiModal(SupportsMultiModalEmbeddings, Protocol):
         """Mark each child module that was assigned to this model during this context
         as a tower model component.
 
-        Tower model components are automatically skipped when `--limit-mm-per-prompt`
-        is set to zero for all of their modalities.
+        Tower model components are automatically skipped in decoder-only mode or
+        when `--limit-mm-per-prompt` is zero for all of their modalities.
 
         If `targets` is set, instead include descendants that are an instance
         of `targets`, even if they aren't direct children.
@@ -376,7 +376,8 @@ class SupportsMultiModal(SupportsMultiModalEmbeddings, Protocol):
                     lambda mod: StageMissingLayer(stage_name, mod),
                     targets=targets,
                 )
-                if all(mm_config.get_limit_per_prompt(m) == 0 for m in modalities)
+                if mm_config.mm_decoder_only
+                or all(mm_config.get_limit_per_prompt(m) == 0 for m in modalities)
                 else nullcontext()
             ):
                 yield

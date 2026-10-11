@@ -643,6 +643,7 @@ class EngineArgs:
         MultiModalConfig.mm_shm_cache_max_object_size_mb
     )
     mm_encoder_only: bool = MultiModalConfig.mm_encoder_only
+    mm_decoder_only: bool = MultiModalConfig.mm_decoder_only
     mm_encoder_tp_mode: MMEncoderTPMode = MultiModalConfig.mm_encoder_tp_mode
     mm_encoder_attn_backend: AttentionBackendEnum | str | None = (
         MultiModalConfig.mm_encoder_attn_backend
@@ -1439,6 +1440,9 @@ class EngineArgs:
             description=MultiModalConfig.__doc__,
         )
         multimodal_group.add_argument(
+            "--mm-decoder-only", **multimodal_kwargs["mm_decoder_only"]
+        )
+        multimodal_group.add_argument(
             "--language-model-only", **multimodal_kwargs["language_model_only"]
         )
         multimodal_group.add_argument(
@@ -1979,6 +1983,7 @@ class EngineArgs:
             mm_shm_cache_max_object_size_mb=self.mm_shm_cache_max_object_size_mb,
             mm_hasher_algorithm=self.mm_hasher_algorithm,
             mm_encoder_only=self.mm_encoder_only,
+            mm_decoder_only=self.mm_decoder_only,
             mm_encoder_tp_mode=self.mm_encoder_tp_mode,
             mm_encoder_attn_backend=self.mm_encoder_attn_backend,
             mm_encoder_attn_dtype=self.mm_encoder_attn_dtype,

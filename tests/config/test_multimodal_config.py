@@ -49,6 +49,14 @@ def test_mm_encoder_attn_backend_invalid():
         MultiModalConfig(mm_encoder_attn_backend="not_a_backend")
 
 
+def test_mm_decoder_only_preserves_modality_limits():
+    config = MultiModalConfig(mm_decoder_only=True, limit_per_prompt={"image": 2})
+    assert config.get_limit_per_prompt("image") == 2
+    assert not config.language_model_only
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        MultiModalConfig(mm_encoder_only=True, mm_decoder_only=True)
+
+
 def test_mm_hasher_algorithm_invalid():
     with pytest.raises(ValueError, match="mm_hasher_algorithm"):
         MultiModalConfig(mm_hasher_algorithm="md5")
