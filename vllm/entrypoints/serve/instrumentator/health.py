@@ -7,7 +7,7 @@ from fastapi.responses import Response
 
 from vllm.engine.protocol import EngineClient
 from vllm.logger import init_logger
-from vllm.v1.engine.exceptions import EngineDeadError
+from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 
 logger = init_logger(__name__)
 
@@ -30,4 +30,17 @@ async def health(raw_request: Request) -> Response:
         await client.check_health()
         return Response(status_code=200)
     except EngineDeadError:
+        return Response(status_code=503)
+
+
+@router.get("/health_generate", response_class=Response)
+async def health_generate(raw_request: Request) -> Response:
+    """Check inference progress while keeping the lightweight health route intact."""
+    client = engine_client(raw_request)
+    if client is None:
+        return Response(status_code=200)
+    try:
+        await client.check_health_generate()
+        return Response(status_code=200)
+    except (EngineDeadError, EngineGenerateError, TimeoutError):
         return Response(status_code=503)
