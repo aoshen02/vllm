@@ -6690,6 +6690,120 @@ async fn collective_rpc_route_sends_expected_utility_call_and_returns_results() 
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
+async fn dumper_control_routes_forward_without_dev_mode_and_return_worker_lists() {
+    let (state, engine_task) =
+        test_admin_state_with_ready_and_engine_script(default_ready_response(), |dealer, push| {
+            boxed_test_future(async move {
+                for (action, expected_body) in [
+                    ("configure", json!({"enable": true})),
+                    ("reset", json!({})),
+                    ("get_state", json!({})),
+                ] {
+                    let utility = recv_engine_message(dealer).await;
+                    let payload = decode_value(&utility[1]).unwrap();
+                    let request = payload.as_array().unwrap();
+                    assert_eq!(request[2], Value::from("collective_rpc"));
+                    let arguments = request[3].as_array().unwrap();
+                    assert_eq!(arguments[0], Value::from("dumper_control"));
+                    assert_eq!(arguments[1], Value::Nil);
+                    let positional = arguments[2].as_array().unwrap();
+                    assert_eq!(positional[0], Value::from(action));
+                    assert_eq!(
+                        serde_json::from_str::<serde_json::Value>(positional[1].as_str().unwrap())
+                            .unwrap(),
+                        expected_body
+                    );
+                    assert_eq!(arguments[3], Value::Map(vec![]));
+                    send_outputs(
+                        push,
+                        utility_outputs(
+                            request[1].as_u64().unwrap(),
+                            UtilityResultEnvelope::without_type_info(Value::Array(vec![
+                                Value::Map(vec![(Value::from("action"), Value::from(action))]),
+                            ])),
+                        ),
+                    )
+                    .await;
+                }
+            })
+        })
+        .await;
+    let mut disabled = super::build_router_with_options(state.clone(), false, false, false, false);
+    let response = disabled
+        .call(
+            Request::builder()
+                .method("POST")
+                .uri("/dumper/get_state")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let mut enabled = super::build_router_with_options(state, false, false, false, true);
+    for (action, body) in [
+        ("configure", Some(r#"{"enable":true}"#)),
+        ("reset", None),
+        ("get_state", Some("null")),
+    ] {
+        let request = Request::builder().method("POST").uri(format!("/dumper/{action}"));
+        let request = if let Some(body) = body {
+            request
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap()
+        } else {
+            request.body(Body::empty()).unwrap()
+        };
+        let response = enabled.call(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
+            json!([{"action": action}])
+        );
+    }
+    engine_task.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn dumper_control_routes_require_configured_api_keys() {
+    let (chat, _engine_task) = test_models_with_engine_outputs_and_backend(
+        b"engine-dumper-auth",
+        default_stream_output_specs(),
+        Arc::new(FakeChatBackend::new()),
+    )
+    .await;
+    let state =
+        Arc::new(AppState::new(vec!["model".into()], chat).with_api_keys(vec!["secret".into()]));
+    let mut app = super::build_router_with_options(state, false, false, false, true);
+    for token in [None, Some("Bearer wrong")] {
+        let request = Request::builder().method("POST").uri("/dumper/reset");
+        let request = if let Some(token) = token {
+            request.header("authorization", token)
+        } else {
+            request
+        };
+        let response = app.call(request.body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+    let response = app
+        .call(
+            Request::builder()
+                .method("GET")
+                .uri("/dumper/get_state")
+                .header("authorization", "Bearer secret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
 async fn weight_checker_route_merges_worker_checksums_and_compares() {
     let (mut app, engine_task) = test_admin_app_with_engine_script(|dealer, push| {
         boxed_test_future(async move {

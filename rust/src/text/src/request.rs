@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::num::NonZeroU32;
 
 use enum_as_inner::EnumAsInner;
@@ -259,6 +259,8 @@ pub struct TextRequest {
     /// Stable session identity shared by related requests.
     #[serde(default)]
     pub session_id: Option<String>,
+    #[serde(default)]
+    pub trace_headers: Option<BTreeMap<String, String>>,
     /// Optional orchestrator-originated KV hints.
     #[serde(default)]
     pub kv_hints: Option<KvHintsEnvelope>,
@@ -302,6 +304,7 @@ impl TextRequest {
             add_special_tokens: false,
             data_parallel_rank: None,
             session_id: None,
+            trace_headers: None,
             kv_hints: None,
             reasoning_parser_kwargs: Default::default(),
             reasoning_ended: None,

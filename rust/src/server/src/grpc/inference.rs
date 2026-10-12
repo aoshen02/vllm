@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+use std::collections::BTreeMap;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Instant;
@@ -24,6 +25,23 @@ use crate::state::AppState;
 pub(crate) type InferenceGrpcService = InferenceServer<InferenceServiceImpl>;
 
 const DATA_PARALLEL_RANK_METADATA_KEY: &str = "x-data-parallel-rank";
+
+fn trace_headers_from_metadata<Message>(
+    request: &Request<Message>,
+) -> Option<BTreeMap<String, String>> {
+    let headers: BTreeMap<_, _> = ["traceparent", "tracestate"]
+        .into_iter()
+        .filter_map(|name| {
+            request
+                .metadata()
+                .get(name)?
+                .to_str()
+                .ok()
+                .map(|value| (name.to_owned(), value.to_owned()))
+        })
+        .collect();
+    (!headers.is_empty()).then_some(headers)
+}
 
 /// gRPC inference service backed by the shared application state.
 pub struct InferenceServiceImpl {
@@ -224,13 +242,15 @@ impl pb::inference_server::Inference for InferenceServiceImpl {
         request: Request<pb::GenerateRequest>,
     ) -> Result<Response<pb::GenerateResponse>, Status> {
         let data_parallel_rank = data_parallel_rank_from_metadata(&request)?;
+        let trace_headers = trace_headers_from_metadata(&request);
         let proto_req = request.into_inner();
         let response_opts = ResponseOpts::from_proto(proto_req.response.as_ref());
         let PreparedGrpcRequest {
-            text_request,
+            mut text_request,
             request_span,
             started_at,
         } = self.prepare_request(proto_req, data_parallel_rank, false, "Generate").await?;
+        text_request.trace_headers = trace_headers;
 
         let stream = self
             .state
@@ -287,15 +307,17 @@ impl pb::inference_server::Inference for InferenceServiceImpl {
         request: Request<pb::GenerateRequest>,
     ) -> Result<Response<Self::GenerateStreamStream>, Status> {
         let data_parallel_rank = data_parallel_rank_from_metadata(&request)?;
+        let trace_headers = trace_headers_from_metadata(&request);
         let proto_req = request.into_inner();
         let response_opts = ResponseOpts::from_proto(proto_req.response.as_ref());
         let PreparedGrpcRequest {
-            text_request,
+            mut text_request,
             request_span,
             started_at,
         } = self
             .prepare_request(proto_req, data_parallel_rank, true, "GenerateStream")
             .await?;
+        text_request.trace_headers = trace_headers;
 
         let stream = self
             .state
