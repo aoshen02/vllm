@@ -43,7 +43,7 @@ where
     S: Stream<Item = Result<Event, E>> + Send + 'static,
     E: Into<BoxError>,
 {
-    let sse = Sse::new(stream);
+    let sse = Sse::new(Box::pin(stream));
     match keep_alive_interval {
         Some(interval) => sse
             .keep_alive(KeepAlive::new().interval(interval).text("keep-alive"))

@@ -2858,6 +2858,11 @@ fn python_msgpack_fixtures_match_rust_encoding() {
                         new_sampling_mask: None,
                         spec_decode_metrics: None,
                         prompt_token_id_logprobs: None,
+                        weight_version: Some(
+                            "step-7",
+                        ),
+                        remote_kv_wait_time: None,
+                        kv_transfer_metrics: None,
                     },
                 ],
                 scheduler_stats: None,

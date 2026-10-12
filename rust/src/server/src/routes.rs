@@ -90,6 +90,7 @@ fn build_router_with_options(
     let mut router = Router::new()
         // Health & monitoring
         .route("/health", get(health::health))
+        .route("/health_generate", get(health::health_generate))
         .route("/metrics", get(metrics::scrape))
         .route("/load", get(load::load))
         .route("/version", get(version::version))
@@ -124,6 +125,10 @@ fn build_router_with_options(
             .route(
                 "/init_weight_transfer_engine",
                 post(weight_transfer::init_weight_transfer_engine),
+            )
+            .route(
+                "/shutdown_weight_transfer_engine",
+                post(weight_transfer::shutdown_weight_transfer_engine),
             )
             .route(
                 "/start_weight_update",

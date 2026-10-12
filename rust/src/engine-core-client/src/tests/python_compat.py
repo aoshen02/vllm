@@ -117,6 +117,9 @@ class EngineCoreOutput(
     new_sampling_mask: object | None = None
     spec_decode_metrics: object | None = None
     prompt_token_id_logprobs: object | None = None
+    weight_version: str | None = None
+    remote_kv_wait_time: float | None = None
+    kv_transfer_metrics: dict[str, float] | None = None
 
 
 class ExtendedEngineCoreOutput(EngineCoreOutput):
@@ -237,6 +240,7 @@ outputs = EngineCoreOutputs(
             request_id="req-1",
             new_token_ids=[7, 8],
             finish_reason=FinishReason.LENGTH,
+            weight_version="step-7",
         )
     ],
     finished_requests={"req-1"},
