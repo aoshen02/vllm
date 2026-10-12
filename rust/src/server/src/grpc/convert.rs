@@ -136,6 +136,7 @@ pub fn to_text_request(
         add_special_tokens: true,
         data_parallel_rank: None,
         session_id,
+        trace_headers: None,
         kv_hints,
         reasoning_parser_kwargs: Default::default(),
         reasoning_ended: None,

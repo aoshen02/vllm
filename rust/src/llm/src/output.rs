@@ -255,6 +255,7 @@ pub struct GenerateOutputStream {
     pending_prompt_info: Option<GeneratePromptInfo>,
     raw_stream: EngineCoreOutputStream,
     request_metrics: RequestMetricsTracker,
+    request_trace: Option<crate::request_trace::RequestTrace>,
     /// Removes this request's external→internal tracking edge on drop. Held for
     /// its `Drop` side effect only; never read directly.
     _request_guard: RequestGuard,
@@ -268,6 +269,7 @@ impl GenerateOutputStream {
         raw_stream: EngineCoreOutputStream,
         request_metrics: RequestMetricsTracker,
         request_guard: RequestGuard,
+        request_trace: Option<crate::request_trace::RequestTrace>,
     ) -> Self {
         Self {
             pending_prompt_info: Some(GeneratePromptInfo {
@@ -277,6 +279,7 @@ impl GenerateOutputStream {
             }),
             raw_stream,
             request_metrics,
+            request_trace,
             _request_guard: request_guard,
         }
     }
@@ -334,7 +337,12 @@ impl Stream for GenerateOutputStream {
 
         let finish_reason = finish_reason_from_engine(raw.finish_reason, raw.stop_reason);
         if let Some(finish_reason) = finish_reason.as_ref() {
-            self.request_metrics.record_finished(received_at, finish_reason.clone());
+            let state = self.as_mut().get_mut();
+            state.request_metrics.record_finished(
+                received_at,
+                finish_reason.clone(),
+                state.request_trace.as_mut(),
+            );
         }
         let request_timings = finish_reason.as_ref().map(|_| self.request_metrics.snapshot());
 
@@ -381,9 +389,11 @@ impl Drop for GenerateOutputStream {
             AbortCause::DroppedStream => FinishReason::Abort,
             AbortCause::StopStringMatched => FinishReason::Stop(None),
         };
-
-        self.request_metrics
-            .record_finished(current_unix_timestamp_secs(), finish_reason);
+        self.request_metrics.record_finished(
+            current_unix_timestamp_secs(),
+            finish_reason,
+            self.request_trace.as_mut(),
+        );
     }
 }
 
