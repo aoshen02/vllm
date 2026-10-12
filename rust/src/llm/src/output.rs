@@ -33,6 +33,15 @@ pub struct TokenUsage {
     pub cached_token_count: usize,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct RequestTimingStats {
+    pub queued_ts: f64,
+    pub scheduled_ts: f64,
+    pub first_token_ts: f64,
+    pub last_token_ts: f64,
+    pub num_generation_tokens: u32,
+}
+
 /// Final raw token output plus terminal stream metadata.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CollectedGenerateOutput {
@@ -53,6 +62,10 @@ pub struct CollectedGenerateOutput {
     pub sampling_mask: Option<SamplingMask>,
     /// Per-request speculative-decoding metrics from the terminal output.
     pub spec_decode_metrics: Option<RequestSpecDecodeMetrics>,
+    pub weight_version: Option<String>,
+    pub remote_kv_wait_time: Option<f64>,
+    pub kv_transfer_metrics: Option<serde_json::Value>,
+    pub request_timings: Option<RequestTimingStats>,
 }
 
 /// Prompt-scoped metadata emitted only once on the first [`GenerateOutput`] for
@@ -170,6 +183,10 @@ pub struct GenerateOutput {
     pub sampling_mask: Option<SamplingMask>,
     /// Per-request speculative-decoding metrics, present on terminal outputs.
     pub spec_decode_metrics: Option<RequestSpecDecodeMetrics>,
+    pub weight_version: Option<String>,
+    pub remote_kv_wait_time: Option<f64>,
+    pub kv_transfer_metrics: Option<serde_json::Value>,
+    pub request_timings: Option<RequestTimingStats>,
 }
 
 impl GenerateOutput {
@@ -220,6 +237,10 @@ impl GenerateOutput {
             ec_transfer_params: None,
             sampling_mask: None,
             spec_decode_metrics: None,
+            weight_version: None,
+            remote_kv_wait_time: None,
+            kv_transfer_metrics: None,
+            request_timings: None,
         }
     }
 }
@@ -315,6 +336,7 @@ impl Stream for GenerateOutputStream {
         if let Some(finish_reason) = finish_reason.as_ref() {
             self.request_metrics.record_finished(received_at, finish_reason.clone());
         }
+        let request_timings = finish_reason.as_ref().map(|_| self.request_metrics.snapshot());
 
         let output = GenerateOutput {
             request_id: raw.request_id,
@@ -327,6 +349,10 @@ impl Stream for GenerateOutputStream {
             ec_transfer_params: raw.ec_transfer_params,
             sampling_mask,
             spec_decode_metrics: raw.spec_decode_metrics,
+            weight_version: raw.weight_version,
+            remote_kv_wait_time: raw.remote_kv_wait_time,
+            kv_transfer_metrics: raw.kv_transfer_metrics,
+            request_timings,
         };
 
         Poll::Ready(Some(Ok(output)))
@@ -400,8 +426,8 @@ impl<T: Stream<Item = Result<GenerateOutput>> + Send> T {
                             existing.logprobs = Some(step_logprobs);
                         }
                     }
-                    if let Some(mut mask) = sampling_mask {
-                        existing.sampling_mask.get_or_insert_default().rows.append(&mut mask.rows);
+                    if let Some(mask) = sampling_mask {
+                        existing.sampling_mask.get_or_insert_default().append(mask);
                     }
                 } else {
                     collected = Some(CollectedGenerateOutput {
@@ -421,6 +447,10 @@ impl<T: Stream<Item = Result<GenerateOutput>> + Send> T {
                         ec_transfer_params: None,
                         sampling_mask,
                         spec_decode_metrics: None,
+                        weight_version: output.weight_version.clone(),
+                        remote_kv_wait_time: None,
+                        kv_transfer_metrics: None,
+                        request_timings: None,
                     });
                 }
 
@@ -435,6 +465,10 @@ impl<T: Stream<Item = Result<GenerateOutput>> + Send> T {
                     collected.kv_transfer_params = output.kv_transfer_params;
                     collected.ec_transfer_params = output.ec_transfer_params;
                     collected.spec_decode_metrics = output.spec_decode_metrics;
+                    collected.weight_version = output.weight_version;
+                    collected.remote_kv_wait_time = output.remote_kv_wait_time;
+                    collected.kv_transfer_metrics = output.kv_transfer_metrics;
+                    collected.request_timings = output.request_timings;
                     if let Some(mask) = collected.sampling_mask.as_ref()
                         && mask.rows.len() != collected.token_ids.len()
                     {

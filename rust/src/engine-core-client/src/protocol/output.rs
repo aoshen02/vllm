@@ -138,6 +138,12 @@ pub struct EngineCoreOutput {
     /// the first output of a request that asked for them.
     #[serde(default)]
     pub prompt_token_id_logprobs: Option<WireNdArray>,
+    #[serde(default)]
+    pub weight_version: Option<String>,
+    #[serde(default)]
+    pub remote_kv_wait_time: Option<f64>,
+    #[serde(default)]
+    pub kv_transfer_metrics: Option<serde_json::Value>,
 }
 
 /// Raw per-sequence speculative-decoding accumulator.
@@ -542,6 +548,9 @@ mod tests {
                             new_sampling_mask: None,
                             spec_decode_metrics: None,
                             prompt_token_id_logprobs: None,
+                            weight_version: None,
+                            remote_kv_wait_time: None,
+                            kv_transfer_metrics: None,
                         },
                     ],
                     scheduler_stats: None,
