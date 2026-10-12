@@ -157,6 +157,7 @@ pub(super) fn prepare_completion_request(
         add_special_tokens: request.add_special_tokens,
         data_parallel_rank: ctx.data_parallel_rank,
         session_id,
+        trace_headers: ctx.trace_headers,
         kv_hints: None,
         reasoning_parser_kwargs: Default::default(),
         reasoning_ended: None,

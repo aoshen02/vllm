@@ -3,6 +3,8 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use opentelemetry::KeyValue;
+
 use vllm_engine_core_client::protocol::output::{
     EngineCoreEvent, EngineCoreEventType, EngineCoreOutput,
 };
@@ -184,7 +186,12 @@ impl RequestMetricsTracker {
     ///
     /// Original Python finished-request stats:
     /// <https://github.com/vllm-project/vllm/blob/bc2c0c86efb28e77677a3cfb8687e976914a313a/vllm/v1/metrics/stats.py#L222-L237>
-    pub(crate) fn record_finished(&self, received_at: f64, finish_reason: FinishReason) {
+    pub(crate) fn record_finished(
+        &self,
+        received_at: f64,
+        finish_reason: FinishReason,
+        trace: Option<&mut crate::request_trace::RequestTrace>,
+    ) {
         let prefill_kv_computed_tokens =
             self.prompt_len.saturating_sub(self.latest_num_cached_tokens);
         let e2e_latency_seconds = received_at - self.arrival_time;
@@ -196,6 +203,7 @@ impl RequestMetricsTracker {
             0.0
         };
 
+        let aborted = matches!(finish_reason, FinishReason::Abort);
         self.record_request_success(finish_reason);
 
         self.handles.request_prompt_tokens.observe(self.prompt_len as f64);
@@ -217,6 +225,22 @@ impl RequestMetricsTracker {
         self.handles
             .request_time_per_output_token_seconds
             .observe(time_per_output_token_seconds);
+        if let Some(trace) = trace.as_ref() {
+            trace.set_attributes([
+                KeyValue::new("gen_ai.usage.prompt_tokens", i64::from(self.prompt_len)),
+                KeyValue::new(
+                    "gen_ai.usage.completion_tokens",
+                    i64::from(self.num_generation_tokens),
+                ),
+                KeyValue::new("gen_ai.request.n", i64::from(self.n_param)),
+                KeyValue::new(
+                    "gen_ai.latency.time_to_first_token",
+                    self.first_token_latency,
+                ),
+                KeyValue::new("gen_ai.latency.e2e", e2e_latency_seconds),
+                KeyValue::new("gen_ai.latency.time_in_model_decode", decode_time_seconds),
+            ]);
+        }
 
         if let Some(events) = &self.handles.events {
             let queue_time_seconds = diff_or_zero(self.scheduled_ts, self.queued_ts);
@@ -227,6 +251,19 @@ impl RequestMetricsTracker {
             events.request_queue_time_seconds.observe(queue_time_seconds);
             events.request_prefill_time_seconds.observe(prefill_time_seconds);
             events.request_inference_time_seconds.observe(inference_time_seconds);
+            if let Some(trace) = trace.as_ref() {
+                trace.set_attributes([
+                    KeyValue::new("gen_ai.latency.time_in_queue", queue_time_seconds),
+                    KeyValue::new("gen_ai.latency.time_in_model_prefill", prefill_time_seconds),
+                    KeyValue::new(
+                        "gen_ai.latency.time_in_model_inference",
+                        inference_time_seconds,
+                    ),
+                ]);
+            }
+        }
+        if let Some(trace) = trace {
+            trace.finish(aborted);
         }
     }
 

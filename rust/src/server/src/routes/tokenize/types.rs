@@ -54,6 +54,7 @@ impl TokenizeCompletionRequest {
             add_special_tokens: self.add_special_tokens,
             data_parallel_rank: None,
             session_id: None,
+            trace_headers: None,
             kv_hints: None,
             reasoning_parser_kwargs: Default::default(),
             reasoning_ended: None,
@@ -126,6 +127,7 @@ impl TokenizeChatRequest {
             add_special_tokens: self.add_special_tokens,
             data_parallel_rank: None,
             session_id: None,
+            trace_headers: None,
             lora_request: None,
         })
     }

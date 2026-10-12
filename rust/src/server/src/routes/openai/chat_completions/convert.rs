@@ -201,6 +201,7 @@ pub(super) fn prepare_chat_request(
         add_special_tokens: request.add_special_tokens,
         data_parallel_rank: ctx.data_parallel_rank,
         session_id,
+        trace_headers: ctx.trace_headers,
         lora_request: lora_resolution.lora_request.clone(),
     };
 
