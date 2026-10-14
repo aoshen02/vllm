@@ -4,6 +4,7 @@ from typing import Annotated, Any, Literal, TypeAlias
 
 from pydantic import (
     BaseModel,
+    BeforeValidator,
     Discriminator,
     Field,
     NonNegativeInt,
@@ -14,6 +15,7 @@ from pydantic import (
 )
 
 from vllm.config import ModelConfig
+from vllm.distributed.aux_output_connector.types import AuxOutputs, validate_aux_outputs
 from vllm.entrypoints.generate.base.protocol import (
     PerRequestMetrics,
     StreamOptions,
@@ -359,6 +361,9 @@ class GenerateChoiceBase(BaseModel):
     routed_experts: str | None = None
     # Ordered keys of published raw R3 objects, returned on the terminal response.
     aux_output_keys: list[str] | None = None
+    aux_outputs: Annotated[AuxOutputs, BeforeValidator(validate_aux_outputs)] | None = (
+        Field(default=None, exclude_if=lambda value: value is None)
+    )
     sampling_mask: list[list[int]] | None = None
 
     @field_validator("token_ids")
@@ -392,6 +397,9 @@ class GenerateStreamChoiceBase(BaseModel):
     token_ids: list[int] | None = None
     routed_experts: str | None = None
     aux_output_keys: list[str] | None = None
+    aux_outputs: Annotated[AuxOutputs, BeforeValidator(validate_aux_outputs)] | None = (
+        Field(default=None, exclude_if=lambda value: value is None)
+    )
     sampling_mask: list[list[int]] | None = None
 
 

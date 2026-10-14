@@ -9,7 +9,10 @@ from typing import Any
 
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import KVEventsConfig, VllmConfig
-from vllm.distributed.aux_output_connector.connector import AuxOutputSchedulerConnector
+from vllm.distributed.aux_output_connector.connector import (
+    AuxOutputSchedulerConnector,
+)
+from vllm.distributed.aux_output_connector.types import AuxOutputResult
 from vllm.distributed.ec_transfer.ec_connector.base import (
     ECConnectorBase,
     ECConnectorMetadata,
@@ -2148,12 +2151,12 @@ class Scheduler(SchedulerInterface):
                 request.resumable = False
                 stopped = True
 
-            routed_experts = None
+            aux_output = AuxOutputResult()
             should_emit_output = bool(
                 new_token_ids or pooler_output is not None or stopped
             )
             if self.aux_output_connector is not None and should_emit_output:
-                routed_experts = self.aux_output_connector.take_output(
+                aux_output = self.aux_output_connector.take_output(
                     request, model_runner_output.aux_output_connector_output
                 )
             if should_emit_output:
@@ -2233,14 +2236,8 @@ class Scheduler(SchedulerInterface):
                         kv_transfer_params=kv_transfer_params,
                         ec_transfer_params=ec_transfer_params,
                         trace_headers=request.trace_headers,
-                        routed_experts=(
-                            routed_experts
-                            if not isinstance(routed_experts, list)
-                            else None
-                        ),
-                        aux_output_keys=(
-                            routed_experts if isinstance(routed_experts, list) else None
-                        ),
+                        routed_experts=aux_output.routed_experts,
+                        aux_outputs=aux_output.aux_outputs,
                         num_nans_in_logits=request.num_nans_in_logits,
                     )
                 )

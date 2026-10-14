@@ -17,6 +17,7 @@ from tests.v1.engine.utils import (
     MockEngineCore,
 )
 from vllm import PoolingParams
+from vllm.distributed.aux_output_connector.types import AuxChunkRef, AuxOutputPayload
 from vllm.logprobs import FlatLogprobs, Logprob, PromptLogprobs, SampleLogprobs
 from vllm.lora.request import LoRARequest
 from vllm.outputs import (
@@ -56,7 +57,7 @@ def test_aux_output_keys_preserve_existing_output_wire_positions():
     assert decoded.aux_output_keys is None
 
 
-def test_terminal_aux_output_keys_survive_ipc_and_output_processing():
+def test_terminal_aux_outputs_survive_ipc_and_output_processing():
     processor = OutputProcessor(None, log_stats=False)
     request = EngineCoreRequest(
         request_id="request",
@@ -71,20 +72,177 @@ def test_terminal_aux_output_keys_survive_ipc_and_output_processing():
         data_parallel_rank=None,
     )
     processor.add_request(request, None)
-    keys = ["prefix-block", "request-tail"]
+    payloads = {
+        "routed_experts": AuxOutputPayload(
+            0,
+            2,
+            {"dtype": "|u1", "num_layers": 3, "experts_per_token": 2},
+            [AuxChunkRef(1, "prefix-block"), AuxChunkRef(1, "request-tail")],
+        ),
+        "other": AuxOutputPayload(0, 1, {}, [AuxChunkRef(1, "other-data")]),
+    }
     wire_output = EngineCoreOutput(
         request_id="request",
         new_token_ids=[3],
         finish_reason=FinishReason.LENGTH,
-        aux_output_keys=keys,
+        aux_outputs=payloads,
     )
     decoded = MsgpackDecoder(EngineCoreOutput).decode(
         MsgpackEncoder().encode(wire_output)
     )
     result = processor.process_outputs([decoded]).request_outputs[0]
     assert result.finished
-    assert result.outputs[0].aux_output_keys == keys
+    assert result.outputs[0].aux_outputs == payloads
+    assert result.outputs[0].aux_output_keys is None
     assert result.outputs[0].routed_experts is None
+
+
+def _aux_processor(
+    kind: RequestOutputKind = RequestOutputKind.DELTA, interval: int = 1
+) -> OutputProcessor:
+    processor = OutputProcessor(None, log_stats=False, stream_interval=interval)
+    processor.add_request(
+        EngineCoreRequest(
+            request_id="aux",
+            external_req_id="aux",
+            prompt_token_ids=[1, 2],
+            mm_features=None,
+            sampling_params=SamplingParams(detokenize=False, output_kind=kind),
+            pooling_params=None,
+            arrival_time=0,
+            lora_request=None,
+            cache_salt=None,
+            data_parallel_rank=None,
+        ),
+        None,
+    )
+    return processor
+
+
+def _routing_payload(start: int, rows: int, key: str = "block") -> AuxOutputPayload:
+    return AuxOutputPayload(
+        start,
+        rows,
+        {"dtype": "|u1", "num_layers": 2, "experts_per_token": 2},
+        [AuxChunkRef(rows, key)] if rows else [],
+    )
+
+
+@pytest.mark.parametrize("kind", list(RequestOutputKind))
+@pytest.mark.parametrize("interval", [1, 3])
+def test_aux_deltas_finalize_once_and_preserve_publisher_coverage(
+    kind: RequestOutputKind, interval: int
+) -> None:
+    processor = _aux_processor(kind, interval)
+    first = processor.process_outputs(
+        [
+            EngineCoreOutput(
+                request_id="aux",
+                new_token_ids=[3],
+                aux_outputs={"routed_experts": _routing_payload(0, 2)},
+            )
+        ]
+    )
+    for result in first.request_outputs:
+        assert isinstance(result, RequestOutput)
+        assert result.outputs[0].aux_outputs is None
+    second = _routing_payload(2, 3, "tail")
+    last = processor.process_outputs(
+        [
+            EngineCoreOutput(
+                request_id="aux",
+                new_token_ids=[4],
+                finish_reason=FinishReason.LENGTH,
+                aux_outputs={"routed_experts": second},
+            )
+        ]
+    ).request_outputs[0]
+    assert isinstance(last, RequestOutput)
+    assert last.outputs[0].aux_outputs is not None
+    payload = last.outputs[0].aux_outputs["routed_experts"]
+    assert payload.num_rows == 5 and payload.token_start == 0
+    assert [c.num_rows for c in payload.chunks] == [2, 3]
+    second.chunks.clear()
+    assert len(payload.chunks) == 2
+    assert processor.get_num_unfinished_requests() == 0
+
+
+@pytest.mark.parametrize("finish", [FinishReason.ABORT, FinishReason.ERROR])
+def test_interrupted_aux_output_does_not_claim_coverage(finish: FinishReason) -> None:
+    processor = _aux_processor()
+    result = processor.process_outputs(
+        [
+            EngineCoreOutput(
+                request_id="aux",
+                new_token_ids=[],
+                finish_reason=finish,
+                aux_outputs={"routed_experts": _routing_payload(0, 1)},
+            )
+        ]
+    ).request_outputs[0]
+    assert isinstance(result, RequestOutput)
+    assert result.outputs[0].aux_outputs is None
+    assert result.outputs[0].finish_reason == str(finish)
+    assert (
+        processor.process_outputs(
+            [
+                EngineCoreOutput(
+                    request_id="aux",
+                    new_token_ids=[3],
+                    aux_outputs={"routed_experts": _routing_payload(0, 2)},
+                )
+            ]
+        ).request_outputs
+        == []
+    )
+
+
+@pytest.mark.parametrize("empty", [False, True])
+def test_aux_map_survives_terminal_output_without_tokens(empty: bool) -> None:
+    processor = _aux_processor()
+    processor.process_outputs([EngineCoreOutput(request_id="aux", new_token_ids=[3])])
+    payload = _routing_payload(2 if empty else 0, 0 if empty else 2)
+    result = processor.process_outputs(
+        [
+            EngineCoreOutput(
+                request_id="aux",
+                new_token_ids=[],
+                finish_reason=FinishReason.LENGTH,
+                aux_outputs={"routed_experts": payload},
+            )
+        ]
+    ).request_outputs[0]
+    assert isinstance(result, RequestOutput)
+    assert result.outputs[0].token_ids == []
+    assert result.outputs[0].aux_outputs == {"routed_experts": payload}
+
+
+@pytest.mark.parametrize("failure", ["gap", "metadata"])
+def test_aux_output_rejects_inconsistent_completion(failure: str) -> None:
+    processor = _aux_processor()
+    processor.process_outputs(
+        [
+            EngineCoreOutput(
+                request_id="aux",
+                new_token_ids=[3],
+                aux_outputs={"routed_experts": _routing_payload(0, 1)},
+            )
+        ]
+    )
+    payload = _routing_payload(2 if failure == "gap" else 1, 1)
+    if failure == "metadata":
+        payload.metadata["num_layers"] = 3
+    with pytest.raises(ValueError, match="Inconsistent"):
+        processor.process_outputs(
+            [
+                EngineCoreOutput(
+                    request_id="aux",
+                    new_token_ids=[4],
+                    finish_reason=FinishReason.LENGTH,
+                    aux_outputs={"routed_experts": payload},
+                )
+            ]
+        )
 
 
 @pytest.mark.parametrize("flat_logprobs", [False, True])
@@ -95,7 +253,7 @@ def test_delta_output_without_new_tokens_returns_empty_logprobs(
     accumulated.append({1: Logprob(logprob=-0.5, rank=1)})
 
     state = RequestState.__new__(RequestState)
-    state.aux_output_keys = None
+    state.aux_outputs = {}
     state.detokenizer = MagicMock()
     state.detokenizer.get_next_output_text.return_value = ""
     state.logprobs_processor = MagicMock()
@@ -115,7 +273,7 @@ def test_delta_output_without_new_tokens_returns_empty_logprobs(
 
 def test_completion_output_preserves_each_sampling_mask_position() -> None:
     state = RequestState.__new__(RequestState)
-    state.aux_output_keys = None
+    state.aux_outputs = {}
     state.detokenizer = MagicMock()
     state.detokenizer.get_next_output_text.return_value = ""
     state.logprobs_processor = MagicMock()
@@ -1387,7 +1545,18 @@ async def test_request_output_collector(keys_only):
     NUM_REQS = 3
     TEXT = "a"
     routed_experts = np.arange(12, dtype=np.uint8).reshape(2, 3, 2)
-    aux_output_keys = ["prefix-block", "request-tail"] if keys_only else None
+    aux_outputs = (
+        {
+            "routed_experts": AuxOutputPayload(
+                0,
+                2,
+                {"dtype": "|u1", "num_layers": 3, "experts_per_token": 2},
+                [AuxChunkRef(2, "prefix-block")],
+            )
+        }
+        if keys_only
+        else None
+    )
 
     def make_outputs() -> list[RequestOutput]:
         return [
@@ -1408,9 +1577,7 @@ async def test_request_output_collector(keys_only):
                             if idx == NUM_REQS - 1 and not keys_only
                             else None
                         ),
-                        aux_output_keys=aux_output_keys
-                        if idx == NUM_REQS - 1
-                        else None,
+                        aux_outputs=aux_outputs if idx == NUM_REQS - 1 else None,
                         finish_reason="length" if (idx == NUM_REQS - 1) else None,
                     )
                 ],
@@ -1463,7 +1630,7 @@ async def test_request_output_collector(keys_only):
 
     assert output.finished
     assert output.outputs[0].finish_reason == "length"
-    assert output.outputs[0].aux_output_keys == aux_output_keys
+    assert output.outputs[0].aux_outputs == aux_outputs
     if keys_only:
         assert output.outputs[0].routed_experts is None
     else:
@@ -1642,7 +1809,7 @@ def test_abort_requests(runner: str, abort_by: str, dummy_test_vectors):
 @pytest.mark.parametrize("output_kind", list(RequestOutputKind))
 def test_sampling_masks_follow_output_kind(output_kind):
     state = RequestState.__new__(RequestState)
-    state.aux_output_keys = None
+    state.aux_outputs = {}
     state.detokenizer = MagicMock()
     state.detokenizer.get_next_output_text.return_value = ""
     state.logprobs_processor = MagicMock()

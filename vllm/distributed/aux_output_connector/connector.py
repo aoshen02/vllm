@@ -8,7 +8,7 @@ from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
-import numpy as np
+from vllm.distributed.aux_output_connector.types import AuxOutputResult, RoutingArray
 
 if TYPE_CHECKING:
     from vllm.distributed.aux_output_connector.mooncake import MooncakeOutputPublisher
@@ -41,7 +41,7 @@ class AuxOutputConnectorMetadata:
 @dataclass
 class AuxRequestOutput:
     token_start: int
-    rows: np.ndarray
+    rows: RoutingArray
     block_keys: list[str] | None = None
 
 
@@ -130,7 +130,7 @@ class AuxOutputSchedulerConnector:
         self,
         request: Request,
         output: dict[str, AuxRequestOutput] | None,
-    ) -> np.ndarray | list[str] | None:
+    ) -> AuxOutputResult:
         """Return the accepted R3 rows for one scheduled request."""
         request_id = request.request_id
         assert output is not None and request_id in output, (
@@ -147,7 +147,10 @@ class AuxOutputSchedulerConnector:
                 self._mooncake_output = MooncakeOutputPublisher(
                     request_output, self._hash_block_size
                 )
-            return self._mooncake_output.take_output(request, request_output)
+            payload = self._mooncake_output.take_output(request, request_output)
+            return AuxOutputResult(
+                aux_outputs={"routed_experts": payload} if payload is not None else None
+            )
         local_end = token_end - request_output.token_start
         if local_end < 0:
             assert not request.is_finished(), (
@@ -157,14 +160,14 @@ class AuxOutputSchedulerConnector:
                 "output_end="
                 f"{request_output.token_start + len(request_output.rows)}"
             )
-            return None
+            return AuxOutputResult()
         assert local_end <= len(request_output.rows), (
             "auxiliary output worker output has an invalid token range: "
             f"request={request_id}, token_end={token_end}, "
             f"output_start={request_output.token_start}, "
             f"output_end={request_output.token_start + len(request_output.rows)}"
         )
-        return request_output.rows[:local_end]
+        return AuxOutputResult(routed_experts=request_output.rows[:local_end])
 
     def request_finished(self, request: Request) -> None:
         """Queue a request's terminal event and final block hashes."""

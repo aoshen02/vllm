@@ -10,6 +10,10 @@ from typing import TYPE_CHECKING, Any, cast
 import numpy as np
 import torch
 
+from vllm.distributed.aux_output_connector.types import (
+    AuxOutputs,
+    append_aux_outputs,
+)
 from vllm.lora.request import LoRARequest
 from vllm.outputs import (
     STREAM_FINISHED,
@@ -189,7 +193,7 @@ class RequestState:
 
         # Routed experts accumulation (prompt + sample chunks)
         self.routed_experts_chunks: list[np.ndarray] = []
-        self.aux_output_keys: list[str] | None = None
+        self.aux_outputs: AuxOutputs = {}
         self.sampling_mask_chunks: list[SamplingMaskLists] = []
 
         # Stream Interval
@@ -461,12 +465,20 @@ class RequestState:
         if finished and self.routed_experts_chunks:
             routed_experts = np.concatenate(self.routed_experts_chunks, axis=0)
 
+        aux_outputs = None
+        if self.aux_outputs and finish_reason not in (
+            None,
+            FinishReason.ABORT,
+            FinishReason.ERROR,
+        ):
+            aux_outputs = self.aux_outputs.copy()
+
         return CompletionOutput(
             index=self.request_index,
             text=text,
             token_ids=token_ids,
             routed_experts=routed_experts,
-            aux_output_keys=self.aux_output_keys if finished else None,
+            aux_outputs=aux_outputs,
             sampling_mask=sampling_mask,
             logprobs=logprobs,
             cumulative_logprob=self.logprobs_processor.cumulative_logprob,
@@ -706,10 +718,13 @@ class OutputProcessor:
                 req_state.routed_experts_chunks.append(
                     engine_core_output.routed_experts
                 )
-            if engine_core_output.aux_output_keys is not None:
-                if req_state.aux_output_keys is None:
-                    req_state.aux_output_keys = []
-                req_state.aux_output_keys.extend(engine_core_output.aux_output_keys)
+            if engine_core_output.aux_outputs is not None and finish_reason not in (
+                FinishReason.ABORT,
+                FinishReason.ERROR,
+            ):
+                append_aux_outputs(
+                    req_state.aux_outputs, engine_core_output.aux_outputs
+                )
 
             if req_state.is_prefilling:
                 if engine_core_output.prefill_stats is not None:

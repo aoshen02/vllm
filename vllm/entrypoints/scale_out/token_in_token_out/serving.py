@@ -425,7 +425,7 @@ class ServingTokens(GenerateBaseServing):
                 finish_reason=output.finish_reason if output.finish_reason else "stop",
                 token_ids=as_list(output.token_ids),
                 routed_experts=routed_experts_b64,
-                aux_output_keys=output.aux_output_keys,
+                aux_outputs=output.aux_outputs,
                 sampling_mask=sampling_mask,
             )
             if text_mode:
@@ -563,8 +563,16 @@ class ServingTokens(GenerateBaseServing):
                         # Still emit a terminal empty chunk while prompt
                         # metadata is pending, so zero-token completions
                         # deliver it.
-                        emit = bool(delta_token_ids) or (
-                            finish_reason is not None and prompt_token_ids is not None
+                        emit = (
+                            bool(delta_token_ids)
+                            or (
+                                finish_reason is not None
+                                and prompt_token_ids is not None
+                            )
+                            or (
+                                finish_reason is not None
+                                and output.aux_outputs is not None
+                            )
                         )
                     if not emit:
                         continue
@@ -597,7 +605,7 @@ class ServingTokens(GenerateBaseServing):
                         token_ids=as_list(delta_token_ids),
                         routed_experts=routed_experts_b64,
                         sampling_mask=sampling_mask,
-                        aux_output_keys=output.aux_output_keys,
+                        aux_outputs=output.aux_outputs,
                     )
                     chunk: GenerateTokensStreamResponse | GenerateTextStreamResponse
                     if text_mode:
