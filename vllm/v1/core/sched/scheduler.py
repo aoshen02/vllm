@@ -401,7 +401,12 @@ class Scheduler(SchedulerInterface):
             self.perf_metrics = ModelMetrics(vllm_config)
 
         self.aux_output_connector = (
-            AuxOutputSchedulerConnector(self.hash_block_size)
+            AuxOutputSchedulerConnector(
+                self.hash_block_size,
+                max_snapshot_rows=self.scheduler_config.max_num_batched_tokens
+                * (vllm_config.max_concurrent_batches + 1)
+                + self.scheduler_config.max_num_seqs * self.hash_block_size,
+            )
             if vllm_config.aux_output_config.enabled
             else None
         )
@@ -2233,14 +2238,7 @@ class Scheduler(SchedulerInterface):
                         kv_transfer_params=kv_transfer_params,
                         ec_transfer_params=ec_transfer_params,
                         trace_headers=request.trace_headers,
-                        routed_experts=(
-                            routed_experts
-                            if not isinstance(routed_experts, list)
-                            else None
-                        ),
-                        aux_output_keys=(
-                            routed_experts if isinstance(routed_experts, list) else None
-                        ),
+                        routed_experts=routed_experts,
                         num_nans_in_logits=request.num_nans_in_logits,
                     )
                 )

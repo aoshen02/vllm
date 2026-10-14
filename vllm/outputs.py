@@ -10,6 +10,7 @@ import numpy as np
 import torch
 from typing_extensions import TypeVar
 
+from vllm.distributed.aux_output_connector.types import AuxOutputRef
 from vllm.logger import init_logger
 from vllm.logprobs import PromptLogprobs, SampleLogprobs
 from vllm.lora.request import LoRARequest
@@ -77,6 +78,7 @@ class CompletionOutput:
     sampling_mask: SamplingMask | None = None
     spec_decode_metrics: RequestSpecDecodeMetrics | None = None
     aux_output_keys: list[str] | None = None
+    aux_outputs: AuxOutputRef | None = None
 
     def finished(self) -> bool:
         return self.finish_reason is not None
@@ -222,6 +224,8 @@ class RequestOutput:
                             completion.routed_experts = next_completion.routed_experts
                         if next_completion.aux_output_keys is not None:
                             completion.aux_output_keys = next_completion.aux_output_keys
+                        if next_completion.aux_outputs is not None:
+                            completion.aux_outputs = next_completion.aux_outputs
                         completion.finish_reason = next_completion.finish_reason
                         completion.stop_reason = next_completion.stop_reason
                     else:

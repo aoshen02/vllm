@@ -352,6 +352,11 @@ class InputProcessor:
         session_id: str | None = None,
         kv_hints: KvHintsEnvelope | None = None,
     ) -> EngineCoreRequest:
+        aux = self.vllm_config.aux_output_config
+        if resumable and aux.enabled and aux.backend == "mooncake":
+            raise VLLMValidationError(
+                "Mooncake auxiliary output does not support streaming input"
+            )
         self._validate_params(params, supported_tasks)
         self._validate_lora(lora_request)
 

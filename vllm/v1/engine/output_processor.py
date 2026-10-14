@@ -4,12 +4,13 @@
 import asyncio
 from collections import defaultdict, deque
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 import torch
 
+from vllm.distributed.aux_output_connector.types import AuxOutputRef
 from vllm.lora.request import LoRARequest
 from vllm.outputs import (
     STREAM_FINISHED,
@@ -116,6 +117,7 @@ class RequestOutputCollector:
 class OutputProcessorOutput:
     request_outputs: list[RequestOutput | PoolingRequestOutput]
     reqs_to_abort: list[str]
+    reqs_to_finalize: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass
@@ -190,6 +192,8 @@ class RequestState:
         # Routed experts accumulation (prompt + sample chunks)
         self.routed_experts_chunks: list[np.ndarray] = []
         self.aux_output_keys: list[str] | None = None
+        self.aux_outputs: AuxOutputRef | None = None
+        self.aux_terminal: EngineCoreOutput | None = None
         self.sampling_mask_chunks: list[SamplingMaskLists] = []
 
         # Stream Interval
@@ -467,6 +471,7 @@ class RequestState:
             token_ids=token_ids,
             routed_experts=routed_experts,
             aux_output_keys=self.aux_output_keys if finished else None,
+            aux_outputs=self.aux_outputs if finished else None,
             sampling_mask=sampling_mask,
             logprobs=logprobs,
             cumulative_logprob=self.logprobs_processor.cumulative_logprob,
@@ -490,6 +495,7 @@ class OutputProcessor:
         stream_interval: int = 1,
         tracing_enabled: bool = False,
         admission_stats: "SharedAdmissionStats | None" = None,
+        finalize_aux_outputs: bool = False,
     ):
         self.log_stats = log_stats
         self.tokenizer = tokenizer
@@ -500,6 +506,7 @@ class OutputProcessor:
         self.lora_states = LoRARequestStates(log_stats)
         self.tracing_enabled = tracing_enabled
         self.admission_stats = admission_stats
+        self._finalize_aux_outputs = finalize_aux_outputs
 
     def get_num_unfinished_requests(self):
         return len(self.request_states)
@@ -684,11 +691,14 @@ class OutputProcessor:
         """
         request_outputs: list[RequestOutput | PoolingRequestOutput] = []
         reqs_to_abort: list[str] = []
+        reqs_to_finalize: dict[str, int] = {}
         for engine_core_output in engine_core_outputs:
             req_id = engine_core_output.request_id
             req_state = self.request_states.get(req_id)
             if req_state is None:
                 # Ignore output for already-aborted request.
+                continue
+            if req_state.aux_terminal is not None:
                 continue
 
             # 1) Compute stats for this iteration.
@@ -758,6 +768,23 @@ class OutputProcessor:
                 # if required.
                 req_state.logprobs_processor.update_from_output(engine_core_output)
 
+            if self._finalize_aux_outputs and finish_reason in (
+                FinishReason.STOP,
+                FinishReason.LENGTH,
+                FinishReason.REPETITION,
+            ):
+                assert req_state.detokenizer is not None
+                engine_core_output.finish_reason = finish_reason
+                engine_core_output.stop_reason = stop_reason
+                req_state.aux_terminal = engine_core_output
+                reqs_to_finalize[req_id] = len(req_state.detokenizer.output_token_ids)
+                self._update_stats_from_finished(
+                    req_state, finish_reason, iteration_stats
+                )
+                if self.tracing_enabled:
+                    self.do_tracing(engine_core_output, req_state, iteration_stats)
+                continue
+
             # 4) Create and handle RequestOutput objects.
             if request_output := req_state.make_request_output(
                 new_token_ids,
@@ -803,7 +830,42 @@ class OutputProcessor:
         return OutputProcessorOutput(
             request_outputs=request_outputs,
             reqs_to_abort=reqs_to_abort,
+            reqs_to_finalize=reqs_to_finalize,
         )
+
+    def complete_aux_outputs(
+        self, request_id: str, ref: AuxOutputRef
+    ) -> RequestOutput | PoolingRequestOutput | None:
+        state = self.request_states.get(request_id)
+        if state is None:
+            return None
+        terminal = state.aux_terminal
+        if terminal is None:
+            raise ValueError("Request is not awaiting auxiliary finalization")
+        state.aux_outputs = ref
+        output = state.make_request_output(
+            terminal.new_token_ids,
+            terminal.pooling_output,
+            terminal.finish_reason,
+            terminal.stop_reason,
+            terminal.kv_transfer_params,
+            terminal.ec_transfer_params,
+        )
+        self._finish_request(state)
+        if state.queue is not None:
+            if output is not None:
+                state.queue.put(output)
+            return None
+        return output
+
+    def fail_aux_outputs(self, request_id: str, error: Exception) -> None:
+        state = self.request_states.get(request_id)
+        if state is not None:
+            if state.queue is not None:
+                state.queue.put(error)
+            if state.parent_req is not None:
+                state.parent_req.child_requests.discard(request_id)
+            self._finish_request(state)
 
     def _finish_request(self, req_state: RequestState) -> None:
         req_id = req_state.request_id

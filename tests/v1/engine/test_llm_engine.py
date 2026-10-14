@@ -23,6 +23,7 @@ DTYPE = "half"
 @pytest.mark.skip_global_cleanup
 def test_step_invalidates_mm_processor_cache_misses():
     engine = object.__new__(LLMEngine)
+    engine._aux_finalizations = {}
     engine.should_execute_dummy_batch = False
     engine.log_stats = False
     engine.logger_manager = None
@@ -41,7 +42,9 @@ def test_step_invalidates_mm_processor_cache_misses():
     engine.engine_core = MagicMock()
     engine.engine_core.get_output.return_value = outputs
 
-    processed_outputs = MagicMock(reqs_to_abort=[], request_outputs=[])
+    processed_outputs = MagicMock(
+        reqs_to_abort=[], reqs_to_finalize={}, request_outputs=[]
+    )
     engine.output_processor = MagicMock()
     engine.output_processor.process_outputs.return_value = processed_outputs
 

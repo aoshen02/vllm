@@ -1,10 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import asyncio
 import math
 import time
+from contextlib import suppress
 from unittest.mock import MagicMock, Mock
 
+import msgspec
 import numpy as np
 import pytest
 import torch
@@ -17,6 +20,7 @@ from tests.v1.engine.utils import (
     MockEngineCore,
 )
 from vllm import PoolingParams
+from vllm.distributed.aux_output_connector.types import AuxOutputRef
 from vllm.logprobs import FlatLogprobs, Logprob, PromptLogprobs, SampleLogprobs
 from vllm.lora.request import LoRARequest
 from vllm.outputs import (
@@ -35,11 +39,13 @@ from vllm.v1.engine import (
     EngineCoreRequest,
     FinishReason,
 )
+from vllm.v1.engine.async_llm import AsyncLLM
 from vllm.v1.engine.output_processor import (
     OutputProcessor,
     RequestOutputCollector,
     RequestState,
 )
+from vllm.v1.engine.parallel_sampling import ParentRequest
 from vllm.v1.metrics.stats import IterationStats, PrefillStats, SchedulerStats
 from vllm.v1.outputs import SamplingMaskLists
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
@@ -56,8 +62,8 @@ def test_aux_output_keys_preserve_existing_output_wire_positions():
     assert decoded.aux_output_keys is None
 
 
-def test_terminal_aux_output_keys_survive_ipc_and_output_processing():
-    processor = OutputProcessor(None, log_stats=False)
+def test_terminal_aux_reference_survives_ipc_and_output_processing():
+    processor = OutputProcessor(None, log_stats=False, finalize_aux_outputs=True)
     request = EngineCoreRequest(
         request_id="request",
         external_req_id="request",
@@ -71,19 +77,23 @@ def test_terminal_aux_output_keys_survive_ipc_and_output_processing():
         data_parallel_rank=None,
     )
     processor.add_request(request, None)
-    keys = ["prefix-block", "request-tail"]
+    ref = AuxOutputRef("mooncake", "opaque/" + "路" * 1024)
     wire_output = EngineCoreOutput(
         request_id="request",
         new_token_ids=[3],
         finish_reason=FinishReason.LENGTH,
-        aux_output_keys=keys,
     )
     decoded = MsgpackDecoder(EngineCoreOutput).decode(
         MsgpackEncoder().encode(wire_output)
     )
-    result = processor.process_outputs([decoded]).request_outputs[0]
+    pending = processor.process_outputs([decoded])
+    assert pending.reqs_to_finalize == {"request": 1}
+    assert not pending.request_outputs
+    decoded_ref = MsgpackDecoder(AuxOutputRef).decode(MsgpackEncoder().encode(ref))
+    result = processor.complete_aux_outputs("request", decoded_ref)
     assert result.finished
-    assert result.outputs[0].aux_output_keys == keys
+    assert result.outputs[0].aux_outputs == ref
+    assert result.outputs[0].aux_output_keys is None
     assert result.outputs[0].routed_experts is None
 
 
@@ -96,6 +106,7 @@ def test_delta_output_without_new_tokens_returns_empty_logprobs(
 
     state = RequestState.__new__(RequestState)
     state.aux_output_keys = None
+    state.aux_outputs = None
     state.detokenizer = MagicMock()
     state.detokenizer.get_next_output_text.return_value = ""
     state.logprobs_processor = MagicMock()
@@ -116,6 +127,7 @@ def test_delta_output_without_new_tokens_returns_empty_logprobs(
 def test_completion_output_preserves_each_sampling_mask_position() -> None:
     state = RequestState.__new__(RequestState)
     state.aux_output_keys = None
+    state.aux_outputs = None
     state.detokenizer = MagicMock()
     state.detokenizer.get_next_output_text.return_value = ""
     state.logprobs_processor = MagicMock()
@@ -1387,7 +1399,7 @@ async def test_request_output_collector(keys_only):
     NUM_REQS = 3
     TEXT = "a"
     routed_experts = np.arange(12, dtype=np.uint8).reshape(2, 3, 2)
-    aux_output_keys = ["prefix-block", "request-tail"] if keys_only else None
+    aux_outputs = AuxOutputRef("mooncake", "manifest") if keys_only else None
 
     def make_outputs() -> list[RequestOutput]:
         return [
@@ -1408,9 +1420,7 @@ async def test_request_output_collector(keys_only):
                             if idx == NUM_REQS - 1 and not keys_only
                             else None
                         ),
-                        aux_output_keys=aux_output_keys
-                        if idx == NUM_REQS - 1
-                        else None,
+                        aux_outputs=aux_outputs if idx == NUM_REQS - 1 else None,
                         finish_reason="length" if (idx == NUM_REQS - 1) else None,
                     )
                 ],
@@ -1463,7 +1473,7 @@ async def test_request_output_collector(keys_only):
 
     assert output.finished
     assert output.outputs[0].finish_reason == "length"
-    assert output.outputs[0].aux_output_keys == aux_output_keys
+    assert output.outputs[0].aux_outputs == aux_outputs
     if keys_only:
         assert output.outputs[0].routed_experts is None
     else:
@@ -1643,6 +1653,7 @@ def test_abort_requests(runner: str, abort_by: str, dummy_test_vectors):
 def test_sampling_masks_follow_output_kind(output_kind):
     state = RequestState.__new__(RequestState)
     state.aux_output_keys = None
+    state.aux_outputs = None
     state.detokenizer = MagicMock()
     state.detokenizer.get_next_output_text.return_value = ""
     state.logprobs_processor = MagicMock()
@@ -1782,3 +1793,135 @@ def test_async_pooling_cache_miss_does_not_fail_output_processor():
     assert output.error is not None
     assert output.error.retryable
     assert not output_processor.has_unfinished_requests()
+
+
+@pytest.mark.parametrize(
+    "kind", [RequestOutputKind.DELTA, RequestOutputKind.FINAL_ONLY]
+)
+def test_aux_choices_finalize_independently_and_release_state(kind):
+    """Each choice waits for its own reference, including out-of-order completion."""
+    request = EngineCoreRequest(
+        request_id="parent",
+        external_req_id="external",
+        prompt_token_ids=[1, 2],
+        mm_features=None,
+        sampling_params=SamplingParams(detokenize=False, n=2, output_kind=kind),
+        pooling_params=None,
+        arrival_time=0,
+        lora_request=None,
+        cache_salt=None,
+        data_parallel_rank=None,
+    )
+    parent = ParentRequest(request)
+    processor = OutputProcessor(None, log_stats=False, finalize_aux_outputs=True)
+    ids = []
+    for index in range(2):
+        request_id, params = parent.get_child_info(index)
+        ids.append(request_id)
+        processor.add_request(
+            msgspec.structs.replace(
+                request, request_id=request_id, sampling_params=params
+            ),
+            None,
+            parent,
+            index,
+        )
+    result = processor.process_outputs(
+        [
+            EngineCoreOutput(
+                request_id=req, new_token_ids=[3], finish_reason=FinishReason.LENGTH
+            )
+            for req in ids
+        ]
+    )
+    assert not result.request_outputs
+    assert result.reqs_to_finalize == dict.fromkeys(ids, 1)
+    ref1, ref0 = AuxOutputRef("mooncake", "one"), AuxOutputRef("mooncake", "zero")
+    first = processor.complete_aux_outputs(ids[1], ref1)
+    if kind == RequestOutputKind.FINAL_ONLY:
+        assert first is None
+    else:
+        assert not first.finished
+        assert first.outputs[0].index == 1
+        assert first.outputs[0].aux_outputs == ref1
+    last = processor.complete_aux_outputs(ids[0], ref0)
+    assert last.finished
+    assert last.outputs[0].aux_outputs == ref0
+    if kind == RequestOutputKind.FINAL_ONLY:
+        assert last.outputs[1].aux_outputs == ref1
+    assert not processor.request_states
+    assert not processor.parent_requests
+    assert not processor.external_req_ids
+
+
+@pytest.mark.asyncio
+async def test_aux_finalization_does_not_block_async_output_pump():
+    """A delayed store result must not prevent another completion's delivery."""
+    processor = OutputProcessor(None, log_stats=False, finalize_aux_outputs=True)
+    queues = {}
+    for req in ("slow", "fast"):
+        queues[req] = RequestOutputCollector(RequestOutputKind.DELTA, request_id=req)
+        processor.add_request(
+            EngineCoreRequest(
+                request_id=req,
+                external_req_id=req,
+                prompt_token_ids=[1, 2],
+                mm_features=None,
+                sampling_params=SamplingParams(detokenize=False),
+                pooling_params=None,
+                arrival_time=0,
+                lora_request=None,
+                cache_salt=None,
+                data_parallel_rank=None,
+            ),
+            None,
+            queue=queues[req],
+        )
+    incoming: asyncio.Queue[EngineCoreOutputs] = asyncio.Queue()
+    futures: dict[str, asyncio.Future[AuxOutputRef]] = {
+        req: asyncio.get_running_loop().create_future() for req in queues
+    }
+    started = {req: asyncio.Event() for req in queues}
+
+    async def finalize(req: str, count: int) -> AuxOutputRef:
+        assert count == 1
+        started[req].set()
+        return await futures[req]
+
+    engine = object.__new__(AsyncLLM)
+    engine.engine_core = Mock(
+        get_output_async=incoming.get, finalize_aux_outputs_async=finalize
+    )
+    engine.output_processor = processor
+    engine.log_stats = False
+    engine.logger_manager = None
+    engine.renderer = Mock(mm_processor_cache=None)
+    engine.output_handler = None
+    engine._run_output_handler()
+    try:
+        for req in queues:
+            incoming.put_nowait(
+                EngineCoreOutputs(
+                    outputs=[
+                        EngineCoreOutput(
+                            request_id=req,
+                            new_token_ids=[3],
+                            finish_reason=FinishReason.LENGTH,
+                        )
+                    ]
+                )
+            )
+            await asyncio.wait_for(started[req].wait(), 5)
+        fast = AuxOutputRef("mooncake", "fast/manifest")
+        futures["fast"].set_result(fast)
+        output = await asyncio.wait_for(queues["fast"].get(), 5)
+        assert output.outputs[0].aux_outputs == fast
+        assert not futures["slow"].done()
+        assert processor.get_num_unfinished_requests() == 1
+        futures["slow"].set_result(AuxOutputRef("mooncake", "slow/manifest"))
+        assert (await asyncio.wait_for(queues["slow"].get(), 5)).finished
+        assert processor.get_num_unfinished_requests() == 0
+    finally:
+        engine.output_handler.cancel()
+        with suppress(asyncio.CancelledError):
+            await engine.output_handler

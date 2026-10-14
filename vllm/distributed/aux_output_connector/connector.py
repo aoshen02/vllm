@@ -5,13 +5,18 @@
 from __future__ import annotations
 
 from collections.abc import Iterator, Sequence
+from concurrent.futures import Future
 from dataclasses import dataclass, field
+from math import prod
 from typing import TYPE_CHECKING
 
 import numpy as np
 
+from vllm.distributed.aux_output_connector.mooncake import MooncakeOutputPublisher
+from vllm.distributed.aux_output_connector.types import AuxOutputRef
+from vllm.v1.request import RequestStatus
+
 if TYPE_CHECKING:
-    from vllm.distributed.aux_output_connector.mooncake import MooncakeOutputPublisher
     from vllm.v1.core.sched.output import SchedulerOutput
     from vllm.v1.request import Request
 
@@ -43,19 +48,34 @@ class AuxRequestOutput:
     token_start: int
     rows: np.ndarray
     block_keys: list[str] | None = None
+    routed_layer_ids: list[int] | None = None
 
 
 class AuxOutputSchedulerConnector:
     """Build worker metadata and finalize backend-specific request outputs."""
 
-    def __init__(self, hash_block_size: int) -> None:
+    def __init__(self, hash_block_size: int, *, max_snapshot_rows: int = 0) -> None:
         self._hash_block_size = hash_block_size
+        self._max_snapshot_rows = max_snapshot_rows
+        self._unreserved_steps = 0
         # Number of hashes already sent to the worker for each active request.
         self._sent_hash_counts: dict[str, int] = {}
         # Terminal events are delivered with the next connector metadata.
         self._finished_requests: dict[str, PackedBlockHashes | None] = {}
         self._generation = 0
         self._mooncake_output: MooncakeOutputPublisher | None = None
+
+    def try_reserve_step(self) -> bool:
+        if self._mooncake_output is None:
+            self._unreserved_steps += 1
+            return True
+        return self._unreserved_steps == 0 and self._mooncake_output.try_reserve_step()
+
+    def release_step(self) -> None:
+        if self._unreserved_steps:
+            self._unreserved_steps -= 1
+        elif self._mooncake_output is not None:
+            self._mooncake_output.release_step()
 
     def build_connector_meta(
         self,
@@ -130,7 +150,7 @@ class AuxOutputSchedulerConnector:
         self,
         request: Request,
         output: dict[str, AuxRequestOutput] | None,
-    ) -> np.ndarray | list[str] | None:
+    ) -> np.ndarray | None:
         """Return the accepted R3 rows for one scheduled request."""
         request_id = request.request_id
         assert output is not None and request_id in output, (
@@ -139,15 +159,16 @@ class AuxOutputSchedulerConnector:
         request_output = output[request_id]
         token_end = request.num_tokens - 1
         if request_output.block_keys is not None:
-            from vllm.distributed.aux_output_connector.mooncake import (
-                MooncakeOutputPublisher,
-            )
-
             if self._mooncake_output is None:
                 self._mooncake_output = MooncakeOutputPublisher(
-                    request_output, self._hash_block_size
+                    request_output,
+                    self._hash_block_size,
+                    max_snapshot_bytes=self._max_snapshot_rows
+                    * prod(request_output.rows.shape[1:])
+                    * request_output.rows.dtype.itemsize,
                 )
-            return self._mooncake_output.take_output(request, request_output)
+            self._mooncake_output.take_output(request, request_output)
+            return None
         local_end = token_end - request_output.token_start
         if local_end < 0:
             assert not request.is_finished(), (
@@ -169,8 +190,11 @@ class AuxOutputSchedulerConnector:
     def request_finished(self, request: Request) -> None:
         """Queue a request's terminal event and final block hashes."""
         request_id = request.request_id
-        if request.is_finished() and self._mooncake_output is not None:
-            self._mooncake_output.discard(request_id)
+        if self._mooncake_output is not None and request.status in (
+            RequestStatus.FINISHED_ABORTED,
+            RequestStatus.FINISHED_ERROR,
+        ):
+            self._mooncake_output.discard(request_id, unless_finalizing=True)
         num_sent = self._sent_hash_counts.pop(request_id, None)
         if num_sent is None:
             return
@@ -178,6 +202,16 @@ class AuxOutputSchedulerConnector:
         self._finished_requests[request_id] = self._pack_new_hashes(
             request.block_hashes, num_sent
         )
+
+    def finalize(self, request_id: str, num_tokens: int) -> Future[AuxOutputRef]:
+        if self._mooncake_output is None:
+            raise ValueError("No Mooncake auxiliary output was produced")
+        return self._mooncake_output.finalize(request_id, num_tokens)
+
+    def discard(self, request_ids: Sequence[str]) -> None:
+        if self._mooncake_output is not None:
+            for request_id in request_ids:
+                self._mooncake_output.discard(request_id)
 
     def close(self) -> None:
         if self._mooncake_output is not None:
