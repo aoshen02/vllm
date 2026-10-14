@@ -9,9 +9,11 @@ fail loudly if the validator semantics ever drift.
 
 import json
 
+import msgspec
 import pytest
 from pydantic import TypeAdapter, ValidationError
 
+from vllm.distributed.aux_output_connector.types import AuxChunkRef, AuxOutputPayload
 from vllm.entrypoints.scale_out.token_in_token_out.protocol import (
     DerenderChatRequest,
     DerenderChatStreamRequest,
@@ -29,6 +31,58 @@ from vllm.entrypoints.scale_out.token_in_token_out.protocol import (
     PlaceholderRangeInfo,
 )
 from vllm.sampling_params import SamplingParams
+
+
+def test_aux_namespace_roundtrip_and_shm_field_omission() -> None:
+    payload = AuxOutputPayload(
+        2,
+        3,
+        {"dtype": "<u2", "num_layers": 3, "experts_per_token": 2},
+        [AuxChunkRef(4, "r3-block:test")],
+    )
+    choice = GenerateTokensChoice(index=0, aux_outputs={"routed_experts": payload})
+    assert GenerateTokensChoice.model_validate_json(choice.model_dump_json()) == choice
+    decoded = msgspec.json.decode(msgspec.json.encode(payload), type=AuxOutputPayload)
+    assert decoded == payload
+    GenerateTokensChoice.model_json_schema()
+    inline = GenerateTokensChoice(index=0, routed_experts="existing-npy")
+    assert inline.model_dump() == {
+        "index": 0,
+        "finish_reason": "stop",
+        "token_ids": None,
+        "routed_experts": "existing-npy",
+        "aux_output_keys": None,
+        "sampling_mask": None,
+        "logprobs": None,
+    }
+    assert "aux_outputs" not in json.loads(inline.model_dump_json())
+
+
+@pytest.mark.parametrize(
+    "fragment",
+    [
+        '"token_start":true,"num_rows":0,"chunks":[]',
+        '"token_start":-1,"num_rows":0,"chunks":[]',
+        '"token_start":0,"num_rows":0',
+        '"token_start":0,"num_rows":0,"chunks":null',
+        '"token_start":0,"num_rows":1,"chunks":[]',
+        '"token_start":0,"num_rows":1,"chunks":[{"num_rows":true,"key":"a"}]',
+        '"token_start":0,"num_rows":1,"chunks":[{"num_rows":1,"key":""}]',
+        '"token_start":0,"num_rows":0,"chunks":[{"num_rows":1,"key":"a"}]',
+    ],
+)
+def test_aux_namespace_rejects_invalid_counts_and_chunks(fragment: str) -> None:
+    raw = (
+        '{"metadata":{"dtype":"|u1","num_layers":2,"experts_per_token":2},'
+        + fragment
+        + "}"
+    )
+    with pytest.raises(ValueError):
+        msgspec.json.decode(raw, type=AuxOutputPayload)
+    with pytest.raises(ValueError):
+        GenerateTokensChoice.model_validate_json(
+            '{"index":0,"aux_outputs":{"routed_experts":' + raw + "}}"
+        )
 
 
 def _base_payload() -> dict:

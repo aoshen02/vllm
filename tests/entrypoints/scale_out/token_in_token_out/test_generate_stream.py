@@ -2,13 +2,15 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import json
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from vllm.config.multimodal import MultiModalConfig
+from vllm.distributed.aux_output_connector.types import AuxChunkRef, AuxOutputPayload
 from vllm.entrypoints.generate.base.protocol import StreamOptions
 from vllm.entrypoints.openai.models.protocol import BaseModelPath
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
@@ -21,7 +23,9 @@ from vllm.entrypoints.scale_out.token_in_token_out.mm_serde import (
 from vllm.entrypoints.scale_out.token_in_token_out.protocol import (
     GenerateRequest,
     GenerateTextResponse,
+    GenerateTextStreamResponse,
     GenerateTokensResponse,
+    GenerateTokensStreamResponse,
     MultiModalFeatures,
     PlaceholderRangeInfo,
 )
@@ -222,15 +226,22 @@ def test_placeholder_ranges_from_engine_input():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("stream", [False, True])
-async def test_serve_tokens_returns_terminal_aux_output_keys_without_inline_r3(stream):
+async def test_serve_tokens_returns_terminal_aux_namespace_without_inline_r3(stream):
     engine = _mock_engine()
-    keys = ["prefix-block", "request-tail"]
+    payloads = {
+        "routed_experts": AuxOutputPayload(
+            0,
+            3,
+            {"dtype": "|u1", "num_layers": 3, "experts_per_token": 2},
+            [AuxChunkRef(2, "prefix-block"), AuxChunkRef(1, "request-tail")],
+        )
+    }
 
     async def generate(*args, **kwargs):
         output = _make_request_output(
             "req-1", token_ids=[10], finish_reason="length", finished=True
         )
-        output.outputs[0].aux_output_keys = keys
+        output.outputs[0].aux_outputs = payloads
         yield output
 
     engine.generate = MagicMock(side_effect=generate)
@@ -254,9 +265,65 @@ async def test_serve_tokens_returns_terminal_aux_output_keys_without_inline_r3(s
     else:
         assert isinstance(response, GenerateTokensResponse)
         choice = response.choices[0].model_dump()
-    assert choice["aux_output_keys"] == keys
+    assert choice["aux_output_keys"] is None
+    assert choice["aux_outputs"]["routed_experts"]["num_rows"] == 3
+    assert [c["key"] for c in choice["aux_outputs"]["routed_experts"]["chunks"]] == [
+        "prefix-block",
+        "request-tail",
+    ]
     assert "artifact_keys" not in choice
     assert choice["routed_experts"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["tokens", "text"])
+async def test_aux_namespace_emits_empty_terminal_once_with_inline_logprobs(
+    mode: Literal["tokens", "text"],
+) -> None:
+    engine = _mock_engine()
+    payload = AuxOutputPayload(
+        0,
+        3,
+        {"dtype": "|u1", "num_layers": 2, "experts_per_token": 2},
+        [AuxChunkRef(3, "routes")],
+    )
+
+    async def generate() -> AsyncIterator[RequestOutput]:
+        yield _make_request_output(
+            "req", [10], logprobs=[{10: Logprob(logprob=-0.5, rank=1)}], text="first"
+        )
+        final = _make_request_output(
+            "req", [], finish_reason="length", finished=True, logprobs=[]
+        )
+        final.outputs[0].aux_outputs = {"routed_experts": payload}
+        yield final
+
+    engine.generate = MagicMock(return_value=generate())
+    response = await _build_serving_tokens(engine).serve_tokens(
+        GenerateRequest(
+            token_ids=[1, 2, 3],
+            sampling_params=SamplingParams(max_tokens=1, logprobs=0),
+            model=MODEL_NAME,
+            stream=True,
+            output_mode=mode,
+            stream_options=StreamOptions(include_usage=True),
+        )
+    )
+    assert isinstance(response, AsyncIterator)
+    events = []
+    model = (
+        GenerateTokensStreamResponse if mode == "tokens" else GenerateTextStreamResponse
+    )
+    async for chunk in response:
+        if chunk.strip() != "data: [DONE]":
+            events.append(model.model_validate_json(chunk[6:]))
+    choices = [choice for event in events for choice in event.choices]
+    assert len(choices) == 2
+    assert choices[0].aux_outputs is None and choices[0].logprobs is not None
+    assert choices[1].token_ids == []
+    assert choices[1].aux_outputs == {"routed_experts": payload}
+    assert choices[1].finish_reason == "length"
+    assert events[-1].choices == [] and events[-1].usage is not None
 
 
 @pytest.mark.asyncio

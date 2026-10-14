@@ -16,6 +16,11 @@ from vllm.distributed.aux_output_connector.store import (
     BlockObject,
     BlockObjectStoreError,
 )
+from vllm.distributed.aux_output_connector.types import (
+    AuxChunkRef,
+    AuxOutputPayload,
+    routing_metadata,
+)
 
 
 class MooncakeBlockObjectStore:
@@ -71,17 +76,21 @@ class MooncakeOutputPublisher:
     """Finalize accepted boundary bytes without reading complete output blocks."""
 
     def __init__(self, output: "AuxRequestOutput", block_size: int) -> None:
+        self._metadata = routing_metadata(output.rows)
         self._block_size = block_size
         self._row_nbytes = prod(output.rows.shape[1:]) * output.rows.dtype.itemsize
         self._store = create_mooncake_block_store(
             object_nbytes=block_size * self._row_nbytes
         )
         self._chunks: dict[str, list[str | bytes]] = {}
+        self._ranges: dict[str, tuple[int, int]] = {}
 
     def take_output(
         self, request: "Request", output: "AuxRequestOutput"
-    ) -> list[str] | None:
-        start, end = output.token_start, request.num_tokens - 1
+    ) -> AuxOutputPayload | None:
+        if routing_metadata(output.rows) != self._metadata:
+            raise ValueError("Routed-experts layout changed during publication")
+        start, end = int(output.token_start), request.num_tokens - 1
         if end < start:
             assert not request.is_finished()
             return None
@@ -91,6 +100,10 @@ class MooncakeOutputPublisher:
         stored_start = start // block_size * block_size
         stored_end = stored_start + len(keys) * block_size if keys else start
         assert end <= stored_end + len(output.rows)
+        first, previous_end = self._ranges.get(request.request_id, (start, start))
+        if previous_end != start:
+            raise ValueError("Nonconsecutive routed-experts output")
+        self._ranges[request.request_id] = first, end
         chunks = self._chunks.setdefault(request.request_id, [])
         for index, key in enumerate(keys):
             block_start = stored_start + index * block_size
@@ -101,6 +114,8 @@ class MooncakeOutputPublisher:
                 chunks.append(key)
             else:
                 payload = self._store.get_concatenated([key])
+                if len(payload) != block_size * self._row_nbytes:
+                    raise ValueError("Invalid routed-experts block length")
                 chunks.append(
                     payload[
                         (lo - block_start) * self._row_nbytes : (hi - block_start)
@@ -115,25 +130,30 @@ class MooncakeOutputPublisher:
         if not request.is_finished() and not request.sampling_params.stop:
             return None
         del self._chunks[request.request_id]
-        result: list[str] = []
+        del self._ranges[request.request_id]
+        result: list[AuxChunkRef] = []
         objects = []
         for is_key, group in groupby(chunks, lambda chunk: isinstance(chunk, str)):
             if is_key:
-                result.extend(cast(Iterable[str], group))
+                result.extend(
+                    AuxChunkRef(block_size, key) for key in cast(Iterable[str], group)
+                )
             else:
                 payload = b"".join(cast(Iterable[bytes], group))
                 object_nbytes = self._store.object_nbytes
                 for offset in range(0, len(payload), object_nbytes):
                     key = f"r3-tail:{uuid4().hex}"
-                    result.append(key)
-                    objects.append(
-                        BlockObject(key, payload[offset : offset + object_nbytes])
-                    )
+                    data = payload[offset : offset + object_nbytes]
+                    if len(data) % self._row_nbytes:
+                        raise ValueError("Partial routed-experts row")
+                    result.append(AuxChunkRef(len(data) // self._row_nbytes, key))
+                    objects.append(BlockObject(key, data))
         self._store.put(objects)
-        return result
+        return AuxOutputPayload(first, end - first, dict(self._metadata), result)
 
     def discard(self, request_id: str) -> None:
         self._chunks.pop(request_id, None)
+        self._ranges.pop(request_id, None)
 
     def close(self) -> None:
         self._store.close()

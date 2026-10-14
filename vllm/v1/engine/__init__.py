@@ -12,6 +12,7 @@ import numpy as np
 import torch
 
 from vllm.config.kv_events import KVEventsConfig
+from vllm.distributed.aux_output_connector.types import AuxOutputs
 from vllm.lora.request import LoRARequest
 from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.pooling_params import PoolingParams
@@ -239,6 +240,8 @@ class EngineCoreOutput(
 
     # [num_scored_rows, num_token_ids]; appended last for array_like compatibility.
     prompt_token_id_logprobs: torch.Tensor | None = None
+
+    aux_outputs: AuxOutputs | None = None
 
     @property
     def finished(self) -> bool:
