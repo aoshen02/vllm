@@ -170,6 +170,10 @@ class AsyncLLM(EngineClient):
             stream_interval=self.vllm_config.scheduler_config.stream_interval,
             tracing_enabled=tracing_endpoint is not None,
             admission_stats=self.admission_stats,
+            finalize_aux_outputs=(
+                vllm_config.aux_output_config.enabled
+                and vllm_config.aux_output_config.backend == "mooncake"
+            ),
         )
 
         # EngineCore (starts the engine in background process).
@@ -816,6 +820,23 @@ class AsyncLLM(EngineClient):
         # P0 multi-modal sender ("shadow") cache; None for text-only models.
         mm_processor_cache = renderer.mm_processor_cache
         chunk_size = envs.VLLM_V1_OUTPUT_PROC_CHUNK_SIZE
+        finalizers: set[asyncio.Task[None]] = set()
+
+        async def finalize_aux_outputs(request_id: str, num_tokens: int) -> None:
+            try:
+                ref = await engine_core.finalize_aux_outputs_async(
+                    request_id, num_tokens
+                )
+                output_processor.complete_aux_outputs(request_id, ref)
+            except asyncio.CancelledError:
+                output_processor.fail_aux_outputs(request_id, EngineDeadError())
+                raise
+            except Exception as error:
+                output_processor.fail_aux_outputs(request_id, error)
+                try:
+                    await engine_core.abort_requests_async([request_id])
+                except Exception:
+                    logger.exception("Failed to abort auxiliary publication")
 
         async def output_handler():
             try:
@@ -841,6 +862,15 @@ class AsyncLLM(EngineClient):
                         )
                         # NOTE: RequestOutputs are pushed to their queues.
                         assert not processed_outputs.request_outputs
+                        for (
+                            request_id,
+                            num_tokens,
+                        ) in processed_outputs.reqs_to_finalize.items():
+                            task = asyncio.create_task(
+                                finalize_aux_outputs(request_id, num_tokens)
+                            )
+                            finalizers.add(task)
+                            task.add_done_callback(finalizers.discard)
 
                         # 2b) Recover from P0/P1 cache drift: the engine flags hashes
                         # it couldn't find (mm_cache_miss_hashes); drop them from the
@@ -877,6 +907,9 @@ class AsyncLLM(EngineClient):
             except Exception as e:
                 logger.exception("AsyncLLM output_handler failed.")
                 output_processor.propagate_error(e)
+            finally:
+                for task in finalizers:
+                    task.cancel()
 
         self.output_handler = asyncio.create_task(output_handler())
 

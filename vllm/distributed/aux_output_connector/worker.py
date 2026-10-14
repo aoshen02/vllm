@@ -18,6 +18,7 @@ from vllm.distributed.aux_output_connector.connector import (
     AuxOutputConnectorMetadata,
     AuxRequestOutput,
 )
+from vllm.distributed.aux_output_connector.mooncake import create_mooncake_block_store
 from vllm.distributed.aux_output_connector.routed_experts import (
     RoutedExpertsBuffer,
     materialize_routed_experts,
@@ -124,10 +125,6 @@ class AuxOutputWorkerConnector:
         block_nbytes = hash_block_size * prod(shape_per_token) * dtype.itemsize
         store: ShmBlockObjectStore | MooncakeBlockObjectStore
         if self._return_keys:
-            from vllm.distributed.aux_output_connector.mooncake import (
-                create_mooncake_block_store,
-            )
-
             store = create_mooncake_block_store(object_nbytes=block_nbytes)
         else:
             max_bytes = vllm_config.aux_output_config.max_bytes
@@ -321,6 +318,8 @@ class AuxOutputWorkerConnector:
             state.emit_cursor = token_end
         if self._return_keys and outputs:
             store.flush()
+            for output in outputs.values():
+                output.routed_layer_ids = sorted(set(self._capturer.routed_layer_ids))
         return outputs
 
     def _restore_tail(

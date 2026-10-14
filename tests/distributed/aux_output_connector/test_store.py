@@ -9,9 +9,13 @@ from dataclasses import dataclass, field
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import msgspec
 import numpy as np
 import pytest
 import torch
+from examples.rl.aux_output_reader import AuxOutputReader
+from tokenizers import Tokenizer, models
+from transformers import TokenizersBackend
 
 from vllm.distributed.aux_output_connector.connector import (
     AuxOutputConnectorMetadata,
@@ -36,11 +40,20 @@ from vllm.distributed.aux_output_connector.store import (
     BlockObject,
     BlockObjectStoreError,
 )
+from vllm.distributed.aux_output_connector.types import (
+    AuxChunkRef,
+    AuxOutputManifest,
+    AuxOutputRef,
+    PayloadRef,
+)
 from vllm.distributed.aux_output_connector.worker import (
     AuxOutputWorkerConnector,
 )
 from vllm.distributed.mooncake_store import MooncakeStoreConfig
+from vllm.sampling_params import SamplingParams
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
+from vllm.v1.engine import EngineCoreOutput, EngineCoreRequest
+from vllm.v1.engine.output_processor import OutputProcessor
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.worker.gpu import async_utils
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
@@ -77,9 +90,10 @@ def test_mooncake_aux_configuration_is_explicit(monkeypatch, tmp_path, aux_confi
     monkeypatch.delenv(name, raising=False)
     if aux_config != "missing":
         monkeypatch.setenv(name, str(kv_path if aux_config == "shared" else aux_path))
-    native = Mock()
-    native.setup.return_value = 0
-    factory = Mock(return_value=native)
+    natives = [Mock(), Mock()]
+    for native in natives:
+        native.setup.return_value = 0
+    factory = Mock(side_effect=natives)
     monkeypatch.setitem(
         sys.modules, "mooncake.store", SimpleNamespace(MooncakeDistributedStore=factory)
     )
@@ -95,14 +109,19 @@ def test_mooncake_aux_configuration_is_explicit(monkeypatch, tmp_path, aux_confi
     publisher = MooncakeOutputPublisher(
         AuxRequestOutput(0, np.zeros((1, *_SHAPE), dtype=_DTYPE)), _BLOCK_SIZE
     )
-    calls = native.setup.call_args_list
-    assert len(calls) == 2 and calls[0] == calls[1]
-    assert calls[0].args[6] == ("kv:50051" if aux_config == "shared" else "aux:50051")
-    if aux_config != "shared":
-        assert calls[0].args[1:6] == ("P2PHANDSHAKE", 0, 4096, "rdma", "")
-        assert calls[0].kwargs == {"tenant_id": "rl"}
+    assert factory.call_count == 2
+    for native in natives:
+        native.setup.assert_called_once()
+        call = native.setup.call_args
+        assert call.args[6] == ("kv:50051" if aux_config == "shared" else "aux:50051")
+        if aux_config != "shared":
+            assert call.args[1:6] == ("P2PHANDSHAKE", 0, 4096, "rdma", "")
+            assert call.kwargs == {"tenant_id": "rl"}
     publisher.close()
+    natives[1].close.assert_called_once_with()
+    natives[0].close.assert_not_called()
     store.close()
+    natives[0].close.assert_called_once_with()
 
 
 @pytest.fixture
@@ -121,6 +140,7 @@ def remote_store(monkeypatch, request):
         native,
         object_nbytes=getattr(request, "param", _BLOCK_SIZE) * int(np.prod(_SHAPE)),
         max_batch_bytes=1024,
+        local_buffer_bytes=1024**2,
     )
     monkeypatch.setattr(
         "vllm.distributed.aux_output_connector.mooncake.create_mooncake_block_store",
@@ -143,15 +163,21 @@ def test_mooncake_output_keys_contain_exact_accepted_rows(remote_store, start, e
         ]
     )
     output = AuxRequestOutput(
-        start, rows[max(start, 16) :], keys[start // block_size :]
+        start, rows[max(start, 16) :], keys[start // block_size :], [0, 1, 2]
     )
     publisher = MooncakeOutputPublisher(output, block_size)
     request = _SchedulerRequest("request", [], num_tokens=end + 1, finished=True)
-    result = publisher.take_output(request, output)
-    assert result is not None
-    assert remote_store.get_concatenated(result) == rows[start:end].tobytes()
+    publisher.take_output(request, output)
+    ref = publisher.finalize(request.request_id, 1).result(timeout=5)
+    reader = AuxOutputReader(remote_store._store, ref)
+    np.testing.assert_array_equal(
+        reader.read("routed_experts", start=0, stop=end - start)["expert_ids"],
+        rows[start:end],
+    )
     if start == 0 and end == 18:
-        assert result[: len(keys)] == keys
+        assert [c.keys["expert_ids"] for c in reader.payloads["routed_experts"].chunks][
+            : len(keys)
+        ] == keys
     publisher.close()
 
 
@@ -169,10 +195,16 @@ def test_mooncake_worker_and_publisher_reuse_prefix_and_finalize_tail(remote_sto
     second = _metadata(0, [_request_metadata("second", 8, 2, 0, hashes)], {"first": []})
     output = _process_output(worker, second, rows[8:], ["second"], np.array([0]))
     publisher = MooncakeOutputPublisher(output["second"], _BLOCK_SIZE)
-    keys = publisher.take_output(
+    publisher.take_output(
         _SchedulerRequest("second", [], num_tokens=11, finished=True), output["second"]
     )
-    assert remote_store.get_concatenated(keys) == rows.tobytes()
+    reader = AuxOutputReader(
+        remote_store._store, publisher.finalize("second", 1).result(timeout=5)
+    )
+    np.testing.assert_array_equal(
+        reader.read("routed_experts", start=0, stop=10)["expert_ids"], rows
+    )
+    publisher.close()
     worker.close()
 
 
@@ -278,30 +310,78 @@ def test_mooncake_pd_missing_tail_fails_closed(remote_store):
     worker.close()
 
 
+@pytest.mark.parametrize("initial_steps", [1, 2])
+def test_lazy_publisher_drains_initial_steps_before_reserving(
+    remote_store, monkeypatch, initial_steps
+):
+    """Lazy startup must not release reservations for steps launched before it."""
+    factory = Mock(return_value=remote_store)
+    monkeypatch.setattr(
+        "vllm.distributed.aux_output_connector.mooncake.create_mooncake_block_store",
+        factory,
+    )
+    connector = AuxOutputSchedulerConnector(_BLOCK_SIZE, max_snapshot_rows=2_000_000)
+    for _ in range(initial_steps):
+        assert connector.try_reserve_step()
+    factory.assert_not_called()
+
+    rows = np.arange(24, dtype=_DTYPE).reshape(4, *_SHAPE)
+    remote_store.put([BlockObject("prefix", rows.tobytes())])
+    request = _SchedulerRequest("request", [], num_tokens=5, finished=True)
+    connector.take_output(
+        request, {"request": AuxRequestOutput(0, rows[:0], ["prefix"], [0, 1, 2])}
+    )
+    factory.assert_called_once()
+    for _ in range(initial_steps):
+        assert not connector.try_reserve_step()
+        connector.release_step()
+
+    assert connector.try_reserve_step()
+    assert connector.try_reserve_step()
+    assert not connector.try_reserve_step()
+    connector.release_step()
+    connector.release_step()
+
+    ref = connector.finalize("request", 1).result(timeout=5)
+    reader = AuxOutputReader(remote_store._store, ref)
+    np.testing.assert_array_equal(
+        reader.read("routed_experts", start=0, stop=4)["expert_ids"], rows
+    )
+    connector.close()
+
+
 def test_mooncake_decode_crosses_blocks_and_clips_terminal_output(remote_store):
     """Late full-block keys must not duplicate bytes accepted in earlier steps."""
     rows = np.arange(60, dtype=np.uint8).reshape(10, *_SHAPE)
     connector = AuxOutputSchedulerConnector(_BLOCK_SIZE)
     request = _SchedulerRequest("request", [], num_tokens=4)
     assert (
-        connector.take_output(request, {"request": AuxRequestOutput(0, rows[:3], [])})
+        connector.take_output(
+            request, {"request": AuxRequestOutput(0, rows[:3], [], [0, 1, 2])}
+        )
         is None
     )
     remote_store.put([BlockObject("block-0", rows[:4].tobytes())])
     request.num_tokens = 6
+    request.num_output_tokens = 3
     assert (
         connector.take_output(
-            request, {"request": AuxRequestOutput(3, rows[4:5], ["block-0"])}
+            request, {"request": AuxRequestOutput(3, rows[4:5], ["block-0"], [0, 1, 2])}
         )
         is None
     )
     remote_store.put([BlockObject("block-1", rows[4:8].tobytes())])
     request.num_tokens = 10
+    request.num_output_tokens = 7
     request.finished = True
-    keys = connector.take_output(
-        request, {"request": AuxRequestOutput(5, rows[8:], ["block-1"])}
+    connector.take_output(
+        request, {"request": AuxRequestOutput(5, rows[8:], ["block-1"], [0, 1, 2])}
     )
-    assert remote_store.get_concatenated(keys) == rows[:9].tobytes()
+    ref = connector.finalize("request", 7).result(timeout=5)
+    reader = AuxOutputReader(remote_store._store, ref)
+    np.testing.assert_array_equal(
+        reader.read("routed_experts", start=0, stop=9)["expert_ids"], rows[:9]
+    )
     connector.close()
     remote_store._store.close.assert_called_once_with()
 
@@ -318,36 +398,36 @@ def test_mooncake_preemption_keeps_already_accepted_output(remote_store):
     connector = AuxOutputSchedulerConnector(_BLOCK_SIZE)
     request = _SchedulerRequest("request", [], num_tokens=9)
     assert (
-        connector.take_output(request, {"request": AuxRequestOutput(0, rows[:0], keys)})
+        connector.take_output(
+            request, {"request": AuxRequestOutput(0, rows[:0], keys, [0, 1, 2])}
+        )
         is None
     )
     # Preemption terminates the Worker state, not the user request/output.
     connector.request_finished(request)
     request.num_tokens = 11
+    request.num_output_tokens = 3
     request.finished = True
-    result = connector.take_output(
-        request, {"request": AuxRequestOutput(8, rows[8:], [])}
+    connector.take_output(
+        request, {"request": AuxRequestOutput(8, rows[8:], [], [0, 1, 2])}
     )
-    assert remote_store.get_concatenated(result) == rows.tobytes()
+    ref = connector.finalize("request", 3).result(timeout=5)
+    reader = AuxOutputReader(remote_store._store, ref)
+    np.testing.assert_array_equal(
+        reader.read("routed_experts", start=0, stop=10)["expert_ids"], rows
+    )
     connector.request_finished(request)
     connector.close()
 
 
-def test_mooncake_string_stop_delivers_keys_before_engine_abort(remote_store):
+def test_mooncake_string_stop_defers_terminal_until_manifest_confirmation(remote_store):
     """API-side termination must retain R3 from every accepted step."""
-    from tokenizers import Tokenizer, models
-    from transformers import PreTrainedTokenizerFast
-
-    from vllm.sampling_params import SamplingParams
-    from vllm.v1.engine import EngineCoreOutput, EngineCoreRequest
-    from vllm.v1.engine.output_processor import OutputProcessor
-
-    tokenizer = PreTrainedTokenizerFast(
+    tokenizer = TokenizersBackend(
         tokenizer_object=Tokenizer(
             models.WordLevel({"hello": 0, "!": 1, "[UNK]": 2}, unk_token="[UNK]")
         )
     )
-    processor = OutputProcessor(tokenizer, log_stats=False)
+    processor = OutputProcessor(tokenizer, log_stats=False, finalize_aux_outputs=True)
     params = SamplingParams(stop=["!"], max_tokens=10)
     processor.add_request(
         EngineCoreRequest(
@@ -369,24 +449,32 @@ def test_mooncake_string_stop_delivers_keys_before_engine_abort(remote_store):
     rows = np.arange(12, dtype=_DTYPE).reshape(2, *_SHAPE)
     for index, token in enumerate([0, 1]):
         request.num_tokens = index + 2
-        keys = connector.take_output(
-            request, {"request": AuxRequestOutput(index, rows[index : index + 1], [])}
-        )
-        assert keys is not None
-        result = processor.process_outputs(
-            [
-                EngineCoreOutput(
-                    request_id="request", new_token_ids=[token], aux_output_keys=keys
+        request.num_output_tokens = index + 1
+        connector.take_output(
+            request,
+            {
+                "request": AuxRequestOutput(
+                    index, rows[index : index + 1], [], [0, 1, 2]
                 )
-            ]
+            },
         )
-        completion = result.request_outputs[0].outputs[0]
+        result = processor.process_outputs(
+            [EngineCoreOutput(request_id="request", new_token_ids=[token])]
+        )
         if index == 0:
-            assert completion.aux_output_keys is None
+            assert result.request_outputs[0].outputs[0].aux_outputs is None
     assert not request.is_finished()
-    assert result.request_outputs[0].finished
-    assert result.reqs_to_abort == ["request"]
-    assert remote_store.get_concatenated(completion.aux_output_keys) == rows.tobytes()
+    assert not result.request_outputs
+    assert not result.reqs_to_abort
+    assert result.reqs_to_finalize == {"request": 2}
+    ref = connector.finalize("request", 2).result(timeout=5)
+    completion = processor.complete_aux_outputs("request", ref)
+    assert completion.finished
+    assert completion.outputs[0].aux_outputs == ref
+    reader = AuxOutputReader(remote_store._store, ref)
+    np.testing.assert_array_equal(
+        reader.read("routed_experts", start=0, stop=2)["expert_ids"], rows
+    )
     request.finished = True
     connector.request_finished(request)
     connector.close()
@@ -445,7 +533,11 @@ def test_mooncake_failure_propagates_through_background_writer():
     with pytest.raises(BlockObjectStoreError, match="publication failed"):
         store.get_concatenated(["a"])
     with pytest.raises(BlockObjectStoreError, match="publication failed"):
+        store.put([BlockObject("b", b"efgh")])
+    with pytest.raises(BlockObjectStoreError, match="publication failed"):
         store.close()
+    with pytest.raises(RuntimeError, match="closed"):
+        store.submit(lambda: None).result(timeout=1)
     native.close.assert_called_once_with()
 
 
@@ -496,6 +588,7 @@ class _SchedulerRequest:
     num_output_tokens: int = 1
     num_computed_tokens: int = 0
     num_in_flight_tokens: int = 0
+    status: int = 0
     finished: bool = False
     prefill_stats: SimpleNamespace | None = None
     num_preemptions: int = 0
@@ -579,6 +672,7 @@ def _make_worker(
     )
     worker = object.__new__(AuxOutputWorkerConnector)
     worker._store = store
+    worker._capturer = Mock(routed_layer_ids=[0, 1, 2])
     worker._buffer = RoutedExpertsBuffer(
         _DTYPE,
         _SHAPE,
@@ -793,7 +887,7 @@ def _process_output(
     if token_starts is None or num_tokens is None:
         assert isinstance(step, _WorkerStep)
         token_starts, num_tokens = _execution_ranges(step, request_ids)
-    worker._capturer = Mock()
+    worker._capturer = Mock(routed_layer_ids=[0, 1, 2])
     worker._capturer.snapshot_routing_data.return_value = torch.from_numpy(rows)
     metadata = step.metadata if isinstance(step, _WorkerStep) else step
     worker.begin_step(metadata)
@@ -2281,3 +2375,166 @@ def test_scheduler_connector_reset_derives_emit_start_from_request():
     assert metadata.generation == 1
     assert metadata.requests[request.request_id] == 4
     assert list(metadata.block_hashes[request.request_id]) == [b"a" * 32]
+
+
+@pytest.mark.parametrize("dtype", ["u1", "<u2"])
+def test_manifest_ranges_fetch_only_selected_objects(remote_store, dtype):
+    """The reader clips immutable chunks and skips missing unselected objects."""
+    rows = np.arange(48).astype(dtype).reshape(8, *_SHAPE)
+    key = "opaque/" + "路" * 1024
+    remote_store.put([BlockObject(key, rows[4:].tobytes())])
+    payload = PayloadRef(
+        3,
+        7,
+        {
+            "dtype": rows.dtype.str,
+            "num_layers": 3,
+            "experts_per_token": 2,
+            "routed_layer_ids": [1, 2],
+        },
+        [
+            AuxChunkRef(4, {"expert_ids": "missing-prefix"}),
+            AuxChunkRef(4, {"expert_ids": key}),
+            AuxChunkRef(4, {"expert_ids": "missing-suffix"}),
+        ],
+    )
+    ref = AuxOutputRef("mooncake", "manifest/" + "m" * 1024)
+    remote_store.put_manifest(
+        BlockObject(
+            ref.manifest_key,
+            msgspec.json.encode(AuxOutputManifest({"routed_experts": payload})),
+        )
+    )
+    reader = AuxOutputReader(remote_store._store, msgspec.to_builtins(ref))
+    remote_store._store.batch_get_buffer.reset_mock()
+    np.testing.assert_array_equal(
+        reader.read("routed_experts", start=5, stop=7)["expert_ids"], rows[5:7]
+    )
+    assert remote_store._store.batch_get_buffer.call_args_list[0].args[0] == [key]
+    remote_store._store.batch_get_buffer.reset_mock()
+    assert list(reader.iter_chunks("routed_experts", start=7, stop=7)) == []
+    remote_store._store.batch_get_buffer.assert_not_called()
+    with pytest.raises(BlockObjectStoreError, match="missing-prefix"):
+        reader.read("routed_experts", start=0, stop=1)
+    with pytest.raises(ValueError, match="range"):
+        reader.read("routed_experts", start=0, stop=8)
+    payload.num_rows = 12_000_000
+    reader.payloads["routed_experts"] = payload
+    remote_store._store.batch_get_buffer.reset_mock()
+    with pytest.raises(ValueError, match="budget"):
+        reader.read("routed_experts", start=0, stop=12_000_000)
+    remote_store._store.batch_get_buffer.assert_not_called()
+
+
+@pytest.mark.parametrize("failure", ["numeric", "manifest", None])
+def test_finalization_waits_for_confirmed_writes(remote_store, failure):
+    """No final reference precedes successful numeric and manifest publication."""
+    started, release = threading.Event(), threading.Event()
+    put = remote_store._store.put_batch.side_effect
+
+    def delayed_put(keys, values):
+        started.set()
+        assert release.wait(5)
+        if failure == ("manifest" if keys[0].endswith("/manifest") else "numeric"):
+            return -1
+        return put(keys, values)
+
+    remote_store._store.put_batch.side_effect = delayed_put
+    rows = np.arange(36, dtype=np.uint8).reshape(6, *_SHAPE)
+    output = AuxRequestOutput(0, rows, [], [0, 1, 2])
+    publisher = MooncakeOutputPublisher(output, 4)
+    request = _SchedulerRequest("completion", [], num_tokens=7, num_output_tokens=3)
+    publisher.take_output(request, output)
+    future = publisher.finalize("completion", 2)
+    assert started.wait(5)
+    assert not future.done()
+    assert publisher.finalize("completion", 2) is future
+    with pytest.raises(ValueError, match="Conflicting"):
+        publisher.finalize("completion", 1)
+    release.set()
+    if failure:
+        with pytest.raises(BlockObjectStoreError):
+            future.result(timeout=5)
+        with pytest.raises(BlockObjectStoreError):
+            publisher.close()
+    else:
+        reader = AuxOutputReader(remote_store._store, future.result(timeout=5))
+        np.testing.assert_array_equal(
+            reader.read("routed_experts", start=0, stop=5)["expert_ids"], rows[:5]
+        )
+        publisher.close()
+    assert not publisher._requests
+    assert publisher._staged_bytes == publisher._queued_bytes == 0
+
+
+@pytest.mark.parametrize("budget,snapshot", [(191, 0), (512, 129)])
+def test_publisher_rejects_small_budget_before_opening_store(
+    monkeypatch, budget, snapshot
+):
+    factory = Mock()
+    monkeypatch.setattr(
+        "vllm.distributed.aux_output_connector.mooncake.create_mooncake_block_store",
+        factory,
+    )
+    output = AuxRequestOutput(0, np.zeros((0, *_SHAPE), dtype=_DTYPE))
+    with pytest.raises(ValueError, match="staging budget"):
+        MooncakeOutputPublisher(
+            output,
+            _BLOCK_SIZE,
+            staging_budget_bytes=budget,
+            max_snapshot_bytes=snapshot,
+        )
+    factory.assert_not_called()
+
+
+def test_publisher_reserves_snapshots_and_releases_cancellation(remote_store):
+    """Admission is bounded while cancellation/control work can still drain."""
+    started, release = threading.Event(), threading.Event()
+    rows = np.arange(36, dtype=np.uint8).reshape(6, *_SHAPE)
+    output = AuxRequestOutput(0, rows, [], [0, 1, 2])
+    publisher = MooncakeOutputPublisher(
+        output, 4, staging_budget_bytes=512, max_snapshot_bytes=100
+    )
+
+    def pause():
+        started.set()
+        assert release.wait(5)
+
+    publisher._writer.submit(pause)
+    assert started.wait(5)
+    assert publisher.try_reserve_step()
+    assert not publisher.try_reserve_step()
+    publisher.take_output(_SchedulerRequest("r", [], num_tokens=7), output)
+    rows.fill(0)
+    publisher.release_step()
+    result = publisher.finalize("r", 1)
+    publisher.discard("r")
+    with pytest.raises(BlockObjectStoreError, match="cancelled"):
+        result.result(timeout=5)
+    release.set()
+    publisher.close()
+    assert not publisher._requests
+    assert publisher._queued_bytes == publisher._staged_bytes == 0
+    remote_store._store.put_batch.assert_not_called()
+
+
+def test_manifest_transfer_uses_local_capacity_not_numeric_batch_limit():
+    native = Mock()
+    native.put_batch.return_value = 0
+    store = MooncakeBlockObjectStore(
+        native, object_nbytes=4, max_batch_bytes=8, local_buffer_bytes=32
+    )
+    store.put(
+        [
+            BlockObject("a", b"a" * 3),
+            BlockObject("b", b"b" * 5),
+            BlockObject("c", b"c" * 6),
+        ]
+    )
+    assert [call.args[0] for call in native.put_batch.call_args_list] == [
+        ["a", "b"],
+        ["c"],
+    ]
+    store.put_manifest(BlockObject("manifest", b"m" * 20))
+    with pytest.raises(ValueError, match="budget"):
+        store.put_manifest(BlockObject("oversized", b"m" * 33))

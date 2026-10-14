@@ -8,8 +8,11 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from vllm.config.aux_output import AuxOutputConfig
 from vllm.config.multimodal import MultiModalConfig
+from vllm.distributed.aux_output_connector.types import AuxOutputRef
 from vllm.entrypoints.generate.base.protocol import StreamOptions
+from vllm.entrypoints.generate.base.serving import GenerateBaseServing
 from vllm.entrypoints.openai.models.protocol import BaseModelPath
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
 from vllm.entrypoints.scale_out.token_in_token_out.mm_features import (
@@ -27,7 +30,7 @@ from vllm.entrypoints.scale_out.token_in_token_out.protocol import (
 )
 from vllm.entrypoints.scale_out.token_in_token_out.serving import ServingTokens
 from vllm.entrypoints.serve.engine.protocol import ErrorResponse
-from vllm.exceptions import GenerationError
+from vllm.exceptions import GenerationError, VLLMValidationError
 from vllm.logprobs import Logprob
 from vllm.multimodal.inputs import (
     MultiModalBatchedField,
@@ -98,6 +101,7 @@ class MockVllmConfig:
     model_config: MockModelConfig
     parallel_config: MockParallelConfig
     scheduler_config: MockSchedulerConfig = field(default_factory=MockSchedulerConfig)
+    aux_output_config: AuxOutputConfig = field(default_factory=AuxOutputConfig)
 
 
 def _build_renderer(model_config: MockModelConfig):
@@ -222,15 +226,20 @@ def test_placeholder_ranges_from_engine_input():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("stream", [False, True])
-async def test_serve_tokens_returns_terminal_aux_output_keys_without_inline_r3(stream):
+async def test_serve_tokens_returns_terminal_aux_reference_without_inline_r3(stream):
     engine = _mock_engine()
-    keys = ["prefix-block", "request-tail"]
+    ref = AuxOutputRef("mooncake", "opaque/" + "路" * 1024)
 
     async def generate(*args, **kwargs):
+        if stream:
+            yield _make_request_output("req-1", token_ids=[10])
         output = _make_request_output(
-            "req-1", token_ids=[10], finish_reason="length", finished=True
+            "req-1",
+            token_ids=[] if stream else [10],
+            finish_reason="length",
+            finished=True,
         )
-        output.outputs[0].aux_output_keys = keys
+        output.outputs[0].aux_outputs = ref
         yield output
 
     engine.generate = MagicMock(side_effect=generate)
@@ -251,10 +260,16 @@ async def test_serve_tokens_returns_terminal_aux_output_keys_without_inline_r3(s
             for choice in chunk["choices"]
         ]
         choice = next(choice for choice in choices if choice["finish_reason"])
+        assert sum(c.get("aux_outputs") is not None for c in choices) == 1
+        assert choice["token_ids"] == []
     else:
         assert isinstance(response, GenerateTokensResponse)
         choice = response.choices[0].model_dump()
-    assert choice["aux_output_keys"] == keys
+    assert choice["aux_outputs"] == {
+        "backend": "mooncake",
+        "manifest_key": ref.manifest_key,
+    }
+    assert "aux_output_keys" not in choice
     assert "artifact_keys" not in choice
     assert choice["routed_experts"] is None
 
@@ -1484,3 +1499,63 @@ async def test_stream_text_mode_usage_chunk_echoes_output_mode():
     assert usage_chunk["output_mode"] == "text"
     assert usage_chunk["choices"] == []
     assert usage_chunk["usage"]["completion_tokens"] == 1
+
+
+@pytest.mark.parametrize("supported", [False, True])
+def test_mooncake_frontend_scope_is_checked_before_inference(supported):
+    """Frontends without the reference field must not silently lose routing."""
+    engine = _mock_engine()
+    engine.vllm_config.aux_output_config = AuxOutputConfig(
+        backend="mooncake", enable_return_routed_experts=True
+    )
+    serving = (
+        _build_serving_tokens(engine)
+        if supported
+        else GenerateBaseServing(engine, MagicMock(), request_logger=None)
+    )
+    if supported:
+        serving._preflight()
+    else:
+        with pytest.raises(VLLMValidationError, match="/inference/v1/generate"):
+            serving._preflight()
+    engine.generate.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_stream_aux_choices_can_finalize_in_reverse_order():
+    engine = _mock_engine()
+
+    async def generate(*args, **kwargs):
+        for index in (1, 0):
+            output = _make_request_output(
+                "req",
+                [10 + index],
+                finish_reason="length",
+                finished=index == 0,
+                index=index,
+            )
+            output.outputs[0].aux_outputs = AuxOutputRef(
+                "mooncake", f"manifest/{index}"
+            )
+            yield output
+
+    engine.generate = MagicMock(side_effect=generate)
+    response = await _build_serving_tokens(engine).serve_tokens(
+        GenerateRequest(
+            token_ids=[1, 2, 3],
+            sampling_params=SamplingParams(n=2, max_tokens=1),
+            model=MODEL_NAME,
+            stream=True,
+        )
+    )
+    chunks = _parse_sse_chunks([chunk async for chunk in response])
+    choices = [
+        choice
+        for chunk in chunks
+        if isinstance(chunk, dict)
+        for choice in chunk["choices"]
+    ]
+    assert [(c["index"], c["aux_outputs"]["manifest_key"]) for c in choices] == [
+        (1, "manifest/1"),
+        (0, "manifest/0"),
+    ]

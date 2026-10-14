@@ -101,6 +101,8 @@ def _top_logprob(
 class ServingTokens(GenerateBaseServing):
     """Provides Tokens IN <> Tokens OUT functionality to vLLM API."""
 
+    supports_aux_outputs = True
+
     def __init__(
         self,
         engine_client: EngineClient,
@@ -425,7 +427,7 @@ class ServingTokens(GenerateBaseServing):
                 finish_reason=output.finish_reason if output.finish_reason else "stop",
                 token_ids=as_list(output.token_ids),
                 routed_experts=routed_experts_b64,
-                aux_output_keys=output.aux_output_keys,
+                aux_outputs=output.aux_outputs,
                 sampling_mask=sampling_mask,
             )
             if text_mode:
@@ -541,7 +543,7 @@ class ServingTokens(GenerateBaseServing):
                     if res.encoder_prompt_token_ids is not None:
                         num_prompt_tokens += len(res.encoder_prompt_token_ids)
                     num_cached_tokens = res.num_cached_tokens
-                    num_generated_tokens = [0] * len(res.outputs)
+                    num_generated_tokens = [0] * sampling_params.n
                     first_iteration = False
 
                 for output in res.outputs:
@@ -564,7 +566,11 @@ class ServingTokens(GenerateBaseServing):
                         # metadata is pending, so zero-token completions
                         # deliver it.
                         emit = bool(delta_token_ids) or (
-                            finish_reason is not None and prompt_token_ids is not None
+                            finish_reason is not None
+                            and (
+                                prompt_token_ids is not None
+                                or output.aux_outputs is not None
+                            )
                         )
                     if not emit:
                         continue
@@ -597,7 +603,7 @@ class ServingTokens(GenerateBaseServing):
                         token_ids=as_list(delta_token_ids),
                         routed_experts=routed_experts_b64,
                         sampling_mask=sampling_mask,
-                        aux_output_keys=output.aux_output_keys,
+                        aux_outputs=output.aux_outputs,
                     )
                     chunk: GenerateTokensStreamResponse | GenerateTextStreamResponse
                     if text_mode:

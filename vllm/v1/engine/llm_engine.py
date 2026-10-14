@@ -4,6 +4,7 @@
 import time
 import weakref
 from collections.abc import Callable, Mapping
+from concurrent.futures import Future
 from copy import copy
 from typing import Any
 
@@ -13,6 +14,7 @@ from typing_extensions import TypeVar
 import vllm.envs as envs
 from vllm.config import ParallelConfig, VllmConfig
 from vllm.distributed import stateless_destroy_torch_distributed_process_group
+from vllm.distributed.aux_output_connector.types import AuxOutputRef
 from vllm.distributed.parallel_state import get_dp_group
 from vllm.engine.arg_utils import EngineArgs
 from vllm.inputs import EngineInput, PromptType
@@ -101,7 +103,12 @@ class LLMEngine:
             log_stats=self.log_stats,
             stream_interval=self.vllm_config.scheduler_config.stream_interval,
             tracing_enabled=tracing_endpoint is not None,
+            finalize_aux_outputs=(
+                vllm_config.aux_output_config.enabled
+                and vllm_config.aux_output_config.backend == "mooncake"
+            ),
         )
+        self._aux_finalizations: dict[str, Future[AuxOutputRef]] = {}
 
         # EngineCore (gets EngineCoreRequests and gives EngineCoreOutputs)
         # Hand the renderer to the client. In multiprocess mode the client
@@ -304,6 +311,9 @@ class LLMEngine:
         return req_id
 
     def step(self) -> list[RequestOutput | PoolingRequestOutput]:
+        completed = self._complete_aux_outputs()
+        if completed:
+            return completed
         if self.should_execute_dummy_batch:
             self.should_execute_dummy_batch = False
             self.engine_core.execute_dummy_batch()
@@ -336,6 +346,11 @@ class LLMEngine:
         # 3) Abort any reqs that finished due to stop strings.
         with record_function_or_nullcontext("llm_engine step: abort_requests"):
             self.engine_core.abort_requests(processed_outputs.reqs_to_abort)
+        for request_id, num_tokens in processed_outputs.reqs_to_finalize.items():
+            self._aux_finalizations[request_id] = self.engine_core.finalize_aux_outputs(
+                request_id, num_tokens
+            )
+        processed_outputs.request_outputs.extend(self._complete_aux_outputs())
 
         # 4) Record stats
         with record_function_or_nullcontext("llm_engine step: record_stats"):
@@ -350,6 +365,23 @@ class LLMEngine:
                     self.do_log_stats_with_interval()
 
         return processed_outputs.request_outputs
+
+    def _complete_aux_outputs(self) -> list[RequestOutput | PoolingRequestOutput]:
+        outputs: list[RequestOutput | PoolingRequestOutput] = []
+        for request_id, future in list(self._aux_finalizations.items()):
+            if not future.done():
+                continue
+            del self._aux_finalizations[request_id]
+            try:
+                ref = future.result()
+            except Exception as error:
+                self.output_processor.fail_aux_outputs(request_id, error)
+                self.engine_core.abort_requests([request_id])
+                raise
+            output = self.output_processor.complete_aux_outputs(request_id, ref)
+            if output is not None:
+                outputs.append(output)
+        return outputs
 
     def start_profile(self, profile_prefix: str | None = None):
         self.engine_core.profile(True, profile_prefix)

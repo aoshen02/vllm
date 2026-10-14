@@ -49,6 +49,7 @@ def _capturer_with_buffer(
     # VllmConfig dependency. The CUDA device-tensor allocation in the
     # real constructor is not what we are exercising here.
     c = RoutedExpertsCapturer.__new__(RoutedExpertsCapturer)
+    c.routed_layer_ids = []
     c.dp_rank = dp_rank
     c.tp_size = tp_size
     c.output_dtype = torch.uint8
@@ -151,7 +152,9 @@ def test_public_binding_binds_target_model_router(monkeypatch):
 
     monkeypatch.setattr(fused_moe_layer, "MoERunner", DummyFusedMoE)
     calls = []
-    capturer = types.SimpleNamespace(capture=lambda *args: calls.append(args))
+    capturer = types.SimpleNamespace(
+        capture=lambda *args: calls.append(args), routed_layer_ids=[]
+    )
 
     bind_routed_experts_capturer(
         types.SimpleNamespace(modules=lambda: [target_module]), capturer
@@ -161,6 +164,7 @@ def test_public_binding_binds_target_model_router(monkeypatch):
     topk_ids = torch.tensor([[5, 6]])
     target_module.router.capture_fn(topk_ids)
     assert calls == [(7, topk_ids)]
+    assert capturer.routed_layer_ids == [7]
 
 
 def test_public_binding_supports_direct_capture_source():
@@ -172,7 +176,9 @@ def test_public_binding_supports_direct_capture_source():
 
     source = DirectCaptureSource()
     calls = []
-    capturer = types.SimpleNamespace(capture=lambda *args: calls.append(args))
+    capturer = types.SimpleNamespace(
+        capture=lambda *args: calls.append(args), routed_layer_ids=[]
+    )
 
     bind_routed_experts_capturer(source, capturer)
 
@@ -239,7 +245,8 @@ def _bind_monolithic(
     monkeypatch.setattr(fused_moe_layer, "MoERunner", _MonolithicMoE)
     layer = _MonolithicMoE(experts)
     bind_routed_experts_capturer(
-        SimpleNamespace(modules=lambda: [layer]), SimpleNamespace(capture=capture)
+        SimpleNamespace(modules=lambda: [layer]),
+        SimpleNamespace(capture=capture, routed_layer_ids=[]),
     )
     return layer
 

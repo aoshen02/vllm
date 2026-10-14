@@ -65,6 +65,7 @@ class RoutedExpertsCapturer:
             vllm_config
         )
         self.shape_per_token = (num_layers, num_experts_per_tok)
+        self.routed_layer_ids: list[int] = []
         self.output_dtype_name = "uint8" if num_experts <= 256 else "uint16"
         self.output_dtype = getattr(torch, self.output_dtype_name)
         logger.info(
@@ -219,10 +220,12 @@ def bind_routed_experts_capturer(
     for module in model.modules():
         if isinstance(module, RoutedExpertsCaptureSource):
             module.capture_fn = partial(capturer.capture, module.layer_id)
+            capturer.routed_layer_ids.append(module.layer_id)
             num_bound += 1
             continue
         if not isinstance(module, MoERunner):
             continue
+        capturer.routed_layer_ids.append(module.layer_id)
         capture_fn = partial(capturer.capture, module.layer_id)
         quant_method = module._quant_method
         if quant_method.is_monolithic:

@@ -11,6 +11,7 @@ import uuid
 from collections import Counter
 from concurrent.futures import Future
 from dataclasses import dataclass
+from queue import Queue
 from threading import Thread
 from types import SimpleNamespace
 from typing import Any
@@ -22,6 +23,7 @@ from transformers import AutoTokenizer
 
 from tests.utils import multi_gpu_test
 from vllm import SamplingParams
+from vllm.distributed.aux_output_connector.types import AuxOutputRef
 from vllm.distributed.kv_events import BlockStored, KVEventBatch, ZmqEventPublisher
 from vllm.engine.arg_utils import EngineArgs
 from vllm.platforms import current_platform
@@ -210,6 +212,8 @@ def _make_dplb_client(num_engines: int = 3, client_count: int = 1) -> DPLBAsyncM
     client = object.__new__(DPLBAsyncMPClient)
     client.client_count = client_count
     client.reqs_in_flight = {}
+    client._aux_request_engines = {}
+    client._aux_enabled = False
     client.engine_inflight = Counter()
     client.core_engines = [bytes([i, 0]) for i in range(num_engines)]
     client.lb_engines = [[0, 0, 0.0] for _ in range(num_engines)]
@@ -1580,3 +1584,41 @@ def test_apply_ready_response_retains_kv_event_sources():
     )
     client._apply_ready_response(ready(1, rank1_again))
     assert client.get_kv_event_sources() == {1: rank1_again}
+
+
+@pytest.mark.asyncio
+async def test_aux_finalization_targets_owner_after_dp_request_finishes():
+    """Auxiliary ownership outlives the DP scheduler's active-request mapping."""
+    client = _make_dplb_client(2)
+    client.core_engine = client.core_engines[0]
+    owner = client.core_engines[1]
+    client._aux_request_engines["r"] = owner
+    ref = AuxOutputRef("mooncake", "completion/manifest")
+
+    async def call_utility(method: str, request_id: str, count: int, *, engine: bytes):
+        assert (method, request_id, count, engine) == (
+            "finalize_aux_outputs",
+            "r",
+            3,
+            owner,
+        )
+        return {"backend": ref.backend, "manifest_key": ref.manifest_key}
+
+    client._call_utility_async = call_utility
+    assert await client.finalize_aux_outputs_async("r", 3) == ref
+    assert not client._aux_request_engines
+
+
+def test_sync_aux_finalization_returns_future_without_waiting_for_utility():
+    """Storage completion wakes a synchronous step without blocking dispatch."""
+    client = object.__new__(SyncMPClient)
+    client.utility_results = {}
+    client.outputs_queue = Queue()
+    client._send_input = MagicMock()
+    future = client.finalize_aux_outputs("r", 2)
+    assert not future.done()
+    pending = next(iter(client.utility_results.values()))
+    ref = AuxOutputRef("mooncake", "completion/manifest")
+    pending.set_result({"backend": ref.backend, "manifest_key": ref.manifest_key})
+    assert future.result(timeout=1) == ref
+    assert isinstance(client.outputs_queue.get_nowait(), EngineCoreOutputs)

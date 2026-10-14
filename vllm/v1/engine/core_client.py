@@ -24,6 +24,7 @@ import zmq.asyncio
 from vllm import envs
 from vllm.config import VllmConfig
 from vllm.config.kv_events import KVEventsConfig
+from vllm.distributed.aux_output_connector.types import AuxOutputRef
 from vllm.envs import VLLM_ENGINE_READY_TIMEOUT_S
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
@@ -86,6 +87,16 @@ class EngineCoreClient(ABC):
     * SyncMPClient: ZMQ + background proc EngineCore (for LLM)
     * AsyncMPClient: ZMQ + background proc EngineCore w/ asyncio (for AsyncLLM)
     """
+
+    def finalize_aux_outputs(
+        self, request_id: str, num_tokens: int
+    ) -> Future[AuxOutputRef]:
+        raise NotImplementedError
+
+    async def finalize_aux_outputs_async(
+        self, request_id: str, num_tokens: int
+    ) -> AuxOutputRef:
+        raise NotImplementedError
 
     def get_kv_event_sources(self) -> dict[int, KVEventsConfig]:
         """KV-event publisher config of each ready engine, keyed by DP rank."""
@@ -371,6 +382,11 @@ class InprocClient(EngineCoreClient):
         # otherwise. The callback must not reference self, or self would stay
         # reachable and the finalizer would never run.
         self._finalizer = weakref.finalize(self, self.engine_core.shutdown)
+
+    def finalize_aux_outputs(
+        self, request_id: str, num_tokens: int
+    ) -> Future[AuxOutputRef]:
+        return self.engine_core.finalize_aux_outputs(request_id, num_tokens)
 
     def get_output(self) -> EngineCoreOutputs:
         outputs, model_executed = self.engine_core.step_fn()
@@ -963,6 +979,10 @@ class SyncMPClient(MPClient):
             except Exception as e:
                 outputs_queue.put_nowait(e)
             finally:
+                for pending in tuple(utility_results.values()):
+                    if not pending.done():
+                        pending.set_exception(EngineDeadError())
+                utility_results.clear()
                 # Close sockets.
                 shutdown_socket.close(linger=0)
                 out_socket.close(linger=0)
@@ -1006,6 +1026,29 @@ class SyncMPClient(MPClient):
         self._send_input(EngineCoreRequestType.UTILITY, (0, call_id, method, args))
 
         return future.result()
+
+    def finalize_aux_outputs(
+        self, request_id: str, num_tokens: int
+    ) -> Future[AuxOutputRef]:
+        call_id = uuid.uuid1().int >> 64
+        pending: Future[object] = Future()
+        result: Future[AuxOutputRef] = Future()
+        self.utility_results[call_id] = pending
+
+        def complete(future: Future[object]) -> None:
+            try:
+                result.set_result(msgspec.convert(future.result(), type=AuxOutputRef))
+            except Exception as error:
+                result.set_exception(error)
+            finally:
+                self.outputs_queue.put_nowait(EngineCoreOutputs())
+
+        pending.add_done_callback(complete)
+        self._send_input(
+            EngineCoreRequestType.UTILITY,
+            (0, call_id, "finalize_aux_outputs", (request_id, num_tokens)),
+        )
+        return result
 
     def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         return self.call_utility("get_supported_tasks")
@@ -1109,6 +1152,11 @@ class AsyncMPClient(MPClient):
         self.client_count = client_count
         self.client_index = client_index
         self.outputs_queue = asyncio.Queue[EngineCoreOutputs | Exception]()
+        self._aux_request_engines: dict[str, EngineIdentity] = {}
+        self._aux_enabled = (
+            vllm_config.aux_output_config.enabled
+            and vllm_config.aux_output_config.backend == "mooncake"
+        )
 
         # locally-cached engine status
         self._engine_status: dict[int, dict] = {}
@@ -1199,6 +1247,11 @@ class AsyncMPClient(MPClient):
                 outputs_queue.put_nowait(e)
             except asyncio.CancelledError:
                 outputs_queue.put_nowait(EngineDeadError())
+            finally:
+                for pending in tuple(utility_results.values()):
+                    if not pending.done():
+                        pending.set_exception(EngineDeadError())
+                utility_results.clear()
 
         resources.output_queue_task = asyncio.create_task(
             process_outputs_socket(), name="EngineCoreOutputQueueTask"
@@ -1238,6 +1291,18 @@ class AsyncMPClient(MPClient):
 
     async def call_utility_async(self, method: str, *args) -> Any:
         return await self._call_utility_async(method, *args, engine=self.core_engine)
+
+    async def finalize_aux_outputs_async(
+        self, request_id: str, num_tokens: int
+    ) -> AuxOutputRef:
+        engine = self._aux_request_engines.get(request_id, self.core_engine)
+        try:
+            value: object = await self._call_utility_async(
+                "finalize_aux_outputs", request_id, num_tokens, engine=engine
+            )
+            return msgspec.convert(value, type=AuxOutputRef)
+        finally:
+            self._aux_request_engines.pop(request_id, None)
 
     async def call_utility_all_async(self, method: str, *args) -> list[Any]:
         # Like the Rust client's call_utility: one result per managed engine.
@@ -1556,6 +1621,8 @@ class DPAsyncMPClient(AsyncMPClient):
         request.client_index = self.client_index
 
         chosen_engine = self.get_core_engine_for_request(request)
+        if self._aux_enabled:
+            self._aux_request_engines[request.request_id] = chosen_engine
         to_await = self._send_input(EngineCoreRequestType.ADD, request, chosen_engine)
         if not self.engines_running:
             # Notify coordinator that we're sending a request
@@ -1731,14 +1798,20 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
 
         if len(request_ids) == 1:
             # Fast-path common case.
-            if engine := self.reqs_in_flight.get(request_ids[0]):
+            if engine := self.reqs_in_flight.get(
+                request_ids[0], self._aux_request_engines.get(request_ids[0])
+            ):
                 await self._abort_requests(request_ids, engine)
+            self._aux_request_engines.pop(request_ids[0], None)
             return
 
         by_engine = defaultdict[EngineIdentity, list[str]](list)
         for req_id in request_ids:
-            if engine := self.reqs_in_flight.get(req_id):
+            if engine := self.reqs_in_flight.get(
+                req_id, self._aux_request_engines.get(req_id)
+            ):
                 by_engine[engine].append(req_id)
+            self._aux_request_engines.pop(req_id, None)
         for engine, req_ids in by_engine.items():
             await self._abort_requests(req_ids, engine)
 

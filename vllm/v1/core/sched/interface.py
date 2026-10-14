@@ -10,6 +10,9 @@ from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
     from vllm.config.kv_events import KVEventsConfig
+    from vllm.distributed.aux_output_connector.connector import (
+        AuxOutputSchedulerConnector,
+    )
     from vllm.distributed.ec_transfer.ec_connector.base import ECConnectorBase
     from vllm.distributed.kv_transfer.kv_connector.v1 import KVConnectorBase_V1
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
@@ -36,6 +39,8 @@ class PauseState(enum.IntEnum):
 
 
 class SchedulerInterface(ABC):
+    aux_output_connector: "AuxOutputSchedulerConnector | None" = None
+
     @abstractmethod
     def __init__(
         self,

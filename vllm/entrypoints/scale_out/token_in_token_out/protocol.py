@@ -14,6 +14,7 @@ from pydantic import (
 )
 
 from vllm.config import ModelConfig
+from vllm.distributed.aux_output_connector.types import AuxOutputRef
 from vllm.entrypoints.generate.base.protocol import (
     PerRequestMetrics,
     StreamOptions,
@@ -357,9 +358,8 @@ class GenerateChoiceBase(BaseModel):
     # `None` if (a) the request was aborted before any forward pass,
     # or (b) `enable_return_routed_experts` is off server-side.
     routed_experts: str | None = None
-    # Ordered keys of published raw R3 objects, returned on the terminal response.
-    aux_output_keys: list[str] | None = None
     sampling_mask: list[list[int]] | None = None
+    aux_outputs: AuxOutputRef | None = None
 
     @field_validator("token_ids")
     @classmethod
@@ -391,8 +391,8 @@ class GenerateStreamChoiceBase(BaseModel):
     finish_reason: str | None = None
     token_ids: list[int] | None = None
     routed_experts: str | None = None
-    aux_output_keys: list[str] | None = None
     sampling_mask: list[list[int]] | None = None
+    aux_outputs: AuxOutputRef | None = None
 
 
 class GenerateTokensStreamChoice(GenerateStreamChoiceBase):

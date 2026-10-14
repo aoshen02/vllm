@@ -6,7 +6,8 @@ from __future__ import annotations
 
 import queue
 import threading
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable, Iterator
+from concurrent.futures import Future
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -27,6 +28,25 @@ class BlockObjectStoreError(RuntimeError):
     """AuxOutput storage or retrieval failed."""
 
 
+def iter_object_batches(
+    objects: Iterable[BlockObject], max_batch_bytes: int
+) -> Iterator[list[BlockObject]]:
+    batch: list[BlockObject] = []
+    batch_bytes = 0
+    for obj in objects:
+        size = len(obj.payload)
+        if not 0 < size <= max_batch_bytes:
+            raise ValueError("Auxiliary object does not fit the byte budget")
+        if batch and batch_bytes + size > max_batch_bytes:
+            yield batch
+            batch = []
+            batch_bytes = 0
+        batch.append(obj)
+        batch_bytes += size
+    if batch:
+        yield batch
+
+
 class BackgroundBlockObjectStore:
     """Serialize store mutations on a background thread."""
 
@@ -37,9 +57,9 @@ class BackgroundBlockObjectStore:
         max_pending_batches: int,
     ) -> None:
         self._store = store
-        self._queue: queue.Queue[
-            tuple[list[BlockObject], tuple[str, ...], tuple[str, ...]] | None
-        ] = queue.Queue(maxsize=max_pending_batches)
+        self._queue: queue.Queue[tuple[Callable[[], None], Future[None]] | None] = (
+            queue.Queue(maxsize=max_pending_batches)
+        )
         self._error: BaseException | None = None
         self._closed = False
         self._thread = threading.Thread(
@@ -52,19 +72,24 @@ class BackgroundBlockObjectStore:
     def _run(self) -> None:
         while True:
             update = self._queue.get()
+            if update is None:
+                self._queue.task_done()
+                return
+            operation, future = update
+            del update
             try:
-                if update is None:
-                    return
-                if self._error is None:
-                    objects, retain_keys, release_keys = update
-                    self._store.put(
-                        objects,
-                        retain_keys=retain_keys,
-                        release_keys=release_keys,
-                    )
+                if not future.set_running_or_notify_cancel():
+                    continue
+                self._raise_if_failed()
+                operation()
             except BaseException as error:
-                self._error = error
+                if self._error is None:
+                    self._error = error
+                future.set_exception(error)
+            else:
+                future.set_result(None)
             finally:
+                del operation, future
                 self._queue.task_done()
 
     def _raise_if_failed(self) -> None:
@@ -86,8 +111,21 @@ class BackgroundBlockObjectStore:
             return
         if self._closed:
             raise RuntimeError("auxiliary output store is closed")
-        self._queue.put((objects, retains, releases))
+        self.submit(
+            lambda: self._store.put(objects, retain_keys=retains, release_keys=releases)
+        )
         self._raise_if_failed()
+
+    def submit(self, operation: Callable[[], None]) -> Future[None]:
+        future: Future[None] = Future()
+        try:
+            if self._closed:
+                raise RuntimeError("auxiliary output store is closed")
+            self._raise_if_failed()
+            self._queue.put((operation, future))
+        except Exception as error:
+            future.set_exception(error)
+        return future
 
     def flush(self) -> None:
         self._queue.join()

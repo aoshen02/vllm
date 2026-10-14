@@ -27,6 +27,7 @@ from vllm.distributed import (
     cleanup_dist_env_and_memory,
     stateless_destroy_torch_distributed_process_group,
 )
+from vllm.distributed.aux_output_connector.types import AuxOutputRef
 from vllm.envs import enable_envs_cache
 from vllm.logger import configure_logging, init_logger
 from vllm.logging_utils.dump_input import dump_engine_exception
@@ -535,6 +536,22 @@ class EngineCore:
         # specific finish reason, TBD whether we propagate that
         # (i.e. client-aborted vs stop criteria met).
         self.scheduler.finish_requests(request_ids, RequestStatus.FINISHED_ABORTED)
+        if self.scheduler.aux_output_connector is not None:
+            self.scheduler.aux_output_connector.discard(request_ids)
+
+    def finalize_aux_outputs(
+        self, request_id: str, num_tokens: int
+    ) -> Future[AuxOutputRef]:
+        connector = self.scheduler.aux_output_connector
+        if connector is None:
+            raise ValueError("Auxiliary output is not enabled")
+        result = connector.finalize(request_id, num_tokens)
+        self.scheduler.finish_requests([request_id], RequestStatus.FINISHED_ABORTED)
+        return result
+
+    def _aux_can_schedule(self) -> bool:
+        connector = self.scheduler.aux_output_connector
+        return connector is None or connector.try_reserve_step()
 
     @contextmanager
     def log_error_detail(self, scheduler_output: SchedulerOutput):
@@ -635,7 +652,7 @@ class EngineCore:
         """
         # Check for any requests remaining in the scheduler - unfinished,
         # or finished and not yet removed from the batch.
-        if not self.scheduler.has_requests():
+        if not self.scheduler.has_requests() or not self._aux_can_schedule():
             return {}, False
         scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
@@ -654,6 +671,8 @@ class EngineCore:
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
         )
+        if self.scheduler.aux_output_connector is not None:
+            self.scheduler.aux_output_connector.release_step()
         self._attach_iteration_details(engine_core_outputs, iteration_details)
 
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
@@ -693,7 +712,7 @@ class EngineCore:
 
         model_executed = False
         deferred_scheduler_output = None
-        if self.scheduler.has_requests():
+        if self.scheduler.has_requests() and self._aux_can_schedule():
             scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
             with self.log_error_detail(scheduler_output):
                 exec_future = self.model_executor.execute_model(
@@ -755,6 +774,8 @@ class EngineCore:
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
         )
+        if self.scheduler.aux_output_connector is not None:
+            self.scheduler.aux_output_connector.release_step()
         self._attach_iteration_details(engine_core_outputs, iteration_details)
 
         # NOTE(nick): We can either handle the deferred tasks here or save
