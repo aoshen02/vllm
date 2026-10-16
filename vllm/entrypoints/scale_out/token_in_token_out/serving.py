@@ -7,13 +7,13 @@ import math
 import time
 from collections.abc import AsyncGenerator
 from collections.abc import Sequence as GenericSequence
-from typing import Any
+from dataclasses import replace
+from typing import Any, cast
 
 import msgspec
 from fastapi import Request
 
 from vllm.engine.protocol import EngineClient
-from vllm.entrypoints.chat_utils import AsyncMultiModalItemTracker
 from vllm.entrypoints.generate.base.protocol import (
     PerRequestMetrics,
     RequestResponseMetadata,
@@ -37,8 +37,8 @@ from vllm.entrypoints.serve.engine.protocol import (
 )
 from vllm.entrypoints.serve.utils.api_utils import get_max_tokens, should_include_usage
 from vllm.entrypoints.serve.utils.request_logger import RequestLogger
-from vllm.exceptions import GenerationError
-from vllm.inputs import EngineInput, TokensPrompt, mm_input
+from vllm.exceptions import GenerationError, VLLMValidationError
+from vllm.inputs import EngineInput, MultiModalInput, TokensPrompt, mm_input
 from vllm.logger import init_logger
 from vllm.logprobs import Logprob
 from vllm.multimodal.inputs import (
@@ -47,6 +47,7 @@ from vllm.multimodal.inputs import (
     PlaceholderRange,
 )
 from vllm.outputs import RequestOutput
+from vllm.renderers.chat_utils import AsyncMultiModalItemTracker
 from vllm.renderers.online_renderer import OnlineRenderer
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 from vllm.tokenizers import TokenizerLike
@@ -242,7 +243,14 @@ class ServingTokens(GenerateBaseServing):
             return self.create_error_response(e)
 
         engine_input: EngineInput
+        features = request.features
         if request.content_parts:
+            # Items in features are already expanded; render every token
+            # after the last of them, so new placeholders must lie there.
+            feature_ranges = features.mm_placeholders.values() if features else ()
+            start = max(
+                (p.offset + p.length for rs in feature_ranges for p in rs), default=0
+            )
             tracker = AsyncMultiModalItemTracker(self.model_config)
             mm_parser = tracker.create_parser()
             for part in request.content_parts:
@@ -256,17 +264,25 @@ class ServingTokens(GenerateBaseServing):
                 elif ptype == "video_url":
                     mm_parser.parse_video(url, uuid)
             mm_data, mm_uuids = await tracker.resolve_items()
-            prompt = TokensPrompt(prompt_token_ids=request.token_ids)
+            prompt = TokensPrompt(prompt_token_ids=request.token_ids[start:])
             if request.cache_salt is not None:
                 prompt["cache_salt"] = request.cache_salt
             if mm_data:
                 prompt["multi_modal_data"] = mm_data
             if mm_uuids:
                 prompt["multi_modal_uuids"] = mm_uuids
-            (engine_input,) = await self.online_renderer.renderer.render_cmpl_async(
-                [prompt]
-            )
-        elif features := request.features:
+            try:
+                (engine_input,) = await self.online_renderer.renderer.render_cmpl_async(
+                    [prompt]
+                )
+            except VLLMValidationError as e:
+                if not features:
+                    raise
+                raise VLLMValidationError(
+                    "content_parts placeholders must come after the last "
+                    f"features range, which ends at offset {start}"
+                ) from e
+        if features:
             # Convert PlaceholderRangeInfo → PlaceholderRange per modality.
             mm_placeholders: dict[str, list[PlaceholderRange]] = {
                 modality: [
@@ -281,14 +297,26 @@ class ServingTokens(GenerateBaseServing):
             if error := self._validate_mm_cache_handles(mm_kwargs, features.mm_hashes):
                 return error
 
+            token_ids = request.token_ids
+            mm_hashes = {m: list(h) for m, h in features.mm_hashes.items()}
+            if request.content_parts:
+                rendered = cast(MultiModalInput, engine_input)
+                token_ids = token_ids[:start] + rendered["prompt_token_ids"]
+                for m, ps in rendered.get("mm_placeholders", {}).items():
+                    mm_placeholders.setdefault(m, []).extend(
+                        replace(p, offset=p.offset + start) for p in ps
+                    )
+                    mm_kwargs.setdefault(m, []).extend(rendered["mm_kwargs"][m])
+                    mm_hashes.setdefault(m, []).extend(rendered["mm_hashes"][m])
+
             engine_input = mm_input(
-                prompt_token_ids=request.token_ids,
+                prompt_token_ids=token_ids,
                 mm_kwargs=MultiModalKwargsItems(mm_kwargs),
-                mm_hashes=features.mm_hashes,
+                mm_hashes=mm_hashes,
                 mm_placeholders=mm_placeholders,
                 cache_salt=request.cache_salt,
             )
-        else:
+        elif not request.content_parts:
             (engine_input,) = await self.online_renderer.preprocess_completion(
                 request,
                 prompt_input=request.token_ids,
@@ -424,14 +452,12 @@ class ServingTokens(GenerateBaseServing):
                     logprobs = self._create_text_logprobs(
                         token_ids=token_ids,
                         top_logprobs=out_logprobs,
-                        num_output_top_logprobs=sampling_params.logprobs,
                         tokenizer=tokenizer,
                     )
                 else:
                     logprobs = self._create_tokens_logprobs(
                         token_ids=token_ids,
                         top_logprobs=out_logprobs,
-                        num_output_top_logprobs=sampling_params.logprobs,
                     )
             else:
                 logprobs = None
@@ -450,9 +476,11 @@ class ServingTokens(GenerateBaseServing):
                 index=output.index,
                 logprobs=logprobs,
                 finish_reason=output.finish_reason if output.finish_reason else "stop",
+                stop_reason=output.stop_reason,
                 token_ids=as_list(output.token_ids),
                 routed_experts=routed_experts_b64,
                 sampling_mask=sampling_mask,
+                weight_versions=output.weight_versions,
             )
             if text_mode:
                 text_choices.append(
@@ -597,14 +625,12 @@ class ServingTokens(GenerateBaseServing):
                             logprobs = self._create_text_logprobs(
                                 token_ids=delta_token_ids,
                                 top_logprobs=out_logprobs,
-                                num_output_top_logprobs=sampling_params.logprobs,
                                 tokenizer=tokenizer,
                             )
                         else:
                             logprobs = self._create_tokens_logprobs(
                                 token_ids=delta_token_ids,
                                 top_logprobs=out_logprobs,
-                                num_output_top_logprobs=sampling_params.logprobs,
                             )
                     else:
                         logprobs = None
@@ -622,9 +648,11 @@ class ServingTokens(GenerateBaseServing):
                         index=i,
                         logprobs=logprobs,
                         finish_reason=finish_reason,
+                        stop_reason=output.stop_reason,
                         token_ids=as_list(delta_token_ids),
                         routed_experts=routed_experts_b64,
                         sampling_mask=sampling_mask,
+                        weight_versions=output.weight_versions,
                     )
                     chunk: GenerateTokensStreamResponse | GenerateTextStreamResponse
                     if text_mode:
@@ -724,14 +752,15 @@ class ServingTokens(GenerateBaseServing):
         self,
         token_ids: GenericSequence[int],
         top_logprobs: GenericSequence[dict[int, Logprob] | None],
-        num_output_top_logprobs: int | None = None,
         tokenizer: TokenizerLike | None = None,
     ) -> ChatCompletionLogProbs:
         """Create OpenAI-style logprobs for ``output_mode="text"``.
 
         With a ``tokenizer`` the tokens are decoded strings and carry ``bytes``;
         without one (``--return-tokens-as-token-ids``) they are ``token_id:N``
-        placeholders.
+        placeholders. Like tokens mode, ``top_logprobs`` carries every candidate
+        the engine returned (the sampled token first, then the top k), not cut
+        to the requested count.
         """
         logprobs_content: list[ChatCompletionLogProbsContent] = []
 
@@ -753,14 +782,7 @@ class ServingTokens(GenerateBaseServing):
                         bytes=token_bytes,
                         top_logprobs=[
                             _top_logprob(top_id, logprob, tokenizer)
-                            for i, (top_id, logprob) in enumerate(
-                                step_top_logprobs.items()
-                            )
-                            if num_output_top_logprobs is not None
-                            and (
-                                num_output_top_logprobs == -1
-                                or i < max(num_output_top_logprobs, 1)
-                            )
+                            for top_id, logprob in step_top_logprobs.items()
                         ],
                     )
                 )
@@ -771,9 +793,15 @@ class ServingTokens(GenerateBaseServing):
         self,
         token_ids: GenericSequence[int],
         top_logprobs: GenericSequence[dict[int, Logprob] | None],
-        num_output_top_logprobs: int | None = None,
     ) -> GenerateLogProbs:
         """Create generate-shaped logprobs (integer token ids, no tokenizer).
+
+        ``top_logprobs`` carries every candidate the engine returned for the
+        position: the sampled token first, then the top k, so k entries when the
+        sampled token is in the top k and k + 1 when it is not. It is not cut to
+        the requested count: `/v1/chat/completions` and
+        `/v1/completions` cut differently, and derender applies each endpoint's
+        cut the way the coupled server does.
 
         The engine reports rank 0 for a sampled token whose logprob is NaN; that
         is not a rank, so it is sent as ``None`` (the logprob is clamped).
@@ -802,14 +830,7 @@ class ServingTokens(GenerateBaseServing):
                                 logprob=_clamp_logprob(top_logprob.logprob),
                                 rank=top_logprob.rank or None,
                             )
-                            for rank_index, (top_token_id, top_logprob) in enumerate(
-                                step_top_logprobs.items()
-                            )
-                            if num_output_top_logprobs is not None
-                            and (
-                                num_output_top_logprobs == -1
-                                or rank_index < max(num_output_top_logprobs, 1)
-                            )
+                            for top_token_id, top_logprob in step_top_logprobs.items()
                         ],
                     )
                 )
