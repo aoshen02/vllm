@@ -10,7 +10,7 @@ The NCCL weight transfer engine uses [NCCL](https://developer.nvidia.com/nccl) b
 
 ## How It Works
 
-1. The trainer and all inference workers join a shared NCCL process group using `StatelessProcessGroup` (vLLM's torch.distributed-independent group abstraction). The trainer is rank 0; workers start at `rank_offset` (1).
+1. The trainer and all inference workers join a shared NCCL process group using `StatelessProcessGroup` (vLLM's torch.distributed-independent group abstraction). The trainer is rank 0; workers start at `rank_offset` (1). Torch-free trainers can skip the TCP rendezvous with a pre-shared [`nccl_unique_id_b64`](#torch-free-trainers-jax-no-tcp-rendezvous-nccl_unique_id_b64).
 2. The trainer broadcasts weights to all workers simultaneously. Each worker receives and loads the weights.
 3. Optionally, **packed tensor broadcasting** batches multiple small tensors into larger buffers with double/triple buffering and CUDA stream overlap for higher throughput. This implementation is based on [NeMo-RL's packed tensor](https://github.com/NVIDIA-NeMo/RL/blob/main/nemo_rl/utils/packed_tensor.py).
 
@@ -192,6 +192,86 @@ client.finish_weight_update()
 Sparse NCCL sends only `O(nnz)` indices and values. Checkpoint application still uses `O(N)` staging through the native loader, and the caller owns export/diff state and restart or reseed after a partial failure.
 
 [`rlhf_sparse_nccl.py`](../../../examples/rl/rlhf_sparse_nccl.py) demonstrates per-expert checkpoint patches with a Qwen3 MoE TP2/EP2 engine.
+
+## Torch-Free Trainers (JAX, No TCP Rendezvous): `nccl_unique_id_b64`
+
+A torch-free trainer (e.g. JAX), or one that cannot expose a TCP rendezvous port
+to the vLLM workers, can mint an `ncclUniqueId` itself and send it as
+`nccl_unique_id_b64` in the worker init info instead of `master_address` /
+`master_port`. The workers then join with `ncclCommInitRank` directly; no
+TCPStore is created. This works for `backend="nccl"` and `backend="sparse_nccl"`,
+which share `NCCLWeightTransferInitInfo`.
+
+Rules, enforced when `init_weight_transfer_engine` parses the init info:
+
+- **Exactly one mode.** Both modes raise `ValueError: ... pass nccl_unique_id_b64
+  OR master_address/master_port, not both`. Neither (or only one of address /
+  port) raises `... need nccl_unique_id_b64, or both master_address and
+  master_port`.
+- **Encoding.** Standard base64 (`base64.b64encode`), **not** URL-safe, of the
+  raw 128-byte `ncclUniqueId`. Anything that does not decode to exactly 128 bytes
+  raises `ValueError`.
+- **Ranks.** The trainer is rank 0 and the broadcast root. `rank_offset` is `1`,
+  and `world_size` is `1 + GET /get_world_size` (TP × PP × DP). Worker rank is
+  `rank_offset + dp_index * (TP * PP) + rank_within_dp`.
+- **No barrier.** The trainer must be inside `ncclCommInitRank(world_size, uid,
+  0)` while the workers are. `init_weight_transfer_engine` returns only after
+  every rank has joined, so send it from a background thread. Nothing times out:
+  a missing rank hangs every rank.
+- **Mandatory warm-up.** Right after `ncclCommInitRank`, each vLLM worker issues
+  a one-element `all_reduce` (float32 sum). The trainer must issue a matching
+  one-element `ncclAllReduce` before any other collective, or all ranks deadlock.
+
+```python
+import base64
+import threading
+
+import nccl.core as nccl  # nccl4py; any ncclGetUniqueId binding works
+import requests
+
+url = "http://localhost:8000"  # vllm serve with VLLM_SERVER_DEV_MODE=1
+uid_b64 = base64.b64encode(nccl.get_unique_id().as_bytes).decode()
+world_size = 1 + requests.get(f"{url}/get_world_size").json()["world_size"]
+
+init = threading.Thread(
+    target=requests.post,
+    args=(f"{url}/init_weight_transfer_engine",),
+    kwargs={"json": {"init_info": {
+        "nccl_unique_id_b64": uid_b64,
+        "rank_offset": 1,
+        "world_size": world_size,
+        "packed": False,
+    }}},
+)
+init.start()
+# Trainer, concurrently on its own GPU:
+#   comm = ncclCommInitRank(world_size, uid, 0)
+#   ncclAllReduce of one float32 element (warm-up)
+init.join()
+```
+
+Offline, pass the same dict to `llm.init_weight_transfer_engine({"init_info":
+{...}})`, again concurrently with the trainer's init.
+
+Each sync is then `POST /start_weight_update`, `POST /update_weights` with
+`{"update_info": {"names": [...], "dtype_names": [...], "shapes": [...]}}`
+running while rank 0 issues one `ncclBroadcast` per tensor in `names` order, and
+`POST /finish_weight_update`. Keep `packed: false` unless the trainer reproduces
+vLLM's packed chunking.
+
+Not supported on this path:
+
+- **The trainer engine.** `NCCLTrainerInitInfo` and `SparseNCCLTrainerInitInfo`
+  have no `nccl_unique_id_b64` field, and `trainer_init` always opens a TCPStore.
+  A UID trainer drives rank 0 itself and calls `init_weight_transfer_engine`
+  directly.
+- **`nccl_m2n`.** Its `nccl_unique_id_b64` replaces only the data-plane ID;
+  `master_address` / `master_port` are still required for the metadata
+  TCPStore. See [NCCL M2N](m2n.md).
+
+[`test_nccl_weight_transfer_torch_free_trainer`](../../../tests/distributed/test_weight_transfer_nccl_uid.py)
+runs this flow against a trainer that uses cupy and raw ctypes NCCL
+(`ncclCommInitRank`, warm-up `ncclAllReduce`, `ncclBroadcast`) and no torch.
 
 ## Examples
 
