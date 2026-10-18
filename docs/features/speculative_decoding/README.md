@@ -186,6 +186,14 @@ vllm serve <target-model> \
   are populated by vLLM and are not intended to be set by users.
 - `use_heterogeneous_vocab` currently supports greedy draft sampling only. Probabilistic acceptance (temperature > 0 draft sampling) is not yet supported and will be added in a future release.
 
+## Updating draft weights during RL training
+
+To sync trained weights into the drafter (EAGLE, MTP, draft model) during
+RL, call `start_draft_weight_update()` (HTTP `POST /start_draft_weight_update`)
+instead of `start_weight_update()`. Supported on the `nccl` and `ipc` weight
+transfer backends. See
+[Draft (speculative) model weight updates](../../training/weight_transfer/base.md#draft-speculative-model-weight-updates).
+
 ## Lossless guarantees of Speculative Decoding
 
 In vLLM, speculative decoding aims to enhance inference efficiency while maintaining accuracy. This section addresses the lossless guarantees of
