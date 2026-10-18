@@ -25,9 +25,7 @@ engine drives on your behalf:
 1. **Initialization** (`init_weight_transfer_engine`): establishes the communication channel between the trainer and inference workers. Called once, from `trainer_init`, before the training loop begins.
 2. **Start** (`start_weight_update`): prepares the inference engine for a weight update.
 3. **Weight Update** (`update_weights`): transfers updated weights. May be called one or more times (e.g. for chunked transfers).
-4. **Finish** (`finish_weight_update`): finalizes the update (e.g. runs post-processing for checkpoint-format weights). Called once after all weights have been transferred.
-
-The worker enforces this order: `update_weights` without `start_weight_update`, a second start, or `finish_weight_update` without start raises `RuntimeError`, and a failed `update_weights` ends the session with no rollback. See [Session rules and failures](base.md#session-rules-and-failures).
+4. **Finish** (`finish_weight_update`): finalizes the update (e.g. runs post-processing for checkpoint-format weights). Called once after all weights have been transferred. **If an update fails: no rollback; call start again and resend the whole update** (see [Session rules and failures](base.md#session-rules-and-failures)).
 
 ## Available Backends
 

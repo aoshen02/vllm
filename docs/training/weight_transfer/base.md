@@ -506,37 +506,22 @@ The base class provides:
 
 #### Session rules and failures
 
-Each worker tracks one weight update session, opened by `start_weight_update`
-(or `start_draft_weight_update`) and closed by `finish_weight_update`. A chunked
-push (many `update_weights` calls) must sit inside one start/finish pair, so
-layerwise reload and post-load processing (re-quantization, fusing) run once, at
-finish. The worker raises `RuntimeError` in these cases, and the HTTP or Python
-call fails:
+**If an update fails: no rollback; call `start_weight_update` again and resend the whole update.** Any exception in `update_weights` ends the session: chunks loaded so far stay in the model, layerwise reload is not finalized, `weight_version` is not committed, and a later `finish_weight_update` raises. Keep generation paused until the retry finishes. If `finish_weight_update` itself raises, the session stays open and a new start raises until finish succeeds.
 
-| Call | When | `RuntimeError` message |
-| ---- | ---- | ---------------------- |
-| `update_weights` | no active session (there is no implicit start) | `start_weight_update must be called before update_weights.` |
-| `start_weight_update` | a session is already active (no nesting) | `start_weight_update called while a weight update is already active. Call finish_weight_update first.` |
+Bracket a chunked push in one session so layerwise reload and post-load processing (re-quantization, fusing) run once, at finish. Over HTTP: `POST /start_weight_update` (no body; `is_checkpoint_format` from older examples is not a weight-transfer argument, only `reload_weights` takes it), `POST /update_weights` once per chunk, then `POST /finish_weight_update` with optional `{"weight_version": "..."}`. Offline:
+
+```python
+llm.start_weight_update()
+llm.update_weights({"update_info": chunk})  # once per chunk
+llm.finish_weight_update(weight_version="step-42")
+```
+
+| Call | Raises `RuntimeError` when | Message |
+| ---- | -------------------------- | ------- |
+| `update_weights` | no active session (no implicit start) | `start_weight_update must be called before update_weights.` |
+| `start_weight_update` | a session is already active | `start_weight_update called while a weight update is already active. Call finish_weight_update first.` |
 | `finish_weight_update` | no active session | `finish_weight_update called without a matching start_weight_update.` |
 | `shutdown_weight_transfer_engine` | a session is active | `Cannot release a trainer connection during a weight update` |
-
-**A failed `update_weights` ends the session, with no rollback.** On any
-exception the worker clears the session, resets the update target and re-raises.
-Chunks loaded before the failure stay in the model, `finish_weight_update` is
-never run (layerwise reload is not finalized), and `weight_version` is not
-committed. A later `finish_weight_update` raises. To recover, keep generation
-paused, call `start_weight_update` again and resend the **whole** update, then
-call `finish_weight_update`.
-
-A failed `start_weight_update` leaves no session open. If
-`finish_weight_update` itself raises, the session stays active and a new start
-raises until finish succeeds.
-
-`is_checkpoint_format` is not a weight-transfer parameter: `/start_weight_update`
-takes no body and ignores one, and `LLM.start_weight_update()` takes no
-arguments. Each engine decides whether its incoming weights are checkpoint
-format. The argument exists only on in-place `reload_weights`. Older examples
-that pass it to `/start_weight_update` are stale.
 
 ### Request Classes
 
