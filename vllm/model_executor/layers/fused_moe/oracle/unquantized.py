@@ -295,6 +295,11 @@ def select_unquantized_moe_backend(
         config: FusedMoEConfig,
         activation_format: mk.FusedMoEActivationFormat,
     ) -> tuple[UnquantizedMoeBackend, type[mk.FusedMoEExperts] | None]:
+        if (
+            backend == UnquantizedMoeBackend.DEEP_GEMM
+            and config.in_dtype != torch.bfloat16
+        ):
+            raise ValueError("DeepGEMM BF16 requires bfloat16 activations and weights")
         reason = None
         for k_cls in backend_to_kernel_cls(backend):
             supported, reason = k_cls.is_supported_config(
