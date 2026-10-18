@@ -4,85 +4,47 @@
 
 ## Enabling the endpoint (`--enable-scale-out`, `--tokens-only`)
 
-| Launch | `/inference/v1/generate` | Tokenizer |
-| --- | --- | --- |
-| `vllm serve <model>` | not registered: returns 403 `Scale-out endpoints are disabled. Restart vllm serve with --enable-scale-out to enable them.` | loaded |
-| `vllm serve <model> --enable-scale-out` | registered, with `/render`, `/derender` and `/inference/v1/abort_requests` | loaded |
-| `vllm serve <model> --tokens-only` | always registered, only the Tokens In <> Tokens Out endpoints | not loaded, detokenization is forced off |
-
-- `--enable-scale-out` replaces the `VLLM_ENABLE_SCALE_OUT_ENDPOINTS` environment variable, which no longer exists.
-- When `--api-key` is set, `/inference/v1/generate` requires it.
-- `--tokens-only` forces `detokenize=False` on every request, so `sampling_params.stop` (stop strings) is rejected with a 400. Use `stop_token_ids`, or check stop strings on the caller side.
+- `--enable-scale-out` registers it, with `/render`, `/derender` and `/inference/v1/abort_requests`.
+- `--tokens-only` always registers it, skips loading the tokenizer and forces `detokenize=False`. Stop strings (`sampling_params.stop`) are then rejected with a 400; use `stop_token_ids`.
+- With neither flag, it returns 403 `Scale-out endpoints are disabled. Restart vllm serve with --enable-scale-out to enable them.`
 
 ```bash
 vllm serve Qwen/Qwen3-0.6B --enable-scale-out
 
 curl -X POST http://localhost:8000/inference/v1/generate \
   -H "Content-Type: application/json" \
-  -d '{"token_ids": [151644, 872, 198], "sampling_params": {"max_tokens": 32, "temperature": 1.0, "logprobs": 1}}'
+  -d '{"token_ids": [151644, 872, 198], "sampling_params": {"max_tokens": 32, "logprobs": 1}}'
 ```
 
-A full client that tokenizes with the model's chat template is in [examples/scale_out/token_generation_client.py](../../../examples/scale_out/token_generation_client.py).
+A full client is in [examples/scale_out/token_generation_client.py](../../../examples/scale_out/token_generation_client.py).
 
 ## Request fields
 
-| Field | Type | Notes |
-| --- | --- | --- |
-| `token_ids` | `list[int]` | Required. The already-templated prompt. At least one ID, no negative IDs. |
-| `sampling_params` | `SamplingParams` | Required. Any [SamplingParams](../../api/README.md#inference-parameters) field, e.g. `max_tokens`, `temperature`, `logprobs`, `prompt_logprobs`, `stop_token_ids`, `n`. If `max_tokens` is omitted, the server applies the same default as the OpenAI endpoints (the remaining context length or the model's generation config), not the dataclass default of 16. `n` must not exceed `--max-num-seqs`. |
-| `output_mode` | `"tokens"` \| `"text"` | Default `"tokens"`. See [Output modes](#output-modes). |
-| `stream` | `bool` | Default `false`. `true` returns SSE chunks (`data: {...}`), ending with `data: [DONE]`. |
-| `stream_options` | `{"include_usage", "continuous_usage_stats"}` | Usage reporting in streams. |
-| `request_id` | `str` | Defaults to a random UUID. The `X-Request-Id` header takes precedence. The server prefixes the ID with `generate-tokens-`. |
-| `return_token_ids` | `bool` | Echo the final prompt IDs (after multimodal placeholder expansion) as `prompt_token_ids`, plus `mm_placeholders`. Generated IDs are always returned. In a stream, only the first chunk carries them. |
-| `features` / `content_parts` | object / `list[dict]` | Multimodal input: `features` from `/render`, or raw `image_url`/`audio_url`/`video_url` parts that the server resolves. Mutually exclusive. |
-| `cache_salt` | `str` | Prefix cache salt, 1 to 1024 characters. |
-| `priority` | `int` | Default 0. Non-zero values need priority scheduling. |
-| `model` | `str` | Served model or LoRA adapter name. |
-| `kv_transfer_params`, `ec_transfer_params` | `dict` | KV and encoder cache transfer parameters for disaggregated serving. |
+| Field | Notes |
+| --- | --- |
+| `token_ids` | Required `list[int]`: the already-templated prompt. Non-empty, no negative IDs. |
+| `sampling_params` | Required. Any [SamplingParams](../../api/README.md#inference-parameters) field, e.g. `max_tokens`, `temperature`, `logprobs`, `stop_token_ids`. Without `max_tokens`, the server applies its own default (as on the OpenAI endpoints), not 16. |
+| `output_mode` | `"tokens"` (default) or `"text"`, see [Output modes](#output-modes). |
+| `stream`, `stream_options` | SSE chunks ending with `data: [DONE]`. |
+| `return_token_ids` | Echo the final prompt IDs as `prompt_token_ids`. |
+| `features` / `content_parts` | Multimodal input, mutually exclusive. |
+| `request_id`, `model`, `cache_salt`, `priority`, `kv_transfer_params`, `ec_transfer_params` | Optional. |
 
 ## Response fields
 
-Top level: `request_id`, `model`, `created`, `output_mode`, `choices`, `usage`, `prompt_token_ids` (with `return_token_ids`), `prompt_logprobs` (with `sampling_params.prompt_logprobs`), `mm_placeholders`, `kv_transfer_params`, `ec_transfer_params`.
-
-Each entry of `choices` (`output_mode: "tokens"`):
-
-| Field | Notes |
+| `choices[i]` field | Notes |
 | --- | --- |
-| `index` | Choice index, for `n > 1`. |
 | `token_ids` | Generated token IDs. |
-| `finish_reason` | For example `stop`, `length` or `abort`. |
-| `stop_reason` | The stop token ID or stop string that ended generation. `null` on EOS, length and abort. |
-| `logprobs` | `{"content": [{"token_id", "logprob", "rank", "top_logprobs": [{"token_id", "logprob", "rank"}]}]}`, one entry per generated token. The sampled token comes first in `top_logprobs`. `null` unless `sampling_params.logprobs` is set. |
-| `weight_versions` | Weight version spans over the output tokens, see [Weight versions](#weight-versions). |
-| `routed_experts` | Base64-encoded `.npy` of per-token MoE expert IDs, with `--enable-return-routed-experts`. |
-| `sampling_mask` | Per-token sampling support, with `--return-sampling-mask`, see [Sampling Mask](../../training/sampling_mask.md). |
+| `finish_reason` | `stop`, `length` or `abort`. |
+| `stop_reason` | Stop token ID or string; `null` on EOS, length and abort. |
+| `logprobs` | `{"content": [{"token_id", "logprob", "rank", "top_logprobs": [...]}]}`, one entry per token, sampled token first. `token_id` is an integer, not the older `"token_id:<id>"` string. Needs `sampling_params.logprobs`. |
+| `weight_versions`, `routed_experts`, `sampling_mask` | Optional, see [Weight versions](#weight-versions); the last two need `--enable-return-routed-experts` / `--return-sampling-mask`. |
 
-Logprob entries carry an integer `token_id`, not the `"token_id:<id>"` strings that older releases returned:
-
-```json
-"logprobs": {"content": [
-  {"token_id": 9707, "logprob": -0.12, "rank": 1,
-   "top_logprobs": [{"token_id": 9707, "logprob": -0.12, "rank": 1},
-                    {"token_id": 13, "logprob": -2.31, "rank": 2}]}
-]}
-```
-
-With `stream: true`, each chunk carries the same per-choice fields for the new tokens. `finish_reason` and `stop_reason` are set on the final chunk of each choice.
+The top level adds `request_id`, `usage`, `prompt_token_ids` and `prompt_logprobs`. Stream chunks carry the same per-choice fields for the new tokens.
 
 ## Targeting a data-parallel rank (`X-data-parallel-rank`)
 
-Send the `X-data-parallel-rank: <int>` header to pin a request to one data-parallel (DP) engine rank, for example to keep a multi-turn rollout on the rank that holds its prefix cache. There is no body field for it.
-
-```bash
-curl -X POST http://localhost:8000/inference/v1/generate \
-  -H "Content-Type: application/json" -H "X-data-parallel-rank: 1" \
-  -d '{"token_ids": [151644, 872, 198], "sampling_params": {"max_tokens": 32}}'
-```
-
-- Without the header, the server's DP load balancer picks the rank.
-- A header that is not an integer is ignored, and the request is load balanced.
-- The rank must be in `[0, data_parallel_size)`, or `[0, data_parallel_size_local)` when the API server only manages its local engines (`local_engines_only`). Out of range ranks are rejected with `data_parallel_rank N is out of range [0, M).` (a 400 for non-streaming requests).
+Send the header `X-data-parallel-rank: <int>` to pin a request to one data-parallel (DP) engine rank; there is no body field. Without the header, or with a non-integer value, the request is load balanced. A rank outside `[0, data_parallel_size)` is rejected.
 
 ## Output modes
 

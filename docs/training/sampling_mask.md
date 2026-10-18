@@ -139,10 +139,9 @@ Each position then carries the sampled token's logprob and the top-128
   drop them. The finite entries are the sampling mask when it has at most `k`
   tokens.
 - The sampled token is always the first entry and may repeat inside the top-k.
-- The `token_id:<id>` strings above come from the OpenAI endpoints with
-  `return_tokens_as_token_ids`. `/inference/v1/generate` returns an integer
-  `token_id` per entry instead (`{"token_id": 11, "logprob": -0.757, "rank": 1}`),
-  see [Tokens In <> Tokens Out API](../serving/online_serving/token_in_token_out.md#response-fields).
+- The `token_id:<id>` strings come from the OpenAI endpoints with
+  `return_tokens_as_token_ids`; `/inference/v1/generate` returns an integer
+  `token_id` instead.
 
 ## Limitations
 
