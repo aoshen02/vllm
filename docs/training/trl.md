@@ -48,6 +48,8 @@ training_args = GRPOConfig(
 )
 ```
 
+Colocate mode runs vLLM with `distributed_executor_backend="external_launcher"` inside the `torchrun`/`accelerate` processes. For the underlying rules (identical prompts and seed per TP group, world size, data-parallel sharding), see [Running vLLM inside torchrun](../serving/parallelism_scaling.md#running-vllm-inside-torchrun-external_launcher-spmd-colocation).
+
 Some trainers also support **vLLM sleep mode**, which offloads parameters and caches to GPU RAM during training, helping reduce memory usage. Learn more in the [memory optimization docs](https://huggingface.co/docs/trl/main/en/reducing_memory_usage#vllm-sleep-mode).
 
 !!! info

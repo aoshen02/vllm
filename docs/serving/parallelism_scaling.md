@@ -30,7 +30,7 @@ It's often advantageous to exploit the inherent parallelism of experts by using 
 
 vLLM supports distributed tensor-parallel and pipeline-parallel inference and serving. The implementation includes [Megatron-LM's tensor parallel algorithm](https://arxiv.org/pdf/1909.08053.pdf).
 
-The default distributed runtimes are [Ray](https://github.com/ray-project/ray) for multi-node inference and native Python `multiprocessing` for single-node inference. You can override the defaults by setting `distributed_executor_backend` in the `LLM` class or `--distributed-executor-backend` in the API server. Use `mp` for `multiprocessing` or `ray` for Ray.
+The default distributed runtimes are [Ray](https://github.com/ray-project/ray) for multi-node inference and native Python `multiprocessing` for single-node inference. You can override the defaults by setting `distributed_executor_backend` in the `LLM` class or `--distributed-executor-backend` in the API server. Use `mp` for `multiprocessing` or `ray` for Ray. To run vLLM inside processes you launch yourself with `torchrun` (one engine shard per trainer rank), use `external_launcher`; see [Running vLLM inside torchrun](#running-vllm-inside-torchrun-external_launcher-spmd-colocation).
 
 For multi-GPU inference, set `tensor_parallel_size` in the `LLM` class to the desired GPU count. For example, to run inference on 4 GPUs:
 
@@ -157,6 +157,52 @@ vllm serve /path/to/the/model/in/the/container \
   --nnodes 2 --node-rank 1 \
   --master-addr <HEAD_NODE_IP> --headless
 ```
+
+## Running vLLM inside torchrun (`external_launcher`, SPMD colocation)
+
+With `distributed_executor_backend="external_launcher"`, vLLM does not spawn worker processes. Instead, you launch one process per GPU with `torchrun` (or any launcher that sets the same env vars), and each process builds its own `LLM(...)` holding one in-process worker shard. All processes run the same script in lockstep (SPMD). This is how RL frameworks colocate a vLLM rollout engine with trainer ranks on the same GPUs.
+
+```python
+# torchrun --nproc-per-node=4 script.py
+from vllm import LLM, SamplingParams
+
+llm = LLM(
+    model="meta-llama/Llama-3.1-8B",
+    tensor_parallel_size=2,
+    data_parallel_size=2,             # optional; world size = TP * PP * DP = 4
+    distributed_executor_backend="external_launcher",
+    seed=1,                           # same seed on every rank
+    gpu_memory_utilization=0.5,       # leave room for the trainer when colocated
+)
+
+# DP: vLLM sets data_parallel_rank itself; you shard the prompts.
+all_prompts = ["Hello, my name is", "The capital of France is"]
+pc = llm.llm_engine.vllm_config.parallel_config
+prompts = [p for i, p in enumerate(all_prompts)
+           if i % pc.data_parallel_size == pc.data_parallel_rank]
+outputs = llm.generate(prompts, SamplingParams(temperature=0.8))
+# Every rank in the same TP/PP group returns the same outputs.
+```
+
+How it works and what you must provide:
+
+- **Env vars:** each process initializes with `env://` using `RANK`, `LOCAL_RANK`, `MASTER_ADDR` and `MASTER_PORT`, which torchrun sets. `LOCAL_RANK` selects the GPU. If the trainer has already called `torch.distributed.init_process_group`, vLLM reuses that WORLD group and builds its TP/PP/DP groups on top of it.
+- **World size:** the number of processes is `TP * PP * DP`. Prefill context parallel (PCP) multiplies it further. `data_parallel_size` counts toward the world size only on this backend.
+- **Identical inputs per engine:** vLLM does not synchronize schedulers across ranks; it relies on deterministic scheduling. Every rank in a TP/PP group must make the same `generate` calls with the same prompts and `SamplingParams`. Set the same explicit `seed` on all ranks so sampling matches.
+- **Data parallelism:** `data_parallel_rank` is set automatically to `RANK // (TP * PP)` (`RANK // (world_size // DP)`). There is no internal load balancing, so each DP rank must take its own share of the prompts, as in the snippet. All DP ranks must call `generate` together, or the engine deadlocks. `LLM(data_parallel_size>1)` is rejected for every other backend (except TPU).
+- **Larger trainer world:** if the trainer's process group is a multiple of `TP * PP * DP`, each consecutive block of `TP * PP * DP` ranks forms an independent engine that can generate different prompts (the outer "ExternalDP" dimension).
+- **Multi-node:** use torchrun's own multi-node options (`--nnodes`, `--node-rank`, `--master-addr`, or rendezvous). Do not pass vLLM's `--nnodes`, `--master-addr` or `--headless`. KV cache memory is all-reduced with MIN across ranks, so every rank allocates the same number of blocks.
+- **`VLLM_ENABLE_V1_MULTIPROCESSING`:** this backend sets it to `0` automatically, so the engine core runs in the calling process. The executor asserts it is `0` "to get deterministic execution".
+- **Async scheduling** is supported and on by default. Async structured-output grammar compilation is turned off for this backend, because it breaks cross-rank determinism and deadlocks.
+- **Pipeline parallelism** works only on the V1 model runner, which broadcasts the PP output to all ranks. Model Runner V2 does not support PP with `external_launcher`: vLLM falls back to V1 with a warning, or raises if `VLLM_USE_V2_MODEL_RUNNER=1` is set. On V1 with PP > 1, async scheduling is disabled.
+- **Offline only:** use the `LLM` class. `vllm serve` and `AsyncLLM` are not supported.
+
+Useful handles on every rank:
+
+- `get_world_group().cpu_group` (gloo) for control messages and `get_world_group().device_group` (NCCL) for tensors, both from `vllm.distributed.parallel_state`.
+- `llm.llm_engine.model_executor.driver_worker.worker.model_runner.model` is the local model shard, for example for in-place weight updates.
+
+Examples: [examples/features/torchrun/torchrun_example_offline.py](../../examples/features/torchrun/torchrun_example_offline.py) (TP + PP) and [examples/features/torchrun/torchrun_dp_example_offline.py](../../examples/features/torchrun/torchrun_dp_example_offline.py) (DP + EP, e.g. `torchrun --nproc-per-node=8 ... --tp-size=2 --dp-size=4 --enable-ep`).
 
 ## Optimizing network communication for tensor parallelism
 
