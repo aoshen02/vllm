@@ -48,6 +48,8 @@ With `VLLM_SERVER_DEV_MODE=1`, the vLLM HTTP server exposes the same functionali
 - `POST /resume` - Resume generation; returns `{"status": "resumed"}`
 - `GET /is_paused` - Returns `{"is_paused": true|false}`
 - `POST /abort_requests` - Abort in-flight requests without pausing the scheduler (send `{}` to abort all, or `{"request_ids": [...]}` with the external request IDs). Aborted requests return partial results with `finish_reason="abort"`; the response is `{"status": "aborted", "aborted": <count>}`
+    - The IDs are the `X-Request-Id` header (or body `request_id`) you sent, with the endpoint prefix: `chatcmpl-<id>` for `/v1/chat/completions`, `cmpl-<id>-<i>` for prompt `i` of `/v1/completions`.
+    - With `--enable-scale-out` or `--tokens-only`, `POST /inference/v1/abort_requests` also exists without dev mode and is guarded by `--api-key`. It requires `request_ids` (no abort-all), returns an empty 200 and aborts in the background; see [Aborting requests](../serving/online_serving/token_in_token_out.md#aborting-requests).
 - `POST /update_weight_version` - Set the `weight_version` label without changing weights (send `{"new_version": "v8"}`)
 - `GET /weight_info` - Return the latest committed `weight_version`
 
