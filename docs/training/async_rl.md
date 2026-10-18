@@ -46,6 +46,8 @@ With `VLLM_SERVER_DEV_MODE=1`, the vLLM HTTP server exposes the same functionali
 - `POST /update_weight_version` - Set the `weight_version` label without changing weights (send `{"new_version": "v8"}`)
 - `GET /weight_info` - Return the latest committed `weight_version`
 
+With the Rust frontend, the same controls are available over gRPC (`--grpc-port`): `vllm.Control/PauseGeneration`, `ResumeGeneration`, `IsPaused`, `UpdateWeightVersion`, and `GetWeightVersion`. See [gRPC Control API for RL](grpc_control.md).
+
 !!! note "Data Parallelism"
     When using data parallelism with vLLM's **internal load balancer** (i.e. `data_parallel_backend="ray"`), pause and resume are handled automatically across all DP ranks -- a single call is sufficient. When using an **external load balancer** (i.e. multiple independent vLLM instances behind a proxy), you must send pause and resume requests to **every** engine instance individually before and after the weight update, and set the weight version on every instance too.
 
