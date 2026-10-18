@@ -221,6 +221,40 @@ curl -X POST 'http://localhost:8000/wake_up?tags=kv_cache'
 !!! note
     These endpoints are only available when passing `VLLM_SERVER_DEV_MODE=1`.
 
+## Monitoring
+
+vLLM exports these sleep-mode Prometheus metrics on `/metrics`:
+
+| Metric | Type | Labels |
+| ------ | ---- | ------ |
+| `vllm:sleep_mode_operation_duration_seconds` | Histogram (buckets 0.01, 0.1, 1, 10, 30, 60, 120, 300, 600 s) | `operation` |
+| `vllm:sleep_mode_operations_in_flight` | Gauge (`livesum` across API-server processes) | `operation` |
+| `vllm:engine_sleep_state` | Gauge, 0 or 1 | `model_name`, `engine`, `sleep_state` |
+
+- `operation` is `sleep` (`POST /sleep`), `release_kv_cache_memory`
+  (`POST /release_kv_cache_memory`) or `wake` (`POST /wake_up`). Only these HTTP
+  endpoints are timed. `/is_sleeping` and offline `LLM.sleep()`/`LLM.wake_up()`
+  calls are not. Failed calls are timed too.
+- `vllm:engine_sleep_state` has one series per `sleep_state` value: `awake`,
+  `weights_offloaded` (level 1) and `discard_all` (level 2). It is updated by
+  the engine's sleep and wake calls and is absent with `--disable-log-stats`.
+  When `awake` is 0 and the other two are
+  0, the engine is in a level 0 pause or has released only its KV cache. A partial
+  `wake_up?tags=...` leaves `awake` at 0 until the engine is fully awake.
+- The Rust frontend exports the two operation metrics but not `vllm:engine_sleep_state`.
+
+```promql
+# average wake_up duration
+rate(vllm:sleep_mode_operation_duration_seconds_sum{operation="wake"}[5m])
+  / rate(vllm:sleep_mode_operation_duration_seconds_count{operation="wake"}[5m])
+# a sleep or wake call is in progress
+sum by (operation) (vllm:sleep_mode_operations_in_flight) > 0
+# engines that are asleep
+vllm:engine_sleep_state{sleep_state="awake"} == 0
+```
+
+For weight-update timing, see [Weight Transfer: Monitoring](../training/weight_transfer/README.md#monitoring).
+
 ## Limitation
 
 On ROCm, the virtual memory allocation on ROCm is done through chunked memory allocation. You can control the chunk size through `VLLM_ROCM_SLEEP_MEM_CHUNK_SIZE` (in MB). The default value is set at 256MB. The larger the chunk size the faster the performance. However, setting it too large will cause OOM. So if you encounter OOM when using sleep mode. Try reducing the chunk size. It is recommended to define the chunk size as a power of 2.

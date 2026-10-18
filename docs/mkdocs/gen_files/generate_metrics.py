@@ -32,6 +32,14 @@ METRIC_SOURCE_FILES = [
         "key": "metrics-simple-kv-offload",
     },
     {"path": "vllm/v1/metrics/perf.py", "key": "metrics-mfu"},
+    {
+        "path": "vllm/entrypoints/rl/online/metrics.py",
+        "key": "metrics-rl-weight-update",
+    },
+    {
+        "path": "vllm/entrypoints/serve/dev/sleep/metrics.py",
+        "key": "metrics-sleep-mode",
+    },
 ]
 
 
@@ -45,8 +53,8 @@ class MetricExtractor(ast.NodeVisitor):
         """Visit function calls to find metric class instantiations."""
         metric_type = self._get_metric_type(node)
         if metric_type:
-            name = self._extract_kwarg(node, "name")
-            documentation = self._extract_kwarg(node, "documentation")
+            name = self._extract_arg(node, "name", 0)
+            documentation = self._extract_arg(node, "documentation", 1)
 
             if name:
                 self.metrics.append(
@@ -66,15 +74,25 @@ class MetricExtractor(ast.NodeVisitor):
             "_counter_cls": "counter",
             "_histogram_cls": "histogram",
         }
+        # Direct prometheus_client classes, e.g. `Histogram("vllm:...", ...)`.
+        direct_type_map = {
+            "Gauge": "gauge",
+            "Counter": "counter",
+            "Histogram": "histogram",
+        }
         if isinstance(node.func, ast.Attribute):
             return metric_type_map.get(node.func.attr)
+        if isinstance(node.func, ast.Name):
+            return direct_type_map.get(node.func.id)
         return None
 
-    def _extract_kwarg(self, node: ast.Call, key: str) -> str | None:
-        """Extract a keyword argument value from a function call."""
+    def _extract_arg(self, node: ast.Call, key: str, position: int) -> str | None:
+        """Extract an argument by keyword, falling back to its position."""
         for keyword in node.keywords:
             if keyword.arg == key:
                 return self._get_string_value(keyword.value)
+        if len(node.args) > position:
+            return self._get_string_value(node.args[position])
         return None
 
     def _get_string_value(self, node: ast.AST) -> str | None:
