@@ -11,7 +11,11 @@ Key benefits:
 - **Fine-grained control**: Optionally wake up only model weights or KV cache to avoid OOM during weight updates.
 
 !!! note
-    This feature is now supported on CUDA and ROCm platform.
+    Sleep mode is supported on CUDA, ROCm, and XPU (Intel GPU). On any other platform, `enable_sleep_mode=True` fails at startup with `ValueError: Sleep mode is not supported on current platform.`
+
+    - **ROCm**: in practice only MI3xx GPUs (for example MI300X) are supported. vLLM cannot detect the GPU model, so it does not reject other ROCm GPUs. See [Limitation](#limitation) for `VLLM_ROCM_SLEEP_MEM_CHUNK_SIZE`.
+    - **XPU**: uses the `xpumem` allocator (`XpuMemAllocator`, which needs the `xpumem_allocator` extension from `vllm_xpu_kernels`). XPU graphs are not compatible with sleep mode, so enabling sleep mode sets `cudagraph_mode` to `NONE`.
+    - **KV connectors**: only some connectors can be used with sleep mode. See [KV connectors with sleep mode](#kv-connectors-with-sleep-mode).
 
 !!! note
     For more information, see this [Blog Post](https://blog.vllm.ai/2025/10/26/sleep-mode.html).
@@ -220,6 +224,24 @@ curl -X POST 'http://localhost:8000/wake_up?tags=kv_cache'
 
 !!! note
     These endpoints are only available when passing `VLLM_SERVER_DEV_MODE=1`.
+
+## KV connectors with sleep mode
+
+When sleep mode is combined with `--kv-transfer-config`, vLLM checks at startup whether the connector can follow the KV cache remap across sleep and wake-up (`KVConnectorBase_V1.supports_sleep_mode()`). If it cannot, startup fails with `ValueError: <kv_connector> does not support sleep mode.`
+
+| Connector | Sleep mode |
+| --------- | ---------- |
+| `MooncakeConnector` | Supported over RDMA only. `kv_connector_extra_config.mooncake_protocol` must be `"rdma"` (the default), and none of `MC_FORCE_MNNVL`, `MC_INTRANODE_NVLINK`, `MC_USE_TENT`, or `MC_USE_TEV1` may be set. NVLink, MNNVL, and TENT transports are rejected. |
+| `MooncakeStoreConnector` | Not supported |
+| `NixlConnector`, `NixlPullConnector`, `NixlPushConnector` | Not supported |
+| `MoRIIOConnector` | Not supported |
+| `MultiConnector` | Supported only if every child connector supports it |
+| Other connectors | Not rejected at startup (the base class default is `True`), but not validated with sleep mode |
+
+```bash
+VLLM_SERVER_DEV_MODE=1 vllm serve Qwen/Qwen3-0.6B --enable-sleep-mode \
+    --kv-transfer-config '{"kv_connector":"MooncakeConnector","kv_role":"kv_both","kv_connector_extra_config":{"mooncake_protocol":"rdma"}}'
+```
 
 ## Limitation
 
