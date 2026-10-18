@@ -54,6 +54,32 @@ class Fp8PerTensorOnlineLinearMethod(LinearMethodBase):
         layer._already_called_process_weights_after_loading = True
 ```
 
+### Quantized Rollouts: bf16 Trainer, FP8 vLLM (QeRL)
+
+To train in bf16 and roll out with an FP8 (or other online-quantized) engine, start vLLM from the **bf16 checkpoint** with an online quantization scheme, then push bf16 weights each step. vLLM re-quantizes each layer in place on every update.
+
+```bash
+VLLM_SERVER_DEV_MODE=1 vllm serve <bf16-model> \
+    --quantization fp8_per_tensor \
+    --weight-transfer-config '{"backend": "nccl"}'
+```
+
+Offline: `LLM(<bf16-model>, quantization="fp8_per_tensor", weight_transfer_config=WeightTransferConfig(backend="nccl"))`. Full example: [rlhf_http_nccl.py](../../examples/rl/rlhf_http_nccl.py).
+
+- **Flag**: `--quantization fp8_per_tensor` or `fp8_per_block`. Other schemes (`fp8_per_channel`, `mxfp8`, `mxfp4`, `int8_per_channel_weight_only`, `nvfp4_per_token`, `--quantization-config`) are listed in [Online Quantization](../features/quantization/online.md). On a bf16 checkpoint, `--quantization fp8` is a deprecated alias of `fp8_per_tensor` and logs a deprecation warning.
+- **What to push**: full-precision weights in checkpoint format, i.e. the trainer's HF names and shapes, unfused and unsharded. Do not quantize on the trainer side.
+    - The `nccl`, `ipc`, `nccl_m2n` and `sharded_rdt` backends run layerwise reloading in `start_weight_update`/`finish_weight_update`. Each layer is quantized when its last weight arrives and copied into the existing quantized storage, so CUDA graphs are not recaptured.
+    - `sparse_nccl` patches parameters in place without layerwise reloading, so it does not re-quantize.
+    - Without weight transfer, use `llm.collective_rpc("reload_weights", kwargs={"weights_iterator": ...})` with the default `is_checkpoint_format=True`. Over HTTP (dev mode), send `POST /collective_rpc` with `{"method": "reload_weights", "kwargs": {"weights_path": "<ckpt>"}}`.
+- **Which quantization methods support reload**:
+    - All online schemes above. They create weights on the meta device and quantize per layer. CI covers `fp8_per_tensor` (dense and MoE/MLA) and `mxfp8` (dense; MLA with `mxfp8` is a known failure).
+    - Pre-quantized checkpoints reloaded from same-format checkpoints, e.g. compressed-tensors FP8 block/dynamic, W4A16 and NVFP4A16, including FP8 `k_scale`/`v_scale`. Attention layers are processed in `finalize_layerwise_reload`.
+    - Not supported: methods that pad weights or load q/k/v into a single parameter at creation time, since reload assumes the loaded weight count matches the created count.
+- **Prefix cache is not reset**: `reload_weights` resets LoRA state and the encoder and multimodal caches, and `finish_weight_update` resets LoRA state only. Neither resets the KV prefix cache, so KV blocks computed with the old weights would be reused for matching prefixes.
+    - Pause with `/pause` in the default `abort` mode (or `wait`), which clears the caches.
+    - Or call `POST /reset_prefix_cache` (`llm.reset_prefix_cache()` offline) after the update. See [Async RL](async_rl.md).
+- **CPU offloading is unsupported**: layerwise reloading does not compose with `--cpu-offload-gb` / `--offload-backend`.
+
 ## Example Usages
 
 ### High Level Weight Transfer API
