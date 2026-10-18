@@ -18,6 +18,20 @@ The following open-source RL libraries use vLLM for fast rollouts (sorted alphab
 
 For weight synchronization between training and inference, see the [Weight Transfer](weight_transfer/README.md) documentation, which covers the pluggable backend system with [NCCL](weight_transfer/nccl.md) (multi-GPU) and [IPC](weight_transfer/ipc.md) (same-GPU) engines. To verify that an update landed on every rank, see the [Weight Checker](weight_checker.md).
 
+## Colocated training: sleep mode
+
+When the trainer and vLLM share GPUs, start vLLM with `--enable-sleep-mode` and free its GPU memory during training with [sleep mode](../features/sleep_mode.md). The HTTP endpoints below need `VLLM_SERVER_DEV_MODE=1`; offline, use `llm.sleep(level=2)` and `llm.wake_up(tags=[...])`.
+
+```bash
+curl -X POST 'http://localhost:8000/sleep?level=2'         # discard weights and KV cache
+# ... train ...
+curl -X POST 'http://localhost:8000/wake_up?tags=weights'  # reallocate weights only
+# ... send new weights (weight transfer update) or collective_rpc "reload_weights" ...
+curl -X POST 'http://localhost:8000/wake_up?tags=kv_cache'
+```
+
+Level 0 only pauses scheduling, level 1 offloads weights to CPU and discards the KV cache, level 2 discards both. `POST /release_kv_cache_memory` (after `sleep?level=0&mode=keep`) frees only the KV cache. To keep frozen parameters (for example a drafter, `draft.*`, or Engram tables) across level-2 sleep so the trainer need not resend them, use `--sleep-preserve-parameter-names`; see [retaining frozen weights](../features/sleep_mode.md#retaining-frozen-weights-during-rlhf-updates) for pattern semantics.
+
 For pipelining generation and training to improve GPU utilization and throughput, see the [Async Reinforcement Learning](async_rl.md) guide, which covers the pause/resume API for safely updating weights mid-flight.
 
 See the following notebooks showing how to use vLLM for GRPO:

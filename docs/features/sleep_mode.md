@@ -119,8 +119,22 @@ VLLM_SERVER_DEV_MODE=1 vllm serve Qwen/Qwen3.8-27B --enable-sleep-mode \
 vLLM selects all draft-private parameters internally; you do not need to list
 them individually. Use `draft.<name>` to select specific draft parameters.
 Parameters shared with the target are excluded from the draft selection, so
-target updates remain authoritative. An empty `draft.*` selection is valid.
-The Engram and draft patterns can be supplied together.
+target updates remain authoritative. The Engram and draft patterns can be
+supplied together.
+
+Pattern semantics:
+
+- Each pattern is a case-sensitive `fnmatch` glob (`*`, `?`, `[...]`) matched
+  against the full runtime name; `*` also matches `.`.
+- Draft-private parameters are named `draft.<name>`, where `<name>` comes from
+  the drafter's `named_parameters()`.
+- Patterns are only evaluated at level-2 sleep, on every worker; levels 0 and 1
+  ignore them. They are not validated at startup.
+- A pattern that matches no parameter raises
+  `ValueError: No parameter matches sleep retention: <pattern>`, and the sleep
+  call fails before any memory is freed. The only exception is the literal
+  `draft.*`, which may match nothing (no drafter, or every draft parameter is
+  shared with the target). `draft.<name>` with no match raises.
 
 #### Release only KV cache memory
 
