@@ -63,9 +63,17 @@ The key insight is that requests paused with `mode="keep"` will produce tokens f
 
 ## Weight Versions in Outputs
 
-To tell which tokens came from which weights, set a weight-version label while generation is paused, after the new weights are loaded: pass `weight_version` to `finish_weight_update`, or call `update_weight_version` (`POST /update_weight_version` over HTTP). Labels are strings you choose, such as the trainer step; vLLM doesn't order or check them.
+To tell which output tokens were sampled by which policy version when a request spans a weight update, label each set of weights and read the `weight_versions` spans from the output (`return_weight_versions: true` on the OpenAI-compatible endpoints).
 
-The final output of every sequence then carries `weight_versions`, one span per label over its output-token indexes. A request paused with `mode="keep"` across one update gets two spans:
+**Set the label** while generation is paused, after the new weights are loaded: pass `weight_version` to `finish_weight_update`, or call `update_weight_version`. Read the current label with `get_weight_version`. Labels are free-form strings you choose, such as the trainer step; vLLM doesn't order or check them. Before any label is set, the label is `"default"`, so tokens sampled by the initial weights get a `"default"` span.
+
+| Python (`AsyncLLM`) | HTTP (requires `VLLM_SERVER_DEV_MODE=1`) |
+| ------------------- | ---------------------------------------- |
+| `await engine.finish_weight_update(weight_version="step-8")` (ends a weight transfer) | `POST /finish_weight_update` `{"weight_version": "step-8"}` |
+| `await engine.update_weight_version("step-8")` | `POST /update_weight_version` `{"new_version": "step-8"}` |
+| `await engine.get_weight_version()` | `GET /weight_info` returns `{"weight_version": "step-8"}` |
+
+**Read the spans.** The final output of every sequence carries `weight_versions`: a list of `WeightVersionSpan(version, start, end)`, one per contiguous label, over half-open output-token index ranges `[start, end)`. Intermediate (streamed) outputs carry `None`. A request paused with `mode="keep"` across one update gets two spans, e.g. `[("default", 0, 12), ("step-8", 12, 40)]`:
 
 ```python
 completion = final_output.outputs[0]
@@ -76,7 +84,18 @@ for span in completion.weight_versions:
 
 The offsets cover the whole output, so with streamed delta outputs, collect the tokens before slicing. `/inference/v1/generate` returns the same list on each choice; see [Tokens In <> Tokens Out API](../serving/online_serving/token_in_token_out.md#weight-versions).
 
-`/v1/completions` and `/v1/chat/completions` return it on each choice when the request sets `return_weight_versions: true`. The offsets count the choice's output tokens, which `return_token_ids` returns as `token_ids`, and a streamed choice gets the list on its last chunk.
+`/v1/completions` and `/v1/chat/completions` return `weight_versions` on each choice **only** when the request sets `return_weight_versions: true` (default `false`). These two request fields do not need dev mode. The offsets count the choice's output tokens, which `return_token_ids` returns as `token_ids`:
+
+```bash
+curl http://localhost:8000/v1/completions -H "Content-Type: application/json" -d '{
+  "model": "my-model", "prompt": "Hello", "max_tokens": 64,
+  "return_token_ids": true, "return_weight_versions": true
+}'
+# choices[0].weight_versions: [{"version": "default", "start": 0, "end": 12},
+#                              {"version": "step-8", "start": 12, "end": 64}]
+```
+
+When streaming, only each choice's last chunk includes `weight_versions`. Beam search (`use_beam_search`) does not return it.
 
 An aborted request returns spans over its partial output. If you resubmit that output as part of a new prompt, the new request's spans start again at 0, so shift them by the number of tokens already generated before joining the two lists.
 
