@@ -3,6 +3,9 @@
 """Call a token-in/token-out server started with:
 
 vllm serve Qwen/Qwen3-0.6B --enable-scale-out
+
+Request and response fields, `--tokens-only` and the `X-data-parallel-rank`
+header are documented in docs/serving/online_serving/token_in_token_out.md.
 """
 
 import httpx
