@@ -153,6 +153,7 @@ When running vLLM as an HTTP server, the following endpoints are available for w
 | `/start_weight_update` | POST | Start a weight update |
 | `/update_weights` | POST | Transfer a batch of weights with backend-specific metadata |
 | `/finish_weight_update` | POST | Finish the update and optionally commit its `weight_version` |
+| `/start_draft_weight_update` | POST | Start an update of the speculative draft model instead of the target; see [draft updates](base.md#draft-speculative-model-weight-updates) |
 | `/update_weight_version` | POST | Update `weight_version` without changing model weights |
 | `/weight_info` | GET | Get the latest committed weight version |
 | `/pause` | POST | Pause generation before weight sync to handle inflight requests |

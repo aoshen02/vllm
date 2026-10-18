@@ -476,7 +476,7 @@ The base class provides:
 1. `__init__`, taking `config` (`WeightTransferConfig`), `vllm_config` (`VllmConfig`), `device` (`torch.device`), and `model` (`nn.Module`).
 2. `update_weights(update_info_dict)`, a thin wrapper for `receive_weights`: it parses the dict into the typed dataclass, calls `receive_weights`, and synchronizes the device — unless the engine sets `defers_processing`, below.
 3. `parse_init_info` / `parse_update_info`, which convert API-level dicts into the typed dataclasses and raise `ValueError` on a bad payload.
-4. `set_weight_update_target` / `reset_weight_update_target`, used to retarget an update at the speculative draft model.
+4. `set_weight_update_target` / `reset_weight_update_target`, used to retarget an update at the speculative draft model ([Draft updates](#draft-speculative-model-weight-updates)).
 
 !!! note "Read wire params from the handshake, not the payload"
     Anything the two sides must agree on — `packed`, buffer geometry — arrives
@@ -528,10 +528,8 @@ update_request = WeightTransferUpdateRequest(
 Using a built-in client, you never construct these by hand — `RayVLLMWeightSyncClient`
 wraps the dicts for you, and `HTTPVLLMWeightSyncClient` posts them as JSON.
 
-At the LLM/API layer, call `start_draft_weight_update()` instead of
-`start_weight_update()` to target the speculative draft model;
-`update_weights` / `finish_weight_update` are unchanged. Engines that cannot
-support this set `supports_draft_weight_update = False`.
+To update the speculative draft model instead of the target, see
+[Draft (speculative) model weight updates](#draft-speculative-model-weight-updates).
 
 ### Implementing a Custom Engine
 
@@ -634,3 +632,92 @@ engine = WeightTransferEngineFactory.create_engine(
 
 vLLM calls this for you during worker startup; you only need it directly when
 embedding the engine in your own worker.
+
+## Draft (speculative) model weight updates
+
+To push trained weights into the **speculative decoding drafter** (EAGLE, MTP,
+draft model, ...) and not only the target model, open the session with
+`start_draft_weight_update()` instead of `start_weight_update()`.
+`update_weights` and `finish_weight_update` are unchanged; every chunk sent in
+that session loads into the draft model (through its `load_weights`, so send
+the drafter's own parameter names). Target and draft are updated in separate
+sessions, one after the other.
+
+| Entry point | Call |
+| ----------- | ---- |
+| HTTP (`VLLM_SERVER_DEV_MODE=1`) | `POST /start_draft_weight_update` |
+| Offline / Ray actor | `LLM.start_draft_weight_update()`, `AsyncLLM.start_draft_weight_update()` |
+| Rust gRPC `Control` | `StartDraftWeightUpdate` |
+
+### Backend support
+
+| Backend | Draft updates |
+| ------- | ------------- |
+| `nccl`, `ipc` | Yes |
+| `sparse_nccl`, `nccl_m2n`, `sharded_rdt` | No: `supports_draft_weight_update = False`, the start call raises `RuntimeError` |
+| `modelexpress` | Decided by the external ModelExpress engine |
+
+Custom engines inherit `supports_draft_weight_update = True`; set it to
+`False` if `receive_weights` cannot load into a model other than the target.
+
+### Requirements and capability check
+
+- A weight-transfer backend (`--weight-transfer-config`) and a model-based
+  speculative method, so a draft model and `speculative_config.draft_model_config`
+  exist. N-gram and suffix decoding have no draft weights. Otherwise the start
+  call raises `RuntimeError: Draft model weight update requested, but no draft
+  model is configured.`
+- gRPC: `GetServerInfo` reports `rl_capabilities.draft_weight_updates_enabled`
+  (true only if every engine has a supporting backend and a draft model).
+  `StartDraftWeightUpdate` returns `FAILED_PRECONDITION` when it is false.
+- Only one session at a time: start the draft session after the target
+  session's `finish_weight_update`.
+
+### Behavior
+
+- If the drafter uses `draft_lm_head_quantization`, the session loads through
+  the unquantized source `lm_head` and re-derives the quantized copy at finish.
+- A draft session does not reset LoRA state (target sessions do).
+- The [weight checker](../weight_checker.md) (`/weight_checker`) hashes the
+  target model only; draft parameters are not checked.
+
+### Example
+
+The built-in clients only open target sessions. Over HTTP, override
+`start_weight_update` and reuse the same trainer engine (one NCCL group).
+`send_weights()` reads `engine.client` and `engine.source` on each call; swap
+them on every trainer rank:
+
+```python
+from vllm.distributed.weight_transfer import (
+    HTTPVLLMWeightSyncClient,
+    ModuleSource,
+    WeightTransferTrainerFactory,
+)
+
+
+class DraftSyncClient(HTTPVLLMWeightSyncClient):
+    def start_weight_update(self) -> None:
+        self._post("start_draft_weight_update")
+
+
+target_client = HTTPVLLMWeightSyncClient(url)
+draft_client = DraftSyncClient(url)
+engine = WeightTransferTrainerFactory.trainer_init(
+    init_info=init_info, client=target_client, source=ModuleSource(policy)
+)
+
+engine.send_weights()  # target model
+
+engine.client, engine.source = draft_client, ModuleSource(drafter)
+engine.send_weights()  # draft model
+engine.client, engine.source = target_client, ModuleSource(policy)
+```
+
+Offline, call the phases directly:
+
+```python
+llm.start_draft_weight_update()
+llm.update_weights({"update_info": update_info})  # backend-specific, as usual
+llm.finish_weight_update()
+```
