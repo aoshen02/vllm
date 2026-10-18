@@ -134,6 +134,56 @@ completion = client.chat.completions.create(
 )
 ```
 
+## Returning token IDs (`return_token_ids`)
+
+Set `return_token_ids: true` on `/v1/chat/completions` or `/v1/completions` to get back the exact prompt and output token IDs the engine used. RL and agentic rollouts can train on these IDs directly instead of retokenizing the text, which can drift from what the model saw (chat template, special tokens, non-unique tokenizations). No server flag is needed.
+
+```python
+completion = client.chat.completions.create(
+    model="NousResearch/Meta-Llama-3-8B-Instruct",
+    messages=[{"role": "user", "content": "Hello!"}],
+    extra_body={"return_token_ids": True},
+)
+prompt_ids = completion.model_extra["prompt_token_ids"]
+output_ids = completion.choices[0].model_extra["token_ids"]
+```
+
+Where the IDs appear:
+
+| API | Prompt IDs (after chat templating) | Output IDs |
+| --- | --- | --- |
+| `/v1/chat/completions` | top-level `prompt_token_ids` | `choices[i].token_ids` |
+| `/v1/completions` | `choices[i].prompt_token_ids` | `choices[i].token_ids` |
+
+- **Streaming:** `prompt_token_ids` is sent only once: in the first chunk (Chat Completions) or the first chunk of each choice (Completions). Each chunk's `choices[i].token_ids` holds only the new tokens, so concatenate them. Chat Completions still emits a chunk when a token produces no text delta, so no IDs are lost.
+- `token_ids` holds output tokens only, also with `echo: true`.
+- Add `return_prompt_text: true` (Chat Completions) to also get the rendered prompt string as `prompt_text`.
+- Each multi-turn request is re-templated from `messages`, so the `prompt_token_ids` of turn N+1 are not guaranteed to equal turn N's prompt plus output IDs. Use the returned IDs as the ground truth, or send token IDs directly with [`/inference/v1/generate`](token_in_token_out.md).
+- **`include_reasoning: false` drops the IDs.** When the server has a reasoning or tool-call parser and the request sets `include_reasoning: false`, Chat Completions omits `choices[i].token_ids` and logprobs (streaming and non-streaming), so hidden reasoning tokens don't leak. `prompt_token_ids` is still returned. Keep the default `include_reasoning: true` for rollouts.
+- With `return_weight_versions: true`, each choice also gets `weight_versions` spans over these output token indexes; see [Weight Versions in Outputs](../../training/async_rl.md#weight-versions-in-outputs).
+
+!!! note
+    `return_tokens_as_token_ids` (request field) and `--return-tokens-as-token-ids` (server flag) are different features. They only change the `token` strings inside `logprobs` to the form `token_id:<id>`, and only when logprobs are requested. They don't add `prompt_token_ids` or `token_ids`.
+
+### Responses API
+
+`/v1/responses` has no `return_token_ids` field. Set `enable_response_messages: true` instead; the response then carries `input_messages` and `output_messages`.
+
+```python
+response = client.responses.create(
+    model="Qwen/Qwen3-8B",
+    input="Hello!",
+    extra_body={"enable_response_messages": True},
+)
+prompt_ids = response.model_extra["input_messages"][0]["tokens"]
+output_ids = response.model_extra["output_messages"][0]["tokens"]
+```
+
+- For non-Harmony models, each entry is `{"type": "raw_message_tokens", "message": <text>, "tokens": [<ids>]}`. If `message` and `tokens` disagree, `tokens` is the source of truth. `input_messages[0].tokens` is the rendered prompt and `output_messages` holds the generated tokens, accumulated into one entry when streaming (they arrive on the final `response.completed` or `response.incomplete` event).
+- For Harmony models (gpt-oss), `input_messages` and `output_messages` are Harmony message objects (role and content), not token ID lists. Use Chat Completions with `return_token_ids` if you need the raw IDs.
+- `enable_response_messages` is documented as supported for non-background requests only (`background: false`, the default).
+- `return_tokens_as_token_ids` has no per-request field here; only the server flag `--return-tokens-as-token-ids` applies to Responses logprobs (with `include: ["message.output_text.logprobs"]`).
+
 ## API Reference
 
 ### Completions API
