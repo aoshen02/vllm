@@ -164,6 +164,37 @@ When running vLLM as an HTTP server, the following endpoints are available for w
 
 The Rust frontend's optional gRPC `Control` service exposes the same pause, sleep, weight-transfer, and weight-version lifecycle for trusted sidecars. The `ServerInfo.rl_capabilities` response reports whether weight transfer and sleep mode were configured. Backend-specific `init_info` and `update_info` remain JSON metadata; model tensors continue to move over the configured NCCL, IPC, sparse-NCCL, or sharded-RDT transport.
 
+## Monitoring
+
+The HTTP weight-transfer endpoints export Prometheus metrics on `/metrics`:
+
+| Metric | Type | Labels |
+| ------ | ---- | ------ |
+| `vllm:rl_weight_update_operation_duration_seconds` | Histogram (buckets 0.01, 0.1, 1, 10, 30, 60, 120, 300, 600 s) | `operation` |
+| `vllm:rl_weight_update_operations_in_flight` | Gauge (`livesum` across API-server processes) | `operation` |
+
+`operation` maps to the endpoint: `init` (`/init_weight_transfer_engine`),
+`shutdown` (`/shutdown_weight_transfer_engine`), `start` (`/start_weight_update`),
+`start_draft` (`/start_draft_weight_update`), `update` (`/update_weights`),
+`finish` (`/finish_weight_update`).
+
+- The duration is measured in the API server around the awaited engine call. It
+  is observed for failed calls too; there is no success label.
+- Not recorded: `/update_weight_version`, `/weight_info`, `/pause`, `/resume`, and
+  offline `LLM` calls. A malformed body (for example `/update_weights` without
+  `update_info`) returns HTTP 400 before the engine is called and is not recorded.
+- The Rust frontend exports the same two metric names.
+
+```promql
+# p95 duration of one update_weights call
+histogram_quantile(0.95, sum by (le) (rate(vllm:rl_weight_update_operation_duration_seconds_bucket{operation="update"}[5m])))
+# a weight update is in progress
+sum(vllm:rl_weight_update_operations_in_flight) > 0
+```
+
+For sleep/wake timing and `vllm:engine_sleep_state`, see
+[Sleep Mode: Monitoring](../../features/sleep_mode.md#monitoring).
+
 ## Extending the System
 
 Every piece of the system is replaceable: the weights you send (`WeightSource`),

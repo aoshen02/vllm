@@ -87,6 +87,23 @@ These metrics are available via `--enable-mfu-metrics`:
 
 --8<-- "gen:metrics-mfu"
 
+## RL Weight Update Metrics
+
+These metrics time the HTTP weight-transfer endpoints (`VLLM_SERVER_DEV_MODE=1`).
+The `operation` label is one of `init`, `shutdown`, `start`, `start_draft`,
+`update`, `finish`. See [Weight Transfer: Monitoring](../training/weight_transfer/README.md#monitoring).
+
+--8<-- "gen:metrics-rl-weight-update"
+
+## Sleep Mode Metrics
+
+These metrics time the HTTP sleep-mode endpoints (`VLLM_SERVER_DEV_MODE=1`).
+The `operation` label is one of `sleep`, `release_kv_cache_memory`, `wake`.
+Whether the engine is asleep is reported by `vllm:engine_sleep_state` under
+[General Metrics](#general-metrics). See [Sleep Mode: Monitoring](../features/sleep_mode.md#monitoring).
+
+--8<-- "gen:metrics-sleep-mode"
+
 ## Custom Histogram Buckets
 
 The core engine histograms ship with default bucket boundaries tuned for
