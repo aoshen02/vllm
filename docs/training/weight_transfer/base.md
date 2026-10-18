@@ -595,12 +595,14 @@ class MyWeightTransferEngine(WeightTransferEngine[MyInitInfo, MyUpdateInfo]):
         ...
 ```
 
-#### 3. Register with the Factory
+#### 3. Register the Backend in Every Worker Process
+
+A custom (out-of-tree) weight transfer backend, such as an in-house RDMA or object-store transport, needs no vLLM fork. Register it with `WeightTransferEngineFactory.register_engine`:
 
 ```python
 from vllm.distributed.weight_transfer import WeightTransferEngineFactory
 
-# Option 1: Lazy loading (recommended for built-in engines)
+# Option 1: Lazy loading: the module is imported only when the backend is selected
 WeightTransferEngineFactory.register_engine(
     "my_backend",
     "my_package.my_module",
@@ -614,11 +616,42 @@ WeightTransferEngineFactory.register_engine(
 )
 ```
 
-Once registered, users select your backend via `WeightTransferConfig(backend="my_backend")`.
+The registry is per process, and the engine is created inside each worker (`Worker.load_model()`), so the registration must run in **every worker process**. Calling `register_engine` in your trainer or driver script does not reach workers that run in separate processes (multiprocessing or Ray). Ship the registration as a [`vllm.general_plugins`](../../design/plugin_system.md) entry point; vLLM loads that group in every process, and workers load it in `init_worker()` before the model and engine are built:
+
+```toml
+# pyproject.toml of your package
+[project.entry-points."vllm.general_plugins"]
+my_weight_transfer = "my_package.vllm_plugin:register"
+```
+
+```python
+# my_package/vllm_plugin.py
+def register() -> None:
+    from vllm.distributed.weight_transfer import WeightTransferEngineFactory
+
+    try:
+        WeightTransferEngineFactory.register_engine(
+            "my_backend", "my_package.my_module", "MyWeightTransferEngine"
+        )
+    except ValueError:
+        pass  # already registered in this process
+```
+
+- **Idempotency**: registering a name twice raises `ValueError: Weight transfer engine 'my_backend' is already registered.` Plugins can run more than once and in several processes, so make `register()` tolerate an existing entry. Built-in names cannot be reused.
+- **`VLLM_PLUGINS`**: if set, it is a comma-separated allowlist of entry-point names (`my_weight_transfer` above); a plugin not in the list is skipped in every process. If unset, all plugins load.
+- Install the package in every environment that runs a worker (for example, all Ray nodes).
+
+Select the backend with `WeightTransferConfig(backend="my_backend")`, `LLM(..., weight_transfer_config={"backend": "my_backend"})`, or `vllm serve ... --weight-transfer-config '{"backend": "my_backend"}'`. `backend` accepts any string; it is checked against the registry only when the worker creates the engine, not when the config is parsed. If the name is not registered in that worker, startup fails with:
+
+```text
+ValueError: Invalid weight transfer backend: my_backend. Available engines: ['nccl', 'ipc', 'sparse_nccl', 'sharded_rdt', 'nccl_m2n', 'modelexpress']
+```
+
+The trainer side has a separate registry, [`WeightTransferTrainerFactory`](#weighttransfertrainerfactory); register your trainer engine there in the trainer process.
 
 ### WeightTransferEngineFactory
 
-The factory uses a registry pattern with lazy loading. Built-in engines (`nccl`, `ipc`, `sparse_nccl` and `sharded_rdt`) are registered at import time but their modules are only loaded when the backend is actually requested. This avoids importing heavy dependencies (like NCCL communicators) when they aren't needed.
+The factory uses a registry pattern with lazy loading. Built-in engines (`nccl`, `ipc`, `sparse_nccl`, `sharded_rdt`, `nccl_m2n` and `modelexpress`) are registered at import time but their modules are only loaded when the backend is actually requested. This avoids importing heavy dependencies (like NCCL communicators) when they aren't needed. `modelexpress` re-exports the engine maintained in the external ModelExpress package, which must be installed. The trainer registry has the same built-ins except `modelexpress`.
 
 ```python
 from vllm.distributed.weight_transfer import WeightTransferEngineFactory
