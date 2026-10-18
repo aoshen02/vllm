@@ -631,7 +631,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
         case_sensitive=False,
     ),
     # Enable batch-invariant mode: deterministic results regardless of
-    # batch composition. Requires NVIDIA GPU with compute capability >= 9.0.
+    # batch composition. Requires NVIDIA GPU with compute capability >= 8.0,
+    # AMD Instinct (gfx90a/gfx942/gfx950), or Intel XPU with Triton.
     "VLLM_BATCH_INVARIANT": lambda: bool(int(os.getenv("VLLM_BATCH_INVARIANT", "0"))),
     "VLLM_REPLICATE_EMBED": lambda: (
         os.getenv("VLLM_REPLICATE_EMBED", "0").strip().lower() in ("1", "true")
