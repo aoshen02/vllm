@@ -82,4 +82,4 @@ An aborted request returns spans over its partial output. If you resubmit that o
 
 ## Example
 
-The [async RLHF example](../../examples/rl/rlhf_async_new_apis.py) demonstrates this pattern with `vllm.AsyncLLMEngine`, NCCL weight transfer, and mid-flight pause/resume with validation.
+The [async RLHF example](../../examples/rl/rlhf_async_new_apis.py) demonstrates this pattern with `vllm.AsyncLLMEngine`, NCCL weight transfer, and mid-flight pause/resume with validation. It runs with `VLLM_BATCH_INVARIANT=1`, and its trainer calls `init_batch_invariance()`; see [Batch Invariance for RL](../features/batch_invariance.md#rl-bitwise-train-inference-consistency-trainer-side).
