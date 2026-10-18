@@ -8,7 +8,7 @@ data plane.
   * NCCL for the weight data plane
 
 3-GPU layout (single node):
-  Inference — GPUs 0-1, `vllm serve` with TP=2 and fp8 quantization
+  Inference — GPUs 0-1, `vllm serve` with TP=2 and `--quantization fp8_per_tensor`
   Training  — GPU 2, a bf16 Hugging Face model in this process
               (the server quantizes to fp8 as it loads)
 
@@ -69,7 +69,7 @@ def start_vllm_server() -> subprocess.Popen:
         "--device-ids",
         SERVER_DEVICE_IDS,
         "--quantization",
-        "fp8",
+        "fp8_per_tensor",
         "--enforce-eager",
         "--load-format",
         "dummy",

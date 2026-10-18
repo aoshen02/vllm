@@ -54,6 +54,21 @@ class Fp8PerTensorOnlineLinearMethod(LinearMethodBase):
         layer._already_called_process_weights_after_loading = True
 ```
 
+### Quantized Rollouts: bf16 Trainer, FP8 vLLM (QeRL)
+
+To train in bf16 and roll out in FP8, start vLLM from the **bf16 checkpoint** with `--quantization fp8_per_tensor` (or another online scheme, see [Online Quantization](../features/quantization/online.md)) and push bf16 weights each step. vLLM re-quantizes each layer in place. On a bf16 checkpoint, `fp8` is a deprecated alias of `fp8_per_tensor`.
+
+```bash
+VLLM_SERVER_DEV_MODE=1 vllm serve <bf16-model> \
+    --quantization fp8_per_tensor \
+    --weight-transfer-config '{"backend": "nccl"}'
+```
+
+- **Push** full-precision weights in checkpoint format (HF names, unfused, unsharded). The weight transfer engine re-quantizes in `start_weight_update`/`finish_weight_update`. Full example: [rlhf_http_nccl.py](../../examples/rl/rlhf_http_nccl.py).
+- **Without weight transfer**: `llm.collective_rpc("reload_weights", kwargs={"weights_iterator": ...})`, or `POST /collective_rpc` with `{"method": "reload_weights", "kwargs": {"weights_path": "<ckpt>"}}` (dev mode). Keep the default `is_checkpoint_format=True`; `False` copies tensors as-is and does not re-quantize.
+- **Prefix cache is not reset** by reload (it resets LoRA, encoder and MM caches only). Pause in the default `abort` mode or call `POST /reset_prefix_cache` after the update. See [Async RL](async_rl.md).
+- **Not supported**: the `sparse_nccl` backend (no re-quantization), CPU offloading, and quant methods that pad weights or fuse q/k/v at creation.
+
 ## Example Usages
 
 ### High Level Weight Transfer API
