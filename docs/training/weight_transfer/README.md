@@ -27,6 +27,8 @@ engine drives on your behalf:
 3. **Weight Update** (`update_weights`): transfers updated weights. May be called one or more times (e.g. for chunked transfers).
 4. **Finish** (`finish_weight_update`): finalizes the update (e.g. runs post-processing for checkpoint-format weights). Called once after all weights have been transferred.
 
+The worker enforces this order: `update_weights` without `start_weight_update`, a second start, or `finish_weight_update` without start raises `RuntimeError`, and a failed `update_weights` ends the session with no rollback. See [Session rules and failures](base.md#session-rules-and-failures).
+
 ## Available Backends
 
 | Backend | Transport | Use Case |
