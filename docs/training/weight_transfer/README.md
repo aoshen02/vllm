@@ -162,7 +162,9 @@ When running vLLM as an HTTP server, the following endpoints are available for w
 !!! note
     The HTTP weight transfer endpoints require `VLLM_SERVER_DEV_MODE=1` to be set.
 
-The Rust frontend's optional gRPC `Control` service exposes the same pause, sleep, weight-transfer, and weight-version lifecycle for trusted sidecars. The `ServerInfo.rl_capabilities` response reports whether weight transfer and sleep mode were configured. Backend-specific `init_info` and `update_info` remain JSON metadata; model tensors continue to move over the configured NCCL, IPC, sparse-NCCL, or sharded-RDT transport.
+### gRPC (Rust frontend)
+
+With `VLLM_USE_RUST_FRONTEND=1 vllm serve ... --grpc-port 50051`, the `vllm.Control` gRPC service exposes the same pause, sleep, weight-transfer, and weight-version lifecycle (`InitWeightTransferEngine`, `StartWeightUpdate`, `UpdateWeights`, `FinishWeightUpdate`, ...) without `VLLM_SERVER_DEV_MODE`. `GetServerInfo.rl_capabilities` reports whether weight transfer and sleep mode are configured. `init_info` and `update_info` are sent as JSON bytes; tensors still move over the configured backend. There is no shutdown-weight-transfer RPC. See [gRPC Control API for RL](../grpc_control.md) for the RPC list, payloads, error codes, and a client example.
 
 ## Extending the System
 
