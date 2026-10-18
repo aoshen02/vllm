@@ -334,7 +334,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
 
         # GLM-5.3-Flash uses a bounded sigmoid gate instead of the default
         # unbounded softplus gate.
-        self.kda_safe_gate = True
+        self.kda_safe_gate = config.linear_lower_bound is not None
         self.kda_lower_bound = config.linear_lower_bound
         # Process-global conv-state layout, resolved once here instead of on
         # every _forward call (it reads an env-derived flag each time).

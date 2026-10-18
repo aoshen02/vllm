@@ -14,9 +14,15 @@ import torch
 from vllm.platforms import current_platform
 
 if current_platform.is_rocm():
-    from vllm.models.glm5next.amd.ops.third_party.kda import fused_recurrent_kda
+    from vllm.models.glm5next.amd.ops.third_party.kda import (
+        chunk_kda_with_fused_gate,
+        fused_recurrent_kda,
+    )
 else:
-    from vllm.models.glm5next.nvidia.ops.third_party.kda import fused_recurrent_kda
+    from vllm.models.glm5next.nvidia.ops.third_party.kda import (
+        chunk_kda_with_fused_gate,
+        fused_recurrent_kda,
+    )
 
 pytestmark = pytest.mark.skipif(
     not current_platform.is_cuda_alike(), reason="Requires CUDA or ROCm"
@@ -35,6 +41,7 @@ def naive_recurrent_kda(
     a_log: torch.Tensor,
     g_bias: torch.Tensor,
     state: torch.Tensor,
+    lower_bound: float | None = LOWER_BOUND,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """fp32 reference for one sequence: ``[T, H, D]`` inputs, ``[H, D, D]``
     (v-major) state; mirrors the kernel's in-kernel gate, beta sigmoid and
@@ -43,7 +50,12 @@ def naive_recurrent_kda(
     q, k, v, raw_g, raw_beta = (x.float() for x in (q, k, v, raw_g, raw_beta))
     q = q / torch.sqrt(q.square().sum(-1, keepdim=True) + 1e-6) * D**-0.5
     k = k / torch.sqrt(k.square().sum(-1, keepdim=True) + 1e-6)
-    gate = LOWER_BOUND * torch.sigmoid(a_log.exp()[:, None] * (raw_g + g_bias))
+    gate_input = raw_g + g_bias
+    gate = (
+        -a_log.exp()[:, None] * torch.nn.functional.softplus(gate_input)
+        if lower_bound is None
+        else lower_bound * torch.sigmoid(a_log.exp()[:, None] * gate_input)
+    )
     beta = torch.sigmoid(raw_beta)
     s = state.clone()
     out = torch.empty_like(v)
@@ -93,14 +105,16 @@ def make_inputs(num_seqs: int, query_len: int, device: torch.device):
     return inputs, state
 
 
-def run_kernel(inputs: dict, state: torch.Tensor) -> torch.Tensor:
+def run_kernel(
+    inputs: dict, state: torch.Tensor, lower_bound: float | None = LOWER_BOUND
+) -> torch.Tensor:
     out, _ = fused_recurrent_kda(
         **inputs,
         initial_state=state,
         use_qk_l2norm_in_kernel=True,
         sigmoid_beta=True,
         compute_gate=True,
-        lower_bound=LOWER_BOUND,
+        lower_bound=lower_bound,
     )
     return out
 
@@ -108,13 +122,16 @@ def run_kernel(inputs: dict, state: torch.Tensor) -> torch.Tensor:
 @pytest.mark.parametrize(
     ("num_seqs", "query_len"), [(1, 1), (7, 1), (3, 3)], ids=["1x1", "7x1", "3x3"]
 )
+@pytest.mark.parametrize("lower_bound", [-5.0, None])
 @torch.inference_mode()
-def test_fused_recurrent_kda_matches_reference(num_seqs: int, query_len: int):
+def test_fused_recurrent_kda_matches_reference(
+    num_seqs: int, query_len: int, lower_bound: float | None
+):
     torch.manual_seed(0)
     device = torch.device("cuda")
     inputs, state = make_inputs(num_seqs, query_len, device)
     expected_state = state.clone()
-    out = run_kernel(inputs, state)
+    out = run_kernel(inputs, state, lower_bound)
 
     indices = inputs["ssm_state_indices"].view(num_seqs, query_len)
     accepted = inputs.get("num_accepted_tokens")
@@ -133,12 +150,56 @@ def test_fused_recurrent_kda_matches_reference(num_seqs: int, query_len: int):
                 inputs["a_log"],
                 inputs["g_bias"].view(H, D),
                 s,
+                lower_bound,
             )
             expected_state[indices[n, t]] = s
 
     torch.testing.assert_close(out[0].float(), expected, rtol=1e-2, atol=1e-3)
     used = indices.flatten().long()
     torch.testing.assert_close(state[used], expected_state[used], rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("query_len", [17, 129])
+@pytest.mark.parametrize("lower_bound", [-5.0, None])
+@torch.inference_mode()
+def test_chunk_kda_gate_matches_reference(query_len, lower_bound):
+    torch.manual_seed(0)
+    inputs, storage = make_inputs(2, query_len, torch.device("cuda"))
+    initial_state = storage[:2].clone()
+    output, state = chunk_kda_with_fused_gate(
+        q=inputs["q"],
+        k=inputs["k"],
+        v=inputs["v"],
+        raw_g=inputs["g"],
+        beta=inputs["beta"].float().sigmoid(),
+        A_log=inputs["a_log"],
+        g_bias=inputs["g_bias"],
+        initial_state=initial_state,
+        output_final_state=True,
+        use_qk_l2norm_in_kernel=True,
+        cu_seqlens=inputs["cu_seqlens"],
+        safe_gate=lower_bound is not None,
+        lower_bound=lower_bound,
+    )
+    for sequence in range(2):
+        tokens = slice(sequence * query_len, (sequence + 1) * query_len)
+        expected, expected_state = naive_recurrent_kda(
+            inputs["q"][0, tokens],
+            inputs["k"][0, tokens],
+            inputs["v"][0, tokens],
+            inputs["g"][0, tokens],
+            inputs["beta"][0, tokens],
+            inputs["a_log"],
+            inputs["g_bias"].view(H, D),
+            initial_state[sequence],
+            lower_bound,
+        )
+        torch.testing.assert_close(
+            output[0, tokens].float(), expected, rtol=1e-2, atol=1e-3
+        )
+        torch.testing.assert_close(
+            state[sequence], expected_state, rtol=3e-2, atol=3e-3
+        )
 
 
 @pytest.mark.parametrize(
