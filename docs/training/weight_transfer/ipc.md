@@ -110,6 +110,10 @@ mode carries a per-chunk barrier across ranks: without it, a rank could overwrit
 its buffer while its colocated worker is still reading the current chunk. This is
 handled inside `send_weights()`.
 
+## Freeing GPU Memory Between Updates
+
+To give the colocated trainer vLLM's GPU memory, put vLLM to sleep (`--enable-sleep-mode`, `POST /sleep?level=2`), then `wake_up?tags=weights` before the IPC update and `wake_up?tags=kv_cache` after it. Frozen parameters such as a drafter can be kept across level-2 sleep with `--sleep-preserve-parameter-names 'draft.*'`. See [Sleep Mode](../../features/sleep_mode.md).
+
 ## Rank-Local Updates
 
 For different parameter subsets per worker, `update_info` may be a list indexed
