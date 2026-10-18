@@ -16,7 +16,7 @@ The backend imports the runtime lazily, so vLLM is unaffected unless you select 
 
 ## How It Works
 
-1. A `StatelessProcessGroup` exchanges metadata and the NCCL unique ID. The trainer ranks and all inference workers then create **one** `nccl.core.Communicator`: trainer ranks occupy `[0, T)` and workers `[T, T + N)`. The communicator is passed directly to each M2N collective.
+1. A `StatelessProcessGroup` exchanges metadata and the NCCL unique ID. The trainer ranks and all inference workers then create **one** `nccl.core.Communicator`: trainer ranks occupy `[0, T)` and workers `[T, T + N)`. The communicator is passed directly to each M2N collective. `nccl_unique_id_b64` on `M2NWeightTransferInitInfo` only replaces the data-plane ID; `master_address` / `master_port` stay required for the metadata group, so this backend always needs a TCP port. A trainer that cannot expose one should use the dense NCCL engine's [`nccl_unique_id_b64` rendezvous](nccl.md#torch-free-trainers-jax-no-tcp-rendezvous-nccl_unique_id_b64).
 2. At the init handshake the trainer ships the full transfer plan: the session-wide destination mesh, then each parameter's name, dtype, shape, source mesh, and source placements. The workers resolve the matching **destination placements** and publish them over the data-plane communicator; the meshes themselves are declared, not negotiated.
 3. Each round, both sides issue one `reshard` per parameter in the same order. Every rank in the communicator participates in every reshard, so — as with the NCCL engine — the worker must be inside `update_weights` while the trainer sends. The trainer engine handles that concurrency itself.
 
