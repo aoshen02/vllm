@@ -643,23 +643,19 @@ class ShardedRDTWeightTransferEngine(
         return self.parallel_config.world_size_across_dp
 
     def start_weight_update(self) -> None:
-        """Put the model's params on meta so layerwise reload streams them in
-        as each layer's slices land. Baked replay uses checkpoint format."""
-        from vllm.model_executor.model_loader.reload import (
-            initialize_layerwise_reload,
-        )
+        """Open a reload session so each layer is processed as its slices land.
+        Baked replay uses checkpoint format."""
+        from vllm.model_executor.model_loader.reload import start_reload
 
-        initialize_layerwise_reload(self.model)
+        start_reload(self.model)
 
     def finish_weight_update(self) -> None:
         """Drain the deferred pull/process pipeline (so every layer is fully
-        loaded) before finalizing the layerwise reload."""
-        from vllm.model_executor.model_loader.reload import (
-            finalize_layerwise_reload,
-        )
+        loaded) before closing the reload session."""
+        from vllm.model_executor.model_loader.reload import finish_reload
 
         self.drain_pending()
-        finalize_layerwise_reload(self.model, self.model_config)
+        finish_reload(self.model, self.model_config)
 
     def update_weights(self, update_info: dict[str, Any]) -> None:
         """Receive one update. Unlike the base, does NOT issue a per-update
