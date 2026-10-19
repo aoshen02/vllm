@@ -481,6 +481,8 @@ def convert_to_nvfp4_moe_kernel_format(
         # Move the E2M1 lookup table to the device now, because
         # `.to(device)` is not allowed during CUDA graph capture.
         kE2M1ToFloat_handle.val = kE2M1ToFloat_handle.val.to(w13.device)
+        # Held by the layer too, so the shared table is a registered buffer.
+        layer.e2m1_lut = kE2M1ToFloat_handle.val
 
         if a13_scale is None or a2_scale is None:
             raise ValueError(
