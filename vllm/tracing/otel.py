@@ -240,6 +240,7 @@ def start_request_span_otel(
         (span, trace_headers): The active span object and a dict of W3C
         trace headers (e.g. {'traceparent': ...}) representing this span's
         context for propagation to downstream workers/subsystems.
+
     """
     if not _IS_OTEL_AVAILABLE:
         return None, None

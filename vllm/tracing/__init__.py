@@ -168,6 +168,7 @@ def start_request_span(
         attributes: Optional dict of span attributes.
         context: Optional trace context (e.g., from extract_trace_context).
         kind: Optional SpanKind (e.g., SpanKind.SERVER).
+
     """
     is_available, _, _, _, _, start_span_fn = _REGISTERED_TRACING_BACKENDS["otel"]
     if is_available():

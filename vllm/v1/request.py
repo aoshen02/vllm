@@ -381,6 +381,8 @@ class Request:
     ) -> None:
         """Helper to manually emit an OTel trace span linked to this request's
         context."""
+        if not self.trace_headers:
+            return
         from vllm.tracing import extract_trace_context, instrument_manual
 
         trace_context = (

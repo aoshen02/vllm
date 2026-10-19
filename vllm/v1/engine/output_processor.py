@@ -637,6 +637,8 @@ class OutputProcessor:
         for request_id in internal_req_ids:
             req_state = self.request_states.pop(request_id, None)
             if req_state is not None:
+                if req_state.trace_span is not None:
+                    req_state.trace_span.end()
                 self.lora_states.request_finished(request_id, req_state.lora_name)
                 request_ids_to_abort.append(request_id)
                 # Produce final abort output.
@@ -690,7 +692,7 @@ class OutputProcessor:
             stream_interval=self.stream_interval,
         )
 
-        if is_tracing_available():
+        if self.tracing_enabled and is_tracing_available():
             arrival_time_ns = int(request.arrival_time * 1e9)
             trace_context = extract_trace_context(request.trace_headers)
             span, updated_headers = start_request_span(
