@@ -37,6 +37,7 @@ from .model import (
     _num_fused_shared_experts,
     _try_load_fp8_attn_proj,
     _try_load_fp8_indexer_wk,
+    finalize_derived_weights,
     get_spec_layer_idx_from_weight_name,
 )
 
@@ -442,3 +443,6 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
                     f"missing from checkpoint."
                 )
         return loaded_params
+
+    def process_weights_after_loading(self) -> None:
+        finalize_derived_weights(self)

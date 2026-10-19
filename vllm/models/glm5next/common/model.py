@@ -56,6 +56,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from vllm.model_executor.model_loader.utils import device_loading_context
 from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
@@ -91,7 +92,7 @@ from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 
-from .attention import Glm5NextMLAAttention
+from .attention import Glm5NextMLAAttention, Indexer
 from .kda import Glm5NextLinearAttention
 from .multimodal import (
     Glm5NextMultiModalProcessor,
@@ -1044,6 +1045,17 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
         return loaded_params
 
 
+def finalize_derived_weights(model: nn.Module) -> None:
+    device = torch.device(
+        current_platform.device_type, torch.accelerator.current_device_index()
+    )
+    for module in model.modules():
+        if isinstance(module, (Indexer, Glm5NextLinearAttention)):
+            # CPU-offloaded weights are moved to the device to build the buffers.
+            with device_loading_context(module, device):
+                module.finalize_weights()
+
+
 class Glm5NextForCausalLM(
     nn.Module, HasInnerState, SupportsPP, MixtureOfExperts, IsHybrid, SupportsEagle3
 ):
@@ -1135,6 +1147,9 @@ class Glm5NextForCausalLM(
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
         return loader.load_weights(weights)
+
+    def process_weights_after_loading(self) -> None:
+        finalize_derived_weights(self)
 
 
 @MULTIMODAL_REGISTRY.register_processor(
@@ -1270,6 +1285,9 @@ class Glm5NextForConditionalGeneration(
             moe.n_physical_experts = num_physical_experts
             moe.n_redundant_experts = self.num_redundant_experts
             moe.experts.update_expert_map()
+
+    def process_weights_after_loading(self) -> None:
+        self.language_model.process_weights_after_loading()
 
     def get_encoder_cudagraph_config(self):
         # This vision tower does not produce the absolute position embedding

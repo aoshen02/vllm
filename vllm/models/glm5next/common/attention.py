@@ -294,6 +294,14 @@ class Indexer(nn.Module):
             tail_cache=self.tail_cache,
         )
 
+    def finalize_weights(self) -> None:
+        self._wp_fp32 = (
+            self.wk_weights_proj.weight.data[self.head_dim :, :]
+            .t()
+            .contiguous()
+            .float()
+        )
+
     def forward(
         self, hidden_states: torch.Tensor, qr: torch.Tensor, positions, rotary_emb
     ) -> torch.Tensor:
@@ -301,16 +309,11 @@ class Indexer(nn.Module):
         q = q.view(-1, self.n_head, self.head_dim)
 
         # Compute the head gate in fp32; bf16 error can change near-tie pool
-        # rankings on long-context tasks. Cache it after weights are loaded.
+        # rankings on long-context tasks.
         kw, _ = self.wk_weights_proj(hidden_states)
         k = kw[:, : self.head_dim]
-        if self._wp_fp32 is None:
-            self._wp_fp32 = (
-                self.wk_weights_proj.weight.data[self.head_dim :, :]
-                .t()
-                .contiguous()
-                .float()
-            )
+        if self._wp_fp32 is None:  # loaders that skip post-load (tensorizer)
+            self.finalize_weights()
         weights = torch.mm(hidden_states.float(), self._wp_fp32)
 
         k = _fused_indexer_k_norm(

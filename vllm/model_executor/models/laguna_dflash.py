@@ -266,6 +266,11 @@ class DFlashLagunaForCausalLM(nn.Module, SupportsEagle3):
         )
         self.logits_processor = LogitsProcessor(self.config.draft_vocab_size)
 
+    def process_weights_after_loading(self) -> None:
+        # Dummy and IPC loading skip load_weights, which builds these buffers.
+        if not hasattr(self.model, "_num_attn_layers"):
+            self.model._build_fused_kv_buffers()
+
     def embed_input_ids(
         self,
         input_ids: torch.Tensor,

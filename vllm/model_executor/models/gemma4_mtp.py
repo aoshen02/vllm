@@ -468,6 +468,7 @@ class Gemma4MTP(nn.Module):
         self.quant_config = get_draft_quant_config(vllm_config)
         self.config = config
         self._stable_full_lm_head_weight: torch.Tensor | None = None
+        self._full_lm_head_stale = True
 
         self.model = Gemma4MultiTokenPredictor(
             vllm_config=vllm_config,
@@ -544,7 +545,8 @@ class Gemma4MTP(nn.Module):
         )
 
     def _get_full_lm_head_weight(self) -> torch.Tensor:
-        if self._stable_full_lm_head_weight is not None:
+        if not self._full_lm_head_stale:
+            assert self._stable_full_lm_head_weight is not None
             return self._stable_full_lm_head_weight
         assert self.masked_embedding is not None
         lm_head_weight = self.lm_head.weight
@@ -556,8 +558,12 @@ class Gemma4MTP(nn.Module):
             )
         lm_head_weight = lm_head_weight[: self.masked_embedding.vocab_size]
         if tp_size > 1:
-            lm_head_weight = lm_head_weight.contiguous()
-            self._stable_full_lm_head_weight = lm_head_weight
+            if self._stable_full_lm_head_weight is None:
+                self._stable_full_lm_head_weight = lm_head_weight.contiguous()
+            else:  # Reloaded weights: keep the address CUDA graphs captured.
+                self._stable_full_lm_head_weight.copy_(lm_head_weight)
+            self._full_lm_head_stale = False
+            return self._stable_full_lm_head_weight
         return lm_head_weight
 
     def compute_logits(
@@ -587,8 +593,13 @@ class Gemma4MTP(nn.Module):
             self._get_full_lm_head_weight(),
         )
 
+    def process_weights_after_loading(self) -> None:
+        # Gather the full lm_head at load, not in the first (captured) forward.
+        if self.masked_embedding is not None:
+            self._get_full_lm_head_weight()
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        self._stable_full_lm_head_weight = None
+        self._full_lm_head_stale = True
         loader = AutoWeightsLoader(self)
         loaded = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
         if self._suppress_token_ids:

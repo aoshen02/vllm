@@ -664,13 +664,8 @@ class DFlashQwen3Model(nn.Module):
         When context_slot_mapping is None (e.g. during dummy_run) only
         the computation runs, and no K/V is written to cache.
         """
-        if not hasattr(self, "_num_attn_layers"):
-            logger.warning_once(
-                "DFlash buffer initialization was skipped. If dummy weights are not "
-                "in use, this may indicate an error in weight loading."
-            )
+        if not hasattr(self, "_num_attn_layers"):  # loaders that skip post-load
             self._build_fused_kv_buffers()
-
         num_ctx = context_states.shape[0]
         L = self._num_attn_layers
         kv = self._kv_size
@@ -789,6 +784,11 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
             )
         else:
             self.draft_id_to_target_id = None
+
+    def process_weights_after_loading(self) -> None:
+        # Dummy and IPC loading skip load_weights, which builds these buffers.
+        if not hasattr(self.model, "_num_attn_layers"):
+            self.model._build_fused_kv_buffers()
 
     def embed_input_ids(
         self,

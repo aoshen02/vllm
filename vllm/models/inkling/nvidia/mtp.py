@@ -282,7 +282,7 @@ class InklingMTP(nn.Module, SupportsMultiModalEmbeddings):
             org_vocab_size=config.vocab_size,
             soft_cap=config.final_logit_softcapping,
         )
-        self._logits_zero: torch.Tensor | None = None
+        self._logits_zero = torch.zeros(1)
 
     def embed_input_ids(
         self,
@@ -329,8 +329,6 @@ class InklingMTP(nn.Module, SupportsMultiModalEmbeddings):
         assert self.logits_processor.soft_cap is None
         assert self.logits_processor.scale == 1.0
         w = self.lm_head.weight
-        if self._logits_zero is None:
-            self._logits_zero = w.new_zeros(1)
         logits = torch.addmm(
             self._logits_zero,
             hidden_states,

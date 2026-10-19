@@ -294,8 +294,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         self.q_conv1d.weight.data = self.q_conv1d.weight.data.unsqueeze(1)
         self.k_conv1d.weight.data = self.k_conv1d.weight.data.unsqueeze(1)
         self.v_conv1d.weight.data = self.v_conv1d.weight.data.unsqueeze(1)
-        # Lazily-built merged q|k|v conv weight (built on first forward, after
-        # weights are loaded). See _forward.
+        # Merged q|k|v conv weight, built by finalize_weights. See _forward.
         self._merged_conv_weight: torch.Tensor | None = None
 
         self.A_log = nn.Parameter(
@@ -381,6 +380,14 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             self._checkpoint_exporter = FlashKDAPrefillCheckpointExporter(
                 state_len=self.conv_size - 1
             )
+
+    def finalize_weights(self) -> None:
+        def _w(m):
+            return m.weight.view(m.weight.size(0), m.weight.size(2))
+
+        self._merged_conv_weight = torch.cat(
+            [_w(self.q_conv1d), _w(self.k_conv1d), _w(self.v_conv1d)], dim=0
+        ).contiguous()
 
     def _flashkda_prefill(
         self,
@@ -552,18 +559,11 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         # One merged short-conv over q|k|v instead of three separate calls. The
         # 1D conv is independent per channel, so concatenating q/k/v along the
         # channel dim and running a single causal_conv1d is bit-identical to
-        # three calls. The merged weight is q|k|v conv weights concatenated;
-        # built once and cached (params are fixed after load). conv_state is
-        # already stored as the merged q|k|v state, so it is used directly.
-        if self._merged_conv_weight is None:
-
-            def _w(m):
-                return m.weight.view(m.weight.size(0), m.weight.size(2))
-
-            self._merged_conv_weight = torch.cat(
-                [_w(self.q_conv1d), _w(self.k_conv1d), _w(self.v_conv1d)],
-                dim=0,
-            ).contiguous()
+        # three calls. The merged weight is q|k|v conv weights concatenated
+        # (built by finalize_weights). conv_state is already stored as the
+        # merged q|k|v state, so it is used directly.
+        if self._merged_conv_weight is None:  # loaders that skip post-load
+            self.finalize_weights()
         conv_weights = self._merged_conv_weight
         conv_bias = self.q_conv1d.bias
 
