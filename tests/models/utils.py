@@ -13,6 +13,7 @@ from transformers import PreTrainedConfig
 from vllm.config.model import AttnTypeStr, ModelConfig, ModelDType, RunnerOption
 from vllm.config.pooler import SequencePoolingType, TokenPoolingType
 from vllm.logprobs import Logprob, PromptLogprobs, SampleLogprobs
+from vllm.model_executor.utils import find_unregistered_tensors
 from vllm.multimodal.processing import InputProcessingContext
 from vllm.tokenizers import cached_tokenizer_from_config
 
@@ -609,3 +610,14 @@ def dummy_hf_overrides(
         )
 
     return hf_config
+
+
+def unregistered_device_tensors(model: torch.nn.Module) -> list[str]:
+    """Device tensors reachable from the model but invisible to sleep mode,
+    CUDA-graph address checks and weight reload (not a parameter or buffer)."""
+    names = {id(m): n or "<root>" for n, m in model.named_modules()}
+    return [
+        f"{names[id(module)]}.{path}: {tuple(t.shape)} {t.dtype} {t.device}"
+        for module, path, t in find_unregistered_tensors(model)
+        if t.device.type != "cpu"
+    ]
