@@ -1144,8 +1144,8 @@ def test_reload_weights_path_replaces_object_storage_source(monkeypatch):
     loader = Mock()
     loader.get_all_weights.return_value = iter(())
     monkeypatch.setattr(reload_inplace_module, "get_model_loader", lambda _: loader)
-    monkeypatch.setattr(reload_inplace_module, "initialize_layerwise_reload", Mock())
-    monkeypatch.setattr(reload_inplace_module, "finalize_layerwise_reload", Mock())
+    monkeypatch.setattr(reload_inplace_module, "start_reload", Mock())
+    monkeypatch.setattr(reload_inplace_module, "finish_reload", Mock())
 
     vllm_config = SimpleNamespace(
         lora_config=None,

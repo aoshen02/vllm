@@ -338,8 +338,8 @@ class WeightTransferEngine(ABC, Generic[TInitInfo, TUpdateInfo]):
     plugged in.
 
     Each engine owns its full weight-update lifecycle: `start_weight_update`,
-    `update_weights`, and `finish_weight_update`. Layerwise reloading (used by
-    checkpoint-format engines) is opted into per engine by running it inside
+    `update_weights`, and `finish_weight_update`. Checkpoint-format engines open
+    and close a reload session (`start_reload`/`finish_reload`) inside
     `start_weight_update`/`finish_weight_update`. Engines that apply weights in
     place (e.g. sparse patches) leave those methods as no-ops.
 
@@ -473,8 +473,8 @@ class WeightTransferEngine(ABC, Generic[TInitInfo, TUpdateInfo]):
     def start_weight_update(self) -> None:
         """Prepare the engine for a new weight update.
 
-        Engines that receive weights in checkpoint format initialize layerwise reloading
-        here, else this is typically a no-op.
+        Engines that receive weights in checkpoint format call `start_reload` here,
+        else this is typically a no-op.
         See: https://docs.vllm.ai/en/latest/training/layerwise/ for more details.
         """
         raise NotImplementedError
@@ -483,7 +483,7 @@ class WeightTransferEngine(ABC, Generic[TInitInfo, TUpdateInfo]):
     def finish_weight_update(self) -> None:
         """Finalize the current weight update.
 
-        Checkpoint-format engines finalize layerwise reloading here; engines
+        Checkpoint-format engines call `finish_reload` here; engines
         that apply weights in place leave this as a no-op.
         """
         raise NotImplementedError
