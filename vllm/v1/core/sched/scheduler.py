@@ -1304,7 +1304,10 @@ class Scheduler(SchedulerInterface):
                     )
                 if request.status == RequestStatus.WAITING:
                     request.trace_end_queuing()
-                    if request.num_computed_tokens > 0:
+                    if (
+                        request.num_computed_tokens > 0
+                        and num_computed_tokens >= request.num_tokens - 1
+                    ):
                         request.decode_start_time_ns = time.time_ns()
                     else:
                         request.prefill_start_time_ns = time.time_ns()
