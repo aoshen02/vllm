@@ -3,7 +3,7 @@
 """UltraQuant inherits TurboQuant's forward/do_kv_cache_update orchestration.
 
 UltraQuant only overrides the store/decode/prefill seams, so a TurboQuant-side
-change to a seam signature, to an inherited helper, or to the ``layer._tq_*``
+change to a seam signature, to an inherited helper, or to the ``_tq_*``
 attributes ``forward`` reads will break UltraQuant at serve time without
 touching any UltraQuant kernel test. These checks pin that contract.
 """
@@ -95,12 +95,14 @@ def test_ultraquant_matches_turboquant_seam_contract():
                 f"TurboQuantAttentionImpl.{fn.attr} accepts {list(params)}"
             )
 
-    # 3. Every layer._tq_* attribute the inherited forward reads is set by
-    #    UltraQuant's _ensure_on_device.
+    # 3. Every _tq_* attribute the inherited forward reads is set by
+    #    UltraQuant's process_weights_after_loading.
     required = _tq_attrs_read(TurboQuantAttentionImpl, "forward")
-    provided = _tq_attrs_written(UltraQuantAttentionImpl, "_ensure_on_device")
-    assert required, "expected inherited forward to read layer._tq_* attributes"
+    provided = _tq_attrs_written(
+        UltraQuantAttentionImpl, "process_weights_after_loading"
+    )
+    assert required, "expected inherited forward to read _tq_* attributes"
     assert required <= provided, (
-        f"UltraQuant._ensure_on_device does not set {sorted(required - provided)}, "
-        f"which the inherited TurboQuant forward reads"
+        f"UltraQuant.process_weights_after_loading does not set "
+        f"{sorted(required - provided)}, which the inherited forward reads"
     )

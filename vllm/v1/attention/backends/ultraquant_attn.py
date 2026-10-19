@@ -28,6 +28,7 @@ import torch.nn.functional as F
 from vllm.config import get_current_vllm_config
 from vllm.config.cache import CacheDType
 from vllm.logger import init_logger
+from vllm.platforms import current_platform
 from vllm.v1.attention.backend import AttentionType
 from vllm.v1.attention.backends.fa_utils import get_flash_attn_version
 from vllm.v1.attention.backends.turboquant_attn import (
@@ -159,26 +160,32 @@ class UltraQuantAttentionImpl(TurboQuantAttentionImpl):
             flydsl_loaded=self._use_ultraquant_flydsl,
         )
 
-    def _ensure_on_device(self, layer, device):
-        """Build the shared Hadamard rotation and pre-warm FlyDSL buffers.
+    def process_weights_after_loading(self, act_dtype: torch.dtype) -> None:
+        """Build the shared Hadamard rotation and FlyDSL index buffer."""
+        if hasattr(self, "_tq_Pi"):
+            return
+        device = torch.device(
+            current_platform.device_type, torch.accelerator.current_device_index()
+        )
+        H = _build_hadamard(self.head_size, str(device))
+        self._tq_PiT = H
+        self._tq_Pi = H
+        self._tq_Pi_half = H.to(torch.float16)
+        # The inherited forward reads _tq_centroids; UltraQuant has none.
+        self._tq_centroids = torch.empty(0, device=device, dtype=torch.float32)
+        if self._use_ultraquant_flydsl:
+            self._arange_cache = torch.arange(
+                0, self._max_model_len + 2, device=device, dtype=torch.int32
+            )
 
-        UltraQuant needs no Lloyd-Max centroids, but the inherited forward reads
-        ``layer._tq_centroids``, so an empty tensor is kept on the layer.
-        """
+    def _ensure_on_device(self, device):
+        """Pre-warm FlyDSL buffers before CUDA-graph capture."""
+        if not hasattr(self, "_tq_Pi"):  # loaders that skip post-load (tensorizer)
+            self.process_weights_after_loading(torch.get_default_dtype())
         if self._use_ultraquant_flydsl:
             # CUDA-graph capture safety for the FlyDSL decode path on ROCm:
-            # pre-allocate index buffers and grow the workspace to its max size
-            # before capture so replay never lands on stale addresses.
-            _max_len = self._max_model_len
-            _already_ok = (
-                hasattr(self, "_arange_cache")
-                and self._arange_cache.device.type == str(device).split(":")[0]
-                and self._arange_cache.shape[0] >= _max_len + 2
-            )
-            if not _already_ok:
-                self._arange_cache = torch.arange(
-                    0, _max_len + 2, device=device, dtype=torch.int32
-                )
+            # grow the workspace to its max size before capture so replay
+            # never lands on stale addresses.
             if not hasattr(self, "_cu_2") or self._cu_2.device != torch.device(device):
                 self._cu_2 = torch.zeros(2, device=device, dtype=torch.int32)
             if (
@@ -199,20 +206,6 @@ class UltraQuantAttentionImpl(TurboQuantAttentionImpl):
                         ((_pre_warm_bytes,), torch.uint8)
                     )
 
-        if not hasattr(layer, "_tq_cached"):
-            D = self.head_size
-            # Pure Hadamard: orthonormal + symmetric (H = H^T), enabling
-            # in-kernel butterfly fusion and trivial inverse for continuation.
-            H = _build_hadamard(D, str(device))
-            layer._tq_PiT = H
-            layer._tq_Pi = H
-            layer._tq_Pi_half = H.to(torch.float16)
-            # Inherited TurboQuantAttentionImpl.forward reads _tq_centroids
-            # unconditionally; UltraQuant has no centroid table, so an empty
-            # tensor satisfies the read.
-            layer._tq_centroids = torch.empty(0, device=device, dtype=torch.float32)
-            layer._tq_cached = True
-
     def _store_kv(
         self,
         key: torch.Tensor,  # (N, Hk, D)
@@ -229,7 +222,7 @@ class UltraQuantAttentionImpl(TurboQuantAttentionImpl):
             value,
             kv_cache,
             slot_mapping,
-            PiT=layer._tq_PiT,
+            PiT=self._tq_PiT,
         )
 
     def _decode_attention(

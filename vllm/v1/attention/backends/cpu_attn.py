@@ -329,6 +329,7 @@ class CPUAttentionBackendImpl(AttentionImpl):
         self.attn_type = attn_type
 
         self.sinks = sinks
+        self._sinks_source = sinks
         if self.sinks is not None:
             assert self.sinks.shape[0] == num_heads, (
                 "Sinks must have the same number of heads as the number of "
@@ -340,6 +341,13 @@ class CPUAttentionBackendImpl(AttentionImpl):
             attn_type,
             vllm_config.model_config.dtype,
         )
+
+    def process_weights_after_loading(self, act_dtype: torch.dtype) -> None:
+        # The CPU kernel runs bf16 sinks natively; other dtypes run in fp32.
+        # Cast from the loaded parameter, so a reload refreshes the copy.
+        sinks = self._sinks_source
+        if sinks is not None and sinks.dtype not in (torch.bfloat16, torch.float32):
+            self.sinks = sinks.to(torch.float32)
 
     def forward(
         self,
@@ -428,15 +436,8 @@ class CPUAttentionBackendImpl(AttentionImpl):
                 kv_cache_dtype=self.kv_cache_dtype,
             )
 
-        # The CPU kernel executes attention sinks natively in bf16. If the
-        # sinks tensor is anything other than bf16, cast it to fp32 so it is
-        # executed in full float precision (done lazily here, after weights
-        # are loaded, rather than at __init__ time).
-        if self.sinks is not None and self.sinks.dtype not in [
-            torch.bfloat16,
-            torch.float32,
-        ]:
-            self.sinks = self.sinks.to(torch.float32)
+        if self.sinks is self._sinks_source:  # loaders that skip post-load
+            self.process_weights_after_loading(query.dtype)
         ops.cpu_attention_with_kv_cache(
             query=query[:num_actual_tokens],
             key_cache=key_cache,
