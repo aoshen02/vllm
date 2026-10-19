@@ -3,11 +3,13 @@
 """Utils for model executor."""
 
 import copy
+import types
 from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import Any
 
 import torch
+from torch.utils._python_dispatch import is_traceable_wrapper_subclass
 
 from vllm.utils.torch_utils import is_torch_equal_or_newer
 
@@ -66,6 +68,179 @@ def set_weight_attrs(
         if current_platform.use_sync_weight_loader() and key == "weight_loader":
             value = current_platform.make_synced_weight_loader(value)
         setattr(weight, key, value)
+
+
+# Runtime state, not model state: bound or rebuilt by the model runner, or
+# per-step scratch. Never registered, at any attribute depth.
+RUNTIME_TENSOR_ATTRS: dict[str, str] = {
+    "kv_cache": "KV cache / SSM state, bound by the model runner",
+    "eplb_state": "EPLB maps and load counters, owned by EplbState",
+    "_replayssm_ring_start": "per-step speculative SSM replay state",
+    "_replayssm_prev_num_accepted": "per-step speculative SSM replay state",
+    "_replayssm_prev_query_len": "per-step speculative SSM replay state",
+    "deepstack_input_embeds": "per-step multimodal staging buffer",
+    "per_layer_embeddings": "per-step staging buffer",
+    "topk_indices_buffer": "per-step sparse attention scratch",
+    "_topk_indices_buffer": "per-step sparse attention scratch",
+    "candidate_block_buffer": "per-step sparse indexer scratch",
+    "_workspace_buffer": "attention workspace",
+    "_nvfp4_fp8_out": "attention output scratch",
+    "index_group": "per-step sparse indexer scratch",
+    "diffusion_states": "per-request diffusion decoding state",
+    "aot_compiled_fn": "torch.compile artifacts (example inputs)",
+    "_prefill_topk_ragged_cache": "per-step sparse prefill scratch",
+    "specialized_decode": "Kimi-K3 decode executor the model runner builds",
+    "_cu_2": "per-step TurboQuant cu_seqlens scratch",
+    "_cu_2_q": "per-step TurboQuant cu_seqlens scratch",
+    "_cu_2_k": "per-step TurboQuant cu_seqlens scratch",
+}
+
+_MODULE_STATE = {"_parameters", "_buffers", "_modules"}
+
+
+def storage_views(tensor: torch.Tensor) -> set[tuple]:
+    """Storage views behind ``tensor``, through traceable wrapper subclasses."""
+    if is_traceable_wrapper_subclass(tensor):
+        names, _ = tensor.__tensor_flatten__()  # type: ignore[attr-defined]
+        return set().union(*(storage_views(getattr(tensor, n)) for n in names))
+    return {
+        (
+            tensor.untyped_storage().data_ptr(),
+            tensor.storage_offset(),
+            tuple(tensor.shape),
+            tuple(tensor.stride()),
+            tensor.dtype,
+        )
+    }
+
+
+def _walk_unregistered(model: torch.nn.Module, include_meta: bool) -> list[tuple]:
+    """``(owning module, path, tensor, holder, key)`` per unregistered tensor;
+    ``holder[key]`` refers to it, ``holder`` None if it cannot be rebound
+    (tuple item)."""
+    registered: set[tuple] = set()
+    for t in (*model.parameters(), *model.buffers()):
+        registered |= storage_views(t)
+    modules = {id(m) for m in model.modules()}
+    seen: set[int] = set()
+    found: list[tuple] = []
+
+    def visit(owner: torch.nn.Module, value: Any, path: str, holder, key) -> None:
+        if id(value) in seen:
+            return
+        seen.add(id(value))
+        if isinstance(value, torch.Tensor):
+            if value.is_meta:
+                if include_meta:
+                    found.append((owner, path, value, holder, key))
+            else:
+                views = storage_views(value)
+                if not views <= registered:
+                    registered.update(views)
+                    found.append((owner, path, value, holder, key))
+        elif isinstance(value, torch.nn.Module):
+            # A module outside model.modules(), e.g. kept in a dict.
+            for prefix, module in value.named_modules(prefix=path):
+                if id(module) not in modules:
+                    for tensors in (module._parameters, module._buffers):
+                        for name, t in list(tensors.items()):
+                            visit(owner, t, f"{prefix}.{name}", tensors, name)
+                    visit_attrs(owner, module, f"{prefix}.")
+        elif isinstance(value, (tuple, list)):
+            container = value if isinstance(value, list) else None
+            for i, item in enumerate(value):
+                visit(owner, item, f"{path}.{i}", container, i)
+        elif isinstance(value, dict):
+            for k, item in list(value.items()):
+                visit(owner, item, f"{path}.{k}", value, k)
+        elif not isinstance(value, (type, types.ModuleType)) and isinstance(
+            getattr(value, "__dict__", None), dict
+        ):
+            # Configs reach other models' layers (drafter forward context);
+            # process groups hold communication buffers, not model state.
+            if str(getattr(type(value), "__module__", "")).startswith(
+                ("vllm.config", "vllm.distributed", "transformers")
+            ):
+                return
+            for name, item in list(vars(value).items()):
+                if name not in RUNTIME_TENSOR_ATTRS:
+                    visit(owner, item, f"{path}.{name}", vars(value), name)
+
+    def visit_attrs(owner: torch.nn.Module, module: torch.nn.Module, prefix: str):
+        for name, value in list(vars(module).items()):
+            if not (
+                name in _MODULE_STATE
+                or name in RUNTIME_TENSOR_ATTRS
+                or name.startswith("_forward_")
+            ):
+                visit(owner, value, f"{prefix}{name}", vars(module), name)
+
+    for module in model.modules():
+        visit_attrs(module, module, "")
+    return found
+
+
+def find_unregistered_tensors(
+    model: torch.nn.Module,
+) -> list[tuple[torch.nn.Module, str, torch.Tensor]]:
+    """Tensors reachable from module attributes (plain attributes, quant methods,
+    kernels, attention impls, dataclasses, containers) whose storage is no
+    parameter or buffer, as ``(owning module, attribute path, tensor)``."""
+    return [found[:3] for found in _walk_unregistered(model, include_meta=False)]
+
+
+def register_model_tensors(model: torch.nn.Module) -> None:
+    """Register each tensor ``find_unregistered_tensors`` finds as a
+    non-persistent ``_held_<path>`` buffer of its module, aliasing it.
+
+    Re-run after a reload: a rebuilt tensor moves into the storage registered
+    under the same name before, so captured addresses stay valid.
+    """
+    previous: dict[tuple[int, str], torch.Tensor] = {}
+    for module in model.modules():
+        for name in [n for n in module._buffers if n.startswith("_held_")]:
+            previous[(id(module), name)] = module._buffers.pop(name)
+            module._non_persistent_buffers_set.discard(name)
+    for module, path, tensor, holder, key in _walk_unregistered(model, True):
+        base = "_held_" + "".join(c if c.isalnum() else "_" for c in path)
+        name, n = base, 0
+        while name in module._buffers:  # "a.b" and "a_b" map to one name
+            n += 1
+            name = f"{base}_{n}"
+        old = previous.get((id(module), name))
+        if tensor.is_meta:
+            # Built on meta, imported from the IPC weight cache: use the import.
+            if old is None or (old.shape, old.stride(), old.dtype) != (
+                tensor.shape,
+                tensor.stride(),
+                tensor.dtype,
+            ):
+                continue
+            if holder is not None:
+                is_param = isinstance(tensor, torch.nn.Parameter)
+                holder[key] = torch.nn.Parameter(old, False) if is_param else old
+            tensor = old
+        elif old is not None:
+            reuse_storage(old, tensor)
+        module.register_buffer(name, tensor, persistent=False)
+
+
+def reuse_storage(old: torch.Tensor, new: torch.Tensor) -> bool:
+    """Copy ``new`` into ``old`` and point ``new`` at that storage, so captured
+    addresses stay valid; returns False, doing nothing, if the layouts differ."""
+    if not (
+        type(new) is type(old) is torch.Tensor
+        and new.data_ptr() != old.data_ptr()
+        and new.shape == old.shape
+        and new.stride() == old.stride()
+        and new.dtype == old.dtype
+        and new.device == old.device
+    ):
+        return False
+    with torch.inference_mode():
+        old.copy_(new)
+        new.set_(old)
+    return True
 
 
 def replace_parameter(

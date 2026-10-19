@@ -2,11 +2,17 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
+import dataclasses
+
 import pytest
 import torch
 
 from vllm.model_executor.parameter import ModelWeightParameter, PackedvLLMParameter
-from vllm.model_executor.utils import replace_parameter
+from vllm.model_executor.utils import (
+    find_unregistered_tensors,
+    register_model_tensors,
+    replace_parameter,
+)
 
 
 @pytest.fixture
@@ -281,3 +287,148 @@ def test_replace_parameter_attributes_from_the_layers_own_parameter(
     if param_kind != "plain":
         for public_name in ("output_dim", "input_dim", "packed_dim", "packed_factor"):
             assert getattr(layer.weight, public_name, None) is None
+
+
+class TestRegisterModelTensors:
+    """Every tensor reachable from a module becomes a registered buffer."""
+
+    @staticmethod
+    def _held(module: torch.nn.Module) -> dict[str, torch.Tensor]:
+        return {n: b for n, b in module.named_buffers() if "_held_" in n}
+
+    def test_reachable_tensors_are_registered_once(self) -> None:
+        @dataclasses.dataclass
+        class Config:
+            scale: torch.Tensor
+            bias: torch.Tensor | None = None
+
+        class Kernel:
+            def __init__(self, weight: torch.Tensor) -> None:
+                self.strides = [torch.ones(2), (torch.zeros(1),)]
+                self.cache = {torch.Size([4]): torch.arange(4)}
+                self.config = Config(scale=weight * 2)
+                self.alias = weight  # already a parameter
+
+        layer = torch.nn.Linear(4, 4)
+        layer.constant = torch.ones(3)
+        layer.kernel = Kernel(layer.weight)
+        layer.kv_cache = torch.zeros(2)  # runtime state, never registered
+        layer.shared = layer.constant  # same tensor twice: one buffer
+        foreign = torch.nn.Linear(2, 2, bias=False)
+        foreign.scale = torch.ones(2)
+        layer.by_task = {"embed": foreign}  # module outside model.modules()
+        layer.kernel_strides_0 = torch.ones(1)  # same name as kernel.strides.0
+        model = torch.nn.Sequential(layer)
+
+        register_model_tensors(model)
+
+        assert set(self._held(model)) == {
+            "0._held_constant",
+            "0._held_kernel_strides_0",
+            "0._held_kernel_strides_1_0",
+            "0._held_kernel_cache_torch_Size__4__",
+            "0._held_kernel_config_scale",
+            "0._held_by_task_embed_weight",
+            "0._held_by_task_embed_scale",
+            "0._held_kernel_strides_0_1",
+        }
+        assert model[0]._held_constant is layer.constant
+        assert find_unregistered_tensors(model) == []
+        assert "0._held_constant" not in model.state_dict()
+
+    def test_views_wrappers_rerun_and_meta(self) -> None:
+        from torch.testing._internal.two_tensor import TwoTensor
+
+        module = torch.nn.Module()
+        module.register_parameter(
+            "wrapped",
+            torch.nn.Parameter(
+                TwoTensor(torch.ones(2), torch.zeros(2)), requires_grad=False
+            ),
+        )
+        module.inner = module.wrapped.a  # registered through the wrapper
+        storage = torch.arange(8.0)
+        module.lo, module.hi = storage[:4], storage[4:]
+        raw = torch.arange(16, dtype=torch.uint8)
+        # Same offset/shape/stride as a view of another dtype: other bytes.
+        module.bytes, module.words = raw[:4], raw.view(torch.int32)
+        register_model_tensors(module)
+        assert set(self._held(module)) == {
+            "_held_lo",
+            "_held_hi",
+            "_held_bytes",
+            "_held_words",
+        }
+
+        # A rebuilt tensor moves into the registered storage (CUDA graphs).
+        lo = module._held_lo
+        module.lo = torch.full((4,), 2.0)
+        register_model_tensors(module)
+        assert module._held_lo is module.lo
+        assert module.lo.data_ptr() == lo.data_ptr()
+        assert torch.equal(storage[:4], torch.full((4,), 2.0))
+
+        # Built on meta (IPC weight cache): the imported buffer is kept and used.
+        words = module._held_words
+        module.words = torch.empty(4, dtype=torch.int32, device="meta")
+        register_model_tensors(module)
+        assert module._held_words is words and module.words is words
+        # A dropped tensor is no longer kept alive.
+        del module.bytes
+        register_model_tensors(module)
+        assert not hasattr(module, "_held_bytes")
+
+
+def test_derived_tensors_keep_addresses_across_layerwise_reload() -> None:
+    """After a layerwise reload, the tensors a processed layer uses are the
+    registered ones, in the storage registered at load."""
+    from vllm.model_executor.layers.quantization.base_config import (
+        QuantizeMethodBase,
+    )
+    from vllm.model_executor.model_loader.reload import (
+        finalize_layerwise_reload,
+        initialize_layerwise_reload,
+        record_metadata_for_reloading,
+    )
+
+    class Holder:
+        def __init__(self, tensor: torch.Tensor) -> None:
+            self.tensor = tensor
+
+    class Method(QuantizeMethodBase):
+        def create_weights(self, *args, **kwargs) -> None:
+            pass
+
+        def apply(self, *args, **kwargs) -> torch.Tensor:
+            raise NotImplementedError
+
+        def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+            layer.derived = layer.weight * 2
+            layer.register_buffer("rebound", layer.weight * 3, persistent=False)
+            self.holder = Holder(layer.weight * 4)
+
+    layer = torch.nn.Module()
+    layer.weight = torch.nn.Parameter(torch.zeros(4), requires_grad=False)
+    layer.constant = torch.ones(3)
+    layer.quant_method = Method()
+    model = torch.nn.Sequential(layer)
+    record_metadata_for_reloading(model)
+
+    layer.weight.data.fill_(1.0)
+    layer.quant_method.process_weights_after_loading(layer)
+    register_model_tensors(model)
+    ptrs = {n: b.data_ptr() for n, b in model.named_buffers()}
+
+    initialize_layerwise_reload(model)
+    weight = layer.weight
+    # Registered constants do not hold back processing until finalize.
+    weight.weight_loader(weight, torch.full((4,), 5.0))
+    assert torch.equal(layer.derived, torch.full((4,), 10.0))
+    finalize_layerwise_reload(model, None)
+
+    assert {n: b.data_ptr() for n, b in model.named_buffers()} == ptrs
+    assert torch.equal(layer.derived, torch.full((4,), 10.0))
+    assert torch.equal(layer.rebound, torch.full((4,), 15.0))
+    assert torch.equal(layer.quant_method.holder.tensor, torch.full((4,), 20.0))
+    assert find_unregistered_tensors(model) == []
+    assert torch.equal(layer.constant, torch.ones(3))

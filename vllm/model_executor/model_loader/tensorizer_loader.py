@@ -23,6 +23,7 @@ from vllm.model_executor.model_loader.utils import (
     get_model_architecture,
     initialize_model,
 )
+from vllm.model_executor.utils import register_model_tensors
 from vllm.utils.torch_utils import set_default_torch_dtype
 
 logger = init_logger(__name__)
@@ -128,6 +129,9 @@ class TensorizerLoader(BaseModelLoader):
                 self.tensorizer_config.tensorizer_uri % get_tensor_model_parallel_rank()
             )
 
+        # Circular import: fused_moe imports model utils, which import the loader.
+        from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
+
         if is_vllm_tensorized(self.tensorizer_config):
             tensorizer_config = self._patch_tensorizer_config(model_config)
             device_config = vllm_config.device_config
@@ -137,8 +141,16 @@ class TensorizerLoader(BaseModelLoader):
                         tensorizer_config=tensorizer_config, vllm_config=vllm_config
                     )
             self.load_weights(model, model_config)
-            return model
-        return self._load_model_serialized_cpu(vllm_config=vllm_config, prefix=prefix)
+        else:
+            model = self._load_model_serialized_cpu(
+                vllm_config=vllm_config, prefix=prefix
+            )
+        # Fused MoE gates are built at post-load, which this loader skips.
+        for module in model.modules():
+            if isinstance(module, MoERunner):
+                module.process_weights_after_loading()
+        register_model_tensors(model)
+        return model
 
     @staticmethod
     def save_model(

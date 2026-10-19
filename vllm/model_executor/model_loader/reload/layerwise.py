@@ -13,9 +13,12 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import is_deferred_attention_layer
 from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from vllm.model_executor.utils import register_model_tensors, reuse_storage
 
 from .meta import (
     SKIP_LOAD_TENSORS,
+    _is_non_persistent_parameter_alias_buffer,
+    _parameter_storage_ptrs,
     capture_layer_to_meta,
     get_numel_loaded,
     materialize_layer,
@@ -236,6 +239,10 @@ def finalize_layerwise_processing(model: torch.nn.Module, model_config: ModelCon
         model_config: config needed for applying processing to attention layers
 
     """
+    # Circular import: fused_moe imports model utils, which import the loader.
+    from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
+    from vllm.model_executor.model_loader.utils import device_loading_context
+
     if hasattr(model, "_original_do_torchao_reload"):
         model._do_torchao_reload = model._original_do_torchao_reload
 
@@ -282,6 +289,12 @@ def finalize_layerwise_processing(model: torch.nn.Module, model_config: ModelCon
         info.reset()
 
     LOADING_LAYERS.clear()
+    for module in model.modules():
+        if isinstance(module, MoERunner):
+            device = get_layerwise_info(module).restore_device
+            with device_loading_context(module, device):
+                module.process_weights_after_loading()
+    register_model_tensors(model)
 
 
 def finalize_layerwise_reload(*args, **kwargs):
@@ -424,7 +437,7 @@ def _copy_and_restore_kernel_tensors(layer: torch.nn.Module, info: LayerReloadin
     for name, param in parameters.items():
         param.data.copy_(getattr(layer, name))
     for name, buffer in buffers.items():
-        if name not in layer._buffers:
+        if buffer is None or name not in layer._buffers:
             continue
         if name in non_persistent and name not in loaded_tensor_names:
             continue
@@ -433,14 +446,43 @@ def _copy_and_restore_kernel_tensors(layer: torch.nn.Module, info: LayerReloadin
     _place_kernel_tensors(layer, info)
 
 
+def _is_derived_buffer(info: LayerReloadingInfo, name: str) -> bool:
+    """Not a tensor when the model was built (placeholder or registered later)."""
+    return info.restore_metadata[1].get(name) is None
+
+
 def _place_kernel_tensors(layer: torch.nn.Module, info: LayerReloadingInfo):
+    assert info.kernel_tensors is not None
+    # Derived buffers rebuilt by processing move into the kernel tensor storage.
+    param_ptrs = _parameter_storage_ptrs(layer)
+    rebuilt = {
+        name: buffer
+        for name, buffer in layer._buffers.items()
+        if buffer is not None
+        and _is_derived_buffer(info, name)
+        and not _is_non_persistent_parameter_alias_buffer(
+            layer, name, buffer, param_ptrs
+        )
+    }
+    rebuilt_non_persistent = set(layer._non_persistent_buffers_set)
     for name in get_layer_tensors(layer):
         delattr(layer, name)
 
-    assert info.kernel_tensors is not None
     parameters, buffers = info.kernel_tensors
     non_persistent = info.kernel_non_persistent_buffers
     for name, param in parameters.items():
         layer.register_parameter(name, param)
     for name, buffer in buffers.items():
         layer.register_buffer(name, buffer, persistent=name not in non_persistent)
+
+    # Re-register None placeholders missing from kernel_tensors.
+    _, restore_bufs = info.restore_metadata
+    for name, buf in restore_bufs.items():
+        if buf is None and name not in parameters and name not in buffers:
+            layer.register_buffer(name, None, persistent=name not in non_persistent)
+    for name, buffer in rebuilt.items():
+        old = layer._buffers.get(name)
+        if old is None or not reuse_storage(old, buffer):
+            layer.register_buffer(
+                name, buffer, persistent=name not in rebuilt_non_persistent
+            )
