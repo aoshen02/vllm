@@ -43,6 +43,8 @@ class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
     Only NVFP4 (kNvfp4Static/kNvfp4Dynamic) quantization is supported.
     """
 
+    held_tensors: tuple[str, ...] = ("_fc2_input_scale",)
+
     _ACTIVATION_MAP: dict[MoEActivation, str] = {
         MoEActivation.SILU: "silu",
         MoEActivation.GELU_TANH: "gelu_tanh",

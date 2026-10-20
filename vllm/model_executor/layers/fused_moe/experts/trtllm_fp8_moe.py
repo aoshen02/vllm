@@ -66,6 +66,8 @@ class TrtLlmFp8ExpertsBase:
     interfaces.
     """
 
+    held_tensors: tuple[str, ...] = ("gemm1_alpha", "gemm1_beta", "gemm1_clamp_limit")
+
     @staticmethod
     def is_supported_config(
         cls: type[mk.FusedMoEExperts],

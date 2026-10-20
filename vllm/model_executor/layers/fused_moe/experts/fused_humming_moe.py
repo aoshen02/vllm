@@ -127,6 +127,8 @@ def get_humming_moe_gemm_type(moe_config: FusedMoEConfig | None = None) -> str:
 
 
 class HummingExpertsBase(mk.FusedMoEExpertsModular):
+    held_tensors: tuple[str, ...] = ("locks",)
+
     quant_config: "HummingMoEQuantConfig"
 
     def __init__(

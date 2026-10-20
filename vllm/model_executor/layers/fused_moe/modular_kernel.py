@@ -485,6 +485,8 @@ class FusedMoEPrepareAndFinalizeMonolithic(FusedMoEPrepareAndFinalize):
 
 # TODO: add supported activations method (return string)
 class FusedMoEExperts(ABC):
+    # Device tensors built at load; the loader registers them as layer buffers.
+    held_tensors: tuple[str, ...] = ()
     # ROCm AITER kernels consume a 0/1 local-expert mask (with a trailing
     # sentinel slot); every other backend consumes the canonical -1/local-slot
     # expert_map. RoutedExperts.expert_map reads this flag to pick which to hand

@@ -184,6 +184,17 @@ def process_weights_after_loading(
             )
             with loading_context, timing_context:
                 quant_method.process_weights_after_loading(module)
+            # MoE experts objects hold load-time device tensors; sleep restores buffers.
+            experts = getattr(
+                getattr(quant_method, "moe_kernel", None), "fused_experts", None
+            )
+            for t_name in getattr(experts, "held_tensors", ()):
+                if (t := getattr(experts, t_name, None)) is not None:
+                    module.register_buffer(f"_experts_{t_name}", t, persistent=False)
+            qc = getattr(quant_method, "moe_quant_config", None)
+            for t_name in ("a1_gscale", "a2_gscale"):
+                if (t := getattr(qc, t_name, None)) is not None:
+                    module.register_buffer(f"_quant_{t_name}", t, persistent=False)
             # process_weights_after_loading may swap in freshly-created
             # Parameters (e.g. FP8 requantization), which are stamped with the
             # global rank in BasevLLMParameter.__init__. Re-reconcile their TP
