@@ -303,6 +303,7 @@ class AuxOutputWorkerConnector:
                     keys,
                     shape_per_token=buffer.shape_per_token,
                     dtype=buffer.dtype,
+                    token_start=emit_start // block_size * block_size,
                 )[emit_start % block_size :]
                 if stored_end < token_end:
                     rows = np.concatenate(
@@ -336,6 +337,7 @@ class AuxOutputWorkerConnector:
             [key],
             shape_per_token=buffer.shape_per_token,
             dtype=buffer.dtype,
+            token_start=block_start,
         )
         if len(rows) < token_start - block_start:
             raise ValueError("Auxiliary prefix does not cover loaded KV")
@@ -369,6 +371,7 @@ class AuxOutputWorkerConnector:
                 block_size=buffer.block_size,
                 retain_keys=retain_keys,
                 release_keys=release_keys,
+                mooncake=self._return_keys,
             )
         for _, blocks in ready_batches:
             for _, rows in blocks:
@@ -433,7 +436,9 @@ class AuxOutputWorkerConnector:
             retained_keys: list[str] = []
             for request_id, block_hashes in metadata.block_hashes.items():
                 state = self._requests[request_id]
-                keys = routed_experts_keys(block_hashes, str(self._generation))
+                keys = routed_experts_keys(
+                    block_hashes, str(self._generation), mooncake=self._return_keys
+                )
                 state.aux_output_keys.extend(keys)
                 retained_keys.extend(keys)
                 block_batches.append((state, []))

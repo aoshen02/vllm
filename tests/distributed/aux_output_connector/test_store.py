@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import gc
 import json
 import sys
 import threading
@@ -13,6 +14,13 @@ import numpy as np
 import pytest
 import torch
 
+from vllm.distributed.aux_output_connector.codec import (
+    HEADER,
+    AuxBlock,
+    RoutingArray,
+    decode_block,
+    encode_parts,
+)
 from vllm.distributed.aux_output_connector.connector import (
     AuxOutputConnectorMetadata,
     AuxOutputSchedulerConnector,
@@ -23,6 +31,11 @@ from vllm.distributed.aux_output_connector.mooncake import (
     MooncakeBlockObjectStore,
     MooncakeOutputPublisher,
     create_mooncake_block_store,
+)
+from vllm.distributed.aux_output_connector.reader import (
+    get_aux_output,
+    iter_aux_blocks,
+    read_aux_block,
 )
 from vllm.distributed.aux_output_connector.routed_experts import (
     RoutedExpertsBuffer,
@@ -35,6 +48,7 @@ from vllm.distributed.aux_output_connector.store import (
     BackgroundBlockObjectStore,
     BlockObject,
     BlockObjectStoreError,
+    BlockPartsObject,
 )
 from vllm.distributed.aux_output_connector.worker import (
     AuxOutputWorkerConnector,
@@ -50,6 +64,145 @@ pytestmark = pytest.mark.cpu_test
 _SHAPE = (3, 2)
 _DTYPE = np.dtype("uint8")
 _BLOCK_SIZE = 4
+
+
+def _encoded_object(key: str, start: int, rows: RoutingArray) -> BlockPartsObject:
+    return BlockPartsObject(key, encode_parts(AuxBlock(start, rows)))
+
+
+@pytest.mark.parametrize("dtype", ["u1", "<u2", ">u2"])
+@pytest.mark.parametrize("start", [0, 3, 2**32])
+def test_aux_codec_owns_canonical_contiguous_rows(dtype: str, start: int):
+    rows = np.arange(48, dtype=dtype).reshape(8, 3, 2)[::2]
+    expected = rows.copy()
+    parts = encode_parts(AuxBlock(start, rows))
+    rows.fill(0)
+    block = decode_block(b"".join(parts))
+    assert block.token_start == start
+    assert block.num_rows == 4
+    assert block.routed_experts.flags.c_contiguous
+    assert not block.routed_experts.flags.writeable
+    assert block.routed_experts.dtype.str in ("|u1", "<u2")
+    np.testing.assert_array_equal(block.routed_experts, expected)
+    assert parts[1] == expected.astype(expected.dtype.newbyteorder("<")).tobytes()
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        (1, 2),
+        (2, 0),
+        (2, 2),
+        (2, 3),
+        (2, 9),
+        (3, 0),
+        (4, 2**64 - 1),
+        (5, 0),
+        (5, 2**32 - 1),
+        (6, 0),
+        (7, 0),
+        (8, 0),
+        (8, 3),
+        (9, 1),
+        (10, 256),
+    ],
+)
+def test_aux_codec_rejects_unsupported_or_invalid_header(field: int, value: int):
+    raw = b"".join(encode_parts(AuxBlock(0, np.zeros((1, 3, 2), dtype=np.uint8))))
+    fields = list(HEADER.unpack_from(raw))
+    fields[field] = value
+    with pytest.raises(ValueError):
+        decode_block(HEADER.pack(*fields) + raw[HEADER.size :])
+
+
+@pytest.mark.parametrize("change", ["magic", "short_header", "short_body", "trailing"])
+def test_aux_codec_rejects_invalid_size_or_magic(change: str):
+    raw = b"".join(encode_parts(AuxBlock(0, np.zeros((1, 3, 2), dtype=np.uint8))))
+    invalid = {
+        "magic": b"X" + raw[1:],
+        "short_header": raw[:10],
+        "short_body": raw[:-1],
+        "trailing": raw + b"x",
+    }[change]
+    with pytest.raises(ValueError):
+        decode_block(invalid)
+
+
+@pytest.mark.parametrize(
+    "dtype,shape,start",
+    [
+        ("i1", (1, 3, 2), 0),
+        ("u4", (1, 3, 2), 0),
+        ("u1", (1, 3), 0),
+        ("u1", (0, 3, 2), 0),
+        ("u1", (1, 0, 2), 0),
+        ("u1", (1, 3, 2), -1),
+        ("u1", (1, 3, 2), 2**64),
+        ("u1", (1, 3, 2), True),
+    ],
+)
+def test_aux_codec_rejects_invalid_input(
+    dtype: str, shape: tuple[int, ...], start: int
+):
+    with pytest.raises(ValueError):
+        encode_parts(AuxBlock(start, np.zeros(shape, dtype=dtype)))
+
+
+def test_aux_reader_arrays_survive_native_buffer_reuse_and_visible_slicing():
+    rows = np.arange(36, dtype=np.uint8).reshape(6, 3, 2)
+    native_buffer = bytearray(b"".join(encode_parts(AuxBlock(4, rows))))
+    store = Mock()
+    store.get_buffer.return_value = native_buffer
+    block = list(iter_aux_blocks(store, ["boundary", "unneeded"], start=5, stop=8))[0]
+    fields = get_aux_output(store, "boundary")
+    native_buffer[:] = b"x" * len(native_buffer)
+    del native_buffer, store
+    gc.collect()
+    assert block.token_start == 5
+    np.testing.assert_array_equal(block.routed_experts, rows[1:4])
+    np.testing.assert_array_equal(fields["routed_experts"], rows)
+    assert not block.routed_experts.flags.writeable
+
+
+@pytest.mark.parametrize("starts", [[0, 5], [0, 3], [1, 4]])
+def test_aux_reader_rejects_gaps_and_overlaps(starts: list[int]):
+    store = Mock()
+    store.get_buffer.side_effect = [
+        b"".join(encode_parts(AuxBlock(start, np.zeros((4, 3, 2), dtype=np.uint8))))
+        for start in starts
+    ]
+    with pytest.raises(ValueError):
+        list(iter_aux_blocks(store, ["first", "second"], start=0, stop=8))
+
+
+def test_aux_reader_missing_object():
+    store = Mock()
+    store.get_buffer.return_value = None
+    with pytest.raises(BlockObjectStoreError, match="missing"):
+        read_aux_block(store, "missing")
+
+
+@pytest.mark.parametrize(
+    "shape,dtype,start",
+    [((2, 3), _DTYPE, 0), (_SHAPE, np.dtype("u2"), 0), (_SHAPE, _DTYPE, 1)],
+)
+def test_mooncake_reads_check_expected_routing_profile_and_range(
+    remote_store, shape, dtype, start
+):
+    remote_store.put(
+        [_encoded_object("block", 0, np.zeros((4, *_SHAPE), dtype=_DTYPE))]
+    )
+    with pytest.raises(ValueError):
+        remote_store.get_concatenated(
+            ["block"], shape_per_token=shape, dtype=dtype, token_start=start
+        )
+
+
+def test_mooncake_requires_parts_api_and_encoded_capacity():
+    with pytest.raises(RuntimeError, match="put_parts"):
+        MooncakeBlockObjectStore(SimpleNamespace(), object_nbytes=4, max_batch_bytes=88)
+    with pytest.raises(ValueError, match="encoded"):
+        MooncakeBlockObjectStore(Mock(), object_nbytes=4, max_batch_bytes=43)
 
 
 @pytest.mark.parametrize("aux_config", ["separate", "shared", "missing", "offload"])
@@ -110,12 +263,12 @@ def remote_store(monkeypatch, request):
     remote: dict[str, bytes] = {}
     native = Mock()
 
-    def put(keys, values):
-        for key, value in zip(keys, values, strict=True):
-            remote.setdefault(key, value)
+    def put(key: str, *parts: bytes) -> int:
+        remote.setdefault(key, b"".join(parts))
         return 0
 
-    native.put_batch.side_effect = put
+    native.put_parts.side_effect = put
+    native.get_buffer.side_effect = remote.get
     native.batch_get_buffer.side_effect = lambda keys: [remote.get(k) for k in keys]
     store = MooncakeBlockObjectStore(
         native,
@@ -138,7 +291,9 @@ def test_mooncake_output_keys_contain_exact_accepted_rows(remote_store, start, e
     keys = [f"block-{i}" for i in range(16 // block_size)]
     remote_store.put(
         [
-            BlockObject(key, rows[i * block_size : (i + 1) * block_size].tobytes())
+            _encoded_object(
+                key, i * block_size, rows[i * block_size : (i + 1) * block_size]
+            )
             for i, key in enumerate(keys)
         ]
     )
@@ -189,10 +344,10 @@ def test_mooncake_pd_reads_only_boundary_and_reuses_shared_blocks(
     full_end = prompt_length // _BLOCK_SIZE * _BLOCK_SIZE
     source_keys = [f"prefill-{i}" for i in range(0, prompt_length, _BLOCK_SIZE)]
     source_keys[: full_end // _BLOCK_SIZE] = routed_experts_keys(
-        hashes[: full_end // _BLOCK_SIZE], "0"
+        hashes[: full_end // _BLOCK_SIZE], "0", mooncake=True
     )
     objects = [
-        BlockObject(key, source[i : i + _BLOCK_SIZE].tobytes())
+        _encoded_object(key, i, source[i : i + _BLOCK_SIZE])
         for key, i in zip(source_keys, range(0, prompt_length, _BLOCK_SIZE))
     ]
     remote_store.put(objects)
@@ -209,7 +364,7 @@ def test_mooncake_pd_reads_only_boundary_and_reuses_shared_blocks(
         step.metadata.remote_tails["decode"] = source_keys[
             (prompt_length - 1) // _BLOCK_SIZE
         ]
-    remote_store._store.put_batch.reset_mock()
+    remote_store._store.put_parts.reset_mock()
     output = _process_output(
         worker, step, rows[prompt_length - 1 :], ["decode"], np.array([0])
     )["decode"]
@@ -218,11 +373,7 @@ def test_mooncake_pd_reads_only_boundary_and_reuses_shared_blocks(
     assert [call.args[0] for call in calls] == (
         [[source_keys[boundary]]] if (prompt_length - 1) % _BLOCK_SIZE else []
     )
-    published = {
-        key
-        for call in remote_store._store.put_batch.call_args_list
-        for key in call.args[0]
-    }
+    published = {call.args[0] for call in remote_store._store.put_parts.call_args_list}
     assert not published.intersection(source_keys[:boundary])
     expected = rows.copy()
     expected[:full_end] = source[:full_end]
@@ -303,7 +454,7 @@ def test_mooncake_decode_crosses_blocks_and_clips_terminal_output(remote_store):
         connector.take_output(request, {"request": AuxRequestOutput(0, rows[:3], [])})
         is None
     )
-    remote_store.put([BlockObject("block-0", rows[:4].tobytes())])
+    remote_store.put([_encoded_object("block-0", 0, rows[:4])])
     request.num_tokens = 6
     assert (
         connector.take_output(
@@ -311,7 +462,7 @@ def test_mooncake_decode_crosses_blocks_and_clips_terminal_output(remote_store):
         )
         is None
     )
-    remote_store.put([BlockObject("block-1", rows[4:8].tobytes())])
+    remote_store.put([_encoded_object("block-1", 4, rows[4:8])])
     request.num_tokens = 10
     request.finished = True
     keys = connector.take_output(
@@ -440,33 +591,33 @@ def test_mooncake_string_stop_delivers_keys_before_engine_abort(remote_store):
 
 
 def test_mooncake_batches_preserve_order_and_request_release_keeps_objects():
-    """The shared writer publishes bytes; a request does not own remote retention."""
+    """The writer deduplicates keys and leaves remote retention to the deployment."""
     remote: dict[str, bytes] = {}
     native = Mock()
 
-    def put(keys, values):
-        for key, value in zip(keys, values, strict=True):
-            remote.setdefault(key, value)
+    def put(key: str, *parts: bytes) -> int:
+        remote.setdefault(key, b"".join(parts))
         return 0
 
-    native.put_batch.side_effect = put
+    native.put_parts.side_effect = put
     native.batch_get_buffer.side_effect = lambda keys: [remote.get(k) for k in keys]
     store = BackgroundBlockObjectStore(
-        MooncakeBlockObjectStore(native, object_nbytes=4, max_batch_bytes=8),
+        MooncakeBlockObjectStore(native, object_nbytes=4, max_batch_bytes=88),
         max_pending_batches=2,
     )
-    store.put(
-        [
-            BlockObject("a", b"abcd"),
-            BlockObject("b", b"efgh"),
-            BlockObject("a", b"abcd"),
-            BlockObject("c", b"ij"),
-        ],
-        retain_keys=("a", "b", "c"),
+    rows = np.arange(10, dtype=np.uint8).reshape(-1, 1, 1)
+    a, b, c = (
+        _encoded_object(key, start, rows[start:stop])
+        for key, start, stop in (("a", 0, 4), ("b", 4, 8), ("c", 8, 10))
     )
+    store.put([a, b, a, c], retain_keys=("a", "b", "c"))
     store.put([], release_keys=("a", "b", "c"))
-    assert store.get_concatenated(["c", "a", "b", "a"]) == b"ijabcdefghabcd"
-    assert native.put_batch.call_count == 2
+    assert store.get_concatenated(["a", "b", "c"]) == rows.tobytes()
+    assert native.put_parts.call_count == 3
+    assert [call.args[0] for call in native.batch_get_buffer.call_args_list] == [
+        ["a", "b"],
+        ["c"],
+    ]
     native.remove.assert_not_called()
     store.close()
     native.close.assert_called_once_with()
@@ -474,31 +625,133 @@ def test_mooncake_batches_preserve_order_and_request_release_keeps_objects():
 
 def test_mooncake_missing_object_does_not_return_partial_output():
     native = Mock()
-    native.batch_get_buffer.return_value = [b"abcd", None]
-    store = MooncakeBlockObjectStore(native, object_nbytes=4, max_batch_bytes=8)
+    rows = np.zeros((4, 1, 1), dtype=np.uint8)
+    native.batch_get_buffer.return_value = [
+        b"".join(encode_parts(AuxBlock(0, rows))),
+        None,
+    ]
+    store = MooncakeBlockObjectStore(native, object_nbytes=4, max_batch_bytes=88)
     with pytest.raises(BlockObjectStoreError, match="unavailable: missing"):
         store.get_concatenated(["present", "missing"])
 
 
 def test_mooncake_republishing_a_key_keeps_its_original_bytes(remote_store):
-    remote_store.put([BlockObject("shared", b"first")])
-    remote_store.put([BlockObject("shared", b"other")])
-    assert remote_store.get_concatenated(["shared"]) == b"first"
+    first = np.zeros((1, *_SHAPE), dtype=np.uint8)
+    other = np.ones_like(first)
+    remote_store.put([_encoded_object("shared", 0, first)])
+    remote_store.put([_encoded_object("shared", 0, other)])
+    assert remote_store.get_concatenated(["shared"]) == first.tobytes()
 
 
 def test_mooncake_failure_propagates_through_background_writer():
     native = Mock()
-    native.put_batch.return_value = -800
+    native.put_parts.return_value = -800
     store = BackgroundBlockObjectStore(
-        MooncakeBlockObjectStore(native, object_nbytes=4, max_batch_bytes=8),
+        MooncakeBlockObjectStore(native, object_nbytes=4, max_batch_bytes=88),
         max_pending_batches=1,
     )
-    # put() can also observe the failure immediately, depending on thread timing.
     with suppress(BlockObjectStoreError):
-        store.put([BlockObject("a", b"abcd")])
+        store.put([_encoded_object("a", 0, np.zeros((4, 1, 1), dtype=np.uint8))])
     with pytest.raises(BlockObjectStoreError, match="publication failed"):
         store.get_concatenated(["a"])
     with pytest.raises(BlockObjectStoreError, match="publication failed"):
+        store.close()
+    native.close.assert_called_once_with()
+
+
+def test_background_shm_rejects_encoded_mooncake_objects():
+    store = BackgroundBlockObjectStore(_make_store(), max_pending_batches=1)
+    with suppress(BlockObjectStoreError):
+        store.put([_encoded_object("encoded", 0, np.zeros((1, 1, 1), dtype=np.uint8))])
+    with pytest.raises(BlockObjectStoreError) as error:
+        store.flush()
+    assert isinstance(error.value.__cause__, TypeError)
+    with pytest.raises(BlockObjectStoreError):
+        store.close()
+
+
+def test_mooncake_partial_keys_survive_step_flush_and_request_id_reuse(remote_store):
+    rows = np.arange(12, dtype=np.uint8).reshape(2, *_SHAPE)
+    output = AuxRequestOutput(np.int64(0), rows[:1], [])
+    publisher = MooncakeOutputPublisher(output, _BLOCK_SIZE)
+    request = _SchedulerRequest(
+        "reused", [], num_tokens=2, sampling_params=SimpleNamespace(stop=["!"])
+    )
+    first = publisher.take_output(request, output)
+    request.num_tokens = 3
+    request.finished = True
+    second = publisher.take_output(request, AuxRequestOutput(np.int64(1), rows[1:], []))
+    assert first[0].rsplit("/", 1)[0] == second[0].rsplit("/", 1)[0]
+    assert remote_store.get_concatenated(first + second) == rows.tobytes()
+    request.num_tokens = 2
+    third = publisher.take_output(request, output)
+    assert third[0].rsplit("/", 1)[0] != first[0].rsplit("/", 1)[0]
+    publisher.close()
+
+
+def test_mooncake_worker_reset_uses_new_format_generation(remote_store):
+    worker = _make_worker(1)
+    worker._store.close()
+    worker._store = BackgroundBlockObjectStore(remote_store, max_pending_batches=2)
+    worker._return_keys = True
+    hashes = [b"a" * 32]
+    rows = np.arange(24, dtype=np.uint8).reshape(4, *_SHAPE)
+    keys = []
+    for generation in (0, 1):
+        step = _metadata(
+            generation, [_request_metadata("request", 0, 4, 0, hashes)], {}
+        )
+        output = _process_output(
+            worker, step, rows + generation, ["request"], np.array([0])
+        )
+        key = output["request"].block_keys[0]
+        assert key == f"vllm-aux/v1/r3/{generation}/{hashes[0].hex()}"
+        keys.append(key)
+    assert remote_store.get_concatenated([keys[0]]) == rows.tobytes()
+    assert remote_store.get_concatenated([keys[1]]) == (rows + 1).tobytes()
+    worker.close()
+
+
+def test_mooncake_boundary_failure_does_not_deliver_keys(remote_store):
+    rows = np.zeros((1, *_SHAPE), dtype=np.uint8)
+    output = AuxRequestOutput(0, rows, [])
+    publisher = MooncakeOutputPublisher(output, _BLOCK_SIZE)
+    request = _SchedulerRequest("failed", [], num_tokens=2, finished=True)
+    remote_store._store.put_parts.side_effect = None
+    remote_store._store.put_parts.return_value = -800
+    with pytest.raises(BlockObjectStoreError, match="publication failed"):
+        publisher.take_output(request, output)
+    publisher.discard(request.request_id)
+    publisher.close()
+
+
+def test_mooncake_failed_parallel_put_waits_for_other_inflight_writes():
+    started, release = threading.Event(), threading.Event()
+    native = Mock()
+
+    def put(key: str, *parts: bytes) -> int:
+        if key == "failed":
+            assert started.wait(timeout=5)
+            return -800
+        started.set()
+        assert release.wait(timeout=5)
+        return 0
+
+    native.put_parts.side_effect = put
+    store = BackgroundBlockObjectStore(
+        MooncakeBlockObjectStore(native, object_nbytes=4, max_batch_bytes=88),
+        max_pending_batches=1,
+    )
+    rows = np.zeros((4, 1, 1), dtype=np.uint8)
+    store.put(
+        [_encoded_object("failed", 0, rows), _encoded_object("inflight", 4, rows)]
+    )
+    assert started.wait(timeout=5)
+    assert store._queue.unfinished_tasks == 1
+    release.set()
+    with pytest.raises(BlockObjectStoreError):
+        store.flush()
+    with pytest.raises(BlockObjectStoreError):
         store.close()
     native.close.assert_called_once_with()
 
