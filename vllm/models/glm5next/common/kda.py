@@ -498,6 +498,20 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         core_attn_out = core_attn_out.reshape(core_attn_out.size(1), -1)
         return self.o_proj(core_attn_out)[0]
 
+    def _concat_conv_weights(self) -> torch.Tensor:
+        return torch.cat(
+            [
+                m.weight.view(m.weight.size(0), m.weight.size(2))
+                for m in (self.q_conv1d, self.k_conv1d, self.v_conv1d)
+            ],
+            dim=0,
+        ).contiguous()
+
+    def refresh_merged_conv_weight(self) -> None:
+        """Rewrite the cached merged conv weight in place after a reload."""
+        if self._merged_conv_weight is not None:
+            self._merged_conv_weight.copy_(self._concat_conv_weights())
+
     @eager_break_during_capture
     def _forward(
         self,
@@ -553,17 +567,10 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         # 1D conv is independent per channel, so concatenating q/k/v along the
         # channel dim and running a single causal_conv1d is bit-identical to
         # three calls. The merged weight is q|k|v conv weights concatenated;
-        # built once and cached (params are fixed after load). conv_state is
+        # built once and cached (refreshed after a reload). conv_state is
         # already stored as the merged q|k|v state, so it is used directly.
         if self._merged_conv_weight is None:
-
-            def _w(m):
-                return m.weight.view(m.weight.size(0), m.weight.size(2))
-
-            self._merged_conv_weight = torch.cat(
-                [_w(self.q_conv1d), _w(self.k_conv1d), _w(self.v_conv1d)],
-                dim=0,
-            ).contiguous()
+            self._merged_conv_weight = self._concat_conv_weights()
         conv_weights = self._merged_conv_weight
         conv_bias = self.q_conv1d.bias
 

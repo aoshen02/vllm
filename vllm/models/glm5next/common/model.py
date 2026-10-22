@@ -1132,6 +1132,11 @@ class Glm5NextForCausalLM(
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
 
+    def process_weights_after_loading(self) -> None:
+        for module in self.modules():
+            if isinstance(module, Glm5NextLinearAttention):
+                module.refresh_merged_conv_weight()
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
         return loader.load_weights(weights)
@@ -1235,6 +1240,9 @@ class Glm5NextForConditionalGeneration(
         # Glm5NextForCausalLM does not implement make_empty_intermediate_tensors,
         # so pipeline parallelism is gated off (consistent with the text-only
         # model) and we intentionally do not alias it here.
+
+    def process_weights_after_loading(self) -> None:
+        self.language_model.process_weights_after_loading()
 
     def set_moe_parameters(self) -> None:
         self.moe_mlp_layers = [
