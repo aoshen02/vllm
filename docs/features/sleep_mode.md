@@ -221,6 +221,110 @@ curl -X POST 'http://localhost:8000/wake_up?tags=kv_cache'
 !!! note
     These endpoints are only available when passing `VLLM_SERVER_DEV_MODE=1`.
 
+## Custom sleep backends
+
+Sleep and wake-up (`LLM.sleep()` / `LLM.wake_up()`, `/sleep` / `/wake_up`) call a
+pluggable sleep-mode backend (`SleepModeBackend`) in each GPU worker. The backend is
+selected by name with `ModelConfig.sleep_mode_backend`, which defaults to `"cumem"`
+(the built-in `CuMemBackend`). Use this extension point to replace the allocator
+offload with your own mechanism, such as CUDA checkpoint or CRIU. vLLM ships only
+`cumem`. The interface is early-stage (RFC #34303) and may change.
+
+!!! warning
+    There is no `--sleep-mode-backend` CLI flag and no `EngineArgs` field yet.
+    `vllm serve` and `LLM(...)` always use `cumem`. To select another backend, set
+    `model_config.sleep_mode_backend` on a `VllmConfig` (see step 3 below).
+
+### 1. Implement the backend
+
+Subclass `SleepModeBackend` and implement `suspend` and `resume`:
+
+```python
+# my_pkg/backend.py
+from vllm.device_allocator.sleep_mode_backend import SleepModeBackend
+
+
+class MyCkptBackend(SleepModeBackend):
+    def suspend(self, level: int = 1) -> None:
+        ...  # free GPU state (level 1 or 2, same meaning as sleep levels)
+        self._state = "SUSPENDED"
+
+    def resume(self, tags: list[str] | None = None) -> None:
+        ...  # restore GPU state; tags may be ["weights"] or ["kv_cache"]
+        self._state = "RUNNING"
+
+    @classmethod
+    def is_supported(cls) -> bool:
+        return True  # probe the driver or tool; False fails backend creation
+```
+
+- Required methods: `suspend(level)` and `resume(tags)`.
+- Optional methods:
+    - `discard(tags)` is needed for `release_kv_cache_memory`. The default raises `RuntimeError`.
+    - `state()` returns `self._state`, which is one of `"RUNNING"`, `"SUSPENDED"` or `"RESUMING"`.
+- Capability classmethods:
+    - `is_supported()` defaults to `True`.
+    - `preserves_communicators()`, `preserves_compiled_artifacts()`, `preserves_graphs_with_communicators()` and `supports_durable_storage()` all default to `False`.
+- vLLM checks only `is_supported()` today. It does not act on the other capability flags. For example, it does not re-create NCCL communicators, recompile kernels or recapture CUDA graphs after `resume`. Your backend must restore anything it destroys.
+- The backend is constructed with no arguments. It is created lazily, once per worker process (each TP/PP rank), on the first sleep, wake-up or discard. If several ranks must act in a fixed order, the backend has to coordinate them.
+
+### 2. Register it from a plugin
+
+Register the backend under a name with `SleepModeBackendFactory.register_backend(name, module_path, class_name)`. Registration is lazy: the module is imported only when the backend is created. The backend is resolved inside each worker, so register it from a `vllm.general_plugins` entry point. vLLM loads general plugins in every process it starts (see [Plugin System](../design/plugin_system.md)).
+
+```python
+# my_pkg/__init__.py
+def register():
+    from vllm.device_allocator.sleep_mode_backend import SleepModeBackendFactory
+
+    try:
+        SleepModeBackendFactory.register_backend(
+            "my_ckpt", "my_pkg.backend", "MyCkptBackend"
+        )
+    except ValueError:
+        pass  # already registered; plugins must be re-entrant
+```
+
+```python
+# setup.py
+setup(
+    name="my_pkg",
+    entry_points={"vllm.general_plugins": ["my_ckpt = my_pkg:register"]},
+)
+```
+
+### 3. Select it
+
+```python
+from vllm import EngineArgs
+from vllm.v1.engine.llm_engine import LLMEngine
+
+vllm_config = EngineArgs(
+    model="Qwen/Qwen3-0.6B", enable_sleep_mode=True
+).create_engine_config()
+vllm_config.model_config.sleep_mode_backend = "my_ckpt"
+engine = LLMEngine.from_vllm_config(vllm_config)
+
+engine.sleep(level=1)
+engine.wake_up()
+```
+
+Use `AsyncLLM.from_vllm_config(vllm_config)` for the async engine.
+
+### Behavior and limitations
+
+- **`--enable-sleep-mode` is still required.** On CUDA/ROCm it still turns on the cumem allocator (`enable_cumem_allocator`), so weights and KV cache are allocated from the CuMem pool whichever backend you select.
+- **The worker still runs its own steps around your backend.** These steps include:
+    - saving and restoring buffers and `sleep_preserve_parameter_names` at level 2;
+    - unregistering and restoring KV-connector caches;
+    - the `enable_nccl_comm_suspend` suspend and resume.
+- **Freed memory is checked.** After `suspend`, the worker asserts that free GPU memory did not decrease (`Memory usage increased after sleeping.`).
+- **CUDA graph offload needs `cumem`.** `sleep_mode_offload_cudagraph` takes effect only with the `cumem` backend.
+- **Errors appear on the first sleep, wake-up or discard, not at startup:**
+    - An unregistered name raises `ValueError: Unsupported sleep-mode backend '<name>'. Registered backends: ...`.
+    - `is_supported()` returning `False` raises `ValueError: Sleep-mode backend '<name>' is not supported on this platform.`
+    - Registering a name twice, including `cumem`, raises `ValueError: Sleep-mode backend '<name>' is already registered.`
+
 ## Limitation
 
 On ROCm, the virtual memory allocation on ROCm is done through chunked memory allocation. You can control the chunk size through `VLLM_ROCM_SLEEP_MEM_CHUNK_SIZE` (in MB). The default value is set at 256MB. The larger the chunk size the faster the performance. However, setting it too large will cause OOM. So if you encounter OOM when using sleep mode. Try reducing the chunk size. It is recommended to define the chunk size as a power of 2.
