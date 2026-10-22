@@ -19,6 +19,9 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from vllm.model_executor.model_loader.mtp_validation import (
+    is_mtp_completeness_check_enabled,
+)
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from .gemma4_mtp import Gemma4MTPAttention, Gemma4MTPDecoderLayer
@@ -326,7 +329,7 @@ class Gemma4DSparkForCausalLM(Qwen3DSparkForCausalLM):
                     loaded.add(name)
                     if "confidence_head" in name:
                         includes_confidence_head = True
-        if not includes_confidence_head:
+        if not includes_confidence_head and is_mtp_completeness_check_enabled():
             self.model.confidence_head = None
         self.model._build_fused_kv_buffers()
         return loaded
