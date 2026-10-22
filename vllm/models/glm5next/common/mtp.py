@@ -310,7 +310,6 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
 
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
-        _pending_wk_fp8: dict = {}
         # GLM-5.3-Flash NoPE checkpoints omit the RoPE rows from
         # ``kv_a_proj_with_mqa``; the FP8-to-BF16 path pads them for the model.
         kv_a_pad_size = 0
@@ -335,7 +334,7 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
             if _try_load_fp8_indexer_wk(
                 name,
                 loaded_weight,
-                _pending_wk_fp8,
+                self,
                 params_dict,
                 loaded_params,
             ):
@@ -349,7 +348,7 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
             if _try_load_fp8_attn_proj(
                 name,
                 loaded_weight,
-                _pending_wk_fp8,
+                self,
                 params_dict,
                 loaded_params,
                 kv_a_pad_size,
