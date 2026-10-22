@@ -510,7 +510,9 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
     def refresh_merged_conv_weight(self) -> None:
         """Rewrite the cached merged conv weight in place after a reload."""
         if self._merged_conv_weight is not None:
-            self._merged_conv_weight.copy_(self._concat_conv_weights())
+            # Built in forward, so an inference tensor.
+            with torch.inference_mode():
+                self._merged_conv_weight.copy_(self._concat_conv_weights())
 
     @eager_break_during_capture
     def _forward(

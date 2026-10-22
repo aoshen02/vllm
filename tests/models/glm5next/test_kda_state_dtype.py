@@ -48,7 +48,8 @@ def test_merged_conv_weight_refreshes_in_place_after_reload():
         conv = torch.nn.Module()
         conv.weight = torch.nn.Parameter(torch.randn(4, 1, 3), requires_grad=False)
         setattr(layer, name, conv)
-    layer._merged_conv_weight = layer._concat_conv_weights()
+    with torch.inference_mode():  # As built in forward.
+        layer._merged_conv_weight = layer._concat_conv_weights()
     cached = layer._merged_conv_weight
     layer.k_conv1d.weight.data.copy_(torch.randn(4, 1, 3))  # A reload writes in place.
 
