@@ -112,6 +112,8 @@ The server returns a 400 for:
 
 For using `output_mode` with separate prefill and decode pools, see [Disaggregated Prefilling](../../features/disagg_prefill.md#generate-api-output-modes).
 
+To force the decoded tokens and score them (trace replay), pass `sampling_params.trace_decode_token_ids` on a server started with `--enable-trace-replay`, see [Trace Replay](trace_replay.md#over-http).
+
 ## Weight versions
 
 The final output of every choice carries `weight_versions`, the label of the weights that sampled each range of its output tokens. Ranges are half-open over output-token indexes (prompt excluded), contiguous and in generation order, so a request that crossed one weight update gets two:
