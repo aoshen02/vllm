@@ -160,7 +160,8 @@ def materialize_layer(layer: torch.nn.Module, info: LayerReloadingInfo):
         for name, tensor in get_layer_tensors(layer).items():
             if name not in SKIP_TENSORS and tensor.is_meta:
                 # A host-offloaded tensor (e.g. a pinned CPU embedding table) is
-                # reloaded on the host: the device may not fit a second copy.
+                # reloaded on the host: the device may not fit a second copy. Its
+                # post-load processing then runs on the host as well.
                 old = kernel.get(name)
                 on_host = old is not None and old.device.type == "cpu"
                 with torch.device("cpu") if on_host else nullcontext():
