@@ -89,6 +89,14 @@ def _get_weight_loader(param: torch.Tensor) -> Callable[..., object]:
     return weight_loader
 
 
+def _load_all_experts(param: torch.Tensor, weight: torch.Tensor, name: str) -> None:
+    """Load every local expert at once through the param's weight loader, so
+    weight reloads (which wrap the loaders) see the write."""
+    _get_weight_loader(param)(
+        param, weight, weight_name=name, shard_id=None, expert_id=None
+    )
+
+
 class OAIAttention(nn.Module):
     # Override to switch RoPE convention. gpt-oss uses NeoX (chunk halves);
     # privacy-filter and similar derivatives use GPT-J (interleaved pairs).
@@ -1195,7 +1203,7 @@ class GptOssModel(nn.Module, EagleModelMixin):
                 narrow_weight = narrow_weight.permute(0, 2, 1).contiguous()
                 param = params_dict[name]
 
-                param.copy_(narrow_weight)
+                _load_all_experts(param, narrow_weight, name)
                 loaded_params.add(name)
                 continue
             elif ".w2_weight" in name:
@@ -1207,7 +1215,7 @@ class GptOssModel(nn.Module, EagleModelMixin):
                 narrow_weight = narrow_weight.permute(0, 2, 1).contiguous()
                 param = params_dict[name]
 
-                param.copy_(narrow_weight)
+                _load_all_experts(param, narrow_weight, name)
                 loaded_params.add(name)
                 continue
             elif ".w13_bias" in name:
@@ -1219,7 +1227,7 @@ class GptOssModel(nn.Module, EagleModelMixin):
                     narrow_weight = weight[:, 2 * tp_rank_start : 2 * tp_rank_end]
 
                 param = params_dict[name]
-                param.copy_(narrow_weight)
+                _load_all_experts(param, narrow_weight, name)
                 loaded_params.add(name)
                 continue
             elif ".w2_bias" in name:
@@ -1229,9 +1237,9 @@ class GptOssModel(nn.Module, EagleModelMixin):
                 else:
                     # (only load on rank 0 to avoid duplication)
                     if tp_rank != 0:
-                        weight.zero_()
+                        weight = torch.zeros_like(weight)
                 param = params_dict[name]
-                param.copy_(weight)
+                _load_all_experts(param, weight, name)
                 loaded_params.add(name)
                 continue
             for param_name, weight_name, shard_id in stacked_params_mapping:

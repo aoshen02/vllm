@@ -695,8 +695,8 @@ class RoutedExperts(PluggableLayer):
         return_success: bool = False,
     ) -> bool | None:
         quant_config_name = self.quant_config and self.quant_config.get_name()
-        if quant_config_name == "gpt_oss_mxfp4":
-            # (FIXME) for gpt-oss all experts are combined
+        if quant_config_name == "gpt_oss_mxfp4" or expert_id is None:
+            # gpt-oss passes all local experts at once, already TP-sliced
             if "bias" in weight_name:
                 dim1 = loaded_weight.shape[1]
                 param.data[:, :dim1].copy_(loaded_weight)
