@@ -164,6 +164,13 @@ def _validate_supported_config(config: Glm5NextTextConfig) -> None:
         )
 
 
+def refresh_weight_caches(root: nn.Module) -> None:
+    """Rewrite weight-derived caches (KDA conv, indexer gate) after a reload."""
+    for module in root.modules():
+        if hasattr(module, "refresh_weight_cache"):
+            module.refresh_weight_cache()
+
+
 class Glm5NextMLP(nn.Module):
     def __init__(
         self,
@@ -1133,9 +1140,7 @@ class Glm5NextForCausalLM(
         return logits
 
     def process_weights_after_loading(self) -> None:
-        for module in self.modules():
-            if isinstance(module, Glm5NextLinearAttention):
-                module.refresh_merged_conv_weight()
+        refresh_weight_caches(self)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)

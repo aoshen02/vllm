@@ -507,7 +507,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             dim=0,
         ).contiguous()
 
-    def refresh_merged_conv_weight(self) -> None:
+    def refresh_weight_cache(self) -> None:
         """Rewrite the cached merged conv weight in place after a reload."""
         if self._merged_conv_weight is not None:
             # Built in forward, so an inference tensor.
