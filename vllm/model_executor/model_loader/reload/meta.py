@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import inspect
 from collections.abc import Callable
+from contextlib import nullcontext
 
 import torch
 from torch.nn.parameter import UninitializedParameter
@@ -150,10 +151,20 @@ def materialize_layer(layer: torch.nn.Module, info: LayerReloadingInfo):
     if layer.__class__.__name__ in SKIP_MODULES:
         return
 
+    kernel = (
+        {}
+        if info.kernel_tensors is None
+        else {**info.kernel_tensors[0], **info.kernel_tensors[1]}
+    )
     with info.restore_device:
         for name, tensor in get_layer_tensors(layer).items():
             if name not in SKIP_TENSORS and tensor.is_meta:
-                setattr(layer, name, materialize_meta_tensor(tensor))
+                # A host-offloaded tensor (e.g. a pinned CPU embedding table) is
+                # reloaded on the host: the device may not fit a second copy.
+                old = kernel.get(name)
+                on_host = old is not None and old.device.type == "cpu"
+                with torch.device("cpu") if on_host else nullcontext():
+                    setattr(layer, name, materialize_meta_tensor(tensor))
 
 
 class CopyCounter(TorchDispatchMode):
