@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import typing
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator
 from functools import partial
 from itertools import islice
 
@@ -127,6 +127,7 @@ logger = init_logger(__name__)
 
 
 _EXPERT_WEIGHT_NAME = re.compile(r"experts\.\d+\.w[123]\.")
+_ROUTED_EXPERT_WEIGHT = re.compile(r"layers\.(\d+)\.ffn\.(experts\.(\d+)\.(w[123])\.)")
 
 
 def _expert_mapping_index(
@@ -1367,6 +1368,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             and not self.use_sequence_parallel
         )
 
+        weights = self._load_routed_expert_runs(weights, params_dict, loaded_params)
         for name, loaded_weight in weights:
             if name.startswith(("vision.", "aligner.", "image_")):
                 # Vision weights are loaded by the outer multimodal wrapper.
@@ -1462,6 +1464,60 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                     continue
 
         return loaded_params
+
+    def _load_routed_expert_runs(
+        self,
+        weights: Iterable[tuple[str, torch.Tensor]],
+        params_dict: dict[str, torch.nn.Parameter],
+        loaded_params: set[str],
+    ) -> Iterator[tuple[str, torch.Tensor]]:
+        """Load runs of consecutive experts of one routed-expert parameter at once.
+
+        Experts that support ``load_routed_experts`` get each run in one batched
+        copy instead of one loader call per expert; every other tensor is
+        yielded unchanged.
+        """
+        run: list[torch.Tensor] = []
+        run_key: tuple[torch.nn.Module, str, str] | None = None
+        run_start = 0
+
+        def flush() -> None:
+            if run_key is not None and run:
+                experts, param_name, shard_id = run_key
+                experts.load_routed_experts(
+                    params_dict[param_name], param_name, shard_id, run_start, run
+                )
+                loaded_params.add(param_name)
+                run.clear()
+
+        for name, loaded_weight in weights:
+            match = _ROUTED_EXPERT_WEIGHT.search(name)
+            experts = None
+            if match is not None:
+                layer_idx = int(match[1])
+                if self.start_layer <= layer_idx < self.end_layer:
+                    experts = self.layers[layer_idx].ffn.experts
+            if experts is not None and hasattr(experts, "load_routed_experts"):
+                shard_id = match[4]
+                param_name = name.replace(
+                    match[2], "experts.w2_" if shard_id == "w2" else "experts.w13_"
+                )
+                if param_name in params_dict:
+                    if (
+                        "weight_scale" in name
+                        and loaded_weight.dtype == torch.float8_e8m0fnu
+                    ):
+                        loaded_weight = loaded_weight.view(torch.uint8)
+                    expert_id = int(match[3])
+                    key = (experts, param_name, shard_id)
+                    if key != run_key or expert_id != run_start + len(run):
+                        flush()
+                        run_key, run_start = key, expert_id
+                    run.append(loaded_weight)
+                    continue
+            flush()
+            yield name, loaded_weight
+        flush()
 
     @staticmethod
     def _pad_shared_expert_weight(

@@ -500,6 +500,43 @@ class DeepGemmMegaMoEExperts(nn.Module):
                 )
         return True if return_success else None
 
+    def load_routed_experts(
+        self,
+        param: nn.Parameter,
+        weight_name: str,
+        shard_id: str,
+        first_expert_id: int,
+        loaded_weights: list[torch.Tensor],
+    ) -> None:
+        """Load checkpoint shards of consecutive logical experts in one copy.
+
+        Same bytes as calling ``weight_loader`` per expert; experts not on this
+        rank are skipped.
+        """
+        num_slots = self.experts_end_idx - self.experts_start_idx
+        if (
+            weight_name.endswith(("weight_scale_2", "input_scale"))
+            or self.experts_end_idx > self.num_logical_experts
+            or num_slots != self.num_local_experts
+        ):
+            for offset, loaded_weight in enumerate(loaded_weights):
+                self.weight_loader(
+                    param,
+                    loaded_weight,
+                    weight_name,
+                    shard_id,
+                    first_expert_id + offset,
+                )
+            return
+        param_prefix = "w2_" if shard_id == "w2" else "w13_"
+        lo = max(first_expert_id, self.experts_start_idx)
+        hi = min(first_expert_id + len(loaded_weights), self.experts_end_idx)
+        if lo >= hi or param_prefix not in weight_name:
+            return
+        src = torch.stack(loaded_weights[lo - first_expert_id : hi - first_expert_id])
+        dst = param.data[lo - self.experts_start_idx : hi - self.experts_start_idx]
+        self._load_weight(dst, src, shard_id, weight_name.endswith("weight_scale"))
+
     def _record_global_scale(
         self, weight_name: str, scale: torch.Tensor, shard_id: str, expert_id: int
     ) -> None:
@@ -556,20 +593,22 @@ class DeepGemmMegaMoEExperts(nn.Module):
     ) -> None:
         """Write checkpoint shard ``src`` into ``dst`` in the kernel layout.
 
-        ``dst`` is one routed expert's slice or a shared-expert parameter.
+        ``dst`` is one routed expert's slice, a shared-expert parameter, or a
+        run of routed experts stacked on a leading dim (as ``src``).
         """
         if shard_id not in ("w1", "w2", "w3"):
             raise ValueError(f"Unsupported expert shard id: {shard_id}")
-        rows = dst.shape[0] // (1 if shard_id == "w2" else 2)
+        rows = dst.shape[-2] // (1 if shard_id == "w2" else 2)
+        shard_shape = (*dst.shape[:-2], rows, dst.shape[-1])
         if is_scale:
-            src = self._pack_scale(src, rows, dst.shape[1] * 4)
+            src = self._pack_scale(src, rows, dst.shape[-1] * 4)
         else:
             src = src.view(dst.dtype)
-            if tuple(src.shape) != (rows, dst.shape[1]):
-                raise ValueError(
-                    f"MegaMoE {shard_id} weight shape {tuple(src.shape)} does not "
-                    f"match the kernel shard ({rows}, {dst.shape[1]})"
-                )
+        if tuple(src.shape) != shard_shape:
+            raise ValueError(
+                f"MegaMoE {shard_id} {'scale' if is_scale else 'weight'} shape "
+                f"{tuple(src.shape)} does not match the kernel shard {shard_shape}"
+            )
         dst, src = self._kernel_layout_shard(dst, src, shard_id, is_scale)
         dst.copy_(src)
 
@@ -577,12 +616,12 @@ class DeepGemmMegaMoEExperts(nn.Module):
     def _pack_scale(sf: torch.Tensor, rows: int, cols: int) -> torch.Tensor:
         """Expand block scales to the kernel granularity, four per int32 along K."""
         sf = sf.view(torch.uint8)
-        if rows % sf.shape[0] or cols % sf.shape[1]:
+        if rows % sf.shape[-2] or cols % sf.shape[-1]:
             raise ValueError(
                 f"Scale shape {tuple(sf.shape)} does not tile ({rows}, {cols})"
             )
-        sf = sf.repeat_interleave(rows // sf.shape[0], 0)
-        sf = sf.repeat_interleave(cols // sf.shape[1], 1)
+        sf = sf.repeat_interleave(rows // sf.shape[-2], -2)
+        sf = sf.repeat_interleave(cols // sf.shape[-1], -1)
         return sf.contiguous().clone().view(torch.int32)
 
     @staticmethod
@@ -592,20 +631,25 @@ class DeepGemmMegaMoEExperts(nn.Module):
         shard_id: str,
         is_scale: bool,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Pair a checkpoint shard with its destination in the MegaMoE layout."""
-        k = src.shape[-1]
+        """Pair a checkpoint shard with its destination in the MegaMoE layout.
+
+        Rows are the second-to-last dim; leading dims (stacked experts) are kept.
+        """
+        lead, k = dst.shape[:-2], src.shape[-1]
         if shard_id == "w2":
             if not is_scale:
                 return dst, src
             # UTCCP: scale row 128*b + 32*j + i -> 128*b + 4*i + j.
-            return dst.view(-1, 32, 4, k).transpose(1, 2), src.reshape(-1, 4, 32, k)
+            dst = dst.view(*lead, -1, 32, 4, k).transpose(-3, -2)
+            return dst, src.reshape(*lead, -1, 4, 32, k)
         half = 0 if shard_id == "w1" else 1
         if not is_scale:
             # Interleave gate/up by 8 rows: r -> (r // 8) * 16 + 8 * half + r % 8.
-            return dst.view(-1, 2, 8, k)[:, half], src.reshape(-1, 8, k)
+            dst = dst.view(*lead, -1, 2, 8, k).select(-3, half)
+            return dst, src.reshape(*lead, -1, 8, k)
         # Interleave + UTCCP: 64b + 16j + 8q + m -> 128b + 64q + 32half + 4m + j.
-        dst = dst.view(-1, 2, 2, 8, 4, k)[:, :, half].permute(0, 3, 1, 2, 4)
-        return dst, src.reshape(-1, 4, 2, 8, k)
+        dst = dst.view(*lead, -1, 2, 2, 8, 4, k).select(-4, half).movedim(-2, -4)
+        return dst, src.reshape(*lead, -1, 4, 2, 8, k)
 
     def get_symm_buffer(self):
         from vllm.utils.deep_gemm import _import_deep_gemm

@@ -1272,3 +1272,48 @@ def test_deep_gemm_mega_moe_matches_reference(dist_init, fmt_name, shared, act_n
     assert output.dtype == torch.bfloat16
     assert _calc_diff(output, expected) < 1e-3
     assert F.cosine_similarity(output.float(), expected, dim=-1).min() > 0.99
+
+
+@pytest.mark.parametrize("weight_format", [MEGA_MOE_MXFP4, MEGA_MOE_NVFP4])
+def test_deep_gemm_mega_moe_batched_load_matches_per_expert_loads(weight_format):
+    """One run of consecutive experts, non-local ones included, writes the same
+    bytes as one weight_loader call per expert."""
+    ckpt = _load_mega_moe_checkpoint_shuffled(
+        _make_mega_moe_experts(6, 6, weight_format), 6, seed=3
+    )
+    per_expert, batched = (
+        _make_experts(
+            num_experts=6,
+            num_local_experts=3,
+            experts_start_idx=2,
+            top_k=1,
+            hidden_size=256,
+            intermediate_size=384,
+            weight_format=weight_format,
+        )
+        for _ in range(2)
+    )
+    for name, tensor in ckpt.items():
+        if name.startswith("w2_"):
+            shards = [("w2", tensor)]
+        elif tensor.dim() == 1:
+            shards = [("w1", tensor), ("w3", tensor)]
+        else:
+            shards = [("w1", tensor[:, :384]), ("w3", tensor[:, 384:])]
+        for shard_id, shard in shards:
+            if name.endswith("weight_scale"):
+                shard = shard.view(weight_format.routed.scale_dtype)
+            for expert_id in range(1, 6):
+                per_expert.weight_loader(
+                    getattr(per_expert, name),
+                    shard[expert_id],
+                    f"experts.{name}",
+                    shard_id=shard_id,
+                    expert_id=expert_id,
+                )
+            batched.load_routed_experts(
+                getattr(batched, name), f"experts.{name}", shard_id, 1, list(shard[1:])
+            )
+    for name, param in per_expert.named_parameters():
+        assert torch.count_nonzero(param) > 0, name
+        assert torch.equal(param, getattr(batched, name)), name
