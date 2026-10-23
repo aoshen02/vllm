@@ -1838,8 +1838,10 @@ class DeepseekV41LLMForCausalLM(
         loaded_params = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
         self.process_weights_after_loading()
         config = self.model.vllm_config
-        if config.engram_config and config.engram_config.use_thp:
+        engram_loaded = any(".engram.embed_tokens." in name for name in loaded_params)
+        if engram_loaded and config.engram_config and config.engram_config.use_thp:
             # Loading weights refills the file cache; release it before MADV_COLLAPSE.
+            # Weight updates that leave the Engram tables untouched skip both.
             model_config = config.model_config
             drop_checkpoint_cache(
                 model_config.model_weights or model_config.model,
