@@ -39,6 +39,7 @@ from .model import (
     _try_load_fp8_indexer_wk,
     get_sparse_topk_buffer_width,
     get_spec_layer_idx_from_weight_name,
+    refresh_weight_caches,
 )
 
 
@@ -286,6 +287,9 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
         elif shared_weight:
             name = name.replace(f"model.layers.{spec_layer}.", "model.")
         return name
+
+    def process_weights_after_loading(self) -> None:
+        refresh_weight_caches(self)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         stacked_params_mapping = [

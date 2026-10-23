@@ -39,3 +39,24 @@ def test_kda_recurrent_state_dtype_follows_ssm_cache_dtype(ssm_dtype, expected):
     layer = Glm5NextLinearAttention.__new__(Glm5NextLinearAttention)
     layer.model_config, layer.cache_config = model_config, cache_config
     assert layer.get_state_dtype() == want
+
+
+def test_merged_conv_weight_refreshes_in_place_after_reload():
+    layer = Glm5NextLinearAttention.__new__(Glm5NextLinearAttention)
+    torch.nn.Module.__init__(layer)
+    for name in ("q_conv1d", "k_conv1d", "v_conv1d"):
+        conv = torch.nn.Module()
+        conv.weight = torch.nn.Parameter(torch.randn(4, 1, 3), requires_grad=False)
+        setattr(layer, name, conv)
+    with torch.inference_mode():  # As built in forward.
+        layer._merged_conv_weight = layer._concat_conv_weights()
+    cached = layer._merged_conv_weight
+    layer.k_conv1d.weight.data.copy_(torch.randn(4, 1, 3))  # A reload writes in place.
+
+    model = Glm5NextForCausalLM.__new__(Glm5NextForCausalLM)
+    torch.nn.Module.__init__(model)
+    model.layer = layer
+    model.process_weights_after_loading()
+
+    assert layer._merged_conv_weight is cached
+    torch.testing.assert_close(cached, layer._concat_conv_weights())
