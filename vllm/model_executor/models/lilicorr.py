@@ -25,7 +25,11 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import kNvfp4Stat
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 
 from .nemotron_h import NemotronHMLP
-from .qwen3_dflash import DFlashQwen3ForCausalLM, DFlashQwen3Model
+from .qwen3_dflash import (
+    DFlashQwen3ForCausalLM,
+    DFlashQwen3Model,
+    _rebuild_in_place,
+)
 from .qwen3_dflash2 import DFlash2Qwen3DecoderLayer
 from .utils import AutoWeightsLoader, maybe_prefix
 
@@ -549,4 +553,9 @@ class LiLiCorrForCausalLM(DFlashQwen3ForCausalLM):
         super().process_weights_after_loading()
         head = self.model.lilicorr
         parameter = head.slot_embedding
-        head.materialize_inference_buffers(parameter.device, parameter.dtype)
+        _rebuild_in_place(
+            head,
+            lambda: head.materialize_inference_buffers(
+                parameter.device, parameter.dtype
+            ),
+        )
