@@ -20,6 +20,7 @@ in :meth:`InklingMoE.load_expert_weight`.
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 import torch
@@ -279,6 +280,40 @@ def _inkling_moe_ep_size() -> int:
     return world if world > 1 else 1
 
 
+def _write_loader(
+    param: torch.Tensor,
+    loaded_weight: torch.Tensor,
+    write: Callable[[torch.Tensor, torch.Tensor], object],
+) -> None:
+    """Weight loader for Inkling's own checkpoint layout: ``write`` copies
+    ``loaded_weight`` into ``param``. Loading through ``param.weight_loader``
+    lets weight reloads, which defer and replay every load, see the write."""
+    write(param, loaded_weight)
+
+
+def _deinterleave_into(
+    slot: int, gate_start: int, up_start: int
+) -> Callable[[torch.Tensor, torch.Tensor], None]:
+    """Write interleaved [g0, u0, g1, u1, ...] rows as [gate; up] into ``slot``."""
+
+    def write(param: torch.Tensor, slab: torch.Tensor) -> None:
+        # one bounded H2D upload, de-interleaved on device
+        slab = slab.to(param.device)
+        rows = slab.shape[0] // 2
+        param.data[slot, gate_start : gate_start + rows].copy_(slab[0::2])
+        param.data[slot, up_start : up_start + rows].copy_(slab[1::2])
+
+    return write
+
+
+def _copy_into_slots(slots: list[int]) -> Callable[[torch.Tensor, torch.Tensor], None]:
+    def write(param: torch.Tensor, weight: torch.Tensor) -> None:
+        for i, slot in enumerate(slots):
+            param.data[slot].copy_(weight[i])
+
+    return write
+
+
 class InklingSinkExperts(nn.Module):
     """Shared "sink" experts with per-token gammas, in bf16.
 
@@ -306,6 +341,8 @@ class InklingSinkExperts(nn.Module):
             torch.empty(d_model, n_experts * intermediate_pp),
             requires_grad=False,
         )
+        for param in (self.w13_weight, self.w2_weight):
+            param.weight_loader = _write_loader
         self._unit: torch.Tensor | None = None
 
     def load_weight(self, key: str, weight: torch.Tensor) -> list[str]:
@@ -314,7 +351,9 @@ class InklingSinkExperts(nn.Module):
             if weight.shape != self.w13_weight.shape:
                 shard = self.w13_weight.shape[1]
                 weight = weight.narrow(1, self.tp_rank * shard, shard)
-            self.w13_weight.data.copy_(weight)
+            self.w13_weight.weight_loader(
+                self.w13_weight, weight, lambda p, w: p.data.copy_(w)
+            )
             return [key]
 
         assert key == "w2_weight"
@@ -323,7 +362,11 @@ class InklingSinkExperts(nn.Module):
         for expert_idx, expert_weight in enumerate(weight):
             local_weight = expert_weight.narrow(1, shard_start, shard)
             start = expert_idx * shard
-            self.w2_weight.data[:, start : start + shard].copy_(local_weight)
+            self.w2_weight.weight_loader(
+                self.w2_weight,
+                local_weight,
+                lambda p, w, s=start: p.data[:, s : s + shard].copy_(w),
+            )
         return [key]
 
     def forward(self, x: torch.Tensor, gammas: torch.Tensor) -> torch.Tensor:
@@ -474,6 +517,8 @@ class InklingMoE(nn.Module):
         # stream itself (RS -> shard sconv -> AG); the runner must return the
         # per-rank partial sum instead of all-reducing.
         self.experts.moe_config.skip_final_all_reduce = True
+        for param in self.experts.routed_experts.parameters():
+            param.weight_loader = _write_loader
 
         self._routed_sel: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
         sink_experts_cls = (
@@ -583,7 +628,11 @@ class InklingMoE(nn.Module):
                 f"bad {projection} input_amax: {amax}"
             )
             input_scale = getattr(experts, f"{projection}_input_scale")
-            input_scale.data.fill_(amax / _MXFP4_INPUT_SCALE_DENOMINATOR)
+            input_scale.weight_loader(
+                input_scale,
+                torch.tensor(amax / _MXFP4_INPUT_SCALE_DENOMINATOR),
+                lambda p, w: p.data.copy_(w.expand_as(p.data)),
+            )
             return [f"experts.routed_experts.{projection}_input_scale"]
 
         # Quark's OCP MXFP4 converter stores block scales as a two-dimensional
@@ -613,8 +662,11 @@ class InklingMoE(nn.Module):
         if key.endswith("_scale_2"):
             # Per-expert scalars, vectorized over the local experts. The
             # fused w13 param carries one slot per gate/up half.
-            vals = weight[gids].float().to(param.device)
-            param.data[lids] = vals[:, None] if param.data.ndim == 2 else vals
+            vals = weight[gids].float()
+            vals = (
+                vals[:, None].expand(-1, *param.shape[1:]) if param.ndim == 2 else vals
+            )
+            param.weight_loader(param, vals, _copy_into_slots(lids))
         elif key.startswith("w13"):
             # Checkpoint w13 rows are interleaved [g0, u0, g1, u1, ...]; the
             # fused param layout is [w1(gate); w3(up)]. The TP-local rows form
@@ -640,12 +692,7 @@ class InklingMoE(nn.Module):
                     tp_rank * 2 * logical_half,
                     2 * logical_half,
                 )
-                slab = slab.to(param.device)
-                param.data[lid, :logical_half].copy_(slab[0::2])
-                param.data[
-                    lid,
-                    dst_half : dst_half + logical_half,
-                ].copy_(slab[1::2])
+                param.weight_loader(param, slab, _deinterleave_into(lid, 0, dst_half))
         else:
             # w2: shard the packed intermediate (last) dim. AITER rounds the
             # destination intermediate width to 256, so derive the logical TP
@@ -663,8 +710,10 @@ class InklingMoE(nn.Module):
                     f"destination only has {param.shape[2]}"
                 )
             for gid, lid in slots.items():
-                param.data[lid, :, :shard].copy_(
-                    weight[gid].narrow(1, tp_rank * shard, shard)
+                param.weight_loader(
+                    param,
+                    weight[gid].narrow(1, tp_rank * shard, shard),
+                    lambda p, w, lid=lid: p.data[lid, :, :shard].copy_(w),
                 )
         return [f"experts.routed_experts.{key}"]
 
