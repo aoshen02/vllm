@@ -1471,24 +1471,23 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         params_dict: dict[str, torch.nn.Parameter],
         loaded_params: set[str],
     ) -> Iterator[tuple[str, torch.Tensor]]:
-        """Load runs of consecutive experts of one routed-expert parameter at once.
+        """Load runs of consecutive experts of one routed-expert shard at once.
 
         Experts that support ``load_routed_experts`` get each run in one batched
-        copy instead of one loader call per expert; every other tensor is
-        yielded unchanged.
+        copy instead of one loader call per expert. Shards of different
+        parameters may interleave (w1, w2, w3 of one expert, then the next), so
+        one run stays open per (parameter, shard) until the input ends; every
+        other tensor is yielded unchanged.
         """
-        run: list[torch.Tensor] = []
-        run_key: tuple[torch.nn.Module, str, str] | None = None
-        run_start = 0
+        runs: dict[tuple[torch.nn.Module, str, str], tuple[int, list]] = {}
 
-        def flush() -> None:
-            if run_key is not None and run:
-                experts, param_name, shard_id = run_key
-                experts.load_routed_experts(
-                    params_dict[param_name], param_name, shard_id, run_start, run
-                )
-                loaded_params.add(param_name)
-                run.clear()
+        def flush(key: tuple[torch.nn.Module, str, str]) -> None:
+            start, run = runs.pop(key)
+            experts, param_name, shard_id = key
+            experts.load_routed_experts(
+                params_dict[param_name], param_name, shard_id, start, run
+            )
+            loaded_params.add(param_name)
 
         for name, loaded_weight in weights:
             match = _ROUTED_EXPERT_WEIGHT.search(name)
@@ -1510,14 +1509,13 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                         loaded_weight = loaded_weight.view(torch.uint8)
                     expert_id = int(match[3])
                     key = (experts, param_name, shard_id)
-                    if key != run_key or expert_id != run_start + len(run):
-                        flush()
-                        run_key, run_start = key, expert_id
-                    run.append(loaded_weight)
+                    if key in runs and expert_id != runs[key][0] + len(runs[key][1]):
+                        flush(key)
+                    runs.setdefault(key, (expert_id, []))[1].append(loaded_weight)
                     continue
-            flush()
             yield name, loaded_weight
-        flush()
+        for key in list(runs):
+            flush(key)
 
     @staticmethod
     def _pad_shared_expert_weight(
