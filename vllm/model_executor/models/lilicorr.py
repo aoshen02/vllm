@@ -25,7 +25,11 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import kNvfp4Stat
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 
 from .nemotron_h import NemotronHMLP
-from .qwen3_dflash import DFlashQwen3ForCausalLM, DFlashQwen3Model
+from .qwen3_dflash import (
+    DFlashQwen3ForCausalLM,
+    DFlashQwen3Model,
+    _rebuild_in_place,
+)
 from .qwen3_dflash2 import DFlash2Qwen3DecoderLayer
 from .utils import AutoWeightsLoader, maybe_prefix
 
@@ -240,6 +244,9 @@ class LiLiCorrHead(nn.Module):
             quant_config=None,
             prefix=maybe_prefix(prefix, "in_head"),
         )
+        # Read raw by materialize_inference_buffers; CPU would repack them away.
+        for proj in (self.factor_input_proj, self.out_head, self.in_head):
+            proj._cpu_skip_gemm_dispatch = True
         self.anchor_out_head = ReplicatedLinear(
             hidden_size,
             self.factor_dim,
@@ -541,6 +548,14 @@ class LiLiCorrForCausalLM(DFlashQwen3ForCausalLM):
             raise ValueError(
                 f"LiLiCorr checkpoint coverage mismatch: missing={sorted(missing)}"
             )
+
+    def process_weights_after_loading(self) -> None:
+        super().process_weights_after_loading()
         head = self.model.lilicorr
         parameter = head.slot_embedding
-        head.materialize_inference_buffers(parameter.device, parameter.dtype)
+        _rebuild_in_place(
+            head,
+            lambda: head.materialize_inference_buffers(
+                parameter.device, parameter.dtype
+            ),
+        )
