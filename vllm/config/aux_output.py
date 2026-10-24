@@ -2,8 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Configuration for execution auxiliary outputs."""
 
-from pydantic import Field
-
 from vllm.config.utils import config
 
 
@@ -13,10 +11,6 @@ class AuxOutputConfig:
 
     enable_return_routed_experts: bool = False
     """Capture and return routed-experts auxiliary outputs."""
-
-    max_bytes: int | None = Field(default=None, gt=0)
-    """Initial capacity, or ``None`` to derive it from the KV cache capacity.
-    Grows when every object is referenced."""
 
     @property
     def enabled(self) -> bool:

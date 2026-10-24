@@ -438,6 +438,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.model_state = init_model_state(
             self.vllm_config, self.model, self.encoder_cache, self.device
         )
+        # The routed-experts cache layer must exist before KV cache specs.
+        if self.vllm_config.aux_output_config.enabled:
+            self.aux_output_connector = get_aux_output_connector(
+                self.model, self.vllm_config
+            )
 
         self.decode_query_len = (
             self.num_speculative_steps
@@ -816,10 +821,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         else:
             self.kv_connector = get_kv_connector(self.vllm_config, kv_caches_dict)
 
-            # AuxOutput connector requires resolved kv_cache_config.
-            if self.vllm_config.aux_output_config.enabled:
-                self.aux_output_connector = get_aux_output_connector(
-                    self.model, self.vllm_config, kv_cache_config
+            if self.aux_output_connector is not None:
+                self.aux_output_connector.initialize_kv_cache(
+                    self.kv_cache_config, self.block_tables
                 )
 
     def _init_kv_zero_meta(self) -> None:
@@ -2073,6 +2077,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     # Eager (NONE): call the raw model directly.
                     model_output = self.model(**model_inputs)
 
+        if self.aux_output_connector is not None and not dummy_run:
+            self.aux_output_connector.write_cache(
+                input_batch.num_tokens, slot_mappings_by_layer
+            )
         self.kv_connector.finish_forward()
 
         if self.is_last_pp_rank:
@@ -2386,8 +2394,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # https://github.com/ROCm/rocm-systems/issues/13018
             CUDAGraphWrapper.clear_all_graphs()
             BreakableCUDAGraphWrapper.clear_all_graphs()
-        if self.aux_output_connector is not None:
-            self.aux_output_connector.close()
         set_offloader(None)
         self.cudagraph_manager = None
         self.fast_prefill = None

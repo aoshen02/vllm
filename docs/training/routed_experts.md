@@ -7,7 +7,7 @@ vllm serve Qwen/Qwen3-30B-A3B --enable-return-routed-experts
 # offline: LLM("Qwen/Qwen3-30B-A3B", enable_return_routed_experts=True)
 ```
 
-The flag sets `AuxOutputConfig.enable_return_routed_experts` (full form: `--aux-output-config '{"enable_return_routed_experts": true, "max_bytes": N}'`). There is no per-request on/off switch.
+The flag sets `AuxOutputConfig.enable_return_routed_experts` (full form: `--aux-output-config '{"enable_return_routed_experts": true}'`). There is no per-request on/off switch.
 
 ## Requirements
 
@@ -17,11 +17,11 @@ Startup fails with a `ValueError` unless:
 - the runner is `generate` and the model is **MoE**;
 - **prefix caching is enabled** (the default). `--no-enable-prefix-caching` fails; the old v0.21 advice to disable it is wrong.
 
-Rejected at startup: adaptive speculative verification, PP > 1, DCP/PCP > 1, and the `NixlConnector`, `NixlPullConnector`, `NixlPushConnector`, `MoRIIOConnector`, `MooncakeConnector` KV connectors. Regular speculative decoding works.
+Rejected at startup: adaptive speculative verification, PP > 1, DCP/PCP > 1, and the `NixlConnector`, `NixlPullConnector`, `NixlPushConnector`, `MoRIIOConnector`, `MooncakeConnector`, `LMCacheConnectorV1` KV connectors. Regular speculative decoding works.
 
 ### How it works: aux output connector
 
-Routing is stored by the aux output connector (`vllm/distributed/aux_output_connector/`, configured via `--aux-output-config`), keyed by KV block hash and shared with prefix caching, which is why prefix caching is required. `max_bytes` is its host-memory LRU capacity (default: derived from KV cache capacity). If a prefix-cache hit needs evicted rows, the worker raises `BlockObjectStoreError`; increase `max_bytes`.
+The aux output connector (`vllm/distributed/aux_output_connector/`) stores routing as one extra full-attention layer of the KV cache. A prefix-cache hit, an eviction, or a KV connector transfer (for example CPU offloading or the Mooncake store) therefore carries the routing of the same blocks with their KV, and prefix caching is required. In hybrid models (sliding window or Mamba), this layer forms its own KV cache group and takes a full page per block, which lowers the KV cache token capacity.
 
 ## Output format
 

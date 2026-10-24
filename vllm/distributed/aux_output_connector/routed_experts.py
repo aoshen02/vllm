@@ -1,219 +1,90 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Routed-experts auxiliary output keys, publication, and materialization."""
+"""Routed-experts rows stored as a full-attention KV cache layer."""
 
 from __future__ import annotations
 
-from collections.abc import Hashable, Iterable, Sequence
-from dataclasses import dataclass
-from typing import Any
+import math
+from typing import ClassVar
 
-import numpy as np
+import torch
+from torch import nn
 
-from vllm.distributed.aux_output_connector.store import (
-    BackgroundBlockObjectStore,
-    BlockObject,
-    BlockObjectStore,
+from vllm.config import VllmConfig
+from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+from vllm.model_executor.models.extract_hidden_states import (
+    CacheOnlyAttentionBackend,
+    CacheOnlyAttentionMetadataBuilder,
 )
+from vllm.v1.attention.backend import AttentionBackend, AttentionCGSupport
+from vllm.v1.kv_cache_interface import HiddenStateCacheSpec, KVCacheSpec
 
 
-@dataclass
-class _RequestTail:
-    slot: int
-    block_start: int
-    length: int = 0
+class RoutedExpertsCacheMetadataBuilder(CacheOnlyAttentionMetadataBuilder):
+    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.ALWAYS
 
 
-class RoutedExpertsBuffer:
-    """Own incomplete and unkeyed full routed-experts blocks."""
+class RoutedExpertsCacheBackend(CacheOnlyAttentionBackend):
+    supported_dtypes: ClassVar[list[torch.dtype]] = [torch.uint8, torch.uint16]
+
+    @staticmethod
+    def get_name() -> str:
+        return "ROUTED_EXPERTS_CACHE"
+
+    @classmethod
+    def supports_batch_invariance(cls) -> bool:
+        return True
+
+    @staticmethod
+    def get_builder_cls() -> type[RoutedExpertsCacheMetadataBuilder]:
+        return RoutedExpertsCacheMetadataBuilder
+
+
+class RoutedExpertsCacheLayer(nn.Module, AttentionLayerBase):
+    """Keep each token's routed experts in a full-attention KV cache group.
+
+    Prefix caching and KV connectors then hit, evict, and transfer routed
+    experts together with the KV of the same blocks.
+    """
 
     def __init__(
         self,
-        dtype: np.dtype[Any],
+        vllm_config: VllmConfig,
         shape_per_token: tuple[int, ...],
-        block_size: int,
-        max_num_seqs: int,
-        max_num_batched_tokens: int,
-        max_concurrent_batches: int,
+        dtype: torch.dtype,
     ) -> None:
-        self.dtype = dtype
+        super().__init__()
+        num_layers = vllm_config.model_config.get_total_num_hidden_layers()
+        self.layer_name = f"routed_experts_cache.{num_layers}"
         self.shape_per_token = shape_per_token
-        self.block_size = block_size
-        max_step_blocks = (
-            max_num_batched_tokens + block_size - 1
-        ) // block_size + max_num_seqs
-        # In-flight full blocks plus one incomplete tail per active request.
-        max_blocks = max_concurrent_batches * max_step_blocks + max_num_seqs
-        self._rows: np.ndarray = np.empty(
-            (max_blocks, block_size, *shape_per_token), dtype=dtype
+        self.head_size = math.prod(shape_per_token)
+        self.dtype = dtype
+        self.kv_cache = torch.tensor([])
+        forward_context = vllm_config.compilation_config.static_forward_context
+        if self.layer_name in forward_context:
+            raise ValueError(f"Duplicate layer name: {self.layer_name}")
+        forward_context[self.layer_name] = self
+
+    def get_attn_backend(self) -> type[AttentionBackend]:
+        return RoutedExpertsCacheBackend
+
+    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
+        return HiddenStateCacheSpec(
+            block_size=vllm_config.cache_config.block_size,
+            num_kv_heads=1,
+            head_size=self.head_size,
+            dtype=self.dtype,
         )
-        self._free_slots = list(range(len(self._rows) - 1, -1, -1))
-        self._owned_slots: dict[int, int] = {}
-        self._requests: dict[Hashable, _RequestTail] = {}
 
-    def _tail(self, request_id: Hashable, block_start: int) -> _RequestTail:
-        tail = self._requests.get(request_id)
-        if tail is not None:
-            assert tail.block_start == block_start, (
-                "auxiliary output capture skipped an incomplete block: "
-                f"request={request_id}, expected={tail.block_start}, "
-                f"actual={block_start}"
-            )
-            return tail
-        assert self._free_slots, "auxiliary output block pool is exhausted"
-        tail = _RequestTail(self._free_slots.pop(), block_start)
-        self._requests[request_id] = tail
-        return tail
-
-    def capture(
-        self, request_id: Hashable, token_start: int, rows: np.ndarray
-    ) -> list[tuple[int, np.ndarray]]:
-        """Stage rows and return completed blocks without retaining them."""
-        rows = np.asarray(rows)
-        assert rows.shape[1:] == self.shape_per_token and rows.dtype == self.dtype, (
-            "routed-experts capture profile changed"
+    def write(self, rows: torch.Tensor, slot_mapping: torch.Tensor) -> None:
+        """Scatter one step's rows; padding slots land in the null block."""
+        block_size = self.kv_cache.shape[2]
+        slot_mapping = slot_mapping[: len(rows)].clamp_min(0)
+        self.kv_cache[slot_mapping // block_size, 0, slot_mapping % block_size] = (
+            rows.reshape(len(rows), -1)
         )
-        if token_start < 0:
-            raise ValueError("auxiliary output token start must be non-negative")
 
-        completed: list[tuple[int, np.ndarray]] = []
-        offset = 0
-        while offset < len(rows):
-            position = token_start + offset
-            block_start = position // self.block_size * self.block_size
-            local_start = position - block_start
-
-            # Full aligned input blocks do not need tail staging.
-            if (
-                request_id not in self._requests
-                and local_start == 0
-                and len(rows) - offset >= self.block_size
-            ):
-                completed.append((block_start, rows[offset : offset + self.block_size]))
-                offset += self.block_size
-                continue
-
-            tail = self._tail(request_id, block_start)
-            assert local_start == tail.length, (
-                "auxiliary output capture is not contiguous: "
-                f"request={request_id}, expected={block_start + tail.length}, "
-                f"actual={position}"
-            )
-            count = min(self.block_size - local_start, len(rows) - offset)
-            if count == 1:
-                self._rows[tail.slot, local_start] = rows[offset]
-            else:
-                self._rows[tail.slot, local_start : local_start + count] = rows[
-                    offset : offset + count
-                ]
-            tail.length += count
-            offset += count
-            if tail.length == self.block_size:
-                block = self._rows[tail.slot]
-                del self._requests[request_id]
-                self._owned_slots[id(block)] = tail.slot
-                completed.append((block_start, block))
-
-        return completed
-
-    def read(
-        self, request_id: Hashable, token_start: int, token_end: int
-    ) -> np.ndarray:
-        tail = self._requests.get(request_id)
-        assert tail is not None, (
-            f"auxiliary output buffer is missing request {request_id}"
-        )
-        local_start = token_start - tail.block_start
-        local_end = token_end - tail.block_start
-        assert 0 <= local_start < local_end <= tail.length, (
-            "auxiliary output range is unavailable: "
-            f"request={request_id}, range=[{token_start}, {token_end}), "
-            f"available=[{tail.block_start}, {tail.block_start + tail.length})"
-        )
-        return self._rows[tail.slot, local_start:local_end].copy()
-
-    def retain_block(self, rows: np.ndarray) -> np.ndarray:
-        """Retain one unkeyed block after the current capture call."""
-        if id(rows) in self._owned_slots:
-            return rows
-        assert self._free_slots, "auxiliary output block pool is exhausted"
-        slot = self._free_slots.pop()
-        retained = self._rows[slot]
-        retained[...] = rows
-        self._owned_slots[id(retained)] = slot
-        return retained
-
-    def release_block(self, rows: np.ndarray) -> None:
-        slot = self._owned_slots.pop(id(rows), None)
-        if slot is not None:
-            self._free_slots.append(slot)
-
-    def discard(self, request_id: Hashable) -> None:
-        tail = self._requests.pop(request_id, None)
-        if tail is not None:
-            self._free_slots.append(tail.slot)
-
-    def reset(self) -> None:
-        self._requests.clear()
-        self._owned_slots.clear()
-        self._free_slots[:] = range(len(self._rows) - 1, -1, -1)
-
-
-def routed_experts_keys(
-    block_hashes: Iterable[bytes], aux_output_namespace: str
-) -> list[str]:
-    prefix = f"vllm-artifact/{aux_output_namespace}/"
-    return [prefix + block_hash.hex() for block_hash in block_hashes]
-
-
-def materialize_routed_experts(
-    store: BackgroundBlockObjectStore | BlockObjectStore,
-    aux_output_keys: list[str],
-    *,
-    shape_per_token: tuple[int, ...],
-    dtype: np.dtype[Any],
-) -> np.ndarray:
-    if not aux_output_keys:
-        raise ValueError("routed-experts auxiliary output key list must not be empty")
-    payload = store.get_concatenated(aux_output_keys)
-    return np.frombuffer(payload, dtype=dtype).reshape((-1, *shape_per_token))
-
-
-def publish_routed_experts(
-    store: BackgroundBlockObjectStore | BlockObjectStore,
-    *,
-    batches: Sequence[tuple[Sequence[str], list[tuple[int, np.ndarray]]]],
-    block_size: int,
-    retain_keys: Sequence[str] = (),
-    release_keys: Sequence[str] = (),
-) -> None:
-    """Publish immutable full R3 blocks."""
-    objects = []
-    for aux_output_keys, blocks in batches:
-        for block_start, array in blocks:
-            if block_start < 0 or block_start % block_size:
-                raise ValueError(
-                    "auxiliary output block start is not hash-block aligned"
-                )
-            block_index = block_start // block_size
-            if block_index >= len(aux_output_keys):
-                raise ValueError(
-                    "auxiliary output block has no corresponding key: "
-                    f"start={block_start}, index={block_index}, "
-                    f"keys={len(aux_output_keys)}, block_size={block_size}"
-                )
-            if len(array) != block_size:
-                raise ValueError(
-                    "auxiliary output block length does not match hash block size"
-                )
-            objects.append(
-                BlockObject(
-                    key=aux_output_keys[block_index],
-                    payload=array.tobytes(order="C"),
-                )
-            )
-    store.put(
-        objects,
-        retain_keys=retain_keys,
-        release_keys=release_keys,
-    )
+    def read(self, slot_mapping: torch.Tensor) -> torch.Tensor:
+        block_size = self.kv_cache.shape[2]
+        rows = self.kv_cache[slot_mapping // block_size, 0, slot_mapping % block_size]
+        return rows.view(len(slot_mapping), *self.shape_per_token)
