@@ -323,6 +323,7 @@ pub struct GenerateOutputStream {
     num_output_tokens: usize,
     /// Routed-expert rows received so far, concatenated on the terminal output.
     routed_experts_chunks: Vec<WireNdArray>,
+    request_trace: Option<crate::request_trace::RequestTrace>,
     /// Removes this request's external→internal tracking edge on drop. Held for
     /// its `Drop` side effect only; never read directly.
     _request_guard: RequestGuard,
@@ -336,6 +337,7 @@ impl GenerateOutputStream {
         raw_stream: EngineCoreOutputStream,
         request_metrics: RequestMetricsTracker,
         request_guard: RequestGuard,
+        request_trace: Option<crate::request_trace::RequestTrace>,
     ) -> Self {
         Self {
             pending_prompt_info: Some(Box::new(GeneratePromptInfo {
@@ -348,6 +350,7 @@ impl GenerateOutputStream {
             weight_version_starts: Vec::new(),
             num_output_tokens: 0,
             routed_experts_chunks: Vec::new(),
+            request_trace,
             _request_guard: request_guard,
         }
     }
@@ -431,7 +434,11 @@ impl GenerateOutputStream {
         if let Some(finish_reason) = finish_reason.as_ref()
             && !rejected
         {
-            self.request_metrics.record_finished(received_at, finish_reason.clone());
+            self.request_metrics.record_finished(
+                received_at,
+                finish_reason.clone(),
+                self.request_trace.as_mut(),
+            );
         }
         let weight_versions = if finish_reason.is_some() {
             self.weight_version_spans()
@@ -551,9 +558,11 @@ impl Drop for GenerateOutputStream {
             AbortCause::DroppedStream => FinishReason::Abort,
             AbortCause::StopStringMatched => FinishReason::Stop(None),
         };
-
-        self.request_metrics
-            .record_finished(current_unix_timestamp_secs(), finish_reason);
+        self.request_metrics.record_finished(
+            current_unix_timestamp_secs(),
+            finish_reason,
+            self.request_trace.as_mut(),
+        );
     }
 }
 

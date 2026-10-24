@@ -16,6 +16,7 @@ mod profile;
 pub(super) mod render;
 mod server_info;
 mod sleep;
+mod tensor_dump;
 mod tokenize;
 mod version;
 mod weight_checker;
@@ -109,6 +110,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         server_dev_mode_enabled(),
         runtime_lora_updating_enabled(),
         scale_out_endpoints_enabled,
+        std::env::var("DUMPER_SERVER_PORT").ok().as_deref() == Some("reuse"),
     )
 }
 
@@ -123,7 +125,13 @@ fn build_router_with_dev_mode_and_lora(
     dev_mode_enabled: bool,
     runtime_lora_updating_enabled: bool,
 ) -> Router {
-    build_router_with_options(state, dev_mode_enabled, runtime_lora_updating_enabled, true)
+    build_router_with_options(
+        state,
+        dev_mode_enabled,
+        runtime_lora_updating_enabled,
+        true,
+        false,
+    )
 }
 
 #[cfg(test)]
@@ -131,7 +139,7 @@ fn build_router_with_scale_out_endpoints(
     state: Arc<AppState>,
     scale_out_endpoints_enabled: bool,
 ) -> Router {
-    build_router_with_options(state, false, false, scale_out_endpoints_enabled)
+    build_router_with_options(state, false, false, scale_out_endpoints_enabled, false)
 }
 
 fn build_router_with_options(
@@ -139,6 +147,7 @@ fn build_router_with_options(
     dev_mode_enabled: bool,
     runtime_lora_updating_enabled: bool,
     scale_out_endpoints_enabled: bool,
+    dumper_enabled: bool,
 ) -> Router {
     let mut router = Router::new()
         // Health & monitoring
@@ -166,6 +175,10 @@ fn build_router_with_options(
         // vLLM specific endpoints
         .route("/tokenize", post(tokenize::tokenize))
         .route("/detokenize", post(tokenize::detokenize));
+
+    if dumper_enabled {
+        router = router.route("/dumper/{action}", post(tensor_dump::control));
+    }
 
     if scale_out_endpoints_enabled {
         router = router.route("/inference/v1/generate", post(inference::generate));
