@@ -10,6 +10,7 @@ mod kv_event_sources;
 mod load;
 mod lora;
 mod metrics;
+mod multimodal_features;
 pub(crate) mod openai;
 mod pause;
 mod profile;
@@ -45,8 +46,6 @@ const SCALE_OUT_DISABLED_MESSAGE: &str =
 /// `/inference/v1/generate` but the Rust frontend does not implement yet.
 const UNIMPLEMENTED_SCALE_OUT_ROUTES: &[&str] = &[
     "/inference/v1/abort_requests",
-    "/v1/chat/completions/render",
-    "/v1/completions/render",
     "/v1/messages/render",
     "/v1/responses/render",
     "/v1/chat/completions/derender",
@@ -167,14 +166,25 @@ fn build_router_with_options(
         .route("/detokenize", post(tokenize::detokenize));
 
     if scale_out_endpoints_enabled {
-        router = router.route("/inference/v1/generate", post(inference::generate));
-        // TODO: implement the remaining scale-out routes.
+        router = router
+            .route("/inference/v1/generate", post(inference::generate))
+            .route(
+                "/v1/chat/completions/render",
+                post(render::serve_render_chat),
+            )
+            .route(
+                "/v1/completions/render",
+                post(render::serve_render_completion),
+            );
         for path in UNIMPLEMENTED_SCALE_OUT_ROUTES {
             router = router.route(path, post(not_supported));
         }
     } else {
         info!("{SCALE_OUT_DISABLED_MESSAGE}");
-        router = router.route("/inference/v1/generate", post(disabled_scale_out));
+        router = router
+            .route("/inference/v1/generate", post(disabled_scale_out))
+            .route("/v1/chat/completions/render", post(disabled_scale_out))
+            .route("/v1/completions/render", post(disabled_scale_out));
         for path in UNIMPLEMENTED_SCALE_OUT_ROUTES {
             router = router.route(path, post(disabled_scale_out));
         }

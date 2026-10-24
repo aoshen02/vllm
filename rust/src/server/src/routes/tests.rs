@@ -948,7 +948,7 @@ async fn scale_out_generate_route_can_be_enabled() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
-async fn unimplemented_scale_out_routes_follow_scale_out_gate() {
+async fn scale_out_routes_follow_scale_out_gate() {
     const ROUTES: [&str; 7] = [
         "/inference/v1/abort_requests",
         "/v1/chat/completions/render",
@@ -968,7 +968,26 @@ async fn unimplemented_scale_out_routes_follow_scale_out_gate() {
 
     let enabled = build_router_with_scale_out_endpoints(state.clone(), true);
     for uri in ROUTES {
-        assert_route_not_supported(&enabled, "POST", uri, uri).await;
+        if matches!(
+            uri,
+            "/v1/chat/completions/render" | "/v1/completions/render"
+        ) {
+            let response = enabled
+                .clone()
+                .call(
+                    Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .header("content-type", "application/json")
+                        .body(Body::from("{}"))
+                        .expect("build request"),
+                )
+                .await
+                .expect("call app");
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}");
+        } else {
+            assert_route_not_supported(&enabled, "POST", uri, uri).await;
+        }
     }
 
     let disabled = build_router_with_scale_out_endpoints(state, false);
@@ -1824,6 +1843,58 @@ async fn render_chat_response_can_be_submitted_to_generate_unchanged() {
     // The request's `return_token_ids` survives render, so generate echoes
     // the prompt as the chat route would.
     assert_eq!(generate_json["prompt_token_ids"], expected_prompt_token_ids);
+    engine_task.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn combined_render_multimodal_response_can_be_submitted_to_generate_unchanged() {
+    let (chat, engine_task) = test_models_with_engine_outputs_and_backend(
+        b"engine-combined-render-multimodal",
+        default_stream_output_specs(),
+        Arc::new(FakeChatBackend::with_multimodal_model_info(
+            qwen_multimodal_model_info(),
+        )),
+    )
+    .await;
+    let mut app = build_router_with_scale_out_endpoints(
+        Arc::new(AppState::new(vec!["render-model".into()], chat)),
+        true,
+    );
+    let response = app.call(Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions/render")
+        .header("content-type", "application/json")
+        .body(Body::from(json!({
+            "model": "render-model",
+            "messages": [{"role": "user", "content": [{
+                "type": "image_url",
+                "image_url": {"url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="}
+            }]}],
+            "max_completion_tokens": 8
+        }).to_string())).unwrap()).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let mut payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        payload["features"]["mm_hashes"]["image"].as_array().unwrap().len(),
+        1
+    );
+    assert!(payload["features"]["kwargs_data"]["image"][0].is_string());
+    payload["content_parts"] = json!([]);
+    let response = app
+        .call(
+            Request::builder()
+                .method("POST")
+                .uri("/inference/v1/generate")
+                .header("content-type", "application/json")
+                .body(Body::from(payload.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     engine_task.finish().await;
 }
 

@@ -56,10 +56,30 @@ pub async fn generate(
     let request_context = resolve_request_context(&headers, body.request_id.as_deref());
     let lora_resolution = state.resolve_model_with_loras(body.model.as_deref()).await;
 
-    let mm_features = if let Some(parts) = body.content_parts.take() {
+    if body.features.is_some() && body.content_parts.as_ref().is_some_and(|parts| !parts.is_empty())
+    {
+        return ApiError::invalid_request(
+            "features and content_parts are mutually exclusive",
+            Some("features"),
+        )
+        .into_response();
+    }
+    let media = if let Some(features) = body.features.take() {
+        match features.into_features(
+            body.ec_transfer_params.as_ref().is_some_and(|params| !params.is_empty()),
+        ) {
+            Ok(features) => Some(vllm_chat::multimodal::MultimodalInput::Preprocessed(
+                features,
+            )),
+            Err(error) => return error.into_response(),
+        }
+    } else {
+        body.content_parts.take().map(vllm_chat::multimodal::MultimodalInput::Raw)
+    };
+    let mm_features = if let Some(media) = media {
         match state
             .chat
-            .prepare_media(parts, &mut body.token_ids)
+            .prepare_media(media, &mut body.token_ids)
             .instrument(vllm_chat::mm_request_span(&request_context.request_id))
             .await
         {
