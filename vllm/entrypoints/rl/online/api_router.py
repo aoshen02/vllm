@@ -229,6 +229,18 @@ async def weight_info(raw_request: Request):
     return JSONResponse(content={"weight_version": weight_version})
 
 
+@router.get("/weight_update_profile")
+async def weight_update_profile(raw_request: Request):
+    """Per-worker cost breakdown of the last finished weight update.
+
+    One entry per worker, ``null`` for workers that have not finished one.
+    """
+    profiles = await engine_client(raw_request).collective_rpc(
+        "get_weight_update_profile"
+    )
+    return JSONResponse(content={"profiles": profiles})
+
+
 @router.post("/weight_checker")
 async def weight_checker(
     raw_request: Request,
