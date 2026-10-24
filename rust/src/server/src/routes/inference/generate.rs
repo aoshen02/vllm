@@ -223,6 +223,9 @@ async fn generate_chunk_stream(
                 } else {
                     None
                 };
+                let (sampling_mask, sampling_mask_logprobs) = output
+                    .sampling_mask
+                    .map_or((None, None), |mask| (Some(mask.rows), mask.logprobs));
 
                 let stop_reason =
                     finish_reason.as_ref().and_then(|reason| reason.as_stop_reason().cloned());
@@ -240,8 +243,9 @@ async fn generate_chunk_stream(
                             .as_deref()
                             .map(npy_base64)
                             .transpose()?,
-                        sampling_mask: output.sampling_mask.map(|mask| mask.rows),
                         weight_versions: output.weight_versions,
+                        sampling_mask,
+                        sampling_mask_logprobs,
                     }],
                     usage: include_continuous_usage
                         .then(|| Usage::from_token_usage(usage, enable_prompt_tokens_details)),
@@ -331,6 +335,9 @@ fn collect_generate(
     };
     let finish_reason = collected.finish_reason.as_str().to_string();
     let stop_reason = collected.finish_reason.as_stop_reason().cloned();
+    let (sampling_mask, sampling_mask_logprobs) = collected
+        .sampling_mask
+        .map_or((None, None), |mask| (Some(mask.rows), mask.logprobs));
 
     if enable_log_requests {
         info!(
@@ -350,8 +357,9 @@ fn collect_generate(
             stop_reason,
             token_ids: collected.token_ids,
             routed_experts: collected.routed_experts.as_ref().map(npy_base64).transpose()?,
-            sampling_mask: collected.sampling_mask.map(|mask| mask.rows),
             weight_versions: collected.weight_versions,
+            sampling_mask,
+            sampling_mask_logprobs,
         }],
         prompt_logprobs,
         prompt_token_id_logprobs: collected
@@ -796,15 +804,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn generate_chunk_stream_returns_sampling_mask() {
+    async fn generate_chunk_stream_returns_aligned_sampling_mask_logprobs() {
         let mut output = stream_output(Some(&[11]), vec![33], Some(FinishReason::Length));
         output.sampling_mask = Some(SamplingMask {
             rows: vec![vec![33, 44]],
+            logprobs: Some(vec![vec![-0.1, -0.2]]),
         });
-
         let chunks = collect_chunks(vec![output], false, None).await;
-
-        assert_eq!(chunks[0].choices[0].sampling_mask, Some(vec![vec![33, 44]]));
+        let choice = &chunks[0].choices[0];
+        assert_eq!(choice.sampling_mask, Some(vec![vec![33, 44]]));
+        assert_eq!(choice.sampling_mask_logprobs, Some(vec![vec![-0.1, -0.2]]));
     }
 
     #[tokio::test]
@@ -944,6 +953,7 @@ mod tests {
             prompt_token_ids: vec![10, 20],
             sampling_mask: Some(SamplingMask {
                 rows: vec![vec![30, 40]],
+                logprobs: Some(vec![vec![-0.1, -0.2]]),
             }),
             spec_decode_metrics: None,
             weight_versions: None,
@@ -968,6 +978,10 @@ mod tests {
         assert!(response.prompt_token_ids.is_none());
         assert!(response.mm_placeholders.is_none());
         assert_eq!(response.choices[0].sampling_mask, Some(vec![vec![30, 40]]));
+        assert_eq!(
+            response.choices[0].sampling_mask_logprobs,
+            Some(vec![vec![-0.1, -0.2]])
+        );
     }
 
     #[test]

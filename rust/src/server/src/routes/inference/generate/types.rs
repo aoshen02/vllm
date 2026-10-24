@@ -105,6 +105,7 @@ pub(super) struct GenerateResponseChoice {
     pub routed_experts: Option<String>,
     pub sampling_mask: Option<Vec<Vec<u32>>>,
     pub weight_versions: Option<Vec<WeightVersionSpan>>,
+    pub sampling_mask_logprobs: Option<Vec<Vec<f32>>>,
 }
 
 /// Mirrors the Python vLLM `GenerateResponseStreamChoice` class.
@@ -122,6 +123,7 @@ pub(super) struct GenerateResponseStreamChoice {
     pub sampling_mask: Option<Vec<Vec<u32>>>,
     /// Set on the final chunk only; covers the whole output.
     pub weight_versions: Option<Vec<WeightVersionSpan>>,
+    pub sampling_mask_logprobs: Option<Vec<Vec<f32>>>,
 }
 
 /// Mirrors the Python vLLM `GenerateStreamResponse` class.
