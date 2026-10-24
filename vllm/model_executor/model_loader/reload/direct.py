@@ -220,6 +220,9 @@ def finish_direct_reload(model: torch.nn.Module, model_config) -> None:
         for module in skipped:
             module.__dict__.pop("_direct_skip_pwal", None)
     _pin_side_state(pinned)
+    # hand the receive buffers and post-load temporaries back to the driver:
+    # the next update's NCCL group allocates outside the caching allocator
+    torch.accelerator.empty_cache()
     if skipped:
         logger.info(
             "direct reload: %d modules received nothing and kept their kernel layout",
