@@ -4010,6 +4010,104 @@ async fn health_endpoint_returns_ok_with_empty_body_when_client_is_healthy() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
+async fn generation_health_requires_scheduler_reply_and_probes_only_idle_engines() {
+    for (queued, pending_work) in [(0, false), (2, false), (0, true)] {
+        let (mut app, engine_task) = test_admin_app_with_engine_script(move |dealer, push| {
+            boxed_test_future(async move {
+                let utility = recv_engine_message(dealer).await;
+                assert_eq!(utility[0].as_ref(), &[0x03]);
+                let payload = decode_value(&utility[1]).expect("decode utility");
+                let fields = payload.as_array().expect("utility fields");
+                assert_eq!(fields[2], Value::from("get_inflight_queue_diagnostics"));
+                assert_eq!(fields[3], Value::Array(vec![Value::from(0)]));
+                send_outputs(
+                    push,
+                    utility_outputs(
+                        fields[1].as_u64().unwrap(),
+                        utility_result_value(
+                            json!({"queues": [{"num_requests": queued}], "data_parallel_rank": 0,
+                                   "has_pending_work": pending_work}),
+                        ),
+                    ),
+                )
+                .await;
+                if queued == 0 && !pending_work {
+                    let add = recv_engine_message(dealer).await;
+                    assert_eq!(add[0].as_ref(), &[0x00]);
+                    let request: EngineCoreRequest =
+                        rmp_serde::from_slice(&add[1]).expect("decode probe");
+                    assert!(request.request_id.starts_with("healthcheck-"));
+                    assert_eq!(request.prompt_token_ids, Some(vec![0]));
+                    let sampling = request.sampling_params.expect("probe sampling");
+                    assert_eq!(sampling.max_tokens, 1);
+                    assert_eq!(sampling.temperature, 1.0);
+                    assert_eq!(sampling.top_k, 1);
+                    send_outputs(
+                        push,
+                        engine_outputs_for_request(
+                            &request.request_id,
+                            vec![(vec![42], Some(EngineCoreFinishReason::Length))],
+                        ),
+                    )
+                    .await;
+                } else {
+                    assert!(
+                        tokio::time::timeout(
+                            Duration::from_millis(50),
+                            recv_engine_message(dealer)
+                        )
+                        .await
+                        .is_err()
+                    );
+                }
+            })
+        })
+        .await;
+        let response = app
+            .call(Request::builder().uri("/health_generate").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(to_bytes(response.into_body(), usize::MAX).await.unwrap().is_empty());
+        engine_task.await.expect("mock engine task");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn load_diagnostics_forwards_limit_and_preserves_scheduler_rank() {
+    let (mut app, engine_task) = test_admin_app_with_engine_script(|dealer, push| {
+        boxed_test_future(async move {
+            let utility = recv_engine_message(dealer).await;
+            let payload = decode_value(&utility[1]).expect("decode utility");
+            let fields = payload.as_array().expect("utility fields");
+            assert_eq!(fields[2], Value::from("get_inflight_queue_diagnostics"));
+            assert_eq!(fields[3], Value::Array(vec![Value::from(1)]));
+            send_outputs(push, utility_outputs(fields[1].as_u64().unwrap(), utility_result_value(
+                json!({"queues": [{"name": "running", "num_requests": 2, "requests": ["a"]}], "data_parallel_rank": 7})
+            ))).await;
+        })
+    }).await;
+    let response = app
+        .call(
+            Request::builder()
+                .uri("/load?include_inflight=true&inflight_limit=1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(value["server_load"], 0);
+    assert_eq!(value["inflight"][0]["data_parallel_rank"], 7);
+    assert_eq!(value["inflight"][0]["queues"][0]["num_requests"], 2);
+    engine_task.await.expect("mock engine task");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
 async fn health_endpoint_returns_503_after_engine_core_dead_sentinel() {
     let (app, state, engine_task) = test_health_app_with_engine_script(|push| {
         boxed_test_future(async move {

@@ -105,6 +105,7 @@ pub(super) struct GenerateResponseChoice {
     pub routed_experts: Option<String>,
     pub sampling_mask: Option<Vec<Vec<u32>>>,
     pub weight_versions: Option<Vec<WeightVersionSpan>>,
+    pub sampling_mask_logprobs: Option<Vec<Vec<f32>>>,
 }
 
 /// Mirrors the Python vLLM `GenerateResponseStreamChoice` class.
@@ -122,6 +123,7 @@ pub(super) struct GenerateResponseStreamChoice {
     pub sampling_mask: Option<Vec<Vec<u32>>>,
     /// Set on the final chunk only; covers the whole output.
     pub weight_versions: Option<Vec<WeightVersionSpan>>,
+    pub sampling_mask_logprobs: Option<Vec<Vec<f32>>>,
 }
 
 /// Mirrors the Python vLLM `GenerateStreamResponse` class.
@@ -133,7 +135,7 @@ pub(super) struct GenerateStreamResponse {
     pub usage: Option<Usage>,
     pub prompt_token_ids: Option<Vec<u32>>,
     pub mm_placeholders: Option<MultiModalPlaceholders>,
-    pub metrics: Option<PerRequestMetrics<StreamingSpeculativeDecodingMetrics>>,
+    pub metrics: Option<StreamingPerRequestMetrics<StreamingSpeculativeDecodingMetrics>>,
 }
 
 /// Mirrors the Python vLLM `GenerateResponse` class.
@@ -153,7 +155,63 @@ pub(super) struct GenerateResponse {
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub(super) struct PerRequestMetrics<T> {
-    pub speculative_decoding: T,
+    pub speculative_decoding: Option<T>,
+    #[serde(flatten)]
+    pub kv_transfer_metrics: Map<String, Value>,
+}
+
+impl<T> PerRequestMetrics<T> {
+    pub fn new(
+        speculative_decoding: Option<T>,
+        mut kv_transfer_metrics: Map<String, Value>,
+    ) -> Option<Self> {
+        if speculative_decoding.is_none() && kv_transfer_metrics.is_empty() {
+            return None;
+        }
+        for name in [
+            "time_to_first_token_ms",
+            "generation_time_ms",
+            "queue_time_ms",
+            "mean_itl_ms",
+            "tokens_per_second",
+            "remote_kv_wait_time_ms",
+            "kv_initial_queue_wait_time_ms",
+            "kv_post_receive_queue_wait_time_ms",
+            "kv_allocation_wait_time_ms",
+            "kv_handshake_wait_worker_time_ms",
+            "kv_transfer_worker_time_ms",
+            "kv_transfer_post_worker_time_ms",
+            "kv_transfer_bytes",
+            "prefill_queue_time_ms",
+            "prefill_time_to_first_token_ms",
+            "prefill_kv_allocation_wait_time_ms",
+            "prefill_kv_initial_queue_wait_time_ms",
+        ] {
+            kv_transfer_metrics.entry(name).or_insert(Value::Null);
+        }
+        Some(Self {
+            speculative_decoding,
+            kv_transfer_metrics,
+        })
+    }
+}
+
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub(super) struct StreamingPerRequestMetrics<T> {
+    pub speculative_decoding: Option<T>,
+    #[serde(flatten)]
+    pub kv_transfer_metrics: Map<String, Value>,
+}
+
+impl<T> From<PerRequestMetrics<T>> for StreamingPerRequestMetrics<T> {
+    fn from(mut metrics: PerRequestMetrics<T>) -> Self {
+        metrics.kv_transfer_metrics.retain(|_, value| !value.is_null());
+        Self {
+            speculative_decoding: metrics.speculative_decoding,
+            kv_transfer_metrics: metrics.kv_transfer_metrics,
+        }
+    }
 }
 
 /// Mirrors the Python vLLM `SpeculativeDecodingMetrics` class.

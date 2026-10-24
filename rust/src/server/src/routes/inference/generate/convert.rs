@@ -60,6 +60,13 @@ pub(super) fn prepare_generate_request(
     let include_prompt_logprobs = request.sampling_params.inner.prompt_logprobs.is_some();
     let return_token_ids = request.return_token_ids.unwrap_or(false);
     let mut sampling_params = request.sampling_params.inner;
+    sampling_params.temperature.get_or_insert(1.0);
+    sampling_params.top_p.get_or_insert(1.0);
+    sampling_params.top_k.get_or_insert(0);
+    sampling_params.min_p.get_or_insert(0.0);
+    sampling_params.repetition_penalty.get_or_insert(1.0);
+    sampling_params.presence_penalty.get_or_insert(0.0);
+    sampling_params.frequency_penalty.get_or_insert(0.0);
     sampling_params.vllm_xargs = merge_kv_transfer_params(
         sampling_params.vllm_xargs,
         request.kv_transfer_params.as_ref(),
@@ -131,6 +138,7 @@ mod tests {
                 "max_tokens": 7,
                 "logprobs": 2,
                 "prompt_logprobs": 1,
+                "repetition_penalty": 1.3,
                 "ignore_eos": true,
                 "routed_experts_prompt_start": 2
             },
@@ -154,6 +162,10 @@ mod tests {
         );
         assert_eq!(prepared.text_request.sampling_params.max_tokens, Some(7));
         assert_eq!(prepared.text_request.sampling_params.logprobs, Some(2));
+        assert_eq!(
+            prepared.text_request.sampling_params.repetition_penalty,
+            Some(1.3)
+        );
         assert_eq!(
             prepared.text_request.sampling_params.prompt_logprobs,
             Some(1)
@@ -191,6 +203,28 @@ mod tests {
             None,
         )
         .expect("prepare request");
+
+        let params = &prepared.text_request.sampling_params;
+        assert_eq!(
+            (
+                params.temperature,
+                params.top_p,
+                params.top_k,
+                params.min_p,
+                params.repetition_penalty,
+                params.presence_penalty,
+                params.frequency_penalty,
+            ),
+            (
+                Some(1.0),
+                Some(1.0),
+                Some(0),
+                Some(0.0),
+                Some(1.0),
+                Some(0.0),
+                Some(0.0),
+            )
+        );
 
         let xargs = prepared.text_request.sampling_params.vllm_xargs.expect("xargs");
         assert_eq!(xargs.get("custom"), Some(&json!(1)));
