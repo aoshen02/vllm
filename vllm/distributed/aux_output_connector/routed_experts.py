@@ -17,7 +17,7 @@ from vllm.model_executor.models.extract_hidden_states import (
     CacheOnlyAttentionMetadataBuilder,
 )
 from vllm.v1.attention.backend import AttentionBackend, AttentionCGSupport
-from vllm.v1.kv_cache_interface import HiddenStateCacheSpec, KVCacheSpec
+from vllm.v1.kv_cache_interface import KVCacheSpec, RoutedExpertsCacheSpec
 
 
 class RoutedExpertsCacheMetadataBuilder(CacheOnlyAttentionMetadataBuilder):
@@ -69,7 +69,7 @@ class RoutedExpertsCacheLayer(nn.Module, AttentionLayerBase):
         return RoutedExpertsCacheBackend
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
-        return HiddenStateCacheSpec(
+        return RoutedExpertsCacheSpec(
             block_size=vllm_config.cache_config.block_size,
             num_kv_heads=1,
             head_size=self.head_size,

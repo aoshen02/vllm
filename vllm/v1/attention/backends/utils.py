@@ -27,6 +27,8 @@ from vllm.v1.kv_cache_interface import (
     KVCacheLayout,
     KVCacheSpec,
     MambaSpec,
+    RoutedExpertsCacheSpec,
+    UniformTypeKVCacheSpecs,
 )
 
 if TYPE_CHECKING:
@@ -325,9 +327,8 @@ def resolve_kv_cache_layout(
     # bytes is the same. If not block-compact, each spec must agree on HNC to alias
     # the same page (this aliasing is done by the Hybrid Memory Allocator, HMA).
     # Specs without per-layer views lay out their own raw backing tensor.
-    kv_cache_specs = tuple(
-        spec for spec in kv_cache_specs or () if spec.has_layer_views
-    )
+    all_specs = tuple(kv_cache_specs or ())
+    kv_cache_specs = tuple(spec for spec in all_specs if spec.has_layer_views)
     hnc_shapes = {
         (spec.num_heads, spec.num_states, spec.page_size_bytes)
         for spec in kv_cache_specs
@@ -338,6 +339,20 @@ def resolve_kv_cache_layout(
             raise ValueError(
                 "Specs with mixed HNC shapes need a block-compact layout, but "
                 f"none is in every supported set: {supported_layouts}."
+            )
+
+    if any(
+        isinstance(spec, RoutedExpertsCacheSpec) for spec in all_specs
+    ) and not UniformTypeKVCacheSpecs.is_uniform_type(
+        {str(i): spec for i, spec in enumerate(all_specs)}
+    ):
+        # Routed experts join a full-attention group of a hybrid model with
+        # their own page, which only block-outer packing can lay out.
+        candidates = [layout for layout in candidates if layout.is_block_outermost]
+        if not candidates:
+            raise ValueError(
+                "Routed experts in a hybrid model require a block-outer KV cache "
+                f"layout; supported sets: {supported_layouts}."
             )
 
     # Self-addressed per-request rings (e.g. the kpool tail) are replicated

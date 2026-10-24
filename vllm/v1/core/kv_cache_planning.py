@@ -35,6 +35,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheTensor,
     MambaSpec,
     MLAAttentionSpec,
+    RoutedExpertsCacheSpec,
     SlidingWindowMLASpec,
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
@@ -1146,15 +1147,18 @@ def get_kv_cache_groups(
         # same window size). Put all layers into one group.
         return _get_kv_cache_groups_uniform_type(uniform_spec)
     # Hidden-state layers use their own block table and must not be absorbed
-    # into a compatible attention bucket.
+    # into a compatible attention bucket. Block-outer packing lets routed
+    # experts join the full-attention bucket with their own page.
+    block_outermost = (
+        vllm_config.cache_config.get_resolved_kv_cache_layout().is_block_outermost
+    )
     hidden_specs = {
-        k: v for k, v in kv_cache_spec.items() if isinstance(v, HiddenStateCacheSpec)
-    }
-    filtered_spec = {
         k: v
         for k, v in kv_cache_spec.items()
-        if not isinstance(v, HiddenStateCacheSpec)
+        if isinstance(v, HiddenStateCacheSpec)
+        and not (block_outermost and isinstance(v, RoutedExpertsCacheSpec))
     }
+    filtered_spec = {k: v for k, v in kv_cache_spec.items() if k not in hidden_specs}
 
     if packed_groups := _get_packed_kv_cache_groups(vllm_config, filtered_spec):
         # Block-outermost blocks are strided by the widest group, so hidden

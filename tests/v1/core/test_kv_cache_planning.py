@@ -54,6 +54,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheTensor,
     MambaSpec,
     MLAAttentionSpec,
+    RoutedExpertsCacheSpec,
     SlidingWindowMLASpec,
     SlidingWindowSpec,
     SparseCacheRole,
@@ -2136,3 +2137,72 @@ def test_kv_cache_groups_tp_replicas(specs, tp_size, dcp_size, expected):
     """Replicas are the gcd of each layer's tp_size // max_tp_shards."""
     groups = [KVCacheGroupSpec([f"l.{i}"], spec) for i, spec in enumerate(specs)]
     assert kv_cache_groups_tp_replicas(groups, tp_size, dcp_size) == expected
+
+
+def _routed_experts_specs(hybrid: bool) -> dict[str, KVCacheSpec]:
+    block_size = 544
+    specs: dict[str, KVCacheSpec] = {
+        "model.full_attn": FullAttentionSpec(
+            block_size=block_size,
+            num_kv_heads=1,
+            head_size=512,
+            dtype=torch.bfloat16,
+        ),
+        "routed_experts_cache.2": RoutedExpertsCacheSpec(
+            block_size=block_size,
+            num_kv_heads=1,
+            head_size=384,
+            dtype=torch.uint8,
+        ),
+    }
+    if hybrid:
+        specs["model.mamba"] = MambaSpec(
+            block_size=block_size,
+            shapes=((557056,),),
+            dtypes=(torch.bfloat16,),
+            mamba_cache_mode="align",
+        )
+    return specs
+
+
+@pytest.mark.parametrize(
+    ("layout", "joins_full_attention"),
+    [("BLNHC", True), ("LBNHC", False)],
+    ids=["block-outer", "layer-outer"],
+)
+def test_routed_experts_share_full_attention_blocks_when_block_outer(
+    layout, joins_full_attention
+):
+    config = _grouping_config()
+    config.cache_config.kv_cache_layout = layout
+
+    groups = get_kv_cache_groups(config, _routed_experts_specs(hybrid=True))
+
+    full_group = next(g for g in groups if "model.full_attn" in g.layer_names)
+    own_group = any(g.layer_names == ["routed_experts_cache.2"] for g in groups)
+    assert ("routed_experts_cache.2" in full_group.layer_names) == joins_full_attention
+    assert own_group != joins_full_attention
+
+
+@pytest.mark.parametrize(
+    ("hybrid", "layout"),
+    [(True, "BLNHC"), (False, "LBNHC")],
+    ids=["hybrid", "uniform"],
+)
+def test_routed_experts_resolve_block_outer_layout_only_for_hybrid(
+    monkeypatch, hybrid, layout
+):
+    from vllm.v1.attention.backends.utils import (
+        get_supported_kv_cache_layouts,
+        resolve_kv_cache_layout,
+    )
+
+    monkeypatch.delenv("VLLM_KV_CACHE_LAYOUT", raising=False)
+    config = SimpleNamespace(cache_config=CacheConfig(), kv_transfer_config=None)
+    supported = [[x.name for x in get_supported_kv_cache_layouts([])]]
+
+    resolved = resolve_kv_cache_layout(
+        config, supported, _routed_experts_specs(hybrid).values()
+    )
+
+    assert resolved.name == layout
