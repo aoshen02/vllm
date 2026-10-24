@@ -704,6 +704,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             experts_cls=self.experts_cls,
             routing_tables=layer._expert_routing_tables(),
         )
+        from vllm.model_executor.layers.fused_moe.kernel_constants import (
+            keep_kernel_constants,
+        )
+
+        keep_kernel_constants(layer, self.moe_kernel.fused_experts)
 
     def process_weights_after_loading(self, layer: RoutedExperts) -> None:
         if is_weights_pre_processed():

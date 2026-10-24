@@ -50,9 +50,19 @@ def unpack_tensor(
     unpacked_tensors = packed_tensor.split(tensor_sizes)
 
     return [
-        (name, tensor.contiguous().view(dtype).view(shape))
+        (name, _aligned(tensor, dtype).view(dtype).view(shape))
         for name, shape, dtype, tensor in zip(names, shapes, dtypes, unpacked_tensors)
     ]
+
+
+def _aligned(tensor: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    """A byte slice that can be viewed as ``dtype``: packing does not pad, so a
+    wider element after an odd-sized one starts at an unaligned offset and is
+    copied out instead of viewed."""
+    itemsize = torch.empty((), dtype=dtype).element_size()
+    if tensor.storage_offset() % itemsize:
+        return tensor.clone()
+    return tensor.contiguous()
 
 
 @dataclass

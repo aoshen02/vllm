@@ -117,6 +117,28 @@ class TrtLlmMxfp4ExpertsBase:
             )
             self.gemm1_clamp_limit = None
 
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        # The experts object is rebuilt on every process_weights_after_loading,
+        # but captured CUDA graphs keep reading the SwiGLU constants at their
+        # first address: keep them in buffers on the layer and refresh in place.
+        for attr in ("gemm1_alpha", "gemm1_beta", "gemm1_clamp_limit"):
+            fresh = getattr(self, attr, None)
+            if not isinstance(fresh, torch.Tensor):
+                continue
+            key = f"_trtllm_{attr}"
+            kept = layer._buffers.get(key)
+            if (
+                kept is not None
+                and kept.shape == fresh.shape
+                and kept.dtype == fresh.dtype
+                and kept.device == fresh.device
+            ):
+                kept.copy_(fresh)
+            else:
+                layer.register_buffer(key, fresh, persistent=False)
+                kept = fresh
+            setattr(self, attr, kept)
+
     @staticmethod
     def _supports_current_device() -> bool:
         p = current_platform

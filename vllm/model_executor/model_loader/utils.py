@@ -155,8 +155,19 @@ def process_weights_after_loading(
 
     maybe_retie_word_embeddings(model, model_config)
 
+    from vllm.model_executor.model_loader.reload.direct import (
+        direct_reload_enabled,
+        record_checkpoint_layout,
+        record_runtime_addresses,
+    )
+
+    if direct_reload_enabled():
+        record_checkpoint_layout(model)  # cold start only; reloads reuse it
+
     for name, module in model.named_modules():
         quant_method = getattr(module, "quant_method", None)
+        if getattr(module, "_direct_skip_pwal", False):
+            continue  # direct reload: nothing written here, kernel layout kept
         if isinstance(quant_method, QuantizeMethodBase):
             if (
                 is_weights_pre_processed()
@@ -200,6 +211,8 @@ def process_weights_after_loading(
     # encoder. NOTE: Happens after other modules so we can easily decompress
     # weights.
     for _, module in model.named_modules():
+        if getattr(module, "_direct_skip_pwal", False):
+            continue
         if is_deferred_attention_layer(module):
             # TODO(lucas): see if there is a way to unify the signatures
             # of process_weights_after_loading
@@ -208,6 +221,9 @@ def process_weights_after_loading(
 
     # Model-level post-load hook, after the per-layer quant finalize.
     finalize_model_weights(model)
+
+    if direct_reload_enabled():
+        record_runtime_addresses(model)  # cold start only
 
     # Needed for torchao model reloading via model.reload_weights
     # @kylesayrs @jerryzh168 this can be removed if callers move to `reload_weights`

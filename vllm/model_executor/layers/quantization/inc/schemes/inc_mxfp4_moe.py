@@ -165,14 +165,12 @@ class INCMxfp4MoEMethod(FusedMoEMethodBase):
         )
 
     def process_weights_after_loading(self, layer: RoutedExperts) -> None:
-        layer.w13_weight = torch.nn.Parameter(
-            layer.w13_weight_packed.data, requires_grad=False
-        )
-        delattr(layer, "w13_weight_packed")
-        layer.w2_weight = torch.nn.Parameter(
-            layer.w2_weight_packed.data, requires_grad=False
-        )
-        delattr(layer, "w2_weight_packed")
+        # Alias, not rename: a direct reload loads by the checkpoint name.
+        if "w13_weight" not in layer._parameters:
+            layer.register_parameter("w13_weight", layer.w13_weight_packed)
+        # Alias, not rename: a direct reload loads by the checkpoint name.
+        if "w2_weight" not in layer._parameters:
+            layer.register_parameter("w2_weight", layer.w2_weight_packed)
 
         if self.use_cutlass_mxfp4:
             # Swizzle weight scales from flat checkpoint layout [E, N, K//32]

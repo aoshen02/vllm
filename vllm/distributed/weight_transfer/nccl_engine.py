@@ -2,12 +2,16 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """NCCL-based (dense) weight transfer engine."""
 
+import os
+import time
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from typing import TYPE_CHECKING, ClassVar, Self
 
 import torch
+
+from vllm.logger import init_logger
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -37,6 +41,8 @@ from vllm.distributed.weight_transfer.packed_tensor import (
     packed_nccl_broadcast_consumer,
     packed_nccl_broadcast_producer,
 )
+
+logger = init_logger(__name__)
 
 # NCCLWeightTransferInitInfo is re-exported here for convenience; its canonical
 # home is nccl_common, shared with the sparse backend.
@@ -169,7 +175,17 @@ class NCCLWeightTransferEngine(
             initialize_layerwise_reload,
         )
 
+        torch.accelerator.synchronize()
+        t0 = time.perf_counter()
         initialize_layerwise_reload(self.model)
+        torch.accelerator.synchronize()
+        self._wu_prof = {
+            "start_s": time.perf_counter() - t0,
+            "recv_s": 0.0,
+            "load_s": 0.0,
+            "calls": 0,
+            "tensors": 0,
+        }
 
     def finish_weight_update(self) -> None:
         """Finalize layerwise reloading after all weights have been received."""
@@ -177,7 +193,33 @@ class NCCLWeightTransferEngine(
             finalize_layerwise_reload,
         )
 
+        torch.accelerator.synchronize()
+        t0 = time.perf_counter()
         finalize_layerwise_reload(self.model, self.model_config)
+        torch.accelerator.synchronize()
+        p = getattr(self, "_wu_prof", None)
+        if p is not None:
+            p["finish_s"] = time.perf_counter() - t0
+            p["total_s"] = p["start_s"] + p["recv_s"] + p["finish_s"]
+            logger.info(
+                "WU_PROFILE mode=%s rank=%d start_s=%.3f recv_s=%.3f "
+                "load_s=%.3f finish_s=%.3f total_s=%.3f calls=%d tensors=%d "
+                "mem_gib=%.2f peak_gib=%.2f",
+                os.environ.get("VLLM_RELOAD_MODE", "layerwise"),
+                torch.distributed.get_rank()
+                if torch.distributed.is_initialized()
+                else 0,
+                p["start_s"],
+                p["recv_s"],
+                p["load_s"],
+                p["finish_s"],
+                p["total_s"],
+                p["calls"],
+                p["tensors"],
+                torch.accelerator.memory_allocated() / (1 << 30),
+                torch.accelerator.max_memory_allocated() / (1 << 30),
+            )
+            torch.accelerator.reset_peak_memory_stats()
 
     def receive_weights(self, update_info: NCCLWeightTransferUpdateInfo) -> None:
         """Receive weights from trainer via NCCL broadcast.
@@ -206,6 +248,21 @@ class NCCLWeightTransferEngine(
             disable_mtp_completeness_check,
         )
 
+        prof = getattr(self, "_wu_prof", None)
+        t_recv = time.perf_counter()
+        model_load = self.model.load_weights
+
+        def timed_load(weights):
+            # host time inside load_weights (GPU work is async on the stream)
+            weights = list(weights)
+            t = time.perf_counter()
+            out = model_load(weights)
+            if prof is not None:
+                prof["load_s"] += time.perf_counter() - t
+                prof["calls"] += 1
+                prof["tensors"] += len(weights)
+            return out
+
         with disable_mtp_completeness_check():
             if self.packed:
                 # Build iterator of (name, (shape, dtype)) from update_info
@@ -220,7 +277,7 @@ class NCCLWeightTransferEngine(
                     iterator=state_dict_info_iterator(),
                     group=self.model_update_group,
                     src=0,
-                    post_unpack_func=self.model.load_weights,
+                    post_unpack_func=timed_load,
                     buffer_size_bytes=self.packed_buffer_size_bytes,
                     num_buffers=self.packed_num_buffers,
                     device=self.device,
@@ -235,8 +292,11 @@ class NCCLWeightTransferEngine(
                     self.model_update_group.broadcast(
                         weight, src=0, stream=torch.cuda.current_stream()
                     )
-                    self.model.load_weights([(name, weight)])
+                    timed_load([(name, weight)])
                     del weight
+        torch.accelerator.synchronize()
+        if prof is not None:
+            prof["recv_s"] += time.perf_counter() - t_recv
 
     def shutdown(self) -> None:
         if self.model_update_group is not None:

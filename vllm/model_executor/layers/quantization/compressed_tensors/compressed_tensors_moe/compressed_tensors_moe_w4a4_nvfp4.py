@@ -210,15 +210,13 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
         # requires this naming convention. However, the name change breaks
         # reloading because the state dict no longer matches disk. Once we
         # remove MKM, we should revert this change to ensure compatibility.
-        layer.w13_weight = torch.nn.Parameter(
-            layer.w13_weight_packed.data, requires_grad=False
-        )
-        delattr(layer, "w13_weight_packed")
+        # Alias, not rename: a direct reload loads by the checkpoint name.
+        if "w13_weight" not in layer._parameters:
+            layer.register_parameter("w13_weight", layer.w13_weight_packed)
 
-        layer.w2_weight = torch.nn.Parameter(
-            layer.w2_weight_packed.data, requires_grad=False
-        )
-        delattr(layer, "w2_weight_packed")
+        # Alias, not rename: a direct reload loads by the checkpoint name.
+        if "w2_weight" not in layer._parameters:
+            layer.register_parameter("w2_weight", layer.w2_weight_packed)
 
         # Use a single gscale for w13.
         if self.moe.is_act_and_mul and not torch.allclose(

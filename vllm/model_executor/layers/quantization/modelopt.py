@@ -619,6 +619,11 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
             experts_cls=self.experts_cls,
             routing_tables=layer._expert_routing_tables(),
         )
+        from vllm.model_executor.layers.fused_moe.kernel_constants import (
+            keep_kernel_constants,
+        )
+
+        keep_kernel_constants(layer, self.moe_kernel.fused_experts)
 
     def process_weights_after_loading(self, layer: RoutedExperts) -> None:
         w13 = layer.w13_weight
@@ -1474,6 +1479,11 @@ class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
             experts_cls=self.experts_cls,
             routing_tables=layer._expert_routing_tables(),
         )
+        from vllm.model_executor.layers.fused_moe.kernel_constants import (
+            keep_kernel_constants,
+        )
+
+        keep_kernel_constants(layer, self.moe_kernel.fused_experts)
 
         # No native MXFP8 MoE kernel on this device (e.g. gfx942): the emulation
         # experts would dequant MXFP8->BF16 every forward step. Convert the
