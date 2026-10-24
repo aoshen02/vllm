@@ -66,7 +66,6 @@ def test_aux_output_config_defaults():
 
     assert not config.enabled
     assert not config.enable_return_routed_experts
-    assert config.max_bytes is None
 
 
 def test_aux_output_capture_changes_compilation_hash():
@@ -114,7 +113,7 @@ def test_aux_output_connector_rejects_unsupported_configuration(kwargs, error):
         ("MooncakeConnector", True),
         ("MooncakeStoreConnector", False),
         ("OffloadingConnector", False),
-        ("LMCacheConnectorV1", False),
+        ("LMCacheConnectorV1", True),
         ("LMCacheMPConnector", False),
         ("SimpleCPUOffloadConnector", False),
     ],

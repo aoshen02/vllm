@@ -1219,11 +1219,12 @@ class VllmConfig:
                 "NixlPushConnector",
                 "MoRIIOConnector",
                 "MooncakeConnector",
+                "LMCacheConnectorV1",
             ):
                 if kv_transfer_config.has_connector(connector_name):
                     raise ValueError(
                         "--enable-return-routed-experts is incompatible with "
-                        f"{connector_name}; PD auxiliary output is not supported."
+                        f"{connector_name}."
                     )
 
     def _verify_kv_transfer_compat(self) -> None:

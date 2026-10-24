@@ -797,6 +797,12 @@ class HiddenStateCacheSpec(MLAAttentionSpec):
     pass
 
 
+class RoutedExpertsCacheSpec(HiddenStateCacheSpec):
+    """Routed-experts rows, which share the full-attention block table."""
+
+    pass
+
+
 @dataclass(frozen=True, kw_only=True)
 class RSWASpec(FullAttentionSpec):
     """KV cache spec for Reference Sliding Window Attention (R-SWA).
