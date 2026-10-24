@@ -13,6 +13,7 @@ use vllm_engine_core_client::protocol::request::ReasoningParserKwargs;
 use vllm_llm::WeightVersionSpan;
 use vllm_text::SamplingParams;
 
+use crate::routes::multimodal_features::MultiModalFeatures;
 use crate::routes::openai::utils::types::{Normalizable, StreamOptions, StringOrArray, Usage};
 
 /// Sampling parameters for the token-in/token-out generate API.
@@ -62,6 +63,7 @@ pub struct GenerateRequest {
     pub priority: i32,
     pub kv_transfer_params: Option<HashMap<String, Value>>,
     pub ec_transfer_params: Option<HashMap<String, Value>>,
+    pub features: Option<MultiModalFeatures>,
     /// Raw multimodal input; server resolves media. Mutually exclusive with `features`.
     pub content_parts: Option<Vec<MediaContentPart>>,
     pub return_token_ids: Option<bool>,
