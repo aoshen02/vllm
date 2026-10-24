@@ -66,6 +66,7 @@ from vllm.multimodal.encoder_budget import (
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import SupportedTask
+from vllm.utils.debug_utils.dumper import dumper
 from vllm.utils.gc_utils import freeze_gc_for_cudagraph_capture
 from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE, async_tensor_h2d
@@ -212,6 +213,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         self.observability_config = vllm_config.observability_config
         self.jit_warmup_registry = JitWarmupRegistry(vllm_config)
+        self.tensor_dumper = dumper if dumper.may_enable else None
 
         self.device = device
         self.dtype = self.model_config.dtype
@@ -425,6 +427,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     eplb_models_added = self.eplb.maybe_register_speculator(
                         self.speculator, self.speculative_config, load_dummy_weights
                     )
+            if self.tensor_dumper is not None:
+                self.tensor_dumper.apply_source_patches()
+                self.tensor_dumper.register_non_intrusive_dumper(self.model)
         time_after_load = time.perf_counter()
 
         self.model_memory_usage = m.consumed_memory
@@ -2010,6 +2015,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             model_inputs["intermediate_tensors"] = IntermediateTensors(new_tensors)
             del intermediate_tensors
 
+        if not dummy_run and self.tensor_dumper is not None:
+            with set_current_vllm_config(self.vllm_config):
+                self.tensor_dumper.dump_dict("forward_batch_info", input_batch)
+
         # Update the EPLB meta.
         ubatch_slices = ubatch_state.slices if ubatch_state is not None else None
         self.eplb.prepare_forward(
@@ -2071,6 +2080,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     model_output = self.model(**model_inputs)
 
         self.kv_connector.finish_forward()
+        if not dummy_run and self.tensor_dumper is not None:
+            self.tensor_dumper.step()
 
         if self.is_last_pp_rank:
             if self.use_aux_hidden_state_outputs:
