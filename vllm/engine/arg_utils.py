@@ -790,6 +790,9 @@ class EngineArgs:
     reasoning_config: ReasoningConfig = get_field(VllmConfig, "reasoning_config")
 
     generation_config: str = ModelConfig.generation_config
+    custom_pull_weights_pre_read_hook: str | None = (
+        ModelConfig.custom_pull_weights_pre_read_hook
+    )
     enable_sleep_mode: bool = ModelConfig.enable_sleep_mode
     sleep_mode_backend: str = ModelConfig.sleep_mode_backend
     sleep_mode_offload_cudagraph: bool = ModelConfig.sleep_mode_offload_cudagraph
@@ -1036,6 +1039,10 @@ class EngineArgs:
         )
         model_group.add_argument(
             "--override-generation-config", **model_kwargs["override_generation_config"]
+        )
+        model_group.add_argument(
+            "--custom-pull-weights-pre-read-hook",
+            **model_kwargs["custom_pull_weights_pre_read_hook"],
         )
         model_group.add_argument(
             "--enable-sleep-mode", **model_kwargs["enable_sleep_mode"]
@@ -2040,6 +2047,7 @@ class EngineArgs:
             pooler_config=self.pooler_config,
             generation_config=self.generation_config,
             override_generation_config=self.override_generation_config,
+            custom_pull_weights_pre_read_hook=self.custom_pull_weights_pre_read_hook,
             enable_sleep_mode=self.enable_sleep_mode,
             sleep_mode_backend=self.sleep_mode_backend,
             sleep_mode_offload_cudagraph=self.sleep_mode_offload_cudagraph,
