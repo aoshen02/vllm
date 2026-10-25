@@ -81,19 +81,74 @@ def record_checkpoint_layout(model: torch.nn.Module) -> None:
         return
     model._direct_layout_recorded = True
     expected: set[str] = set()
-    for name, t in _loadable_tensors(model):
-        if t.is_meta:
-            continue
-        t._ckpt_layout = (tuple(t.shape), t.stride(), t.dtype, t.storage_offset())
-        if not name.endswith(_OPTIONAL_SUFFIXES):
-            expected.add(name)
+    registered: list[tuple[torch.nn.Module, str, bool, torch.Tensor]] = []
+    for module_name, module in model.named_modules():
+        for local, t, is_param in _own_tensors(module):
+            if t.is_meta or hasattr(t, "_ckpt_layout"):
+                continue
+            name = f"{module_name}.{local}" if module_name else local
+            t._ckpt_layout = (tuple(t.shape), t.stride(), t.dtype, t.storage_offset())
+            if not name.endswith(_OPTIONAL_SUFFIXES):
+                expected.add(name)
+            registered.append((module, local, is_param, t))
     model._direct_expected = expected
+    model._direct_registered = registered
 
 
 def record_runtime_addresses(model: torch.nn.Module) -> None:
-    """Cold start, after post-load processing: remember every address."""
-    if not hasattr(model, "_direct_addresses"):
-        model._direct_addresses = _addresses(model)
+    """Cold start, after post-load processing: remember every address, and
+    keep the checkpoint tensors post-load processing unregistered (deleted, or
+    replaced under the same name) so each reload can register them again."""
+    if hasattr(model, "_direct_addresses"):
+        return
+    model._direct_addresses = _addresses(model)
+    dropped = [
+        entry
+        for entry in model.__dict__.pop("_direct_registered", [])
+        if _registered(entry[0], entry[1]) is not entry[3]
+    ]
+    model._direct_dropped = dropped
+    if dropped:
+        live = {t.untyped_storage().data_ptr() for _, t in _loadable_tensors(model)}
+        held = sum(
+            t.untyped_storage().nbytes()
+            for *_, t in dropped
+            if t.untyped_storage().data_ptr() not in live
+        )
+        logger.info(
+            "direct reload: %d checkpoint tensors are unregistered by post-load "
+            "processing (e.g. %s); kept for reloads, %.2f GiB not shared with "
+            "the runtime tensors",
+            len(dropped),
+            [f"{type(m).__name__}.{n}" for m, n, *_ in dropped[:4]],
+            held / 2**30,
+        )
+
+
+def _own_tensors(module: torch.nn.Module):
+    for n, p in module._parameters.items():
+        if p is not None:
+            yield n, p, True
+    for n, b in module._buffers.items():
+        if b is not None and n not in module._non_persistent_buffers_set:
+            yield n, b, False
+
+
+def _registered(module: torch.nn.Module, name: str) -> torch.Tensor | None:
+    t = module._parameters.get(name)
+    return t if t is not None else module._buffers.get(name)
+
+
+def _register(module, name: str, is_param: bool, t: torch.Tensor | None) -> None:
+    module._parameters.pop(name, None)
+    module._buffers.pop(name, None)
+    module.__dict__.pop(name, None)
+    if t is None:
+        return
+    if is_param:
+        module.register_parameter(name, t)
+    else:
+        module.register_buffer(name, t)
 
 
 def _unsupported(model: torch.nn.Module) -> str | None:
@@ -118,6 +173,16 @@ def begin_direct_reload(model: torch.nn.Module) -> None:
         raise RuntimeError("direct reload: no checkpoint layout was recorded")
     if (reason := _unsupported(model)) is not None:
         raise NotImplementedError(f"direct reload: {reason}")
+
+    # checkpoint names post-load processing deleted or replaced: register the
+    # checkpoint tensors again so the model's loader finds them; the rerun at
+    # finish unregisters them as cold start did
+    reregistered = []
+    for module, name, is_param, t in getattr(model, "_direct_dropped", []):
+        current = _registered(module, name)
+        reregistered.append((module, name, name in module._parameters, current))
+        _register(module, name, is_param, t)
+    model._direct_reregistered = reregistered
 
     written: set[str] = set()
     wrapped: list[tuple[torch.Tensor, Callable | None]] = []
@@ -198,6 +263,13 @@ def finish_direct_reload(model: torch.nn.Module, model_config) -> None:
         skipped.append(module)
     for _, t in _loadable_tensors(model):
         t.__dict__.pop("_direct_runtime_data", None)
+    # a skipped module keeps its runtime registration (no rerun unregisters)
+    skipped_ids = {id(m) for m in skipped}
+    for module, name, is_param, current in model.__dict__.pop(
+        "_direct_reregistered", []
+    ):
+        if id(module) in skipped_ids:
+            _register(module, name, is_param, current)
     # One-shot "already processed" guards (R7) would make the rerun below a
     # no-op and leave the freshly written checkpoint layout in place.
     cleared = 0
