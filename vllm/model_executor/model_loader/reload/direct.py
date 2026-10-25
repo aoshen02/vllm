@@ -41,6 +41,44 @@ def direct_reload_enabled() -> bool:
     return os.environ.get("VLLM_RELOAD_MODE", "layerwise") == "direct"
 
 
+def _diff_enabled() -> bool:
+    return os.environ.get("VLLM_DIRECT_RELOAD_DIFF", "0") == "1"
+
+
+@torch.no_grad()
+def _fingerprints(model: torch.nn.Module) -> dict[str, tuple[int, int, tuple]]:
+    """Byte sums of every parameter, buffer and plain tensor attribute: a
+    reload of the same checkpoint should leave all of them unchanged."""
+    out: dict[str, tuple[int, int, tuple]] = {}
+    for module_name, module in model.named_modules():
+        tensors = list(module._parameters.items()) + list(module._buffers.items())
+        tensors += [
+            (f"<attr>{n}", v)
+            for n, v in module.__dict__.items()
+            if isinstance(v, torch.Tensor)
+            and n not in module._parameters
+            and n not in module._buffers
+        ]
+        for n, t in tensors:
+            if t is None or t.is_meta or t.device.type != "cuda" or not t.numel():
+                continue
+            if "kv_cache" in n:
+                continue  # serving state, not weights
+            b = t.detach().reshape(-1).view(torch.uint8)
+            half = b.numel() // 2
+            out[f"{module_name}.{n}"] = (
+                _byte_sum(b),
+                _byte_sum(b[:half]),
+                tuple(t.shape),
+            )
+    return out
+
+
+def _byte_sum(b: torch.Tensor, chunk: int = 1 << 26) -> int:
+    """Sum of bytes, in chunks so the int64 accumulation stays small."""
+    return int(sum(c.sum(dtype=torch.int64) for c in b.split(chunk)))
+
+
 def _strict() -> bool:
     return os.environ.get("VLLM_DIRECT_RELOAD_STRICT", "0") == "1"
 
@@ -171,6 +209,8 @@ def begin_direct_reload(model: torch.nn.Module) -> None:
 
     if not getattr(model, "_direct_layout_recorded", False):
         raise RuntimeError("direct reload: no checkpoint layout was recorded")
+    if _diff_enabled():
+        model._direct_fingerprints = _fingerprints(model)
     if (reason := _unsupported(model)) is not None:
         raise NotImplementedError(f"direct reload: {reason}")
 
@@ -216,6 +256,7 @@ def begin_direct_reload(model: torch.nn.Module) -> None:
             written.add(_name)
             return _loader(param, *args, **kwargs)
 
+        tracked.__wrapped__ = loader  # type: ignore[attr-defined]
         t.weight_loader = tracked
         wrapped.append((t, original))
 
@@ -292,6 +333,22 @@ def finish_direct_reload(model: torch.nn.Module, model_config) -> None:
         for module in skipped:
             module.__dict__.pop("_direct_skip_pwal", None)
     _pin_side_state(pinned)
+    if (before := model.__dict__.pop("_direct_fingerprints", None)) is not None:
+        after = _fingerprints(model)
+        changed = sorted(n for n, v in before.items() if after.get(n, v) != v)
+        gone = sorted(set(before) - set(after))
+        new = sorted(set(after) - set(before))
+        logger.warning(
+            "direct reload diff: %d of %d tensors changed, %d gone, %d new; "
+            "changed e.g. %s; gone e.g. %s; new e.g. %s",
+            len(changed),
+            len(before),
+            len(gone),
+            len(new),
+            changed[:40],
+            gone[:10],
+            new[:10],
+        )
     # hand the receive buffers and post-load temporaries back to the driver:
     # the next update's NCCL group allocates outside the caching allocator
     torch.accelerator.empty_cache()
