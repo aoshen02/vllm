@@ -60,13 +60,8 @@ def _loadable_tensors(
     """Parameters and persistent buffers, each object once."""
     seen: set[int] = set()
     for module_name, module in model.named_modules():
-        tensors = list(module._parameters.items()) + [
-            (n, b)
-            for n, b in module._buffers.items()
-            if n not in module._non_persistent_buffers_set
-        ]
-        for name, tensor in tensors:
-            if tensor is None or id(tensor) in seen:
+        for name, tensor, _ in _own_tensors(module):
+            if id(tensor) in seen:
                 continue
             seen.add(id(tensor))
             yield (f"{module_name}.{name}" if module_name else name), tensor
@@ -251,19 +246,14 @@ def finish_direct_reload(model: torch.nn.Module, model_config) -> None:
     excluded = _excluded()
     skipped: list[torch.nn.Module] = []
     for module_name, module in model.named_modules():
-        tensors = list(module._parameters.items()) + [
-            (n, b)
-            for n, b in module._buffers.items()
-            if n not in module._non_persistent_buffers_set
-        ]
         own = [
-            (f"{module_name}.{n}" if module_name else n, t)
-            for n, t in tensors
-            if t is not None and hasattr(t, "_ckpt_layout")
+            f"{module_name}.{n}" if module_name else n
+            for n, t, _ in _own_tensors(module)
+            if hasattr(t, "_ckpt_layout")
         ]
         if not own or excluded is None:
             continue
-        if not all(excluded.search(name) for name, _ in own):
+        if not all(excluded.search(name) for name in own):
             continue
         module._direct_skip_pwal = True
         skipped.append(module)
@@ -311,7 +301,6 @@ def finish_direct_reload(model: torch.nn.Module, model_config) -> None:
     )
     current = _addresses(model)
     moved = sorted(n for n, p in model._direct_addresses.items() if current.get(n) != p)
-    model._direct_report = {"missing": missing, "moved": moved}
     if missing:
         logger.warning(
             "direct reload: %d checkpoint names not received, e.g. %s",
