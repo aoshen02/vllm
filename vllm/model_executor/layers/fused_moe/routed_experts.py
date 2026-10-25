@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import inspect
 from collections.abc import Callable, Iterable
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Literal, cast, overload
@@ -672,6 +673,7 @@ class RoutedExperts(PluggableLayer):
         shard_id: str,
         expert_id: int,
         return_success: Literal[False],
+        num_experts: int | None = None,
     ) -> None: ...
 
     @overload
@@ -683,6 +685,7 @@ class RoutedExperts(PluggableLayer):
         shard_id: str,
         expert_id: int,
         return_success: Literal[True],
+        num_experts: int | None = None,
     ) -> bool: ...
 
     def weight_loader(
@@ -693,7 +696,13 @@ class RoutedExperts(PluggableLayer):
         shard_id: str,
         expert_id: int,
         return_success: bool = False,
+        num_experts: int | None = None,
     ) -> bool | None:
+        if num_experts is not None:
+            loaded = self._load_expert_run(
+                param, loaded_weight, weight_name, shard_id, expert_id, num_experts
+            )
+            return loaded if return_success else None
         quant_config_name = self.quant_config and self.quant_config.get_name()
         if quant_config_name == "gpt_oss_mxfp4" or expert_id is None:
             # gpt-oss passes all local experts at once, already TP-sliced
@@ -1001,8 +1010,130 @@ class RoutedExperts(PluggableLayer):
 
         return False if return_success else None
 
+    def _load_expert_run(
+        self,
+        param: torch.nn.Parameter,
+        loaded_weight: torch.Tensor,
+        weight_name: str,
+        shard_id: str,
+        expert_id: int,
+        num_experts: int,
+    ) -> bool:
+        """Load ``num_experts`` consecutive global experts stacked along dim 0.
+
+        Plain expert weights and group/block scales whose experts are all local
+        and consecutive take one narrow-and-copy per tensor: the per-expert
+        path with an expert dim in front. Anything else loads one expert at a
+        time through ``weight_loader``, as before.
+        """
+        from vllm.model_executor.layers.quantization.online.moe_base import (
+            OnlineMoEMethodBase,
+        )
+
+        local = [
+            self._map_global_expert_id_to_local_expert_id(e)
+            for e in range(expert_id, expert_id + num_experts)
+        ]
+        quant_method = getattr(param, "quant_method", None)
+        is_scale = "scale" in weight_name
+        base = self.quant_method
+        batched = (
+            local[0] >= 0
+            and local == list(range(local[0], local[0] + num_experts))
+            and loaded_weight.dim() == 3
+            and shard_id in ("w1", "w2", "w3")
+            and not any(
+                s in weight_name
+                for s in ("bias", "input_scale", "zero", "offset", "weight_shape")
+            )
+            and (
+                quant_method
+                in (
+                    FusedMoeWeightScaleSupported.GROUP.value,
+                    FusedMoeWeightScaleSupported.BLOCK.value,
+                )
+                if is_scale
+                else "weight" in weight_name
+            )
+            and not getattr(param, "is_transposed", False)
+            and not self.moe_config.tp_shard_with_padding
+            and self._fused_shared_expert_quantizer is None
+            and not isinstance(base, OnlineMoEMethodBase)
+            and "ModelOpt" not in type(base).__name__
+            and not (
+                self.quant_config is not None
+                and self.quant_config.get_name() == "gpt_oss_mxfp4"
+            )
+        )
+        if not batched:
+            loaded = False
+            for i, expert_weight in enumerate(loaded_weight.unbind()):
+                ok = self.weight_loader(
+                    param, expert_weight, weight_name, shard_id, expert_id + i, True
+                )
+                loaded = bool(ok) or loaded
+            return loaded
+        if is_scale and quant_method == FusedMoeWeightScaleSupported.BLOCK.value:
+            refine = getattr(base, "weight_scale_refine", None)
+            if refine is not None:
+                # same upsampling as the per-expert path, once for the run
+                loaded_weight = loaded_weight.repeat_interleave(
+                    refine[0], dim=-2
+                ).repeat_interleave(refine[1], dim=-1)
+        self._load_model_weight_or_group_weight_scale(
+            shard_id=shard_id,
+            shard_dim={"w1": 0, "w2": 1, "w3": 0}[shard_id] + 1,
+            loaded_weight=loaded_weight,
+            expert_data=param.data.narrow(0, local[0], num_experts),
+            tp_rank=self.moe_config.tp_rank,
+            is_scale=is_scale,
+        )
+        return True
+
     def load_weights(
         self, weights: Iterable[tuple[str, torch.Tensor]]
+    ) -> Iterable[str]:
+        # Per-expert checkpoint tensors of one parameter and shard are loaded
+        # together, in runs of consecutive experts (see _load_expert_run).
+        runs: dict[tuple[str, str, str], list[tuple[int, torch.Tensor]]] = {}
+        params: dict[str, torch.nn.Parameter] = {}
+        yield from self._load_weights_unbatched(weights, runs, params)
+        for (param_name, weight_name, shard_id), items in runs.items():
+            param = params[param_name]
+            loader = inspect.unwrap(param.weight_loader)
+            if (
+                getattr(loader, "__self__", None) is not self
+                or getattr(loader, "__func__", None) is not type(self).weight_loader
+            ):
+                # a loader that may not take num_experts: one expert per call
+                for expert_id, loaded_expert in sorted(items, key=lambda i: i[0]):
+                    if param.weight_loader(
+                        param=param,
+                        loaded_weight=loaded_expert,
+                        weight_name=weight_name,
+                        shard_id=shard_id,
+                        expert_id=expert_id,
+                        return_success=True,
+                    ):
+                        yield param_name
+                continue
+            for start, stacked in _expert_runs(items):
+                if param.weight_loader(
+                    param=param,
+                    loaded_weight=stacked,
+                    weight_name=weight_name,
+                    shard_id=shard_id,
+                    expert_id=start,
+                    return_success=True,
+                    num_experts=stacked.shape[0],
+                ):
+                    yield param_name
+
+    def _load_weights_unbatched(
+        self,
+        weights: Iterable[tuple[str, torch.Tensor]],
+        runs: dict[tuple[str, str, str], list[tuple[int, torch.Tensor]]],
+        params: dict[str, torch.nn.Parameter],
     ) -> Iterable[str]:
         expert_mapping = self.get_expert_mapping(include_fused=True)
         mapping_by_expert = _index_expert_mapping(expert_mapping)
@@ -1077,6 +1208,14 @@ class RoutedExperts(PluggableLayer):
                         shard_index
                     ].unsqueeze(0)
                     start = expert_id
+                elif loaded_weight.dim() == 2:
+                    # one expert's weight: deferred, loaded with its neighbours
+                    # by load_weights
+                    params[param_name] = param
+                    runs.setdefault((param_name, weight_name, shard_id), []).append(
+                        (expert_id, loaded_weight)
+                    )
+                    continue
                 else:
                     # loaded_weight is a single expert weight, so we add a dummy expert
                     # dimension to unify the loading logic with the fused case
@@ -1445,3 +1584,46 @@ class RoutedExperts(PluggableLayer):
 
 # Mark the RoutedExperts weight_loader as supporting MoE-specific parameters
 RoutedExperts.weight_loader.supports_moe_loading = True  # type: ignore[attr-defined]
+
+
+# experts per batched load: bounds the stacking copy when the per-expert tensors
+# are not adjacent in memory
+_EXPERT_RUN = 64
+
+
+def _expert_runs(
+    items: list[tuple[int, torch.Tensor]],
+) -> Iterable[tuple[int, torch.Tensor]]:
+    """Group (expert_id, tensor) into runs of consecutive ids with one shape,
+    each as one tensor with a leading expert dim: a strided view when the
+    tensors sit back to back in one buffer (packed transfer), else a stack."""
+    items = sorted(items, key=lambda item: item[0])
+    i = 0
+    while i < len(items):
+        start, first = items[i]
+        j = i + 1
+        while (
+            j < len(items)
+            and j - i < _EXPERT_RUN
+            and items[j][0] == start + (j - i)
+            and items[j][1].shape == first.shape
+            and items[j][1].dtype == first.dtype
+            and items[j][1].device == first.device
+        ):
+            j += 1
+        yield start, _adjacent_view([t for _, t in items[i:j]])
+        i = j
+
+
+def _adjacent_view(tensors: list[torch.Tensor]) -> torch.Tensor:
+    first = tensors[0]
+    nbytes = first.numel() * first.element_size()
+    if all(t.is_contiguous() for t in tensors) and all(
+        t.untyped_storage().data_ptr() == first.untyped_storage().data_ptr()
+        and t.data_ptr() == first.data_ptr() + k * nbytes
+        for k, t in enumerate(tensors)
+    ):
+        return first.as_strided(
+            (len(tensors), *first.shape), (first.numel(), *first.stride())
+        )
+    return torch.stack(tensors)
