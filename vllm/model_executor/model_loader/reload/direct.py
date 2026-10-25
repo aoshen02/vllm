@@ -10,15 +10,24 @@ tensors and the cold-start post-load processing runs once at the end:
   processing) and every tensor's address (after it);
 - ``begin`` views tensors whose layout post-load processing changed back to
   their checkpoint layout, on the same storage;
-- ``finish`` reruns ``process_weights_after_loading`` and checks that every
-  loadable tensor was written and that no address moved.
+- ``finish`` reruns ``process_weights_after_loading`` for every module, as
+  cold start does, raises if an address moved, and warns about checkpoint
+  names cold start loaded that this update did not deliver.
+
+A reload is exactly as correct as a cold start: no module is skipped because
+it "received nothing" (a loader may bypass the parameter's ``weight_loader``,
+and post-processing may read other modules' tensors). The only exception is
+tensors the trainer deliberately does not sync, named by the regex
+``VLLM_DIRECT_RELOAD_EXCLUDE_REGEX`` (e.g. Engram): they keep their kernel
+layout, and modules holding only such tensors skip post-processing.
 
 Selected with ``VLLM_RELOAD_MODE=direct``.
 """
 
 import os
-from collections.abc import Callable, Iterator
+from collections.abc import Iterable, Iterator
 
+import regex as re
 import torch
 
 from vllm.logger import init_logger
@@ -30,19 +39,19 @@ __all__ = [
     "direct_reload_enabled",
     "finish_direct_reload",
     "record_checkpoint_layout",
+    "record_load_names",
     "record_runtime_addresses",
 ]
-
-# tensors with a default value that a checkpoint may legitimately omit
-_OPTIONAL_SUFFIXES = ("k_scale", "v_scale", "q_scale", "prob_scale")
 
 
 def direct_reload_enabled() -> bool:
     return os.environ.get("VLLM_RELOAD_MODE", "layerwise") == "direct"
 
 
-def _strict() -> bool:
-    return os.environ.get("VLLM_DIRECT_RELOAD_STRICT", "0") == "1"
+def _excluded() -> "re.Pattern[str] | None":
+    """Names the trainer deliberately does not sync (e.g. Engram)."""
+    pattern = os.environ.get("VLLM_DIRECT_RELOAD_EXCLUDE_REGEX", "")
+    return re.compile(pattern) if pattern else None
 
 
 def _loadable_tensors(
@@ -74,24 +83,43 @@ def _addresses(model: torch.nn.Module) -> dict[str, int]:
     return out
 
 
+def record_load_names(model: torch.nn.Module) -> None:
+    """Record the names passed through the model's own ``load_weights`` (cold
+    start: before loading; reloads: from ``begin`` to ``finish``)."""
+    names: set[str] = set()
+    load_weights = model.load_weights
+
+    def recording(weights: Iterable[tuple[str, torch.Tensor]], *args, **kwargs):
+        def named():
+            for name, tensor in weights:
+                names.add(name)
+                yield name, tensor
+
+        return load_weights(named(), *args, **kwargs)
+
+    model.load_weights = recording
+    model._direct_load_names = names
+
+
+def _pop_load_names(model: torch.nn.Module) -> set[str]:
+    model.__dict__.pop("load_weights", None)  # back to the class method
+    return model.__dict__.pop("_direct_load_names", set())
+
+
 def record_checkpoint_layout(model: torch.nn.Module) -> None:
     """Cold start, before post-load processing: remember each tensor's
     checkpoint layout. Runs once; reloads reuse the cold-start record."""
     if getattr(model, "_direct_layout_recorded", False):
         return
     model._direct_layout_recorded = True
-    expected: set[str] = set()
+    model._direct_cold_names = _pop_load_names(model)
     registered: list[tuple[torch.nn.Module, str, bool, torch.Tensor]] = []
     for module_name, module in model.named_modules():
         for local, t, is_param in _own_tensors(module):
             if t.is_meta or hasattr(t, "_ckpt_layout"):
                 continue
-            name = f"{module_name}.{local}" if module_name else local
             t._ckpt_layout = (tuple(t.shape), t.stride(), t.dtype, t.storage_offset())
-            if not name.endswith(_OPTIONAL_SUFFIXES):
-                expected.add(name)
             registered.append((module, local, is_param, t))
-    model._direct_expected = expected
     model._direct_registered = registered
 
 
@@ -167,8 +195,6 @@ def _unsupported(model: torch.nn.Module) -> str | None:
 @torch.no_grad()
 def begin_direct_reload(model: torch.nn.Module) -> None:
     """Make every tensor writable by its checkpoint weight loader."""
-    from vllm.model_executor.model_loader.weight_utils import default_weight_loader
-
     if not getattr(model, "_direct_layout_recorded", False):
         raise RuntimeError("direct reload: no checkpoint layout was recorded")
     if (reason := _unsupported(model)) is not None:
@@ -184,13 +210,14 @@ def begin_direct_reload(model: torch.nn.Module) -> None:
         _register(module, name, is_param, t)
     model._direct_reregistered = reregistered
 
-    written: set[str] = set()
-    wrapped: list[tuple[torch.Tensor, Callable | None]] = []
+    excluded = _excluded()
     restored = 0
     for name, t in _loadable_tensors(model):
         layout = getattr(t, "_ckpt_layout", None)
         if layout is None:
             continue  # created by post-load processing: derived, rewritten there
+        if excluded is not None and excluded.search(name):
+            continue  # not synced: stays in kernel layout
         shape, stride, dtype, offset = layout
         if (tuple(t.shape), t.stride(), t.dtype, t.storage_offset()) != layout:
             storage = t.untyped_storage()
@@ -203,44 +230,25 @@ def begin_direct_reload(model: torch.nn.Module) -> None:
                 )
             view = torch.empty(0, dtype=dtype, device=t.device)
             view.set_(storage, offset, shape, stride)
-            # kept so a module that receives nothing can return to its kernel
-            # layout untouched (e.g. Engram, which RL does not sync)
-            t._direct_runtime_data = t.data
             t.data = view  # no zeroing: the full sync rewrites the checkpoint region
             restored += 1
 
-        original = getattr(t, "weight_loader", None)
-        loader = original if original is not None else default_weight_loader
-
-        def tracked(param, *args, _loader=loader, _name=name, **kwargs):
-            written.add(_name)
-            return _loader(param, *args, **kwargs)
-
-        t.weight_loader = tracked
-        wrapped.append((t, original))
-
-    model._direct_written = written
-    model._direct_wrapped = wrapped
+    record_load_names(model)
     logger.info("direct reload: %d tensors viewed back to checkpoint layout", restored)
 
 
 @torch.no_grad()
 def finish_direct_reload(model: torch.nn.Module, model_config) -> None:
-    """Rerun cold-start post-load processing, then check writes and addresses."""
+    """Rerun cold-start post-load processing, then check names and addresses."""
     from vllm.model_executor.model_loader.utils import process_weights_after_loading
 
     torch.accelerator.synchronize()  # engines may write on other streams
-    for t, original in model.__dict__.pop("_direct_wrapped", []):
-        if original is None:
-            t.__dict__.pop("weight_loader", None)  # plain tensor: drop the attribute
-        else:
-            t.weight_loader = original
-    written = model.__dict__.pop("_direct_written", set())
+    received = _pop_load_names(model)
 
-    # A module none of whose checkpoint tensors was written is not part of this
-    # update (the sender does not sync it): put its tensors back in kernel
-    # layout and skip its post-processing, which would otherwise convert the
-    # already-converted bytes a second time.
+    # A module the trainer deliberately does not sync (every checkpoint tensor
+    # matches the exclude regex) keeps its kernel layout and skips
+    # post-processing, which would otherwise convert converted bytes again.
+    excluded = _excluded()
     skipped: list[torch.nn.Module] = []
     for module_name, module in model.named_modules():
         tensors = list(module._parameters.items()) + [
@@ -253,16 +261,12 @@ def finish_direct_reload(model: torch.nn.Module, model_config) -> None:
             for n, t in tensors
             if t is not None and hasattr(t, "_ckpt_layout")
         ]
-        if not own or any(name in written for name, _ in own):
+        if not own or excluded is None:
             continue
-        for _, t in own:
-            runtime = t.__dict__.pop("_direct_runtime_data", None)
-            if runtime is not None:
-                t.data = runtime
+        if not all(excluded.search(name) for name, _ in own):
+            continue
         module._direct_skip_pwal = True
         skipped.append(module)
-    for _, t in _loadable_tensors(model):
-        t.__dict__.pop("_direct_runtime_data", None)
     # a skipped module keeps its runtime registration (no rerun unregisters)
     skipped_ids = {id(m) for m in skipped}
     for module, name, is_param, current in model.__dict__.pop(
@@ -297,24 +301,26 @@ def finish_direct_reload(model: torch.nn.Module, model_config) -> None:
     torch.accelerator.empty_cache()
     if skipped:
         logger.info(
-            "direct reload: %d modules received nothing and kept their kernel layout",
-            len(skipped),
+            "direct reload: %d excluded modules kept their kernel layout", len(skipped)
         )
 
-    missing = sorted(model._direct_expected - written)
+    missing = sorted(
+        n
+        for n in model._direct_cold_names - received
+        if excluded is None or not excluded.search(n)
+    )
     current = _addresses(model)
     moved = sorted(n for n, p in model._direct_addresses.items() if current.get(n) != p)
     model._direct_report = {"missing": missing, "moved": moved}
     if missing:
         logger.warning(
-            "direct reload: %d tensors not written, e.g. %s", len(missing), missing[:8]
+            "direct reload: %d checkpoint names not received, e.g. %s",
+            len(missing),
+            missing[:8],
         )
-    if moved:
-        logger.warning(
-            "direct reload: %d tensors moved, e.g. %s", len(moved), moved[:8]
-        )
-    if _strict() and (missing or moved):
-        raise RuntimeError(f"direct reload: missing={missing[:8]} moved={moved[:8]}")
+    # kernels and captured graphs would keep reading the old storage
+    if moved and os.environ.get("VLLM_DIRECT_RELOAD_ALLOW_MOVED") != "1":
+        raise RuntimeError(f"direct reload: {len(moved)} tensors moved: {moved[:8]}")
 
 
 def _snapshot_side_state(model: torch.nn.Module, skipped: list[torch.nn.Module]):
