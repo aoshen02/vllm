@@ -1,10 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from types import SimpleNamespace
-
 import pytest
-import regex as re
 import torch
 from torch import nn
 
@@ -14,11 +11,12 @@ from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
 from vllm.model_executor.layers.linear import UnquantizedLinearMethod
 from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod
 from vllm.model_executor.model_loader import get_model_loader, register_model_loader
-from vllm.model_executor.model_loader.base_loader import BaseModelLoader
-from vllm.model_executor.model_loader.default_loader import (
-    DefaultModelLoader,
-    check_all_weights_loaded,
+from vllm.model_executor.model_loader.base_loader import (
+    CHECKPOINT_WEIGHT_NAMES,
+    BaseModelLoader,
+    record_checkpoint_weight_names,
 )
+from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 
@@ -136,15 +134,12 @@ def test_weights_track_reports_missing_quantized_weights():
     model.unquantized = _layer(UnquantizedLinearMethod(), weight=(4, 4), bias=(4,))
     model.gptq = _layer(_QuantMethod(), qweight=(4, 4), qzeros=(0,))
     model.fbgemm = _layer(_QuantMethod(), weight=(4, 4), input_scale_ub=())
-    model.w4a16 = _layer(_QuantMethod(), weight=(4, 4), input_scale=(1,))
-    model.w4a16.input_scale.checkpoint_optional = True
     model.attn = _layer(BaseKVCacheMethod(None), k_scale=(), k_zero_point=())
     model.online = _layer(online, weight=(4, 4))
     loaded = {"proj.weight", "unquantized.weight", "gptq.qweight", "fbgemm.weight"}
-    loaded.add("w4a16.weight")
     error = _track(model, loaded, quantized=True)
     assert "proj.weight_scale_inv" in error and "unquantized.bias" in error
-    assert not any(n in error for n in ("gptq", "fbgemm", "w4a16", "attn", "online"))
+    assert not any(n in error for n in ("gptq", "fbgemm", "attn", "online"))
 
 
 def test_weights_track_keeps_unquantized_models_unchanged():
@@ -156,63 +151,50 @@ def test_weights_track_keeps_unquantized_models_unchanged():
     assert "norm.weight" in _track(model, set(), quantized=False)
 
 
-class TestCheckAllWeightsLoaded:
-    """A weight update reruns the check its cold start ran, on the names the
-    update delivered."""
-
-    @staticmethod
-    def _cold_started() -> nn.Module:
-        model = nn.Module()
-        model.proj = _layer(_QuantMethod(), weight=(4, 4), weight_scale_inv=(1, 1))
-        model.attn = _layer(BaseKVCacheMethod(None), k_scale=())
-        model.engram = _layer(weight=(4,))
-        cold = {"proj.weight", "proj.weight_scale_inv", "engram.weight"}
-        assert _track(model, cold, quantized=True) == ""
-        return model
+class TestRecordCheckpointWeightNames:
+    """Cold start records the checkpoint names fed to `load_weights` (what a
+    weight update must deliver), not what `load_weights` reports."""
 
     @pytest.mark.parametrize(
-        "loaded,exclude,missing",
+        "fed,instance_loader,raises,recorded",
         [
-            ({"proj.weight", "proj.weight_scale_inv", "engram.weight"}, None, ""),
-            ({"proj.weight", "engram.weight"}, None, "proj.weight_scale_inv"),
-            ({"proj.weight", "proj.weight_scale_inv"}, r"^engram\.", ""),
-            ({"proj.weight"}, r"^engram\.", "proj.weight_scale_inv"),
+            (
+                ["a.weight", "a.weight_scale"],
+                False,
+                False,
+                {"a.weight", "a.weight_scale"},
+            ),
+            (["a.weight", "mtp.0.weight"], True, False, {"a.weight"}),
+            ([], False, False, None),
+            (["a.weight"], False, True, None),
         ],
-        ids=[
-            "complete",
-            "missing-raises",
-            "excluded-ignored",
-            "exclude-only-covers-its-names",
-        ],
+        ids=["fed-not-reported", "unused-dropped", "nothing-fed", "load-failed"],
     )
-    def test_update(self, loaded, exclude, missing):
-        model = self._cold_started()
-        pattern = re.compile(exclude) if exclude else None
-        if not missing:
-            check_all_weights_loaded(model, loaded, pattern, source="the update")
-            return
-        with pytest.raises(ValueError, match="not initialized from the update") as e:
-            check_all_weights_loaded(model, loaded, pattern, source="the update")
-        assert missing in str(e.value) and "attn" not in str(e.value)
+    def test_record(self, fed, instance_loader, raises, recorded):
+        class Model(nn.Module):
+            def load_weights(self, weights):
+                for name, _ in weights:
+                    if raises:
+                        raise RuntimeError("load failed")
+                return {"a.weight"}
 
-    def test_quantized_cold_start_records_names_for_updates(self, monkeypatch):
-        # Cold start of a quantized model does not raise by default (unchanged),
-        # but every update is checked against the names it recorded.
-        model = nn.Module()
-        model.proj = _layer(_QuantMethod(), weight=(4, 4), weight_scale_inv=(1, 1))
-        model.load_weights = lambda weights: {"proj.weight"}
-        loader = DefaultModelLoader(LoadConfig())
-        for name in ("_init_ep_weight_filter", "_init_mm_encoder_only_weight_filter"):
-            monkeypatch.setattr(loader, name, lambda *_: None)
-        monkeypatch.setattr(loader, "get_all_weights", lambda *_: iter(()))
-        loader.counter_before_loading_weights = 0.0
-        loader.load_weights(model, SimpleNamespace(quantization="fp8"))
+            def is_unused_checkpoint_weight(self, name):
+                return name.startswith("mtp.")
 
-        with pytest.raises(ValueError, match=r"\['proj.weight_scale_inv'\]"):
-            check_all_weights_loaded(model, {"proj.weight"}, source="the update")
-        check_all_weights_loaded(
-            model, {"proj.weight", "proj.weight_scale_inv"}, source="the update"
-        )
+        model = Model()
+        own = None
+        if instance_loader:  # a loader set on the instance, not the class
+            own = model.__dict__["load_weights"] = lambda w: Model.load_weights(
+                model, w
+            )
+        try:
+            with record_checkpoint_weight_names(model):
+                model.load_weights((name, torch.zeros(1)) for name in fed)
+        except RuntimeError:
+            assert raises
+        assert getattr(model, CHECKPOINT_WEIGHT_NAMES, None) == recorded
+        # the model's own loader is back
+        assert model.__dict__.get("load_weights") is own
 
 
 def test_moe_runner_reports_registered_expert_names():

@@ -179,7 +179,7 @@ class NCCLWeightTransferEngine(
 
         t0 = time.perf_counter()
         initialize_layerwise_reload(self.model)
-        self._begin_loaded_tracking()
+        self._begin_delivery_tracking()
         self._update_seconds = {"start": time.perf_counter() - t0, "recv": 0, "load": 0}
 
     def finish_weight_update(self) -> None:
@@ -189,9 +189,9 @@ class NCCLWeightTransferEngine(
             finalize_layerwise_reload,
         )
 
-        self._check_update_complete()
         t0 = time.perf_counter()
-        finalize_layerwise_reload(self.model, self.model_config)
+        with self._complete_update():
+            finalize_layerwise_reload(self.model, self.model_config)
         sec = self._update_seconds
         finish = time.perf_counter() - t0
         logger.info(

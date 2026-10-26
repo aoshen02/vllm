@@ -3,7 +3,8 @@
 """Base class for weight transfer engines."""
 
 from abc import ABC, abstractmethod
-from collections.abc import Collection, Iterable, Iterator
+from collections.abc import Collection, Iterable, Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING,
@@ -19,10 +20,15 @@ from typing import (
 import torch
 
 if TYPE_CHECKING:
+    import regex as re
+
     from vllm.config import VllmConfig
 
 from vllm.config.parallel import ParallelConfig
 from vllm.config.weight_transfer import WeightTransferConfig
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
 
 TInitInfo = TypeVar("TInitInfo", bound="WeightTransferInitInfo")
 TUpdateInfo = TypeVar("TUpdateInfo", bound="WeightTransferUpdateInfo")
@@ -354,9 +360,10 @@ class WeightTransferEngine(ABC, Generic[TInitInfo, TUpdateInfo]):
 
     supports_draft_weight_update: bool = True
 
-    _update_loaded: set[str] | None = None
-    """Names the current update initialized; None outside an update or when
-    the model's `load_weights` does not report them."""
+    _delivered: set[str] | None = None
+    """Checkpoint names the current full update delivered; None outside one."""
+
+    _unsynced: "re.Pattern[str] | None" = None
 
     defers_processing: bool = False
     """Whether `update_weights` returns before the weights are on the device.
@@ -408,63 +415,93 @@ class WeightTransferEngine(ABC, Generic[TInitInfo, TUpdateInfo]):
         self._default_model_config = self.model_config
         self._default_model = model
 
-    def _begin_loaded_tracking(self) -> None:
-        """Start collecting the names one checkpoint-format update loads.
+    def _begin_delivery_tracking(self) -> None:
+        """Start collecting the checkpoint names one full update delivers.
 
         Called by `start_weight_update` of engines that deliver the full
-        checkpoint per update, paired with `_check_update_complete`.
+        checkpoint per update, paired with `_complete_update`.
         """
-        self._update_loaded = set()
+        from vllm.model_executor.model_loader.reload.direct import (
+            unsynced_weights_regex,
+        )
+
+        self._delivered = set()
+        self._unsynced = unsynced_weights_regex()
 
     def _load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> Any:
-        """`model.load_weights`, recording the names it initialized."""
-        loaded = self.model.load_weights(weights)
-        if loaded is None:
-            self._update_loaded = None  # untracked, as at cold start
-        else:
-            self._record_loaded(loaded)
-        return loaded
+        """`model.load_weights`, recording the names of the tensors it is fed."""
+        if isinstance(weights, Sequence):
+            self._record_delivered(name for name, _ in weights)
+            return self.model.load_weights(weights)
 
-    def _record_loaded(self, names: Iterable[str]) -> None:
-        """Record names an engine wrote without `load_weights`."""
-        if self._update_loaded is not None:
-            self._update_loaded.update(names)
+        def delivered():
+            for name, tensor in weights:
+                self._record_delivered((name,))
+                yield name, tensor
 
-    def _check_update_complete(self) -> None:
-        """Run the cold-start completeness checks once over the whole update.
+        return self.model.load_weights(delivered())
 
-        Must run before the reload is finalized: post-load processing of a
-        weight that did not arrive would rewrite its runtime bytes in place
-        (direct reload views them as checkpoint bytes), which cannot be
-        undone.
+    def _record_delivered(self, names: Iterable[str]) -> None:
+        """Record checkpoint names delivered to the model, before they are
+        written. A name the trainer declared unsynced
+        (`VLLM_DIRECT_RELOAD_EXCLUDE_REGEX`) raises: a reload leaves those
+        tensors in their runtime layout, which checkpoint bytes are not."""
+        if self._delivered is None:
+            return  # outside start/finish: `_complete_update` raises
+        for name in names:
+            if self._unsynced is not None and self._unsynced.search(name):
+                raise ValueError(
+                    f"weight update delivered {name!r}, which "
+                    "VLLM_DIRECT_RELOAD_EXCLUDE_REGEX declares unsynced"
+                )
+            self._delivered.add(name)
 
-        One update spans many `load_weights` calls (one per bucket), each a
-        part of the checkpoint, so the check runs on their union, at the
-        granularity cold start checks: the whole load. Names the trainer
-        deliberately does not sync (`VLLM_DIRECT_RELOAD_EXCLUDE_REGEX`) are
-        not required. Raises like cold start on a missing name, and on a
-        multi-tensor weight whose parts did not all arrive.
+    @contextmanager
+    def _complete_update(self) -> Iterator[None]:
+        """Raise unless the update delivered every checkpoint tensor the
+        model's cold start was fed, then run the caller's finalization.
+
+        Runs before the reload is finalized: post-load processing of a weight
+        that did not arrive would rewrite its runtime bytes in place (direct
+        reload views them as checkpoint bytes), which cannot be undone.
+
+        The required names are those cold start fed to `load_weights` on this
+        rank (`record_checkpoint_weight_names`), minus the unsynced ones; what
+        `load_weights` reports does not matter. A model without them (dummy
+        weights, a loader that does not feed `load_weights`) adopts the first
+        successful update's names. Also raises on a multi-tensor weight whose
+        parts did not all arrive.
         """
+        from vllm.model_executor.model_loader.base_loader import (
+            CHECKPOINT_WEIGHT_NAMES,
+        )
         from vllm.model_executor.model_loader.weight_utils import (
             check_weight_parts_complete,
         )
 
-        loaded, self._update_loaded = self._update_loaded, None
-        if loaded is not None:
-            from vllm.model_executor.model_loader.default_loader import (
-                check_all_weights_loaded,
+        delivered, self._delivered = self._delivered, None
+        assert delivered is not None, "no weight update in progress"
+        model = self.model
+        required: set[str] | None = getattr(model, CHECKPOINT_WEIGHT_NAMES, None)
+        if required is not None:
+            missing = required - delivered
+            if self._unsynced is not None:
+                missing = {n for n in missing if not self._unsynced.search(n)}
+            if missing:
+                raise ValueError(
+                    f"weight update did not deliver {len(missing)} checkpoint "
+                    f"tensors its cold start loaded: {sorted(missing)[:16]}"
+                )
+        check_weight_parts_complete(model)
+        yield
+        if required is None and delivered:
+            setattr(model, CHECKPOINT_WEIGHT_NAMES, delivered)
+            logger.info(
+                "Weight updates of %s must deliver the %d checkpoint tensors "
+                "of the first one: cold start recorded none",
+                type(model).__name__,
+                len(delivered),
             )
-            from vllm.model_executor.model_loader.reload.direct import (
-                unsynced_weights_regex,
-            )
-
-            check_all_weights_loaded(
-                self.model,
-                loaded,
-                unsynced_weights_regex(),
-                source="the weight update",
-            )
-        check_weight_parts_complete(self.model)
 
     def set_weight_update_target(
         self,
