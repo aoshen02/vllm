@@ -498,11 +498,6 @@ class M2NWeightTransferEngine(
             requested.append((name, index))
         # recorded before any is written: direct destinations bypass load_weights
         self._record_delivered(name for name, _ in requested)
-        self._record_loaded(
-            name
-            for name, index in requested
-            if self._parameter_destinations[index].tensor is not None
-        )
 
         from vllm.model_executor.model_loader.mtp_validation import (
             disable_mtp_completeness_check,
@@ -545,7 +540,7 @@ class M2NWeightTransferEngine(
             if has_fallback:
                 # Some model loaders keep invocation-local state to combine
                 # related checkpoint tensors, so preserve one iterable scope.
-                self._record_loaded(self.model.load_weights(received_weights))
+                self.model.load_weights(received_weights)
             else:
                 # The iterator performs the reshards. With nothing to yield to
                 # `load_weights`, exhaust it here to execute direct transfers.

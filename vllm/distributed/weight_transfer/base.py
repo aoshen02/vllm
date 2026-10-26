@@ -386,10 +386,6 @@ class WeightTransferEngine(ABC, Generic[TInitInfo, TUpdateInfo]):
     _delivered: set[str] | None = None
     """Checkpoint names the current direct reload delivered; None outside one."""
 
-    _loaded: set[str] | None = None
-    """Parameter names `load_weights` reported loading in the current direct
-    reload; None once a call did not report them."""
-
     _unsynced: "re.Pattern[str] | None" = None
 
     defers_processing: bool = False
@@ -458,7 +454,6 @@ class WeightTransferEngine(ABC, Generic[TInitInfo, TUpdateInfo]):
             self._delivered = None
             return
         self._delivered = set()
-        self._loaded = set()
         self._unsynced = unsynced_weights_regex()
 
     def _load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> Any:
@@ -467,24 +462,14 @@ class WeightTransferEngine(ABC, Generic[TInitInfo, TUpdateInfo]):
             return self.model.load_weights(weights)
         if isinstance(weights, Sequence):
             self._record_delivered(name for name, _ in weights)
-            return self._record_loaded(self.model.load_weights(weights))
+            return self.model.load_weights(weights)
 
         def delivered():
             for name, tensor in weights:
                 self._record_delivered((name,))
                 yield name, tensor
 
-        return self._record_loaded(self.model.load_weights(delivered()))
-
-    def _record_loaded(self, names: Iterable[str] | None) -> Any:
-        """Record the parameter names a `load_weights` call reported, for the
-        cold-start check of a first update (`_complete_update`)."""
-        if self._loaded is not None:
-            if names is None:
-                self._loaded = None
-            else:
-                self._loaded.update(names)
-        return names
+        return self.model.load_weights(delivered())
 
     def _record_delivered(self, names: Iterable[str]) -> None:
         """Record checkpoint names delivered to the model, before they are
@@ -515,17 +500,12 @@ class WeightTransferEngine(ABC, Generic[TInitInfo, TUpdateInfo]):
         The required names are those cold start fed to `load_weights` on this
         rank (`record_checkpoint_weight_names`), minus the unsynced ones; what
         `load_weights` reports does not matter. A model without them (dummy
-        weights, a raw tensorizer load) is cold-started from its first update,
-        so that update gets the cold-start check (`track_weights_loading` on
-        the names `load_weights` reported) and its names become the required
-        ones once it succeeds. Also raises on a multi-tensor weight whose
-        parts did not all arrive.
+        weights, a raw tensorizer load) adopts the first successful update's
+        names, which therefore must be complete; an empty first update raises.
+        Also raises on a multi-tensor weight whose parts did not all arrive.
         """
         from vllm.model_executor.model_loader.base_loader import (
             CHECKPOINT_WEIGHT_NAMES,
-        )
-        from vllm.model_executor.model_loader.default_loader import (
-            DefaultModelLoader,
         )
         from vllm.model_executor.model_loader.reload.direct import (
             direct_reload_enabled,
@@ -538,27 +518,15 @@ class WeightTransferEngine(ABC, Generic[TInitInfo, TUpdateInfo]):
             yield
             return
         delivered, self._delivered = self._delivered, None
-        loaded, self._loaded = self._loaded, None
         assert delivered is not None, "no weight update in progress"
         model = self.model
         required: set[str] | None = getattr(model, CHECKPOINT_WEIGHT_NAMES, None)
         if required is None:
-            # cold start fed no checkpoint: this update is the cold start
             if not delivered:
                 raise ValueError(
                     "the first weight update delivered no tensors; with no "
                     "checkpoint loaded at cold start it must deliver all of them"
                 )
-            if loaded is None:
-                raise ValueError(
-                    "cannot check the first weight update like a cold start: "
-                    "load_weights did not report the parameters it loaded"
-                )
-            DefaultModelLoader.track_weights_loading(
-                model,
-                loaded,
-                quantized=getattr(self.model_config, "quantization", None) is not None,
-            )
         else:
             missing = required - delivered
             if self._unsynced is not None:
@@ -577,8 +545,9 @@ class WeightTransferEngine(ABC, Generic[TInitInfo, TUpdateInfo]):
         if required is None:
             setattr(model, CHECKPOINT_WEIGHT_NAMES, delivered)
             logger.warning(
-                "Weight updates of %s must deliver the %d checkpoint tensors "
-                "of the first one: cold start loaded no checkpoint",
+                "Cold start loaded no checkpoint: the first weight update of %s "
+                "must have been complete; later ones must deliver its %d "
+                "checkpoint tensors",
                 type(model).__name__,
                 len(delivered),
             )
