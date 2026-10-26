@@ -27,6 +27,7 @@ no re-registration, no post-processing (`_unsynced_modules` has the rule).
 Selected with ``VLLM_RELOAD_MODE=direct``.
 """
 
+import functools
 import os
 from collections.abc import Iterator, Set
 
@@ -279,6 +280,24 @@ def _unsynced_modules(model: torch.nn.Module) -> set[int]:
     return skipped
 
 
+def _refuse_writes(model: torch.nn.Module, skipped: Set[int]) -> None:
+    """Skipped modules hold kernel-layout bytes nothing converts again, so a
+    write into them is refused, whatever checkpoint name it came under (the
+    regex is matched on vLLM names here, on checkpoint names by the engines;
+    a fused or renamed tensor matches in one namespace only)."""
+    for name, module in model.named_modules():
+        if id(module) in skipped:
+            for local, t, _ in _own_tensors(module):
+                t.weight_loader = functools.partial(_refuse, f"{name}.{local}")
+
+
+def _refuse(name: str, *args, **kwargs) -> None:
+    raise ValueError(
+        f"direct reload: the update writes {name}, which "
+        "VLLM_DIRECT_RELOAD_EXCLUDE_REGEX excludes (in vLLM's names)"
+    )
+
+
 def _checkpoint_views(
     model: torch.nn.Module, skipped: Set[int], dropped: list
 ) -> list[tuple[torch.Tensor, torch.Tensor]]:
@@ -339,6 +358,7 @@ def begin_direct_reload(model: torch.nn.Module) -> None:
     if "_direct_side_state" not in model.__dict__:
         model._direct_side_state = _snapshot_side_state(model)
     model._direct_skipped = skipped
+    _refuse_writes(model, skipped)
     for module, name, is_param, t in dropped:
         _register(module, name, is_param, t)
     for t, view in views:

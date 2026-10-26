@@ -285,6 +285,15 @@ class TestExclusion:
         _assert_same(after, fresh, names=[n for n in fresh if n not in mine])
         assert sorted(after) == sorted(fresh)
 
+    def test_write_into_excluded_module_raises(self, monkeypatch):
+        # e.g. a regex naming the fused qkv_proj, while the update delivers
+        # the checkpoint's q/k/v_proj, which the regex does not match
+        monkeypatch.setenv("VLLM_DIRECT_RELOAD_EXCLUDE_REGEX", r"^engram\.")
+        model = _cold_start(_checkpoint())
+        begin_direct_reload(model)
+        with pytest.raises(ValueError, match=r"writes engram.weight, which"):
+            model.load_weights([("engram.weight", _checkpoint()["engram.weight"])])
+
     @pytest.mark.parametrize(
         "regex,module",
         [
