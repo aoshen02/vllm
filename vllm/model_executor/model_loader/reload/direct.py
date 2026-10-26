@@ -27,6 +27,7 @@ Selected with ``VLLM_RELOAD_MODE=direct``.
 """
 
 import os
+import time
 from collections.abc import Iterator
 
 import regex as re
@@ -256,13 +257,25 @@ def finish_direct_reload(model: torch.nn.Module, model_config) -> None:
         (p.device for p in model.parameters() if p.device.type == "cuda"),
         torch.accelerator.current_accelerator(),
     )
+    t0 = time.perf_counter()
     pinned = _snapshot_side_state(model, skipped)
+    t_snapshot = time.perf_counter() - t0
     try:
         process_weights_after_loading(model, model_config, device)
     finally:
         for module in skipped:
             module.__dict__.pop("_direct_skip_pwal", None)
-    _pin_side_state(pinned)
+    t0 = time.perf_counter()
+    unpinned = _pin_side_state(pinned)
+    logger.info(
+        "direct reload: side state of %d modules (%d tensors) snapshot %.3f s, "
+        "pin %.3f s",
+        len(pinned),
+        sum(len(r) + len(s) for *_, r, s in pinned),
+        t_snapshot,
+        time.perf_counter() - t0,
+    )
+    del pinned
     # hand the receive buffers and post-load temporaries back to the driver:
     # the next update's NCCL group allocates outside the caching allocator
     torch.accelerator.empty_cache()
@@ -273,59 +286,63 @@ def finish_direct_reload(model: torch.nn.Module, model_config) -> None:
 
     current = _addresses(model)
     moved = sorted(n for n, p in model._direct_addresses.items() if current.get(n) != p)
+    moved += sorted(unpinned)
     # kernels and captured graphs would keep reading the old storage
     if moved and os.environ.get("VLLM_DIRECT_RELOAD_ALLOW_MOVED") != "1":
         raise RuntimeError(f"direct reload: {len(moved)} tensors moved: {moved[:8]}")
 
 
 def _snapshot_side_state(model: torch.nn.Module, skipped: list[torch.nn.Module]):
-    """Before the rerun: each processed module's side references and its
-    registered tensors that are not loaded from the checkpoint (kernel
-    constants, derived scales), which post-load processing may reallocate."""
-    from .side_state import collect_side_tensors
+    """Before the rerun: each processed module's derived device tensors, i.e.
+    registered tensors not loaded from the checkpoint (kernel constants,
+    derived scales) and tensors reachable from its plain attributes, as
+    aliases of their storage. CUDA graphs captured at cold start read these
+    storages, so the rerun's values have to land in them."""
+    from .side_state import snapshot_side_tensors
 
+    skipped_ids = {id(m) for m in skipped}
     out = []
-    for module in model.modules():
-        if module in skipped or getattr(module, "quant_method", None) is None:
+    for name, module in model.named_modules():
+        if id(module) in skipped_ids:
             continue
-        startup = {
-            n: t.data
+        registered = {
+            n: t.detach()
             for n, t in list(module._parameters.items()) + list(module._buffers.items())
-            if t is not None and not hasattr(t, "_ckpt_layout")
+            if t is not None
+            and not hasattr(t, "_ckpt_layout")
+            and t.device.type not in ("cpu", "meta")
         }
-        out.append((module, collect_side_tensors(module), startup))
+        out.append((name, module, registered, snapshot_side_tensors(module)))
     return out
 
 
-def _pin_side_state(pinned) -> None:
-    """After the rerun: copy reallocated tensors back into their startup
-    storage and redirect side references to it, so captured CUDA graphs read
-    the new values."""
+def _pin_side_state(pinned) -> list[str]:
+    """After the rerun: copy every derived tensor the rerun reallocated into
+    its startup storage and point the module back at that storage. Returns
+    the tensors that cannot be pinned (gone, or a different layout)."""
     from .side_state import pin_side_tensors
 
-    for module, before, startup in pinned:
-        temps: dict[str, torch.Tensor] = {}
-        kernels: dict[str, torch.Tensor] = {}
-        for n, old in startup.items():
-            cur = module._parameters.get(n)
-            is_param = cur is not None
-            if cur is None:
-                cur = module._buffers.get(n)
-            if (
-                cur is None
-                or cur.data_ptr() == old.data_ptr()
-                or cur.shape != old.shape
-                or cur.stride() != old.stride()
-                or cur.dtype != old.dtype
-                or cur.device != old.device
+    failed = []
+    for name, module, registered, side in pinned:
+        prefix = f"{name}." if name else ""
+        for n, old in registered.items():
+            cur = _registered(module, n)
+            if cur is None or (
+                cur.untyped_storage().data_ptr() == old.untyped_storage().data_ptr()
             ):
+                continue  # gone: the address check names it
+            if (cur.shape, cur.stride(), cur.dtype, cur.device) != (
+                old.shape,
+                old.stride(),
+                old.dtype,
+                old.device,
+            ):
+                failed.append(prefix + n)
                 continue
-            temps[n] = cur
             old.copy_(cur)
-            if is_param:
+            if n in module._parameters:
                 cur.data = old
-                kernels[n] = cur
             else:
                 module._buffers[n] = old
-                kernels[n] = old
-        pin_side_tensors(module, before, temps, kernels, logger.debug)
+        failed += [prefix + p.lstrip(".") for p in pin_side_tensors(module, side)]
+    return failed

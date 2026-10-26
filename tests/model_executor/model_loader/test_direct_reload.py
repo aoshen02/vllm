@@ -292,3 +292,115 @@ class TestMovedAddress:
         _reload(model, new)
         fresh = _state(_cold_start(new, rebind=True))
         _assert_same(_state(model), fresh)
+
+
+class _OneLayer(torch.nn.Module):
+    """One layer ``s`` with a (4, 4) weight and the given post-load
+    processing; ``hook`` is an optional model-level post-load hook."""
+
+    def __init__(self, fn, hook=None):
+        super().__init__()
+        self.s = _Layer(fn)
+        self.s.register_parameter(
+            "weight", torch.nn.Parameter(torch.empty(4, 4), requires_grad=False)
+        )
+        self.hook = hook
+
+    def process_weights_after_loading(self):
+        if self.hook is not None:
+            self.hook(self)
+
+    def load_weights(self, weights):
+        for name, weight in weights:
+            default_weight_loader(self.get_parameter(name), weight)
+        return {name for name, _ in weights}
+
+
+def _one_layer(fn, weight, hook=None) -> _OneLayer:
+    with _DEVICE:
+        model = _OneLayer(fn, hook)
+    model.load_weights([("s.weight", weight)])
+    process_weights_after_loading(model, _MODEL_CONFIG, _DEVICE)
+    return model
+
+
+def _side(module: torch.nn.Module) -> dict[str, torch.Tensor]:
+    from vllm.model_executor.model_loader.reload.side_state import (
+        collect_side_tensors,
+    )
+
+    tensors = {str(p): t for p, t in collect_side_tensors(module).items()}
+    tensors.update(module.named_buffers(recurse=False))
+    return tensors
+
+
+def _side_refs(layer):  # registered derived buffer, side refs and views of it
+    replace_parameter(layer, "weight", layer.weight * 1)
+    layer.register_buffer("kc", layer.weight.sum().reshape(1) * 2)
+    layer.cfg = {
+        "kc": layer.kc,
+        "kc_u8": layer.kc.view(torch.uint8),
+        "w": layer.weight,
+        "d": layer.weight * 3,
+    }
+
+
+def _data_rebind(layer):  # `x.data = fresh` on a side tensor (J)
+    fresh = layer.weight * 2
+    if getattr(layer, "cache", None) is None:
+        layer.cache = fresh
+    else:
+        layer.cache.data = fresh
+
+
+def _root_cache(model):  # model-level hook, root has no quant_method (B)
+    model.derived = model.s.weight * 2
+
+
+class TestSideState:
+    """Derived tensors outside the checkpoint stay at their cold-start
+    storage and hold the values a cold start on the new weights computes."""
+
+    @pytest.mark.parametrize(
+        "fn,hook,module",
+        [
+            (_side_refs, None, "s"),
+            (_data_rebind, None, "s"),
+            (lambda layer: None, _root_cache, ""),
+        ],
+        ids=["buffer-and-views", "data-rebind", "model-root"],
+    )
+    def test_pinned(self, fn, hook, module):
+        model = _one_layer(fn, torch.rand(4, 4), hook)
+        before = {
+            n: t.data_ptr() for n, t in _side(model.get_submodule(module)).items()
+        }
+        new = torch.rand(4, 4)
+        _reload(model, {"s.weight": new})
+        after = _side(model.get_submodule(module))
+        fresh = _side(_one_layer(fn, new, hook).get_submodule(module))
+        assert sorted(after) == sorted(before) == sorted(fresh)
+        for name, t in after.items():
+            assert t.data_ptr() == before[name], f"{name} moved"
+            assert torch.equal(t, fresh[name]), f"{name} differs"
+
+    @staticmethod
+    def _resized(layer):
+        layer.cache = torch.zeros(layer.quant_method.runs, device=_DEVICE)
+
+    @staticmethod
+    def _dropped(layer):
+        runs = layer.quant_method.runs
+        layer.cache = torch.zeros(2, device=_DEVICE) if runs == 1 else None
+
+    @pytest.mark.parametrize("allow", [False, True], ids=["raises", "allowed"])
+    @pytest.mark.parametrize("fn", ["_resized", "_dropped"])
+    def test_unpinnable_raises(self, monkeypatch, fn, allow):
+        if allow:
+            monkeypatch.setenv("VLLM_DIRECT_RELOAD_ALLOW_MOVED", "1")
+        model = _one_layer(getattr(self, fn), torch.rand(4, 4))
+        if not allow:
+            with pytest.raises(RuntimeError, match=r"moved: \['s.cache'\]"):
+                _reload(model, {"s.weight": torch.rand(4, 4)})
+            return
+        _reload(model, {"s.weight": torch.rand(4, 4)})

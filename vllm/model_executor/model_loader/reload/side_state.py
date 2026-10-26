@@ -5,26 +5,21 @@ startup storage across a reload.
 
 `process_weights_after_loading` often stores tensors on objects hanging off
 the layer rather than registering them: `quant_method.moe_quant_config`,
-`quant_method.moe_kernel`, experts objects, plain layer attributes.  A reload
-reruns it on freshly materialized tensors, so those objects end up pointing
-at the reload's temporaries (and at freshly computed derived tensors), while
-CUDA graphs captured at startup keep reading the startup storage.
+`quant_method.moe_kernel`, experts objects, plain layer attributes. A reload
+reruns it, so those objects end up pointing at freshly allocated tensors,
+while CUDA graphs captured at startup keep reading the startup storage.
 
-`pin_side_tensors` walks the same attribute paths before and after the rerun
-and puts every tensor back on startup storage:
-- a reference to one of the layer's processed temporaries (or a view of one)
-  is redirected to the matching kernel tensor, which already holds the new
-  values;
-- a freshly computed tensor is copied into the startup tensor found at the
-  same path (same shape, dtype and device) and that tensor is kept.
+One rule: before the rerun, `snapshot_side_tensors` records every device
+tensor reachable from the layer's attributes, by attribute path, as an alias
+of its storage; after the rerun, `pin_side_tensors` copies the tensor found at
+the same path into that storage and puts the alias back at the path.
 """
 
-from collections.abc import Callable
 from typing import Any
 
 import torch
 
-__all__ = ["collect_side_tensors", "pin_side_tensors"]
+__all__ = ["pin_side_tensors", "snapshot_side_tensors"]
 
 Path = tuple[tuple[str, Any], ...]
 
@@ -69,7 +64,11 @@ def collect_side_tensors(layer: torch.nn.Module) -> dict[Path, torch.Tensor]:
             walk(child, path + (key,), depth + 1)
 
     for name, value in vars(layer).items():
-        if name in _SKIP_LAYER_ATTRS or name.startswith("_forward") or "hooks" in name:
+        if (
+            name in _SKIP_LAYER_ATTRS
+            or name.startswith(("_forward", "_direct"))  # _direct: reload records
+            or "hooks" in name
+        ):
             continue
         walk(value, (("a", name),), 1)
     return found
@@ -102,76 +101,42 @@ def _set_path(root: Any, path: Path, value: Any) -> Any:
     return root if new_child is child else _with(root, path[0], new_child)
 
 
-def _view_on(
-    t: torch.Tensor, temp: torch.Tensor, kernel: torch.Tensor
-) -> torch.Tensor | None:
-    """`t` is a view of `temp`; return the same view of `kernel`."""
-    if kernel.shape != temp.shape or kernel.stride() != temp.stride():
-        return None
-    base = kernel
-    if t.dtype != base.dtype:
-        if t.element_size() != base.element_size():
-            return None
-        base = base.view(t.dtype)
-    offset = base.storage_offset() + t.storage_offset() - temp.storage_offset()
-    return base.as_strided(t.size(), t.stride(), offset)
+def _layout(t: torch.Tensor) -> tuple:
+    return (tuple(t.shape), t.stride(), t.dtype, t.device)
+
+
+def snapshot_side_tensors(layer: torch.nn.Module) -> dict[Path, torch.Tensor]:
+    """Device tensors reachable from the layer's non-module attributes, by
+    path. Aliases, not the objects: `x.data = y` later leaves them on the
+    storage graphs captured."""
+    return {
+        path: t.detach()
+        for path, t in collect_side_tensors(layer).items()
+        if t.device.type not in ("cpu", "meta")
+    }
 
 
 @torch.no_grad()
 def pin_side_tensors(
-    layer: torch.nn.Module,
-    before: dict[Path, torch.Tensor],
-    temps: dict[str, torch.Tensor],
-    kernels: dict[str, torch.Tensor],
-    log: Callable[[str], None] | None = None,
-) -> None:
-    """Redirect side references to startup storage (see module docstring).
-
-    Args:
-        layer: the reloaded layer, its kernel tensors already restored
-        before: `collect_side_tensors(layer)` taken before the rerun
-        temps: the layer's processed tensors by name, before the copy-back
-        kernels: the startup kernel tensors by name
-        log: called with a message for each reference that could not be pinned
-
-    """
-    by_id = {id(t): kernels[n] for n, t in temps.items() if n in kernels}
-    by_storage = {
-        t.untyped_storage().data_ptr(): (t, kernels[n])
-        for n, t in temps.items()
-        if n in kernels and t.device.type != "meta"
-    }
-    kernel_ids = {id(t) for t in kernels.values()}
-
-    for path, t in collect_side_tensors(layer).items():
-        repl: torch.Tensor | None = None
-        if id(t) in by_id:
-            repl = by_id[id(t)]
-        elif t.device.type != "meta" and t.untyped_storage().data_ptr() in by_storage:
-            temp, kernel = by_storage[t.untyped_storage().data_ptr()]
-            repl = _view_on(t, temp, kernel)
-        else:
-            old = before.get(path)
-            if (
-                old is not None
-                and old is not t
-                and id(old) not in kernel_ids
-                and old.shape == t.shape
-                and old.dtype == t.dtype
-                and old.device == t.device
-                and old.data_ptr() != t.data_ptr()
-            ):
-                old.copy_(t)
-                repl = old
-        if repl is not None and repl is not t:
-            _set_path(layer, path, repl)
-        elif (
-            repl is None
-            and log is not None
-            and path in before
-            and before[path] is not t
+    layer: torch.nn.Module, before: dict[Path, torch.Tensor]
+) -> list[str]:
+    """Put every snapshotted path back on its startup storage, holding the
+    rerun's values. Returns the paths that cannot be pinned: gone, or now a
+    tensor of a different shape, stride, dtype or device."""
+    after = collect_side_tensors(layer)
+    failed = []
+    for path, old in before.items():
+        t = after.get(path)
+        if t is not None and t.untyped_storage().data_ptr() == (
+            old.untyped_storage().data_ptr()
         ):
-            log(f"{type(layer).__name__}: cannot pin {_fmt(path)} to startup storage")
+            continue
+        if t is None or _layout(t) != _layout(old):
+            failed.append(_fmt(path))
+            continue
+        old.copy_(t)
+        _set_path(layer, path, old)
+    return failed
 
 
 def _fmt(path: Path) -> str:
