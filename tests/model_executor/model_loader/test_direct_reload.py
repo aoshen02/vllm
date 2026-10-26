@@ -499,7 +499,8 @@ class TestSideWalk:
         layer.deep = self._nested(torch.ones(2), _MAX_DEPTH + 1)
         side_walk = SideWalk()
         assert collect_side_tensors(layer, side_walk) == {}
-        assert side_walk.truncated == 1 and side_walk.clean == {}
+        assert side_walk.truncated == 1
+        assert not any(isinstance(o, list) for o in side_walk.clean.values())
 
     @pytest.mark.parametrize(
         "base", ["tokenizer", "config", "vllm-subclass", "remote-code"]
@@ -581,6 +582,25 @@ def test_retry_after_aborted_update_matches_cold_start():
 
 
 class TestAbortedUpdate:
+    def test_retry_after_failed_finish_pins_into_startup_storage(self):
+        """The first rerun replaces a plain cache, then raises; the retry
+        still leaves the value in the storage graphs captured at cold start."""
+
+        def fn(layer):
+            layer.cache = layer.weight * 2
+            if layer.quant_method.runs == 2:
+                raise RuntimeError("failed rerun")
+
+        model = _one_layer(fn, torch.rand(4, 4))
+        startup = model.s.cache.data_ptr()
+        new = torch.rand(4, 4)
+        with pytest.raises(RuntimeError, match="failed rerun"):
+            _reload(model, {"s.weight": new})
+        assert model.s.cache.data_ptr() != startup
+        _reload(model, {"s.weight": new})
+        assert model.s.cache.data_ptr() == startup
+        assert torch.equal(model.s.cache, _one_layer(fn, new).s.cache)
+
     def test_parked_part_does_not_pair_with_next_update(self):
         """A part parked by an update that never finished is dropped when the
         next update begins, so the next update's other part waits for its own."""

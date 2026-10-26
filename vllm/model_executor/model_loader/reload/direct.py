@@ -294,7 +294,12 @@ def finish_direct_reload(model: torch.nn.Module, model_config) -> None:
         (p.device for p in model.parameters() if p.device.type == "cuda"),
         torch.accelerator.current_accelerator(),
     )
-    pinned = _snapshot_side_state(model, skipped_ids)
+    # The storages captured graphs read, taken before the first rerun and kept
+    # until a finish succeeds: a retry after a finish that failed midway pins
+    # into them, not into the failed rerun's allocations.
+    pinned = model.__dict__.get("_direct_side_state")
+    if pinned is None:
+        pinned = model._direct_side_state = _snapshot_side_state(model, skipped_ids)
     global _rerunning
     _rerunning = True
     try:
@@ -304,7 +309,6 @@ def finish_direct_reload(model: torch.nn.Module, model_config) -> None:
         for module in skipped:
             module.__dict__.pop("_direct_skip_pwal", None)
     unpinned = _pin_side_state(pinned)
-    del pinned
     # hand the receive buffers and post-load temporaries back to the driver:
     # the next update's NCCL group allocates outside the caching allocator
     torch.accelerator.empty_cache()
@@ -319,6 +323,7 @@ def finish_direct_reload(model: torch.nn.Module, model_config) -> None:
     # kernels and captured graphs would keep reading the old storage
     if moved and os.environ.get("VLLM_DIRECT_RELOAD_ALLOW_MOVED") != "1":
         raise RuntimeError(f"direct reload: {len(moved)} tensors moved: {moved[:8]}")
+    del model._direct_side_state
 
 
 def _snapshot_side_state(model: torch.nn.Module, skipped_ids: Set[int]):
