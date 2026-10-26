@@ -152,14 +152,16 @@ def process_weights_after_loading(
     from vllm.model_executor.layers.quantization.online.moe_base import (
         OnlineMoEMethodBase,
     )
-
-    maybe_retie_word_embeddings(model, model_config)
-
     from vllm.model_executor.model_loader.reload.direct import (
         direct_reload_enabled,
         record_checkpoint_layout,
         record_runtime_addresses,
+        rerunning_post_load,
     )
+
+    # a direct reload keeps the tie cold start decided (and checks it holds)
+    if not rerunning_post_load():
+        maybe_retie_word_embeddings(model, model_config)
 
     if direct_reload_enabled():
         record_checkpoint_layout(model)  # cold start only; reloads reuse it
