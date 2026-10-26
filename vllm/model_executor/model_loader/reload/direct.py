@@ -20,20 +20,22 @@ A reload is exactly as correct as a cold start: no module is skipped because
 it "received nothing" (a loader may bypass the parameter's ``weight_loader``,
 and post-processing may read other modules' tensors). The only exception is
 tensors the trainer deliberately does not sync, named by the regex
-``VLLM_DIRECT_RELOAD_EXCLUDE_REGEX`` (e.g. Engram): they keep their kernel
-layout, and modules holding only such tensors skip post-processing.
+``VLLM_DIRECT_RELOAD_EXCLUDE_REGEX`` (e.g. Engram). It has to cover whole
+modules with their submodules, which a reload leaves untouched: no view-back,
+no re-registration, no post-processing.
 
 Selected with ``VLLM_RELOAD_MODE=direct``.
 """
 
 import os
 import time
-from collections.abc import Iterator
+from collections.abc import Iterator, Set
 
 import regex as re
 import torch
 
 from vllm.logger import init_logger
+from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
 
 logger = init_logger(__name__)
 
@@ -59,11 +61,14 @@ def unsynced_weights_regex() -> "re.Pattern[str] | None":
 
 
 def _loadable_tensors(
-    model: torch.nn.Module,
+    model: torch.nn.Module, skipped: Set[int] = frozenset()
 ) -> Iterator[tuple[str, torch.Tensor]]:
-    """Parameters and persistent buffers, each object once."""
+    """Parameters and persistent buffers, each object once, outside the
+    modules whose ids are in ``skipped``."""
     seen: set[int] = set()
     for module_name, module in model.named_modules():
+        if id(module) in skipped:
+            continue
         for name, tensor, _ in _own_tensors(module):
             if id(tensor) in seen:
                 continue
@@ -167,6 +172,55 @@ def _unsupported(model: torch.nn.Module) -> str | None:
     return None
 
 
+def _unsynced_modules(model: torch.nn.Module) -> set[int]:
+    """Ids of the modules a reload leaves alone: every checkpoint tensor in
+    their subtree matches ``VLLM_DIRECT_RELOAD_EXCLUDE_REGEX``.
+
+    Every other module reruns post-processing on its checkpoint tensors in
+    checkpoint layout, which an unsynced tensor (kept in kernel layout) is
+    not. So a subtree holding both synced and unsynced tensors raises when
+    its root owns an unsynced tensor (it would convert it again), or runs a
+    quantization method's post-processing (at cold start that read the
+    subtree in checkpoint layout).
+    """
+    excluded = unsynced_weights_regex()
+    if excluded is None:
+        return set()
+    dropped: dict[int, list[str]] = {}
+    for module, name, *_ in getattr(model, "_direct_dropped", []):
+        dropped.setdefault(id(module), []).append(name)
+    skipped: set[int] = set()
+    mixed: list[str] = []
+
+    def visit(prefix: str, module: torch.nn.Module) -> tuple[bool, bool]:
+        own = [n for n, t, _ in _own_tensors(module) if hasattr(t, "_ckpt_layout")]
+        own = [prefix + n for n in own + dropped.get(id(module), [])]
+        unsynced = [n for n in own if excluded.search(n)]
+        any_unsynced, any_synced = bool(unsynced), len(unsynced) < len(own)
+        for name, child in module.named_children():
+            u, s = visit(f"{prefix}{name}.", child)
+            any_unsynced |= u
+            any_synced |= s
+        if not any_synced:
+            if any_unsynced:
+                skipped.add(id(module))
+        elif any_unsynced and (
+            unsynced
+            or isinstance(getattr(module, "quant_method", None), QuantizeMethodBase)
+        ):
+            mixed.append(prefix.rstrip(".") or "<root>")
+        return any_unsynced, any_synced
+
+    visit("", model)
+    if mixed:
+        raise RuntimeError(
+            "direct reload: VLLM_DIRECT_RELOAD_EXCLUDE_REGEX must cover all of "
+            "the checkpoint tensors under these modules, or none: "
+            f"{mixed[:8]}"
+        )
+    return skipped
+
+
 @torch.no_grad()
 def begin_direct_reload(model: torch.nn.Module) -> None:
     """Make every tensor writable by its checkpoint weight loader."""
@@ -175,24 +229,21 @@ def begin_direct_reload(model: torch.nn.Module) -> None:
     if (reason := _unsupported(model)) is not None:
         raise NotImplementedError(f"direct reload: {reason}")
 
+    # modules the trainer does not sync keep their runtime state untouched
+    skipped = model._direct_skipped = _unsynced_modules(model)
+
     # checkpoint names post-load processing deleted or replaced: register the
     # checkpoint tensors again so the model's loader finds them; the rerun at
     # finish unregisters them as cold start did
-    reregistered = []
     for module, name, is_param, t in getattr(model, "_direct_dropped", []):
-        current = _registered(module, name)
-        reregistered.append((module, name, name in module._parameters, current))
-        _register(module, name, is_param, t)
-    model._direct_reregistered = reregistered
+        if id(module) not in skipped:
+            _register(module, name, is_param, t)
 
-    excluded = unsynced_weights_regex()
     restored = 0
-    for name, t in _loadable_tensors(model):
+    for name, t in _loadable_tensors(model, skipped):
         layout = getattr(t, "_ckpt_layout", None)
         if layout is None:
             continue  # created by post-load processing: derived, rewritten there
-        if excluded is not None and excluded.search(name):
-            continue  # not synced: stays in kernel layout
         shape, stride, dtype, offset = layout
         if (tuple(t.shape), t.stride(), t.dtype, t.storage_offset()) != layout:
             storage = t.untyped_storage()
@@ -218,35 +269,17 @@ def finish_direct_reload(model: torch.nn.Module, model_config) -> None:
 
     torch.accelerator.synchronize()  # engines may write on other streams
 
-    # A module the trainer deliberately does not sync (every checkpoint tensor
-    # matches the exclude regex) keeps its kernel layout and skips
-    # post-processing, which would otherwise convert converted bytes again.
-    excluded = unsynced_weights_regex()
-    skipped: list[torch.nn.Module] = []
-    for module_name, module in model.named_modules():
-        own = [
-            f"{module_name}.{n}" if module_name else n
-            for n, t, _ in _own_tensors(module)
-            if hasattr(t, "_ckpt_layout")
-        ]
-        if not own or excluded is None:
-            continue
-        if not all(excluded.search(name) for name in own):
-            continue
+    # Unsynced modules keep their kernel layout and skip post-processing,
+    # which would otherwise convert converted bytes again.
+    skipped_ids = model.__dict__.pop("_direct_skipped")
+    skipped = [m for m in model.modules() if id(m) in skipped_ids]
+    for module in skipped:
         module._direct_skip_pwal = True
-        skipped.append(module)
-    # a skipped module keeps its runtime registration (no rerun unregisters)
-    skipped_ids = {id(m) for m in skipped}
-    for module, name, is_param, current in model.__dict__.pop(
-        "_direct_reregistered", []
-    ):
-        if id(module) in skipped_ids:
-            _register(module, name, is_param, current)
     # One-shot "already processed" guards (R7) would make the rerun below a
     # no-op and leave the freshly written checkpoint layout in place.
     cleared = 0
     for module in model.modules():
-        if module not in skipped and module.__dict__.pop(
+        if id(module) not in skipped_ids and module.__dict__.pop(
             "_already_called_process_weights_after_loading", None
         ):
             cleared += 1
@@ -258,7 +291,7 @@ def finish_direct_reload(model: torch.nn.Module, model_config) -> None:
         torch.accelerator.current_accelerator(),
     )
     t0 = time.perf_counter()
-    pinned = _snapshot_side_state(model, skipped)
+    pinned = _snapshot_side_state(model, skipped_ids)
     t_snapshot = time.perf_counter() - t0
     try:
         process_weights_after_loading(model, model_config, device)
@@ -292,7 +325,7 @@ def finish_direct_reload(model: torch.nn.Module, model_config) -> None:
         raise RuntimeError(f"direct reload: {len(moved)} tensors moved: {moved[:8]}")
 
 
-def _snapshot_side_state(model: torch.nn.Module, skipped: list[torch.nn.Module]):
+def _snapshot_side_state(model: torch.nn.Module, skipped_ids: Set[int]):
     """Before the rerun: each processed module's derived device tensors, i.e.
     registered tensors not loaded from the checkpoint (kernel constants,
     derived scales) and tensors reachable from its plain attributes, as
@@ -300,7 +333,6 @@ def _snapshot_side_state(model: torch.nn.Module, skipped: list[torch.nn.Module])
     storages, so the rerun's values have to land in them."""
     from .side_state import snapshot_side_tensors
 
-    skipped_ids = {id(m) for m in skipped}
     out = []
     for name, module in model.named_modules():
         if id(module) in skipped_ids:

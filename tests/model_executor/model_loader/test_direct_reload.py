@@ -263,19 +263,42 @@ class TestReloadEqualsColdStart:
 
 
 class TestExclusion:
-    def test_excluded_module_keeps_kernel_state(self, monkeypatch):
-        monkeypatch.setenv("VLLM_DIRECT_RELOAD_EXCLUDE_REGEX", r"^engram\.")
+    @pytest.mark.parametrize(
+        "module", ["engram", "nvfp4"], ids=["engram", "dropped-tensor"]
+    )
+    def test_excluded_module_keeps_kernel_state(self, monkeypatch, module):
+        monkeypatch.setenv("VLLM_DIRECT_RELOAD_EXCLUDE_REGEX", rf"^{module}\.")
         model = _cold_start(_checkpoint())
         before = _state(model)
         new = _checkpoint(1.01)
-        _reload(model, {n: t for n, t in new.items() if not n.startswith("engram.")})
+        _reload(model, {n: t for n, t in new.items() if not n.startswith(module)})
         after = _state(model)
 
-        _assert_same(after, before, names=["engram.weight"], addresses=True)
-        assert model.engram.quant_method.runs == 1
+        mine = [n for n in before if n.startswith(f"{module}.")]
+        _assert_same(after, before, names=mine, addresses=True)
+        assert getattr(model, module).quant_method.runs == 1
         fresh = _state(_cold_start(new))
-        _assert_same(after, fresh, names=[n for n in fresh if "engram" not in n])
+        _assert_same(after, fresh, names=[n for n in fresh if n not in mine])
         assert sorted(after) == sorted(fresh)
+
+    @pytest.mark.parametrize(
+        "regex,module",
+        [
+            (r"^nvfp4\.weight_scale_2$", "nvfp4"),
+            (r"^attn\.k_scale$", "attn"),
+            (r"^attn\.kv_b\.", "attn"),
+        ],
+        ids=[
+            "own-tensors-partly",  # rerun would convert the kept scale again
+            "children-synced",  # skipping attn would leave W_UK stale
+            "quantized-parent",  # attn's processing read kv_b's ckpt layout
+        ],
+    )
+    def test_partial_exclusion_raises(self, monkeypatch, regex, module):
+        monkeypatch.setenv("VLLM_DIRECT_RELOAD_EXCLUDE_REGEX", regex)
+        model = _cold_start(_checkpoint())
+        with pytest.raises(RuntimeError, match=rf"or none: \['{module}'\]"):
+            begin_direct_reload(model)
 
 
 class TestMovedAddress:
