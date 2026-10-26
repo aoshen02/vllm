@@ -36,6 +36,7 @@ import torch
 
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
+from vllm.model_executor.utils import is_weights_pre_processed
 
 logger = init_logger(__name__)
 
@@ -47,6 +48,14 @@ __all__ = [
     "record_runtime_addresses",
     "unsynced_weights_regex",
 ]
+
+
+_rerunning = False
+
+
+def rerunning_post_load() -> bool:
+    """Whether a direct reload is rerunning post-load processing."""
+    return _rerunning
 
 
 def direct_reload_enabled() -> bool:
@@ -76,14 +85,14 @@ def _loadable_tensors(
             yield (f"{module_name}.{name}" if module_name else name), tensor
 
 
-def _addresses(model: torch.nn.Module) -> dict[str, int]:
-    out: dict[str, int] = {}
-    for name, t in model.named_parameters(remove_duplicate=False):
-        if t.device.type == "cuda" and t.numel():
-            out[name] = t.data_ptr()
-    for name, t in model.named_buffers(remove_duplicate=False):
+def _addresses(model: torch.nn.Module) -> dict[str, tuple]:
+    """Where kernels and captured graphs read each tensor, and how."""
+    out: dict[str, tuple] = {}
+    tensors = list(model.named_parameters(remove_duplicate=False))
+    tensors += model.named_buffers(remove_duplicate=False)
+    for name, t in tensors:
         if t is not None and t.device.type == "cuda" and t.numel():
-            out[name] = t.data_ptr()
+            out[name] = (t.data_ptr(), tuple(t.shape), t.stride(), t.dtype)
     return out
 
 
@@ -93,6 +102,8 @@ def record_checkpoint_layout(model: torch.nn.Module) -> None:
     if getattr(model, "_direct_layout_recorded", False):
         return
     model._direct_layout_recorded = True
+    # the IPC weight cache loads runtime layout: there is no checkpoint layout
+    model._direct_pre_processed = is_weights_pre_processed()
     registered: list[tuple[torch.nn.Module, str, bool, torch.Tensor]] = []
     for module_name, module in model.named_modules():
         for local, t, is_param in _own_tensors(module):
@@ -165,6 +176,8 @@ def _unsupported(model: torch.nn.Module) -> str | None:
         OnlineMoEMethodBase,
     )
 
+    if model._direct_pre_processed:
+        return "weights loaded pre-processed (IPC weight cache)"
     for name, module in model.named_modules():
         method = getattr(module, "quant_method", None)
         if isinstance(method, (OnlineLinearBase, OnlineMoEMethodBase)):
@@ -293,9 +306,12 @@ def finish_direct_reload(model: torch.nn.Module, model_config) -> None:
     t0 = time.perf_counter()
     pinned = _snapshot_side_state(model, skipped_ids)
     t_snapshot = time.perf_counter() - t0
+    global _rerunning
+    _rerunning = True
     try:
         process_weights_after_loading(model, model_config, device)
     finally:
+        _rerunning = False
         for module in skipped:
             module.__dict__.pop("_direct_skip_pwal", None)
     t0 = time.perf_counter()

@@ -427,3 +427,33 @@ class TestSideState:
                 _reload(model, {"s.weight": torch.rand(4, 4)})
             return
         _reload(model, {"s.weight": torch.rand(4, 4)})
+
+
+class TestLoudChecks:
+    def test_cached_tensor_cannot_change_layout(self):
+        from vllm.model_executor.model_loader.weight_utils import set_cached_tensor
+
+        def fn(layer):
+            runs = layer.quant_method.runs
+            set_cached_tensor(layer, "cache", torch.zeros(runs, device=_DEVICE))
+
+        model = _one_layer(fn, torch.rand(4, 4))
+        with pytest.raises(RuntimeError, match=r"cannot refill _Layer.cache"):
+            _reload(model, {"s.weight": torch.rand(4, 4)})
+
+    def test_same_address_new_layout_moves(self):
+        def fn(layer):  # same storage, flattened only on reloads
+            if layer.quant_method.runs > 1:
+                layer.weight.data = layer.weight.data.view(16)
+
+        model = _one_layer(fn, torch.rand(4, 4))
+        with pytest.raises(RuntimeError, match=r"moved: \['s.weight'\]"):
+            _reload(model, {"s.weight": torch.rand(4, 4)})
+
+    def test_pre_processed_weights_refused(self):
+        from vllm.model_executor.utils import weights_already_processed
+
+        with weights_already_processed():
+            model = _one_layer(None, torch.rand(4, 4))
+        with pytest.raises(NotImplementedError, match="pre-processed"):
+            begin_direct_reload(model)
