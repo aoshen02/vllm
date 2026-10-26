@@ -522,8 +522,8 @@ class DefaultModelLoader(BaseModelLoader):
                 model, loaded_weights, quantized=model_config.quantization is not None
             )
 
+    @staticmethod
     def track_weights_loading(
-        self,
         model: nn.Module,
         loaded_weights: set[str] | None,
         quantized: bool = False,
