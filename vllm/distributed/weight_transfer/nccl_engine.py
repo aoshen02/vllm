@@ -150,6 +150,8 @@ class NCCLWeightTransferEngine(
         self.packed_num_buffers = DEFAULT_PACKED_NUM_BUFFERS
         # Metadata of the last update per model, reused by empty update info.
         self._last_update_info: dict[torch.nn.Module, NCCLWeightTransferUpdateInfo] = {}
+        # Host seconds per update phase, logged once per update.
+        self._update_seconds = {"start": 0.0, "recv": 0.0, "load": 0.0}
 
     def init_transfer_engine(self, init_info: NCCLWeightTransferInitInfo) -> None:
         """Initialize NCCL process group with the trainer and record the
@@ -175,18 +177,10 @@ class NCCLWeightTransferEngine(
             initialize_layerwise_reload,
         )
 
-        torch.accelerator.synchronize()
         t0 = time.perf_counter()
         initialize_layerwise_reload(self.model)
         self._begin_loaded_tracking()
-        torch.accelerator.synchronize()
-        self._wu_prof = {
-            "start_s": time.perf_counter() - t0,
-            "recv_s": 0.0,
-            "load_s": 0.0,
-            "calls": 0,
-            "tensors": 0,
-        }
+        self._update_seconds = {"start": time.perf_counter() - t0, "recv": 0, "load": 0}
 
     def finish_weight_update(self) -> None:
         """Check the update delivered every weight, then finalize layerwise
@@ -196,33 +190,21 @@ class NCCLWeightTransferEngine(
         )
 
         self._check_update_complete()
-        torch.accelerator.synchronize()
         t0 = time.perf_counter()
         finalize_layerwise_reload(self.model, self.model_config)
-        torch.accelerator.synchronize()
-        p = getattr(self, "_wu_prof", None)
-        if p is not None:
-            p["finish_s"] = time.perf_counter() - t0
-            p["total_s"] = p["start_s"] + p["recv_s"] + p["finish_s"]
-            logger.info(
-                "WU_PROFILE mode=%s rank=%d start_s=%.3f recv_s=%.3f "
-                "load_s=%.3f finish_s=%.3f total_s=%.3f calls=%d tensors=%d "
-                "mem_gib=%.2f peak_gib=%.2f",
-                os.environ.get("VLLM_RELOAD_MODE", "layerwise"),
-                torch.distributed.get_rank()
-                if torch.distributed.is_initialized()
-                else 0,
-                p["start_s"],
-                p["recv_s"],
-                p["load_s"],
-                p["finish_s"],
-                p["total_s"],
-                p["calls"],
-                p["tensors"],
-                torch.accelerator.memory_allocated() / (1 << 30),
-                torch.accelerator.max_memory_allocated() / (1 << 30),
-            )
-            torch.accelerator.reset_peak_memory_stats()
+        sec = self._update_seconds
+        finish = time.perf_counter() - t0
+        logger.info(
+            "WU_PROFILE mode=%s rank=%d start_s=%.3f recv_s=%.3f load_s=%.3f "
+            "finish_s=%.3f total_s=%.3f",
+            os.environ.get("VLLM_RELOAD_MODE", "layerwise"),
+            torch.distributed.get_rank() if torch.distributed.is_initialized() else 0,
+            sec["start"],
+            sec["recv"],
+            sec["load"],
+            finish,
+            sec["start"] + sec["recv"] + finish,
+        )
 
     def receive_weights(self, update_info: NCCLWeightTransferUpdateInfo) -> None:
         """Receive weights from trainer via NCCL broadcast.
@@ -251,19 +233,13 @@ class NCCLWeightTransferEngine(
             disable_mtp_completeness_check,
         )
 
-        prof = getattr(self, "_wu_prof", None)
+        sec = self._update_seconds
         t_recv = time.perf_counter()
-        model_load = self._load_weights
 
-        def timed_load(weights):
-            # host time inside load_weights (GPU work is async on the stream)
-            weights = list(weights)
+        def load(weights):
             t = time.perf_counter()
-            out = model_load(weights)
-            if prof is not None:
-                prof["load_s"] += time.perf_counter() - t
-                prof["calls"] += 1
-                prof["tensors"] += len(weights)
+            out = self._load_weights(weights)
+            sec["load"] += time.perf_counter() - t
             return out
 
         with disable_mtp_completeness_check():
@@ -280,7 +256,7 @@ class NCCLWeightTransferEngine(
                     iterator=state_dict_info_iterator(),
                     group=self.model_update_group,
                     src=0,
-                    post_unpack_func=timed_load,
+                    post_unpack_func=load,
                     buffer_size_bytes=self.packed_buffer_size_bytes,
                     num_buffers=self.packed_num_buffers,
                     device=self.device,
@@ -295,11 +271,9 @@ class NCCLWeightTransferEngine(
                     self.model_update_group.broadcast(
                         weight, src=0, stream=torch.cuda.current_stream()
                     )
-                    timed_load([(name, weight)])
+                    load([(name, weight)])
                     del weight
-        torch.accelerator.synchronize()
-        if prof is not None:
-            prof["recv_s"] += time.perf_counter() - t_recv
+        sec["recv"] += time.perf_counter() - t_recv
 
     def shutdown(self) -> None:
         if self.model_update_group is not None:
