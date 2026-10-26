@@ -28,7 +28,6 @@ Selected with ``VLLM_RELOAD_MODE=direct``.
 """
 
 import os
-import time
 from collections.abc import Iterator, Set
 
 import regex as re
@@ -128,19 +127,11 @@ def record_runtime_addresses(model: torch.nn.Module) -> None:
     ]
     model._direct_dropped = dropped
     if dropped:
-        live = {t.untyped_storage().data_ptr() for _, t in _loadable_tensors(model)}
-        held = sum(
-            t.untyped_storage().nbytes()
-            for *_, t in dropped
-            if t.untyped_storage().data_ptr() not in live
-        )
         logger.info(
             "direct reload: %d checkpoint tensors are unregistered by post-load "
-            "processing (e.g. %s); kept for reloads, %.2f GiB not shared with "
-            "the runtime tensors",
+            "processing (e.g. %s); kept for reloads",
             len(dropped),
             [f"{type(m).__name__}.{n}" for m, n, *_ in dropped[:4]],
-            held / 2**30,
         )
 
 
@@ -303,9 +294,7 @@ def finish_direct_reload(model: torch.nn.Module, model_config) -> None:
         (p.device for p in model.parameters() if p.device.type == "cuda"),
         torch.accelerator.current_accelerator(),
     )
-    t0 = time.perf_counter()
     pinned = _snapshot_side_state(model, skipped_ids)
-    t_snapshot = time.perf_counter() - t0
     global _rerunning
     _rerunning = True
     try:
@@ -314,16 +303,7 @@ def finish_direct_reload(model: torch.nn.Module, model_config) -> None:
         _rerunning = False
         for module in skipped:
             module.__dict__.pop("_direct_skip_pwal", None)
-    t0 = time.perf_counter()
     unpinned = _pin_side_state(pinned)
-    logger.info(
-        "direct reload: side state of %d modules (%d tensors) snapshot %.3f s, "
-        "pin %.3f s",
-        len(pinned),
-        sum(len(r) + len(s) for *_, r, s in pinned),
-        t_snapshot,
-        time.perf_counter() - t0,
-    )
     del pinned
     # hand the receive buffers and post-load temporaries back to the driver:
     # the next update's NCCL group allocates outside the caching allocator
