@@ -301,8 +301,154 @@ class TestExclusion:
     def test_partial_exclusion_raises(self, monkeypatch, regex, module):
         monkeypatch.setenv("VLLM_DIRECT_RELOAD_EXCLUDE_REGEX", regex)
         model = _cold_start(_checkpoint())
-        with pytest.raises(RuntimeError, match=rf"or none: \['{module}'\]"):
+        with pytest.raises(RuntimeError, match=rf"reads them: \['{module}'\]"):
             begin_direct_reload(model)
+
+
+def _with_weight(module: torch.nn.Module, shape=(2, 2)) -> torch.nn.Module:
+    module.register_parameter(
+        "weight", torch.nn.Parameter(torch.empty(shape), requires_grad=False)
+    )
+    return module
+
+
+class _Attn(torch.nn.Module):
+    """A deferred attention layer without a quant_method (unquantized MLA):
+    derives W from its children."""
+
+    def __init__(self):
+        super().__init__()
+        self.kv_b = _with_weight(_Layer(lambda layer: None))
+        self.q = _with_weight(_Layer(lambda layer: None))
+
+    def process_weights_after_loading(self, dtype):
+        self.W = self.kv_b.weight * 3 + self.q.weight
+
+
+class _Tree(torch.nn.Module):
+    """Modules given by dotted name; ``hook`` is a model-level hook."""
+
+    def __init__(self, modules: dict[str, torch.nn.Module], hook=None):
+        super().__init__()
+        for name, module in modules.items():
+            *path, local = name.split(".")
+            parent = self.get_submodule(".".join(path)) if path else self
+            parent.add_module(local, module)
+        self.hook = hook
+
+    def process_weights_after_loading(self):
+        if self.hook is not None:
+            self.hook(self)
+
+    def load_weights(self, weights):
+        for name, weight in weights:
+            default_weight_loader(self.get_parameter(name), weight)
+        return {name for name, _ in weights}
+
+
+def _tree_cold_start(build, weights) -> "_Tree":
+    with _DEVICE:
+        model = build()
+    model.load_weights(weights.items())
+    process_weights_after_loading(model, _MODEL_CONFIG, _DEVICE)
+    return model
+
+
+class TestExclusionRule:
+    """Canonical names, whole subtrees, and no post-load processing that
+    reads a skipped module."""
+
+    @pytest.fixture
+    def deferred(self, monkeypatch):
+        import vllm.model_executor.layers.attention as attention
+        import vllm.model_executor.model_loader.utils as loader_utils
+
+        real = attention.is_deferred_attention_layer
+
+        def is_deferred(module):
+            return isinstance(module, _Attn) or real(module)
+
+        monkeypatch.setattr(attention, "is_deferred_attention_layer", is_deferred)
+        monkeypatch.setattr(loader_utils, "is_deferred_attention_layer", is_deferred)
+
+    def test_deferred_attention_over_skipped_module_raises(self, monkeypatch, deferred):
+        # MLA absorbing an excluded kv_b_proj
+        monkeypatch.setenv("VLLM_DIRECT_RELOAD_EXCLUDE_REGEX", r"^attn\.kv_b\.")
+        model = _tree_cold_start(
+            lambda: _Tree({"attn": _Attn()}),
+            {"attn.kv_b.weight": torch.rand(2, 2), "attn.q.weight": torch.rand(2, 2)},
+        )
+        with pytest.raises(RuntimeError, match=r"reads them: \['attn'\]"):
+            begin_direct_reload(model)
+
+    def test_alias_is_matched_on_its_canonical_name(self, monkeypatch):
+        monkeypatch.setenv("VLLM_DIRECT_RELOAD_EXCLUDE_REGEX", r"^sub\.alias\.")
+
+        def build():
+            proj = _with_weight(_Layer(lambda layer: None))
+            return _Tree({"proj": proj, "sub": _Layer(None), "sub.alias": proj})
+
+        model = _tree_cold_start(build, {"proj.weight": torch.rand(2, 2)})
+        new = torch.rand(2, 2)
+        _reload(model, {"proj.weight": new})
+        assert model.proj.quant_method.runs == 2
+        assert torch.equal(model.proj.weight, new.to(_DEVICE))
+
+    def test_skipped_module_skips_its_descendants(self, monkeypatch):
+        monkeypatch.setenv("VLLM_DIRECT_RELOAD_EXCLUDE_REGEX", r"^engram\.")
+        model = _tree_cold_start(
+            lambda: _Tree(
+                {
+                    "engram": _with_weight(_Layer(None)),
+                    "engram.sub": _Layer(lambda layer: None),  # no tensors
+                    "other": _with_weight(_Layer(None)),
+                }
+            ),
+            {"engram.weight": torch.rand(2, 2), "other.weight": torch.rand(2, 2)},
+        )
+        _reload(model, {"other.weight": torch.rand(2, 2)})
+        assert model.engram.sub.quant_method.runs == 1
+
+    def test_engram_like_model(self, monkeypatch):
+        """DeepSeek-V4.1's shape under VLLM_DIRECT_RELOAD_EXCLUDE_REGEX=
+        '[.]engram[.]': a decoder layer (no post-load processing of its own)
+        holds the Engram module beside quantized layers; the model keeps
+        a batch object listing the Engram modules outside the module tree;
+        the model-level hook reads a synced weight and rebuilds a cache on
+        the Engram module."""
+
+        def hook(model):
+            model.broadcast = model.layers[0].attn.weight.sum(0)
+            model.layers[0].engram.cache = model.layers[0].engram.weight * 2
+
+        def build():
+            model = _Tree(
+                {
+                    "layers": torch.nn.ModuleList([torch.nn.Module()]),
+                    "layers.0.attn": _with_weight(_Layer(_transpose)),
+                    "layers.0.engram": _with_weight(_Layer(None)),
+                    "layers.0.engram.proj": _with_weight(_Layer(_transpose)),
+                },
+                hook,
+            )
+            model.batch = SimpleNamespace(layers=[model.layers[0].engram])
+            return model
+
+        weights = {
+            "layers.0.attn.weight": torch.rand(2, 2),
+            "layers.0.engram.weight": torch.rand(2, 2),
+            "layers.0.engram.proj.weight": torch.rand(2, 2),
+        }
+        monkeypatch.setenv("VLLM_DIRECT_RELOAD_EXCLUDE_REGEX", r"[.]engram[.]")
+        model = _tree_cold_start(build, weights)
+        before = _state(model)
+        new = dict(weights, **{"layers.0.attn.weight": torch.rand(2, 2)})
+        _reload(model, {"layers.0.attn.weight": new["layers.0.attn.weight"]})
+        after = _state(model)
+        monkeypatch.delenv("VLLM_DIRECT_RELOAD_EXCLUDE_REGEX")
+        _assert_same(after, _state(_tree_cold_start(build, new)))
+        assert _ptrs(after) == _ptrs(before)
+        assert model.layers[0].engram.proj.quant_method.runs == 1
 
 
 class TestMovedAddress:

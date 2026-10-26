@@ -22,7 +22,7 @@ and post-processing may read other modules' tensors). The only exception is
 tensors the trainer deliberately does not sync, named by the regex
 ``VLLM_DIRECT_RELOAD_EXCLUDE_REGEX`` (e.g. Engram). It has to cover whole
 modules with their submodules, which a reload leaves untouched: no view-back,
-no re-registration, no post-processing.
+no re-registration, no post-processing (`_unsynced_modules` has the rule).
 
 Selected with ``VLLM_RELOAD_MODE=direct``.
 """
@@ -177,50 +177,78 @@ def _unsupported(model: torch.nn.Module) -> str | None:
 
 
 def _unsynced_modules(model: torch.nn.Module) -> set[int]:
-    """Ids of the modules a reload leaves alone: every checkpoint tensor in
-    their subtree matches ``VLLM_DIRECT_RELOAD_EXCLUDE_REGEX``.
+    """Ids of the modules a reload leaves alone, from
+    ``VLLM_DIRECT_RELOAD_EXCLUDE_REGEX`` matched on canonical names (the
+    first name `named_modules()` gives a module; each module once).
 
-    Every other module reruns post-processing on its checkpoint tensors in
-    checkpoint layout, which an unsynced tensor (kept in kernel layout) is
-    not. So a subtree holding both synced and unsynced tensors raises when
-    its root owns an unsynced tensor (it would convert it again), or runs a
-    quantization method's post-processing (at cold start that read the
-    subtree in checkpoint layout).
+    A module is skipped iff it has checkpoint tensors in its subtree and the
+    regex matches all of them; its descendants are skipped with it. A module
+    that is not skipped raises if
+    - it owns a matching tensor: its post-processing would convert the kept
+      kernel-layout bytes again;
+    - or it has post-load processing (a quantization method, or a deferred
+      attention layer) and a skipped module below it: that processing read
+      the skipped module at cold start, so it must not rerun on its own
+      (e.g. MLA absorbing an excluded kv_b_proj).
+
+    The model-level hook (`finalize_model_weights`) still runs: it belongs
+    to the whole model, which a reload never skips. Like at cold start it
+    sees the skipped modules in kernel layout, holding their cold-start
+    bytes, and any derived tensor it reallocates for them is pinned (their
+    side state is snapshotted with every other module's).
     """
+    from vllm.model_executor.layers.attention import is_deferred_attention_layer
+
     excluded = unsynced_weights_regex()
     if excluded is None:
         return set()
     dropped: dict[int, list[str]] = {}
     for module, name, *_ in getattr(model, "_direct_dropped", []):
         dropped.setdefault(id(module), []).append(name)
+    modules = list(model.named_modules())
+    own: dict[int, list[bool]] = {}  # per checkpoint tensor: does it match
+    for name, module in modules:
+        prefix = f"{name}." if name else ""
+        ckpt = [n for n, t, _ in _own_tensors(module) if hasattr(t, "_ckpt_layout")]
+        own[id(module)] = [
+            excluded.search(prefix + n) is not None
+            for n in ckpt + dropped.get(id(module), [])
+        ]
+    subtree: dict[int, tuple[bool, bool]] = {}  # any matching, any synced
+
+    def visit(module: torch.nn.Module) -> tuple[bool, bool]:
+        if (seen := subtree.get(id(module))) is not None:
+            return seen
+        hits = own[id(module)]
+        unsynced, synced = any(hits), not all(hits)
+        for child in module.children():
+            u, s = visit(child)
+            unsynced, synced = unsynced or u, synced or s
+        subtree[id(module)] = (unsynced, synced)
+        return unsynced, synced
+
     skipped: set[int] = set()
-    mixed: list[str] = []
+    for _, module in modules:
+        if id(module) not in skipped and visit(module) == (True, False):
+            skipped.update(id(m) for m in module.modules())
 
-    def visit(prefix: str, module: torch.nn.Module) -> tuple[bool, bool]:
-        own = [n for n, t, _ in _own_tensors(module) if hasattr(t, "_ckpt_layout")]
-        own = [prefix + n for n in own + dropped.get(id(module), [])]
-        unsynced = [n for n in own if excluded.search(n)]
-        any_unsynced, any_synced = bool(unsynced), len(unsynced) < len(own)
-        for name, child in module.named_children():
-            u, s = visit(f"{prefix}{name}.", child)
-            any_unsynced |= u
-            any_synced |= s
-        if not any_synced:
-            if any_unsynced:
-                skipped.add(id(module))
-        elif any_unsynced and (
-            unsynced
-            or isinstance(getattr(module, "quant_method", None), QuantizeMethodBase)
-        ):
-            mixed.append(prefix.rstrip(".") or "<root>")
-        return any_unsynced, any_synced
+    def reads_skipped(module: torch.nn.Module) -> bool:
+        method = getattr(module, "quant_method", None)
+        return (
+            isinstance(method, QuantizeMethodBase)
+            or is_deferred_attention_layer(module)
+        ) and any(id(m) in skipped for m in module.modules())
 
-    visit("", model)
-    if mixed:
+    bad = [
+        name or "<root>"
+        for name, module in modules
+        if id(module) not in skipped and (any(own[id(module)]) or reads_skipped(module))
+    ]
+    if bad:
         raise RuntimeError(
-            "direct reload: VLLM_DIRECT_RELOAD_EXCLUDE_REGEX must cover all of "
-            "the checkpoint tensors under these modules, or none: "
-            f"{mixed[:8]}"
+            "direct reload: VLLM_DIRECT_RELOAD_EXCLUDE_REGEX must cover whole "
+            "modules, without a module whose post-load processing reads them: "
+            f"{bad[:8]}"
         )
     return skipped
 
@@ -299,7 +327,7 @@ def finish_direct_reload(model: torch.nn.Module, model_config) -> None:
     # into them, not into the failed rerun's allocations.
     pinned = model.__dict__.get("_direct_side_state")
     if pinned is None:
-        pinned = model._direct_side_state = _snapshot_side_state(model, skipped_ids)
+        pinned = model._direct_side_state = _snapshot_side_state(model)
     global _rerunning
     _rerunning = True
     try:
@@ -326,17 +354,17 @@ def finish_direct_reload(model: torch.nn.Module, model_config) -> None:
     del model._direct_side_state
 
 
-def _snapshot_side_state(model: torch.nn.Module, skipped_ids: Set[int]):
-    """Before the rerun: each processed module's derived device tensors
-    (`side_state`), as aliases of their storage. CUDA graphs captured at cold
-    start read these storages, so the rerun's values have to land in them."""
+def _snapshot_side_state(model: torch.nn.Module):
+    """Before the rerun: each module's derived device tensors (`side_state`),
+    as aliases of their storage. CUDA graphs captured at cold start read
+    these storages, so the rerun's values have to land in them. Skipped
+    modules too: the model-level hook still runs over them."""
     from .side_state import SideWalk, snapshot_side_tensors
 
     side_walk = SideWalk()
     pinned = [
         (name, module, snapshot_side_tensors(module, side_walk))
         for name, module in model.named_modules()
-        if id(module) not in skipped_ids
     ]
     _log_truncated(side_walk, "snapshot")
     return pinned
