@@ -73,7 +73,13 @@ def unsynced_weights_regex() -> "re.Pattern[str] | None":
     """Names the trainer deliberately does not sync (e.g. Engram); weight
     updates do not have to deliver them. A malformed pattern refuses the
     update before anything is modified (`begin_direct_reload` compiles it
-    first)."""
+    first).
+
+    The regex must name whole vLLM modules (`_unsynced_modules`) or
+    checkpoint-only names (MTP layers the served model does not load, a
+    tied ``lm_head``). A regex naming only some checkpoint parts of a fused
+    module (``gate_proj`` of ``gate_up_proj``) is a configuration error that
+    nothing detects: the module is not skipped and reconverts its bytes."""
     pattern = os.environ.get("VLLM_DIRECT_RELOAD_EXCLUDE_REGEX", "")
     try:
         return re.compile(pattern) if pattern else None
@@ -273,36 +279,10 @@ def _unsynced_modules(model: torch.nn.Module) -> set[int]:
     ]
     if bad:
         raise DirectReloadRefused(
-            "direct reload: VLLM_DIRECT_RELOAD_EXCLUDE_REGEX must cover whole "
-            "modules, without a module whose post-load processing reads them: "
+            "direct reload: VLLM_DIRECT_RELOAD_EXCLUDE_REGEX must name whole "
+            "vLLM modules or checkpoint-only names (unused MTP layers, a tied "
+            "lm_head), without a module whose post-load processing reads them: "
             f"{bad[:8]}"
-        )
-    # A checkpoint name the regex matches must lie in a skipped module, or
-    # below one (a skipped module's descendants are skipped, renamed or not:
-    # DSv4.1 engram.embed -> engram.embed_tokens). One fused or renamed in
-    # vLLM (gate_proj -> gate_up_proj) is not skipped, and its rerun would
-    # convert the kept kernel bytes again.
-    tails = {
-        ".".join(parts[i:])
-        for name, module in modules
-        if id(module) in skipped
-        for parts in [name.split(".")]
-        for i in range(len(parts))
-    }
-    ckpt_names = getattr(model, "_checkpoint_weight_names", None) or ()
-    stray = sorted(
-        n
-        for n in ckpt_names
-        if excluded.search(n)
-        and not any(
-            ".".join(n.split(".")[:i]) in tails for i in range(1, n.count(".") + 1)
-        )
-    )
-    if stray:
-        raise DirectReloadRefused(
-            "direct reload: VLLM_DIRECT_RELOAD_EXCLUDE_REGEX must cover whole "
-            "modules; these checkpoint names match it but their module is not "
-            f"skipped (fused or renamed in vLLM?): {stray[:8]}"
         )
     return skipped
 

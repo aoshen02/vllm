@@ -459,62 +459,6 @@ class TestExclusionRule:
         assert _ptrs(after) == _ptrs(before)
         assert model.layers[0].engram.proj.quant_method.runs == 1
 
-    @pytest.mark.parametrize(
-        "regex,modules,ckpt,refused",
-        [
-            (
-                r"[.]engram[.]",  # the loader renames engram.embed
-                ["model.layers.0.attn", "model.layers.0.engram.embed_tokens"],
-                ["layers.0.attn", "layers.0.engram.embed"],
-                False,
-            ),
-            (
-                r"^audio_encoder[.](audio_tokenizer|input_local_transformer"
-                r"[.]embed_tokens)[.]",
-                [
-                    "audio_encoder.audio_tokenizer.enc",
-                    "audio_encoder.input_local_transformer.embed_tokens",
-                    "audio_encoder.proj",
-                ],
-                [
-                    "audio_encoder.audio_tokenizer.enc",
-                    "audio_encoder.input_local_transformer.embed_tokens",
-                    "audio_encoder.proj",
-                ],
-                False,
-            ),
-            (
-                r"[.]gate_proj[.]",
-                ["mlp.gate_up_proj", "mlp.down_proj"],
-                ["mlp.gate_proj", "mlp.up_proj", "mlp.down_proj"],
-                True,
-            ),
-        ],
-        ids=["engram-dsv41", "mimo-audio-tower", "gate_proj-fused"],
-    )
-    def test_checkpoint_names_must_fall_in_skipped_modules(
-        self, monkeypatch, regex, modules, ckpt, refused
-    ):
-        def build():
-            tree: dict[str, torch.nn.Module] = {}
-            for name in modules:  # parents first, as _Tree needs
-                parts = name.split(".")
-                for i in range(1, len(parts)):
-                    tree.setdefault(".".join(parts[:i]), torch.nn.Module())
-                tree[name] = _with_weight(_Layer(None))
-            return _Tree(tree)
-
-        monkeypatch.setenv("VLLM_DIRECT_RELOAD_EXCLUDE_REGEX", regex)
-        model = _tree_cold_start(
-            build, {f"{m}.weight": torch.rand(2, 2) for m in modules}
-        )
-        model._checkpoint_weight_names = {f"{m}.weight" for m in ckpt}
-        if refused:
-            with pytest.raises(RuntimeError, match=r"must cover whole modules"):
-                begin_direct_reload(model)
-        else:
-            begin_direct_reload(model)
-
 
 class TestMovedAddress:
     def test_rebinding_pwal_raises(self):
