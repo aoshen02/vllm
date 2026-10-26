@@ -793,7 +793,7 @@ class TestLoudChecks:
             set_cached_tensor(layer, "cache", torch.zeros(runs, device=_DEVICE))
 
         model = _one_layer(fn, torch.rand(4, 4))
-        with pytest.raises(RuntimeError, match=r"cannot refill _Layer.cache"):
+        with pytest.raises(RuntimeError, match=r"moved: \['s.cache'\]"):
             _reload(model, {"s.weight": torch.rand(4, 4)})
 
     def test_same_address_new_layout_moves(self):

@@ -59,14 +59,6 @@ class DirectReloadRefused(RuntimeError):
     which still holds the weights it served with."""
 
 
-_rerunning = False
-
-
-def rerunning_post_load() -> bool:
-    """Whether a direct reload is rerunning post-load processing."""
-    return _rerunning
-
-
 def direct_reload_enabled() -> bool:
     return os.environ.get("VLLM_RELOAD_MODE", "layerwise") == "direct"
 
@@ -513,12 +505,7 @@ def finish_direct_reload(model: torch.nn.Module, model_config) -> None:
         torch.accelerator.current_accelerator(),
     )
     pinned = model._direct_side_state  # taken by the first begin
-    global _rerunning
-    _rerunning = True
-    try:
-        process_weights_after_loading(model, model_config, device, skipped)
-    finally:
-        _rerunning = False
+    process_weights_after_loading(model, model_config, device, skipped)
     unpinned = _pin_side_state(pinned)
     # hand the receive buffers and post-load temporaries back to the driver:
     # the next update's NCCL group allocates outside the caching allocator

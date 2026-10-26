@@ -1531,26 +1531,17 @@ def set_cached_tensor(owner: object, name: str, new: torch.Tensor | None) -> Non
     """Set ``owner.<name>`` to a tensor derived from loaded weights. Post-load
     hooks rerun on every weight reload while CUDA graphs keep the address
     captured at startup, so refill the existing tensor in place when it matches
-    ``new`` in shape, dtype and device; a direct reload raises otherwise."""
+    ``new`` in shape, dtype and device. Otherwise replace it; a direct reload
+    then reports it as moved (its side-state pin)."""
     cached = getattr(owner, name, None)
-    if isinstance(cached, torch.Tensor):
-        if new is not None and (cached.shape, cached.dtype, cached.device) == (
-            new.shape,
-            new.dtype,
-            new.device,
-        ):
-            cached.copy_(new)
-            return
-        from vllm.model_executor.model_loader.reload.direct import (
-            rerunning_post_load,
-        )
-
-        if rerunning_post_load():
-            raise RuntimeError(
-                f"direct reload: cannot refill {type(owner).__name__}.{name} "
-                f"{(tuple(cached.shape), cached.dtype, cached.device)} in place "
-                f"with {None if new is None else (tuple(new.shape), new.dtype)}"
-            )
+    if (
+        isinstance(cached, torch.Tensor)
+        and new is not None
+        and (cached.shape, cached.dtype, cached.device)
+        == (new.shape, new.dtype, new.device)
+    ):
+        cached.copy_(new)
+        return
     setattr(owner, name, new)
 
 
