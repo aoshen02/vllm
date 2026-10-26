@@ -159,7 +159,7 @@ def process_weights_after_loading(
     from vllm.model_executor.model_loader.reload.direct import (
         direct_reload_enabled,
         record_checkpoint_layout,
-        record_runtime_addresses,
+        record_dropped_checkpoint_tensors,
     )
 
     # Direct reload never ties by equality, cold start included: whether two
@@ -230,7 +230,7 @@ def process_weights_after_loading(
     finalize_model_weights(model)
 
     if direct_reload_enabled():
-        record_runtime_addresses(model)  # cold start only
+        record_dropped_checkpoint_tensors(model)  # cold start only
 
     # Needed for torchao model reloading via model.reload_weights
     # @kylesayrs @jerryzh168 this can be removed if callers move to `reload_weights`

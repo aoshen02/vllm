@@ -49,7 +49,7 @@ __all__ = [
     "finish_direct_reload",
     "record_checkpoint_layout",
     "record_delivered",
-    "record_runtime_addresses",
+    "record_dropped_checkpoint_tensors",
     "unsynced_weights_regex",
 ]
 
@@ -129,7 +129,7 @@ def record_checkpoint_layout(model: torch.nn.Module) -> None:
     model._direct_registered = registered
 
 
-def record_runtime_addresses(model: torch.nn.Module) -> None:
+def record_dropped_checkpoint_tensors(model: torch.nn.Module) -> None:
     """Cold start, after post-load processing: keep the checkpoint tensors
     post-load processing unregistered (deleted, or replaced under the same
     name) so each reload can register them again."""
