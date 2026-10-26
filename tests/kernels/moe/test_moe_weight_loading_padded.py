@@ -788,6 +788,46 @@ class TestLoadWeightsExpertMapping:
             self._load(mapping, [("1.gate_proj.weight", torch.ones(2, 3))])
 
 
+class TestExpertRunRetention:
+    """Deferred per-expert tensors load once they reach _EXPERT_RUN_BYTES,
+    so the input iterable's tensors are not all kept alive until it ends."""
+
+    def test_deferred_experts_load_in_bounded_batches(self, monkeypatch):
+        from vllm.model_executor.layers.fused_moe import routed_experts
+
+        num, shape = 16, (2, 3)
+        cap = 4 * torch.zeros(shape).nbytes
+        monkeypatch.setattr(routed_experts, "_loads_expert_runs", lambda *_: True)
+        monkeypatch.setattr(routed_experts, "_EXPERT_RUN_BYTES", cap)
+        mapping = TestLoadWeightsExpertMapping._mapping()
+        experts = torch.nn.Module()
+        experts.layer_name = "model.layers.0.mlp.experts"
+        experts.moe_config = SimpleNamespace(is_act_and_mul=True)
+        experts.get_expert_mapping = lambda **_: mapping
+        loaded: dict[int, torch.Tensor] = {}
+
+        def weight_loader(param, loaded_weight, expert_id, num_experts, **_):
+            for i in range(num_experts):
+                loaded[expert_id + i] = loaded_weight[i].clone()
+            return True
+
+        param = torch.nn.Parameter(torch.empty(0), requires_grad=False)
+        param.weight_loader = weight_loader
+        experts.w13_weight = param
+        pending = []  # tensors yielded and not loaded yet, at each yield
+
+        def weights():
+            for e in range(num):
+                pending.append(e - len(loaded))
+                yield f"{e}.gate_proj.weight", torch.full(shape, float(e))
+
+        assert set(RoutedExperts.load_weights(experts, weights())) == {"w13_weight"}
+        assert max(pending) < 4
+        assert {e: t[0, 0].item() for e, t in loaded.items()} == {
+            e: float(e) for e in range(num)
+        }
+
+
 class TestPerTensorScaleCoercion:
     """Regression test for shape-(1,) per-tensor scales (issue #43297).
 
