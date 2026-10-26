@@ -321,14 +321,24 @@ def test_failed_draft_head_restore_keeps_the_draft_incomplete(monkeypatch):
         Worker._check_weights_complete(worker)
 
 
-@pytest.mark.parametrize("from_disk", [True, False], ids=["from-disk", "iterator"])
-def test_reload_from_disk_clears_a_failed_update(from_disk):
+@pytest.mark.parametrize(
+    "from_disk,checkpoint_format,clears",
+    [(True, True, True), (False, True, False), (True, False, False)],
+    ids=["from-disk", "iterator", "kernel-format-copy"],
+)
+def test_reload_from_disk_clears_a_failed_update(from_disk, checkpoint_format, clears):
+    # only a checkpoint-format reload from disk runs the reload lifecycle over
+    # the whole model; a kernel-format copy skips it
     class Runner(_RecordingModelRunner):
-        def reload_weights(self, weights_iterator=None) -> None:
+        def reload_weights(self, weights_iterator=None, **_) -> None:
             pass
 
     worker = _make_worker(None)
     worker.model_runner = Runner()
     worker._incomplete_updates = frozenset({"target"})
-    Worker.reload_weights(worker, None if from_disk else iter([]))
-    assert worker._incomplete_updates == (set() if from_disk else {"target"})
+    Worker.reload_weights(
+        worker,
+        None if from_disk else iter([]),
+        is_checkpoint_format=checkpoint_format,
+    )
+    assert worker._incomplete_updates == (set() if clears else {"target"})

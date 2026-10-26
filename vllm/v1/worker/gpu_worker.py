@@ -642,7 +642,10 @@ class Worker(WorkerBase):
     def reload_weights(self, *args, **kwargs) -> None:
         """Reload the target model's weights in place. Without a
         `weights_iterator` it reads a whole checkpoint from disk, which also
-        repairs a model a failed weight update left incomplete."""
+        repairs a model a failed weight update left incomplete: in direct mode
+        it runs the reload lifecycle of an update (`begin_direct_reload`, then
+        `finish_direct_reload` pins into the storage graphs read), unless it
+        copies kernel-format weights (`is_checkpoint_format=False`)."""
         try:
             with set_current_vllm_config(self.vllm_config):
                 self.model_runner.reload_weights(*args, **kwargs)
@@ -651,7 +654,9 @@ class Worker(WorkerBase):
         except BaseException:
             self._incomplete_updates |= {"target"}
             raise
-        if (args[0] if args else kwargs.get("weights_iterator")) is None:
+        from_disk = (args[0] if args else kwargs.get("weights_iterator")) is None
+        checkpoint = args[2] if len(args) > 2 else kwargs.get("is_checkpoint_format")
+        if from_disk and checkpoint is not False:
             self._incomplete_updates -= {"target"}
 
     @torch.inference_mode()
