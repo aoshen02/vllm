@@ -244,9 +244,10 @@ def test_nccl_shutdown_destroys_communicator_once(engine_type):
 
 
 class TestUpdateCompleteness:
-    """A full update must deliver every checkpoint tensor its cold start fed
+    """A direct reload must deliver every checkpoint tensor its cold start fed
     to `load_weights`, minus the unsynced ones, whatever `load_weights`
-    reports; checked once, before the reload is finalized."""
+    reports; checked once, before the reload is finalized. Layerwise reloads
+    check nothing."""
 
     # experts.* load into one fused parameter; mtp.* is declared unused; the
     # model's `audio` parameter is set up in __init__, never fed
@@ -263,7 +264,11 @@ class TestUpdateCompleteness:
 
     @staticmethod
     def _engine(
-        monkeypatch, cold: list[str] | None, reports_names: bool, finalized: list
+        monkeypatch,
+        cold: list[str] | None,
+        reports_names: bool,
+        finalized: list,
+        mode: str = "direct",
     ) -> NCCLWeightTransferEngine:
         import vllm.model_executor.model_loader.reload as reload
 
@@ -273,6 +278,7 @@ class TestUpdateCompleteness:
                 raise RuntimeError("post-load processing failed")
             finalized.append("ok")
 
+        monkeypatch.setenv("VLLM_RELOAD_MODE", mode)
         monkeypatch.setattr(reload, "initialize_layerwise_reload", lambda *_: None)
         monkeypatch.setattr(reload, "finalize_layerwise_reload", finalize)
         monkeypatch.setattr(torch.cuda, "current_stream", lambda *_, **__: None)
@@ -356,6 +362,16 @@ class TestUpdateCompleteness:
         with pytest.raises(ValueError, match=error):
             self._update(engine, sent)
         assert finalized == []  # raised before post-load processing
+
+    @pytest.mark.parametrize(
+        "sent", [FULL[:4], FULL], ids=["partial", "delivers-unsynced"]
+    )
+    def test_layerwise_checks_nothing(self, monkeypatch, sent):
+        monkeypatch.setenv("VLLM_DIRECT_RELOAD_EXCLUDE_REGEX", r"[.]?engram[.]")
+        finalized: list = []
+        engine = self._engine(monkeypatch, self.COLD, True, finalized, "layerwise")
+        self._update(engine, sent)
+        assert finalized == ["ok"]
 
     def test_without_cold_start_names_first_successful_update_is_required(
         self, monkeypatch
