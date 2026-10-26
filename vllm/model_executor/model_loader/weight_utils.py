@@ -1563,13 +1563,16 @@ def stash_weight_part(
 ) -> dict[str, torch.Tensor] | None:
     """Buffer one part of a multi-tensor checkpoint weight on ``module``, so the
     parts may arrive in different ``load_weights`` calls. Returns all parts once
-    complete; ``finalize_model_weights`` raises on parts left unpaired.
+    complete; ``finalize_model_weights`` raises on parts left unpaired, and a
+    part delivered twice before its weight completes raises here.
 
     The calls may run on different streams (packed NCCL alternates streams
     between buckets), so a parked part carries an event recorded on the stream
     that parked it, which the stream pairing it waits on."""
     pending = module.__dict__.setdefault("_pending_weight_parts", {})
     entry = pending.setdefault(key, {})
+    if part in entry:
+        raise ValueError(f"{key}: {part} delivered twice in one load")
     entry[part] = (tensor, None)
     if all(p in entry for p in parts):
         del pending[key]

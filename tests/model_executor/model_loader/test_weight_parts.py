@@ -90,6 +90,14 @@ class TestSplitWeightParts:
         assert len(got) == 1
         torch.testing.assert_close(got[0], expected[0])
 
+    def test_duplicate_part_raises(self):
+        # a part delivered twice in one update must not pair last-writer-wins
+        weight, scale = _wk_tensors()
+        module = nn.Module()
+        _load_in_calls(module, [[weight]])
+        with pytest.raises(ValueError, match="delivered twice"):
+            _load_in_calls(module, [[weight]])
+
 
 class _HookCounter(nn.Module):
     def __init__(self) -> None:
