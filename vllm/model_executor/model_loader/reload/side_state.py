@@ -188,20 +188,29 @@ def pin_side_tensors(
 ) -> list[str]:
     """Put the tensor at every snapshotted path back on its startup storage,
     holding the rerun's values. Returns the paths that cannot be pinned: gone,
-    or now a tensor of a different shape, stride, dtype or device. Pinning
-    changes no object but tensors, so objects the pass proved tensor-free
-    stay so."""
+    or now a tensor of a different shape, stride, dtype or device, or whose
+    aliasing changed (two startup tensors sharing an address now hold
+    different tensors, or the reverse: copying both into one storage would
+    lose one). Pinning changes no object but tensors, so objects the pass
+    proved tensor-free stay so."""
     after = collect_side_tensors(layer, side_walk)
-    failed = []
+    failed: list[str] = []
+    pins: list[tuple[torch.Tensor, torch.Tensor]] = []
+    fwd: dict[int, int] = {}  # startup address -> live address, and back
+    back: dict[int, int] = {}
     for path, old in before.items():
         t = after.get(path)
         if t is None or _layout(t) != _layout(old):
             failed.append(_fmt(path))
             continue
-        if t.data_ptr() == old.data_ptr():
-            continue  # the same view of the startup storage
-        old.copy_(t)
-        t.data = old  # every holder of `t`, seen by the walk or not
+        s, a = old.data_ptr(), t.data_ptr()
+        if old.numel() and (fwd.setdefault(s, a) != a or back.setdefault(a, s) != s):
+            return failed + [f"{_fmt(path)} (aliasing changed)"]
+        pins.append((old, t))
+    for old, t in pins:
+        if t.data_ptr() != old.data_ptr():  # else: the startup view already
+            old.copy_(t)
+            t.data = old  # every holder of `t`, seen by the walk or not
     return failed
 
 

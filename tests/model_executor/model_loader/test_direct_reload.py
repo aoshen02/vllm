@@ -721,6 +721,20 @@ class TestLoudChecks:
         with pytest.raises(RuntimeError, match=r"moved: \['s.weight'\]"):
             _reload(model, {"s.weight": torch.rand(4, 4)})
 
+    @pytest.mark.parametrize("split", [True, False], ids=["split", "merged"])
+    def test_side_tensor_aliasing_change_raises(self, split):
+        # a cold start on the new weights gives a and b separate values; one
+        # startup storage cannot hold both (or the reverse: one tensor pinned
+        # into two storages ends up reading only the last)
+        def fn(layer):
+            shared = (layer.quant_method.runs == 1) == split
+            layer.a = layer.weight * 2
+            layer.b = layer.a if shared else layer.weight * 3
+
+        model = _one_layer(fn, torch.rand(4, 4))
+        with pytest.raises(RuntimeError, match=r"s.b \(aliasing changed\)"):
+            _reload(model, {"s.weight": torch.rand(4, 4)})
+
     def test_side_tensor_new_view_of_same_storage_moves(self):
         def fn(layer):  # graphs read the startup view, the layer a transposed one
             if layer.quant_method.runs == 1:
