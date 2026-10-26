@@ -220,7 +220,6 @@ def _runs(model: _ToyModel) -> dict[str, int]:
 def _direct_mode(monkeypatch):
     monkeypatch.setenv("VLLM_RELOAD_MODE", "direct")
     monkeypatch.delenv("VLLM_DIRECT_RELOAD_EXCLUDE_REGEX", raising=False)
-    monkeypatch.delenv("VLLM_DIRECT_RELOAD_ALLOW_MOVED", raising=False)
 
 
 class TestReloadEqualsColdStart:
@@ -453,19 +452,10 @@ class TestExclusionRule:
 
 
 class TestMovedAddress:
-    @pytest.mark.parametrize("allow", [False, True], ids=["raises", "allowed"])
-    def test_rebinding_pwal(self, monkeypatch, allow):
-        if allow:
-            monkeypatch.setenv("VLLM_DIRECT_RELOAD_ALLOW_MOVED", "1")
+    def test_rebinding_pwal_raises(self):
         model = _cold_start(_checkpoint(rebind=True), rebind=True)
-        new = _checkpoint(1.01, rebind=True)
-        if not allow:
-            with pytest.raises(RuntimeError, match=r"moved: \['rebind.weight'\]"):
-                _reload(model, new)
-            return
-        _reload(model, new)
-        fresh = _state(_cold_start(new, rebind=True))
-        _assert_same(_state(model), fresh)
+        with pytest.raises(RuntimeError, match=r"moved: \['rebind.weight'\]"):
+            _reload(model, _checkpoint(1.01, rebind=True))
 
 
 class _OneLayer(torch.nn.Module):
@@ -584,17 +574,11 @@ class TestSideState:
         runs = layer.quant_method.runs
         layer.cache = torch.zeros(2, device=_DEVICE) if runs == 1 else None
 
-    @pytest.mark.parametrize("allow", [False, True], ids=["raises", "allowed"])
     @pytest.mark.parametrize("fn", ["_resized", "_dropped"])
-    def test_unpinnable_raises(self, monkeypatch, fn, allow):
-        if allow:
-            monkeypatch.setenv("VLLM_DIRECT_RELOAD_ALLOW_MOVED", "1")
+    def test_unpinnable_raises(self, fn):
         model = _one_layer(getattr(self, fn), torch.rand(4, 4))
-        if not allow:
-            with pytest.raises(RuntimeError, match=r"moved: \['s.cache'\]"):
-                _reload(model, {"s.weight": torch.rand(4, 4)})
-            return
-        _reload(model, {"s.weight": torch.rand(4, 4)})
+        with pytest.raises(RuntimeError, match=r"moved: \['s.cache'\]"):
+            _reload(model, {"s.weight": torch.rand(4, 4)})
 
 
 class _CountedDict(dict):

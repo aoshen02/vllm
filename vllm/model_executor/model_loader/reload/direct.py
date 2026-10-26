@@ -434,7 +434,7 @@ def finish_direct_reload(model: torch.nn.Module, model_config) -> None:
     moved = sorted(n for n, p in model._direct_addresses.items() if current.get(n) != p)
     moved += sorted(unpinned)
     # kernels and captured graphs would keep reading the old storage
-    if moved and os.environ.get("VLLM_DIRECT_RELOAD_ALLOW_MOVED") != "1":
+    if moved:
         raise RuntimeError(f"direct reload: {len(moved)} tensors moved: {moved[:8]}")
     del model._direct_side_state
 
