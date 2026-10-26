@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from types import SimpleNamespace
+
 import pytest
 import regex as re
 import torch
@@ -134,12 +136,15 @@ def test_weights_track_reports_missing_quantized_weights():
     model.unquantized = _layer(UnquantizedLinearMethod(), weight=(4, 4), bias=(4,))
     model.gptq = _layer(_QuantMethod(), qweight=(4, 4), qzeros=(0,))
     model.fbgemm = _layer(_QuantMethod(), weight=(4, 4), input_scale_ub=())
+    model.w4a16 = _layer(_QuantMethod(), weight=(4, 4), input_scale=(1,))
+    model.w4a16.input_scale.checkpoint_optional = True
     model.attn = _layer(BaseKVCacheMethod(None), k_scale=(), k_zero_point=())
     model.online = _layer(online, weight=(4, 4))
     loaded = {"proj.weight", "unquantized.weight", "gptq.qweight", "fbgemm.weight"}
+    loaded.add("w4a16.weight")
     error = _track(model, loaded, quantized=True)
     assert "proj.weight_scale_inv" in error and "unquantized.bias" in error
-    assert not any(n in error for n in ("gptq", "fbgemm", "attn", "online"))
+    assert not any(n in error for n in ("gptq", "fbgemm", "w4a16", "attn", "online"))
 
 
 def test_weights_track_keeps_unquantized_models_unchanged():
@@ -190,11 +195,24 @@ class TestCheckAllWeightsLoaded:
             check_all_weights_loaded(model, loaded, pattern, source="the update")
         assert missing in str(e.value) and "attn" not in str(e.value)
 
-    def test_unchecked_cold_start_leaves_updates_unchecked(self):
-        # quantized without enable_weights_track: cold start ran no check
+    def test_quantized_cold_start_records_names_for_updates(self, monkeypatch):
+        # Cold start of a quantized model does not raise by default (unchanged),
+        # but every update is checked against the names it recorded.
         model = nn.Module()
-        model.proj = _layer(_QuantMethod(), weight=(4, 4))
-        check_all_weights_loaded(model, set())
+        model.proj = _layer(_QuantMethod(), weight=(4, 4), weight_scale_inv=(1, 1))
+        model.load_weights = lambda weights: {"proj.weight"}
+        loader = DefaultModelLoader(LoadConfig())
+        for name in ("_init_ep_weight_filter", "_init_mm_encoder_only_weight_filter"):
+            monkeypatch.setattr(loader, name, lambda *_: None)
+        monkeypatch.setattr(loader, "get_all_weights", lambda *_: iter(()))
+        loader.counter_before_loading_weights = 0.0
+        loader.load_weights(model, SimpleNamespace(quantization="fp8"))
+
+        with pytest.raises(ValueError, match=r"\['proj.weight_scale_inv'\]"):
+            check_all_weights_loaded(model, {"proj.weight"}, source="the update")
+        check_all_weights_loaded(
+            model, {"proj.weight", "proj.weight_scale_inv"}, source="the update"
+        )
 
 
 def test_moe_runner_reports_registered_expert_names():
