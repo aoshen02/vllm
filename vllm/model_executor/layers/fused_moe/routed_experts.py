@@ -497,14 +497,21 @@ class RoutedExperts(PluggableLayer):
         loaded_weight: torch.Tensor,
         hidden_dim: int,
         shard_dim: int | None = None,
+        zero_padding: bool = True,
     ) -> torch.Tensor:
-        """Narrow expert_data to match loaded_weight for padded dimensions.
+        """Narrow expert_data to match loaded_weight for padded dimensions,
+        and zero the padding left out.
 
         When backends (e.g., DeepEP) round up hidden_size, weight parameters
         are larger than checkpoint weights. Narrow the padded hidden dimension
         before copying. Similarly, when padding occurs on the shard
         (intermediate) dimension (e.g. for MXFP4 GEMM), narrow that dimension
         as well.
+
+        The padding is written (zero) on every load rather than left as
+        allocated: post-load processing reads it (e.g. TRT-LLM MXFP4 shuffles
+        the whole padded tensor), and a reload into storage that already holds
+        post-processed weights would otherwise feed it stale bytes.
 
         Args:
             expert_data: The (possibly padded) parameter tensor to narrow.
@@ -513,6 +520,8 @@ class RoutedExperts(PluggableLayer):
                 Must be non-negative.
             shard_dim: The dimension index corresponding to the shard
                 (intermediate) dimension. Defaults to `None`.
+            zero_padding: Zero the padding. False when the caller has already
+                written it (block-aligned TP fills unit scales).
 
         """
         dims = (hidden_dim,) if shard_dim is None else (hidden_dim, shard_dim)
@@ -523,7 +532,11 @@ class RoutedExperts(PluggableLayer):
                     and dim < loaded_weight.ndim
                     and expert_data.shape[dim] > loaded_weight.shape[dim]
                 ):
-                    expert_data = expert_data.narrow(dim, 0, loaded_weight.shape[dim])
+                    size = loaded_weight.shape[dim]
+                    if zero_padding:
+                        pad = expert_data.shape[dim] - size
+                        expert_data.narrow(dim, size, pad).zero_()
+                    expert_data = expert_data.narrow(dim, 0, size)
         return expert_data
 
     def _load_w13(
@@ -554,9 +567,10 @@ class RoutedExperts(PluggableLayer):
             start_offset = loaded_per_rank * tp_rank
             available = loaded_weight.shape[shard_dim] - start_offset
             if available <= 0:
-                # If there is no available weight to load for this TP rank
-                # (can happen on last TP rank with padding), we can skip
-                # loading and return early
+                # No checkpoint rows for this TP rank (last rank with
+                # padding): its whole shard is padding, zero it
+                start = 0 if shard_id == "w1" else shard_size
+                expert_data.narrow(shard_dim, start, shard_size).zero_()
                 return
             narrow_size = min(loaded_per_rank, available)
             loaded_weight = loaded_weight.narrow(shard_dim, start_offset, narrow_size)
@@ -574,6 +588,7 @@ class RoutedExperts(PluggableLayer):
             loaded_weight,
             hidden_dim=hidden_dim,
             shard_dim=shard_dim,
+            zero_padding=not load_full,
         )
         expert_data.copy_(loaded_weight)
 
@@ -595,9 +610,9 @@ class RoutedExperts(PluggableLayer):
             start_offset = loaded_per_rank * tp_rank
             available = loaded_weight.shape[shard_dim] - start_offset
             if available <= 0:
-                # If there is no available weight to load for this TP rank
-                # (can happen on last TP rank with padding), we can skip
-                # loading and return early
+                # No checkpoint columns for this TP rank (last rank with
+                # padding): its whole shard is padding, zero it
+                expert_data.zero_()
                 return
             narrow_size = min(loaded_per_rank, available)
             loaded_weight = loaded_weight.narrow(shard_dim, start_offset, narrow_size)
@@ -608,6 +623,7 @@ class RoutedExperts(PluggableLayer):
             loaded_weight,
             hidden_dim=hidden_dim,
             shard_dim=shard_dim,
+            zero_padding=not load_full,
         )
         if (
             loaded_weight.device.type == "cpu"
@@ -697,13 +713,13 @@ class RoutedExperts(PluggableLayer):
         quant_config_name = self.quant_config and self.quant_config.get_name()
         if quant_config_name == "gpt_oss_mxfp4" or expert_id is None:
             # gpt-oss passes all local experts at once, already TP-sliced
-            if "bias" in weight_name:
-                dim1 = loaded_weight.shape[1]
-                param.data[:, :dim1].copy_(loaded_weight)
-            else:
-                dim1 = loaded_weight.shape[1]
-                dim2 = loaded_weight.shape[2]
-                param.data[:, :dim1, :dim2].copy_(loaded_weight)
+            expert_data = self._narrow_expert_data_for_padding(
+                param.data,
+                loaded_weight,
+                hidden_dim=1,
+                shard_dim=None if "bias" in weight_name else 2,
+            )
+            expert_data.copy_(loaded_weight)
             return True if return_success else None
 
         from vllm.model_executor.layers.quantization.online.moe_base import (
