@@ -67,6 +67,7 @@ from vllm.model_executor.layers.quantization.online.lm_head import (
     share_source_lm_heads,
 )
 from vllm.model_executor.model_loader import get_model_loader
+from vllm.model_executor.model_loader.reload.direct import DirectReloadRefused
 from vllm.model_executor.model_loader.weight_checksum import (
     compute_tensor_digests,
     zero_weights,
@@ -195,9 +196,12 @@ class AsyncIntermediateTensors(IntermediateTensors):
 
 class Worker(WorkerBase):
     _incomplete_updates: frozenset[str] = frozenset()
-    """Models ("target", "draft") a weight update started on and did not
-    complete. Updates modify the weights in place without a rollback, so these
-    models may hold a mix of old and new weights: they must not run."""
+    """Models ("target", "draft") a weight update may have modified and did
+    not complete. Updates modify the weights in place without a rollback, so
+    these models may hold a mix of old and new weights: they must not run.
+    Set once an update can have modified the model, cleared when a later
+    update of it completes every step, or when `reload_weights` reloads the
+    target model from disk."""
 
     def __init__(
         self,
@@ -636,8 +640,19 @@ class Worker(WorkerBase):
             setattr(self, config_name, new_config)
 
     def reload_weights(self, *args, **kwargs) -> None:
-        with set_current_vllm_config(self.vllm_config):
-            self.model_runner.reload_weights(*args, **kwargs)
+        """Reload the target model's weights in place. Without a
+        `weights_iterator` it reads a whole checkpoint from disk, which also
+        repairs a model a failed weight update left incomplete."""
+        try:
+            with set_current_vllm_config(self.vllm_config):
+                self.model_runner.reload_weights(*args, **kwargs)
+        except DirectReloadRefused:
+            raise
+        except BaseException:
+            self._incomplete_updates |= {"target"}
+            raise
+        if (args[0] if args else kwargs.get("weights_iterator")) is None:
+            self._incomplete_updates -= {"target"}
 
     @torch.inference_mode()
     def determine_available_memory(self) -> int:
@@ -1550,6 +1565,13 @@ class Worker(WorkerBase):
         Delegates engine-specific preparation (e.g. layerwise reload setup) to
         the configured weight transfer engine. The worker only tracks that a
         session is active.
+
+        Updates modify the weights in place without a rollback. If one fails
+        after it can have modified the model (any failure of this call other
+        than a refused direct reload, of `update_weights`, or of
+        `finish_weight_update`), the worker refuses to run that model:
+        `execute_model` raises until a later update of it completes, or
+        `reload_weights` reloads the target model from disk.
         """
         with set_current_vllm_config(self.vllm_config):
             self._start_weight_update()
@@ -1578,6 +1600,7 @@ class Worker(WorkerBase):
             )
 
         draft_model = self.get_draft_model() if is_draft else None
+        updated = {"draft" if is_draft else "target"}
         try:
             if is_draft:
                 self._set_draft_weight_update_target()
@@ -1585,13 +1608,15 @@ class Worker(WorkerBase):
                 # Load through the unquantized target head, as without
                 # draft_lm_head_quantization; finish re-derives the copies.
                 share_source_lm_heads(draft_model)
-            self._incomplete_updates |= {"draft" if is_draft else "target"}
             self.weight_transfer_engine.start_weight_update()
-        except BaseException:
+        except BaseException as e:
+            if not isinstance(e, DirectReloadRefused):  # refused: unmodified
+                self._incomplete_updates |= updated
             self.weight_transfer_engine.reset_weight_update_target()
             if draft_model is not None:
                 restore_quantized_lm_heads(draft_model, refresh=False)
             raise
+        self._incomplete_updates |= updated
         self._weight_update_active = True
         self._weight_update_is_draft = is_draft
 
@@ -1658,14 +1683,14 @@ class Worker(WorkerBase):
         assert self.weight_transfer_engine is not None
         self.weight_transfer_engine.reset_weight_update_target()
         self._weight_update_active = False
-        if completed:
-            self._incomplete_updates -= {
-                "draft" if self._weight_update_is_draft else "target"
-            }
         if self._weight_update_is_draft and (
             (draft_model := self.get_draft_model()) is not None
         ):
             restore_quantized_lm_heads(draft_model, refresh=completed)
+        if completed:  # every step done, the quantized head copies included
+            self._incomplete_updates -= {
+                "draft" if self._weight_update_is_draft else "target"
+            }
 
     def shutdown(self) -> None:
         gc.unfreeze()

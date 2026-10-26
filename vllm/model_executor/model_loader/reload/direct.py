@@ -40,6 +40,7 @@ from vllm.model_executor.utils import is_weights_pre_processed
 logger = init_logger(__name__)
 
 __all__ = [
+    "DirectReloadRefused",
     "begin_direct_reload",
     "direct_reload_enabled",
     "finish_direct_reload",
@@ -47,6 +48,11 @@ __all__ = [
     "record_runtime_addresses",
     "unsynced_weights_regex",
 ]
+
+
+class DirectReloadRefused(RuntimeError):
+    """`begin_direct_reload` refused the reload before modifying the model,
+    which still holds the weights it served with."""
 
 
 _rerunning = False
@@ -258,7 +264,7 @@ def _unsynced_modules(model: torch.nn.Module) -> set[int]:
         if id(module) not in skipped and (any(own[id(module)]) or reads_skipped(module))
     ]
     if bad:
-        raise RuntimeError(
+        raise DirectReloadRefused(
             "direct reload: VLLM_DIRECT_RELOAD_EXCLUDE_REGEX must cover whole "
             "modules, without a module whose post-load processing reads them: "
             f"{bad[:8]}"
@@ -266,44 +272,68 @@ def _unsynced_modules(model: torch.nn.Module) -> set[int]:
     return skipped
 
 
+def _checkpoint_views(
+    model: torch.nn.Module, skipped: Set[int], dropped: list
+) -> list[tuple[torch.Tensor, torch.Tensor]]:
+    """(tensor, view of its storage in its checkpoint layout) for every
+    tensor post-load processing re-laid out; raises if a storage cannot
+    hold its checkpoint layout."""
+    tensors = list(_loadable_tensors(model, skipped))
+    tensors += [(f"{type(m).__name__}.{n}", t) for m, n, _, t in dropped]
+    views: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+    for name, t in tensors:
+        layout = getattr(t, "_ckpt_layout", None)
+        if layout is None or id(t) in views:
+            continue  # no layout: created by post-load processing, derived
+        if (tuple(t.shape), t.stride(), t.dtype, t.storage_offset()) == layout:
+            continue
+        shape, stride, dtype, offset = layout
+        storage = t.untyped_storage()
+        span = 1 + sum((s - 1) * st for s, st in zip(shape, stride)) if shape else 1
+        need = (offset + span) * dtype.itemsize
+        if need > storage.nbytes():
+            raise DirectReloadRefused(
+                f"direct reload: {name} storage has {storage.nbytes()} bytes, "
+                f"its checkpoint layout needs {need}"
+            )
+        view = torch.empty(0, dtype=dtype, device=t.device)
+        view.set_(storage, offset, shape, stride)
+        views[id(t)] = (t, view)
+    return list(views.values())
+
+
 @torch.no_grad()
 def begin_direct_reload(model: torch.nn.Module) -> None:
-    """Make every tensor writable by its checkpoint weight loader."""
-    if not getattr(model, "_direct_layout_recorded", False):
-        raise RuntimeError("direct reload: no checkpoint layout was recorded")
-    # modules the trainer does not sync keep their runtime state untouched
-    skipped = model._direct_skipped = _unsynced_modules(model)
-    if (reason := _unsupported(model, skipped)) is not None:
-        raise NotImplementedError(f"direct reload: {reason}")
+    """Make every tensor writable by its checkpoint weight loader.
 
+    Everything that can refuse the reload is checked first and raises
+    `DirectReloadRefused` with the model untouched. Once this returns, the
+    model holds checkpoint-layout bytes until a finish succeeds."""
+    if not getattr(model, "_direct_layout_recorded", False):
+        raise DirectReloadRefused("direct reload: no checkpoint layout was recorded")
+    # modules the trainer does not sync keep their runtime state untouched
+    skipped = _unsynced_modules(model)
+    if (reason := _unsupported(model, skipped)) is not None:
+        raise DirectReloadRefused(f"direct reload: {reason}")
     # checkpoint names post-load processing deleted or replaced: register the
     # checkpoint tensors again so the model's loader finds them; the rerun at
     # finish unregisters them as cold start did
-    for module, name, is_param, t in getattr(model, "_direct_dropped", []):
-        if id(module) not in skipped:
-            _register(module, name, is_param, t)
+    dropped = [
+        entry
+        for entry in getattr(model, "_direct_dropped", [])
+        if id(entry[0]) not in skipped
+    ]
+    views = _checkpoint_views(model, skipped, dropped)
 
-    restored = 0
-    for name, t in _loadable_tensors(model, skipped):
-        layout = getattr(t, "_ckpt_layout", None)
-        if layout is None:
-            continue  # created by post-load processing: derived, rewritten there
-        shape, stride, dtype, offset = layout
-        if (tuple(t.shape), t.stride(), t.dtype, t.storage_offset()) != layout:
-            storage = t.untyped_storage()
-            span = 1 + sum((s - 1) * st for s, st in zip(shape, stride)) if shape else 1
-            need = (offset + span) * dtype.itemsize
-            if need > storage.nbytes():
-                raise RuntimeError(
-                    f"direct reload: {name} storage has {storage.nbytes()} bytes, "
-                    f"its checkpoint layout needs {need}"
-                )
-            view = torch.empty(0, dtype=dtype, device=t.device)
-            view.set_(storage, offset, shape, stride)
-            t.data = view  # no zeroing: the full sync rewrites the checkpoint region
-            restored += 1
-
-    logger.info("direct reload: %d tensors viewed back to checkpoint layout", restored)
+    # nothing above modified the model
+    model._direct_skipped = skipped
+    for module, name, is_param, t in dropped:
+        _register(module, name, is_param, t)
+    for t, view in views:
+        t.data = view  # no zeroing: the full sync rewrites the checkpoint region
+    logger.info(
+        "direct reload: %d tensors viewed back to checkpoint layout", len(views)
+    )
 
 
 @torch.no_grad()

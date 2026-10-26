@@ -272,3 +272,63 @@ def test_failed_update_refuses_to_run_until_an_update_completes(fail):
     Worker.update_weights(worker, {"names": ["w"]})
     Worker.finish_weight_update(worker)
     Worker._check_weights_complete(worker)
+
+
+def test_refused_start_leaves_the_model_runnable(monkeypatch):
+    # direct reload checks everything that can refuse before modifying the model
+    from vllm.model_executor.model_loader.reload.direct import DirectReloadRefused
+
+    engine = _RecordingEngine()
+    error: Exception = DirectReloadRefused("direct reload: refused")
+
+    def start():
+        raise error
+
+    monkeypatch.setattr(engine, "start_weight_update", start)
+    worker = _make_worker(engine)
+    with pytest.raises(DirectReloadRefused):
+        Worker.start_weight_update(worker)
+    assert worker._weight_update_active is False
+    Worker._check_weights_complete(worker)
+
+    error = ValueError("boom")  # may have modified the model
+    with pytest.raises(ValueError, match="boom"):
+        Worker.start_weight_update(worker)
+    with pytest.raises(RuntimeError, match="refuses to run the model"):
+        Worker._check_weights_complete(worker)
+
+
+def test_failed_draft_head_restore_keeps_the_draft_incomplete(monkeypatch):
+    import vllm.v1.worker.gpu_worker as gpu_worker
+
+    engine = _RecordingEngine()
+    engine.supports_draft_weight_update = True
+    worker = _make_worker(engine)
+    draft = nn.Module()
+    monkeypatch.setattr(worker.model_runner, "get_draft_model", lambda: draft)
+    monkeypatch.setattr(worker, "_set_draft_weight_update_target", lambda: None)
+    monkeypatch.setattr(gpu_worker, "share_source_lm_heads", lambda model: None)
+
+    def restore(model, refresh=True):
+        if refresh:
+            raise torch.OutOfMemoryError("quantized head copy")
+
+    monkeypatch.setattr(gpu_worker, "restore_quantized_lm_heads", restore)
+    Worker.start_draft_weight_update(worker)
+    with pytest.raises(torch.OutOfMemoryError):
+        Worker.finish_weight_update(worker)
+    with pytest.raises(RuntimeError, match="draft model did not complete"):
+        Worker._check_weights_complete(worker)
+
+
+@pytest.mark.parametrize("from_disk", [True, False], ids=["from-disk", "iterator"])
+def test_reload_from_disk_clears_a_failed_update(from_disk):
+    class Runner(_RecordingModelRunner):
+        def reload_weights(self, weights_iterator=None) -> None:
+            pass
+
+    worker = _make_worker(None)
+    worker.model_runner = Runner()
+    worker._incomplete_updates = frozenset({"target"})
+    Worker.reload_weights(worker, None if from_disk else iter([]))
+    assert worker._incomplete_updates == (set() if from_disk else {"target"})

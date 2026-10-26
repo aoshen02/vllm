@@ -24,6 +24,7 @@ import torch
 from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
 from vllm.model_executor.model_loader.reload import initialize_layerwise_reload
 from vllm.model_executor.model_loader.reload.direct import (
+    DirectReloadRefused,
     begin_direct_reload,
     finish_direct_reload,
 )
@@ -716,7 +717,7 @@ class TestLoudChecks:
             {"s.weight": torch.rand(2, 2)},
         )
         model.s.weight.data = model.s.weight.data.cpu()
-        with pytest.raises(NotImplementedError, match="s: CPU-offloaded weights"):
+        with pytest.raises(DirectReloadRefused, match="s: CPU-offloaded weights"):
             begin_direct_reload(model)
 
     def test_pre_processed_weights_refused(self):
@@ -724,8 +725,25 @@ class TestLoudChecks:
 
         with weights_already_processed():
             model = _one_layer(None, torch.rand(4, 4))
-        with pytest.raises(NotImplementedError, match="pre-processed"):
+        with pytest.raises(DirectReloadRefused, match="pre-processed"):
             begin_direct_reload(model)
+
+    @pytest.mark.parametrize("refusal", ["exclusion", "storage-size"])
+    def test_refused_begin_leaves_the_model_untouched(self, monkeypatch, refusal):
+        # the worker keeps serving a model whose update was refused
+        model = _cold_start(_checkpoint())
+        if refusal == "exclusion":  # nvfp4: a dropped scale, re-registered
+            monkeypatch.setenv(
+                "VLLM_DIRECT_RELOAD_EXCLUDE_REGEX", r"^nvfp4\.weight_scale_2$"
+            )
+        else:  # proj is viewed back first, in module order
+            shape, stride, dtype, offset = model.mimo.weight._ckpt_layout
+            model.mimo.weight._ckpt_layout = ((64, 64), (64, 1), dtype, offset)
+        before = _state(model)
+        with pytest.raises(DirectReloadRefused):
+            begin_direct_reload(model)
+        _assert_same(_state(model), before, addresses=True)
+        assert not hasattr(model, "_direct_skipped")
 
 
 def test_retry_after_aborted_update_matches_cold_start():
