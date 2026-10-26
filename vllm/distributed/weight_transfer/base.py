@@ -30,6 +30,20 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
+
+def _exclude_regex(names: Iterable[str]) -> str:
+    """A VLLM_DIRECT_RELOAD_EXCLUDE_REGEX matching ``names``: their module
+    paths, each cut after its first layer index (``model.layers.61``)."""
+    import regex as re
+
+    prefixes = set()
+    for name in names:
+        parts = name.split(".")[:-1] or [name]
+        index = next((i for i, p in enumerate(parts) if p.isdigit()), None)
+        prefixes.add(".".join(parts if index is None else parts[: index + 1]))
+    return rf"^({'|'.join(re.escape(p) for p in sorted(prefixes))})(\.|$)"
+
+
 TInitInfo = TypeVar("TInitInfo", bound="WeightTransferInitInfo")
 TUpdateInfo = TypeVar("TUpdateInfo", bound="WeightTransferUpdateInfo")
 TTrainerInitInfo = TypeVar("TTrainerInitInfo", bound="TrainerInitInfo")
@@ -543,7 +557,9 @@ class WeightTransferEngine(ABC, Generic[TInitInfo, TUpdateInfo]):
             if missing:
                 raise ValueError(
                     f"weight update did not deliver {len(missing)} checkpoint "
-                    f"tensors its cold start loaded: {sorted(missing)[:16]}"
+                    f"tensors its cold start loaded: {sorted(missing)[:16]}; if "
+                    "the trainer does not sync them, set "
+                    f"VLLM_DIRECT_RELOAD_EXCLUDE_REGEX='{_exclude_regex(missing)}'"
                 )
         check_weight_parts_complete(model)
         yield

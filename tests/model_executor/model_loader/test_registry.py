@@ -165,10 +165,22 @@ class TestRecordCheckpointWeightNames:
                 {"a.weight", "a.weight_scale"},
             ),
             (["a.weight", "mtp.0.weight"], True, False, {"a.weight"}),
+            (
+                ["a.weight", "layers.0.rotary_emb.inv_freq"],
+                False,
+                False,
+                {"a.weight"},
+            ),
             ([], False, False, None),
             (["a.weight"], False, True, None),
         ],
-        ids=["fed-not-reported", "unused-dropped", "nothing-fed", "load-failed"],
+        ids=[
+            "fed-not-reported",
+            "unused-dropped",
+            "rotary-cache-dropped",
+            "nothing-fed",
+            "load-failed",
+        ],
     )
     def test_record(self, fed, instance_loader, raises, recorded):
         class Model(nn.Module):

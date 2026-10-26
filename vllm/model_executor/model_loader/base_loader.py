@@ -6,6 +6,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 
+import regex as re
 import torch
 import torch.nn as nn
 
@@ -118,6 +119,8 @@ class BaseModelLoader(ABC):
         return model.eval()
 
 
+_ROTARY_CACHE = re.compile(r"rotary_emb\.(inv_freq|cos_cached|sin_cached)$")
+
 CHECKPOINT_WEIGHT_NAMES = "_checkpoint_weight_names"
 """Model attribute: the checkpoint tensor names cold start fed to the model's
 ``load_weights``, which every full weight update has to deliver again."""
@@ -130,8 +133,9 @@ def record_checkpoint_weight_names(model: nn.Module) -> Iterator[None]:
 
     These are what a cold start on a new checkpoint reads, whatever the model
     then does with them (fused into another parameter, one expert of many,
-    skipped, a draft's head). Names the model declares unused
-    (``is_unused_checkpoint_weight``) are left out. Nothing is recorded when
+    skipped, a draft's head). Rotary caches, which models drop, and names the
+    model declares unused (``is_unused_checkpoint_weight``) are left out.
+    Nothing is recorded when
     no tensor is fed (dummy weights, a loader that does not feed
     ``load_weights``)."""
     load_weights = getattr(model, "load_weights", None)
@@ -154,6 +158,7 @@ def record_checkpoint_weight_names(model: nn.Module) -> Iterator[None]:
             del model.load_weights
         else:
             model.load_weights = own
+    names = {name for name in names if not _ROTARY_CACHE.search(name)}
     unused = getattr(model, "is_unused_checkpoint_weight", None)
     if unused is not None:
         names = {name for name in names if not unused(name)}
