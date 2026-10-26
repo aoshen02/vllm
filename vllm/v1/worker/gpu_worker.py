@@ -5,7 +5,7 @@
 import gc
 import os
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from datetime import timedelta
 from fnmatch import filter as fnmatch_filter
@@ -639,7 +639,12 @@ class Worker(WorkerBase):
             setattr(self.model_runner, config_name, new_config)
             setattr(self, config_name, new_config)
 
-    def reload_weights(self, *args, **kwargs) -> None:
+    def reload_weights(
+        self,
+        weights_iterator: Iterable[tuple[str, torch.Tensor]] | None = None,
+        weights_path: str | None = None,
+        is_checkpoint_format: bool = True,
+    ) -> None:
         """Reload the target model's weights in place. Without a
         `weights_iterator` it reads a whole checkpoint from disk, which also
         repairs a model a failed weight update left incomplete: in direct mode
@@ -648,15 +653,17 @@ class Worker(WorkerBase):
         copies kernel-format weights (`is_checkpoint_format=False`)."""
         try:
             with set_current_vllm_config(self.vllm_config):
-                self.model_runner.reload_weights(*args, **kwargs)
+                self.model_runner.reload_weights(
+                    weights_iterator=weights_iterator,
+                    weights_path=weights_path,
+                    is_checkpoint_format=is_checkpoint_format,
+                )
         except DirectReloadRefused:
             raise
         except BaseException:
             self._incomplete_updates |= {"target"}
             raise
-        from_disk = (args[0] if args else kwargs.get("weights_iterator")) is None
-        checkpoint = args[2] if len(args) > 2 else kwargs.get("is_checkpoint_format")
-        if from_disk and checkpoint is not False:
+        if weights_iterator is None and is_checkpoint_format is True:
             self._incomplete_updates -= {"target"}
 
     @torch.inference_mode()

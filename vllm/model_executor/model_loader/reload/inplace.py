@@ -11,6 +11,7 @@ from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader import get_model_loader
 
+from .direct import direct_reload_enabled, unsynced_weights_regex
 from .layerwise import finalize_layerwise_reload, initialize_layerwise_reload
 
 logger = init_logger(__name__)
@@ -86,6 +87,16 @@ def reload_weights(
             model_config.revision = None
         weights_iterator = model_loader.get_all_weights(model_config, model)
         weights_iterator = cast(Iterable[tuple[str, torch.Tensor]], weights_iterator)
+        if is_checkpoint_format and direct_reload_enabled():
+            # a direct reload leaves excluded modules untouched (their
+            # cold-start state), so it must not write the checkpoint's copy
+            excluded = unsynced_weights_regex()
+            if excluded is not None:
+                weights_iterator = (
+                    (name, tensor)
+                    for name, tensor in weights_iterator
+                    if not excluded.search(name)
+                )
 
     # begin loading weights
     logger.info_once("Reloading weights inplace...")

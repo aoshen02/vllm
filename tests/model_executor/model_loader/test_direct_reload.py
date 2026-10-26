@@ -429,6 +429,27 @@ class TestExclusionRule:
             begin_direct_reload(model)
         _assert_same(_state(model), before, addresses=True)
 
+    def test_disk_reload_leaves_excluded_modules_untouched(self, monkeypatch):
+        # the documented repair of a failed update: the checkpoint on disk
+        # holds the excluded tensors, which the reload must not write
+        import vllm.model_executor.model_loader.reload.inplace as inplace
+
+        monkeypatch.setenv("VLLM_DIRECT_RELOAD_EXCLUDE_REGEX", r"^engram\.")
+        model = _cold_start(_checkpoint())
+        before = _state(model)
+        new = _checkpoint(1.01)
+        loader = SimpleNamespace(get_all_weights=lambda *_: iter(new.items()))
+        monkeypatch.setattr(inplace, "get_model_loader", lambda _: loader)
+        config = SimpleNamespace(
+            model_config=_MODEL_CONFIG, load_config=None, lora_config=None
+        )
+        inplace.reload_weights(config, model, None, None, True)
+        after = _state(model)
+        _assert_same(after, before, names=["engram.weight"], addresses=True)
+        assert model.engram.quant_method.runs == 1
+        fresh = _state(_cold_start(new))
+        _assert_same(after, fresh, names=[n for n in fresh if n != "engram.weight"])
+
     def test_skipped_module_skips_its_descendants(self, monkeypatch):
         monkeypatch.setenv("VLLM_DIRECT_RELOAD_EXCLUDE_REGEX", r"^engram\.")
         model = _tree_cold_start(

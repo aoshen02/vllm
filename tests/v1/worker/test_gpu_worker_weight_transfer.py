@@ -62,7 +62,7 @@ class _RecordingModelRunner:
         self.seen_config: VllmConfig | None = None
         self.reset_lora_calls = 0
 
-    def reload_weights(self) -> None:
+    def reload_weights(self, **_) -> None:
         self.seen_config = get_current_vllm_config()
 
     def reset_lora_state(self) -> None:
@@ -326,7 +326,10 @@ def test_failed_draft_head_restore_keeps_the_draft_incomplete(monkeypatch):
     [(True, True, True), (False, True, False), (True, False, False)],
     ids=["from-disk", "iterator", "kernel-format-copy"],
 )
-def test_reload_from_disk_clears_a_failed_update(from_disk, checkpoint_format, clears):
+@pytest.mark.parametrize("positional", [False, True], ids=["kwargs", "positional"])
+def test_reload_from_disk_clears_a_failed_update(
+    from_disk, checkpoint_format, clears, positional
+):
     # only a checkpoint-format reload from disk runs the reload lifecycle over
     # the whole model; a kernel-format copy skips it
     class Runner(_RecordingModelRunner):
@@ -336,9 +339,9 @@ def test_reload_from_disk_clears_a_failed_update(from_disk, checkpoint_format, c
     worker = _make_worker(None)
     worker.model_runner = Runner()
     worker._incomplete_updates = frozenset({"target"})
-    Worker.reload_weights(
-        worker,
-        None if from_disk else iter([]),
-        is_checkpoint_format=checkpoint_format,
-    )
+    iterator: list[tuple[str, torch.Tensor]] | None = None if from_disk else []
+    if positional:
+        Worker.reload_weights(worker, iterator, None, checkpoint_format)
+    else:
+        Worker.reload_weights(worker, iterator, is_checkpoint_format=checkpoint_format)
     assert worker._incomplete_updates == (set() if clears else {"target"})
