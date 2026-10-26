@@ -222,12 +222,6 @@ class NCCLWeightTransferEngine(
             self._last_update_info[self.model] = update_info
         else:
             update_info = self._last_update_info.get(self.model, update_info)
-        # before any bucket arrives: a refusal mid-broadcast would leave the
-        # trainer blocked in its broadcast
-        from vllm.model_executor.model_loader.reload.direct import record_delivered
-
-        for name in update_info.names:
-            record_delivered(self.model, name)
 
         from vllm.model_executor.model_loader.mtp_validation import (
             disable_mtp_completeness_check,

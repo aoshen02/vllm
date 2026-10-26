@@ -301,6 +301,7 @@ class TestUpdateCompleteness:
             def load_weights(self, weights):
                 names = set()
                 for name, _ in weights:
+                    self.fed.append(name)
                     if name == "b.weight_scale":  # first part of a two-part weight
                         stash_weight_part(self.b, "b", "scale", torch.ones(1))
                     elif not name.startswith("mtp."):
@@ -308,6 +309,7 @@ class TestUpdateCompleteness:
                 return names if reports_names else None
 
         model = Model()
+        model.fed = []
         if cold is not None:
             with record_checkpoint_weight_names(model):
                 model.load_weights((name, torch.zeros(2, 2)) for name in cold)
@@ -404,20 +406,26 @@ class TestUpdateCompleteness:
         engine.finish_weight_update()
         assert lines[-1].endswith("transfer_s=4.000 finish_s=0.000 total_s=4.000")
 
-    def test_unsynced_name_raises_before_any_bucket_is_received(self, monkeypatch):
-        # raising mid-broadcast would leave the trainer blocked in it
+    def test_unsynced_name_is_received_then_refused_at_finish(self, monkeypatch):
+        # raising in receive would leave the trainer blocked in its broadcast:
+        # the name is received and dropped unwritten, and finish refuses
         monkeypatch.setenv("VLLM_DIRECT_RELOAD_EXCLUDE_REGEX", r"[.]?engram[.]")
-        engine = self._engine(monkeypatch, self.COLD, True, [])
+        finalized: list = []
+        engine = self._engine(monkeypatch, self.COLD, True, finalized)
         engine.start_weight_update()
-        with pytest.raises(ValueError, match="declares unsynced"):
-            engine.receive_weights(
-                NCCLWeightTransferUpdateInfo(
-                    names=self.FULL,  # engram.weight last
-                    dtype_names=["float32"] * len(self.FULL),
-                    shapes=[[2, 2]] * len(self.FULL),
-                )
+        engine.model.fed.clear()
+        engine.receive_weights(
+            NCCLWeightTransferUpdateInfo(
+                names=self.FULL,  # engram.weight last
+                dtype_names=["float32"] * len(self.FULL),
+                shapes=[[2, 2]] * len(self.FULL),
             )
-        engine.model_update_group.broadcast.assert_not_called()
+        )
+        engine.model_update_group.broadcast.assert_called()
+        assert engine.model.fed == self.FULL[:5]
+        with pytest.raises(ValueError, match=r"not written: \['engram.weight'\]"):
+            engine.finish_weight_update()
+        assert finalized == []
 
     @pytest.mark.parametrize(
         "sent", [FULL[:4], FULL], ids=["partial", "delivers-unsynced"]

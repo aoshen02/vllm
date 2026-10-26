@@ -495,9 +495,6 @@ class M2NWeightTransferEngine(
                     "trainer must send the same parameter set it announced"
                 )
             requested.append((name, index))
-        # recorded before any is written: direct destinations bypass load_weights
-        for name, _ in requested:
-            record_delivered(self.model, name)
 
         from vllm.model_executor.model_loader.mtp_validation import (
             disable_mtp_completeness_check,
@@ -513,6 +510,10 @@ class M2NWeightTransferEngine(
                 meta = self._metas[index]
                 destination = self._parameter_destinations[index]
                 buffer = destination.tensor
+                # written here, not by `load_weights`: a direct reload records
+                # it, and an excluded one is received into a scratch buffer
+                if buffer is not None and not record_delivered(self.model, name):
+                    buffer = None
                 if buffer is None:
                     buffer = torch.empty(
                         meta.shape, dtype=meta.dtype, device=self.device

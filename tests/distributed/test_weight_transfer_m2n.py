@@ -795,7 +795,12 @@ class TestWireTypes:
 
         engine._reshard.assert_not_called()
 
-    def test_fallback_tensors_share_one_load_weights_invocation(self, monkeypatch):
+    @pytest.mark.parametrize("excluded", [False, True], ids=["synced", "excluded"])
+    def test_fallback_tensors_share_one_load_weights_invocation(
+        self, monkeypatch, excluded
+    ):
+        import regex as re
+
         class CoupledModel:
             def __init__(self):
                 self.calls = 0
@@ -808,6 +813,9 @@ class TestWireTypes:
                     self.loaded = [(name, tensor.clone()) for name, tensor in received]
 
         model = CoupledModel()
+        # a direct reload in progress (`begin_direct_reload`)
+        excludes = re.compile("^direct$" if excluded else "^$")
+        model.__dict__["_direct_delivery"] = (set(), [], excludes)
         direct = torch.zeros(1)
         engine = object.__new__(M2NWeightTransferEngine)
         engine._handle = object()
@@ -846,7 +854,12 @@ class TestWireTypes:
         assert model.calls == 1
         assert [name for name, _ in model.loaded] == ["pair.weight", "pair.scale"]
         assert [tensor.item() for _, tensor in model.loaded] == [1, 3]
-        assert direct.item() == 2
+        # an excluded direct destination is received, not written; finish
+        # refuses the update (raising here would strand the trainer)
+        assert direct.item() == (0 if excluded else 2)
+        delivered, refused, _ = model.__dict__["_direct_delivery"]
+        expected = (set(), ["direct"]) if excluded else ({"direct"}, [])
+        assert (delivered, refused) == expected
         assert reshard_order == ["pair.weight", "direct", "pair.scale"]
         assert stream.synchronize.call_count == 2
 

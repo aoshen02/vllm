@@ -291,8 +291,19 @@ class TestExclusion:
         monkeypatch.setenv("VLLM_DIRECT_RELOAD_EXCLUDE_REGEX", r"^engram\.")
         model = _cold_start(_checkpoint())
         begin_direct_reload(model)
+        param = model.engram.weight
         with pytest.raises(ValueError, match=r"writes engram.weight, which"):
-            model.load_weights([("engram.weight", _checkpoint()["engram.weight"])])
+            param.weight_loader(param, _checkpoint()["engram.weight"])
+
+    def test_delivered_excluded_name_is_dropped_then_refused(self, monkeypatch):
+        # an engine has received it (raising there strands the trainer)
+        monkeypatch.setenv("VLLM_DIRECT_RELOAD_EXCLUDE_REGEX", r"^engram\.")
+        model = _cold_start(_checkpoint())
+        before = _state(model)
+        with pytest.raises(ValueError, match=r"not written: \['engram.weight'\]"):
+            _reload(model, _checkpoint(1.01))
+        assert model.engram.quant_method.runs == 1
+        _assert_same(_state(model), before, names=["engram.weight"], addresses=True)
 
     @pytest.mark.parametrize(
         "regex,module",

@@ -211,41 +211,38 @@ def _unsupported(model: torch.nn.Module, skipped: Set[int]) -> str | None:
     return None
 
 
-def record_delivered(model: torch.nn.Module, name: str) -> None:
+def record_delivered(model: torch.nn.Module, name: str) -> bool:
     """Record that the current direct reload delivered checkpoint tensor
-    ``name``, before it is written; a no-op outside one. A name
-    ``VLLM_DIRECT_RELOAD_EXCLUDE_REGEX`` excludes raises: a reload leaves
-    those tensors in their runtime layout, which checkpoint bytes are not.
+    ``name``, before it is written; True outside one. False for a name
+    ``VLLM_DIRECT_RELOAD_EXCLUDE_REGEX`` excludes (a reload leaves those
+    tensors in their runtime layout, which checkpoint bytes are not): the
+    caller drops it unwritten and `finish_direct_reload` raises. Raising
+    here instead would leave a trainer blocked in its broadcast.
     ``model.load_weights`` calls this for every tensor it is fed; an engine
     writing a tensor without it (m2n reshards) calls it."""
     delivery = model.__dict__.get("_direct_delivery")
     if delivery is None:
-        return
-    delivered, excluded = delivery
+        return True
+    delivered, refused, excluded = delivery
     if excluded is not None and excluded.search(name):
-        raise ValueError(
-            f"weight update delivered {name!r}, which "
-            "VLLM_DIRECT_RELOAD_EXCLUDE_REGEX declares unsynced"
-        )
+        refused.append(name)
+        return False
     delivered.add(name)
+    return True
 
 
 def _track_delivery(model: torch.nn.Module, excluded) -> None:
     """Until finish, feed ``model.load_weights`` through `record_delivered`,
     as `record_checkpoint_weight_names` does at cold start: whoever loads
     the update (an engine, ``reload_weights``) is checked alike."""
-    model._direct_delivery = (set(), excluded)
+    model._direct_delivery = (set(), [], excluded)
     load_weights = getattr(model, "load_weights", None)
     if load_weights is None or getattr(load_weights, "_direct_tracked", False):
         return
 
     def tracked(weights, *args, **kwargs):
-        def fed():
-            for name, tensor in weights:
-                record_delivered(model, name)
-                yield name, tensor
-
-        return load_weights(fed(), *args, **kwargs)
+        fed = ((n, t) for n, t in weights if record_delivered(model, n))
+        return load_weights(fed, *args, **kwargs)
 
     tracked._direct_tracked = True  # type: ignore[attr-defined]
     model.load_weights = tracked
@@ -256,7 +253,8 @@ def _check_delivered(model: torch.nn.Module) -> set[str] | None:
     bytes of a tensor that did not arrive again (they are viewed as
     checkpoint bytes): raise unless the update delivered every checkpoint
     name cold start fed to ``load_weights`` (`record_checkpoint_weight_names`),
-    except the excluded ones, and every part of each multi-tensor weight. A
+    except the excluded ones, none of those, and every part of each
+    multi-tensor weight. A
     model cold start fed nothing (dummy weights) adopts the first update's
     names, returned here; an empty first update raises."""
     from vllm.model_executor.model_loader.base_loader import CHECKPOINT_WEIGHT_NAMES
@@ -264,7 +262,13 @@ def _check_delivered(model: torch.nn.Module) -> set[str] | None:
         check_weight_parts_complete,
     )
 
-    delivered, excluded = model.__dict__.pop("_direct_delivery")
+    delivered, refused, excluded = model.__dict__.pop("_direct_delivery")
+    if refused:
+        raise ValueError(
+            f"weight update delivered {len(refused)} tensors that "
+            "VLLM_DIRECT_RELOAD_EXCLUDE_REGEX declares unsynced; they were not "
+            f"written: {refused[:16]}"
+        )
     required: set[str] | None = getattr(model, CHECKPOINT_WEIGHT_NAMES, None)
     if required is None and not delivered:
         raise ValueError(
