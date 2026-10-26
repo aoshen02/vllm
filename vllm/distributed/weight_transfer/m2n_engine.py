@@ -447,7 +447,7 @@ class M2NWeightTransferEngine(
         `load_weights`, so a plan with no fallback entries has nothing to
         reload.
         """
-        self._begin_loaded_tracking()
+        self._begin_delivery_tracking()
         if not self._uses_load_weights:
             return
         from vllm.model_executor.model_loader.reload import (
@@ -459,12 +459,11 @@ class M2NWeightTransferEngine(
     def finish_weight_update(self) -> None:
         """Check the update delivered every weight, then finalize layerwise
         reloading when the plan uses fallback entries."""
-        self._check_update_complete()
-        if not self._uses_load_weights:
-            return
         from vllm.model_executor.model_loader.reload import finalize_layerwise_reload
 
-        finalize_layerwise_reload(self.model, self.model_config)
+        with self._complete_update():
+            if self._uses_load_weights:
+                finalize_layerwise_reload(self.model, self.model_config)
 
     def receive_weights(self, update_info: M2NWeightTransferUpdateInfo) -> None:
         """Receive each requested parameter using its initialization-time plan."""
@@ -487,6 +486,8 @@ class M2NWeightTransferEngine(
                     "trainer must send the same parameter set it announced"
                 )
             requested.append((name, index))
+        # recorded before any is written: direct destinations bypass load_weights
+        self._record_delivered(name for name, _ in requested)
 
         from vllm.model_executor.model_loader.mtp_validation import (
             disable_mtp_completeness_check,
@@ -529,18 +530,12 @@ class M2NWeightTransferEngine(
             if has_fallback:
                 # Some model loaders keep invocation-local state to combine
                 # related checkpoint tensors, so preserve one iterable scope.
-                self._load_weights(received_weights)
+                self.model.load_weights(received_weights)
             else:
                 # The iterator performs the reshards. With nothing to yield to
                 # `load_weights`, exhaust it here to execute direct transfers.
                 for _ in received_weights:
                     pass
-        # direct destinations are parameters, written in place under their name
-        self._record_loaded(
-            name
-            for name, index in requested
-            if self._parameter_destinations[index].direct
-        )
 
     def _reshard(
         self,

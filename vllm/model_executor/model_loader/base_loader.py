@@ -3,6 +3,8 @@
 import gc
 import time
 from abc import ABC, abstractmethod
+from collections.abc import Iterable, Iterator
+from contextlib import contextmanager
 
 import torch
 import torch.nn as nn
@@ -85,7 +87,8 @@ class BaseModelLoader(ABC):
                 )
 
             logger.debug("Loading weights on %s ...", load_device)
-            self.load_weights(model, model_config)
+            with record_checkpoint_weight_names(model):
+                self.load_weights(model, model_config)
 
             # Release transient tensors held by PyTorch's caching allocator
             # before weight post-processing and raw CUDA driver allocations.
@@ -113,6 +116,49 @@ class BaseModelLoader(ABC):
             torch.accelerator.empty_cache()
 
         return model.eval()
+
+
+CHECKPOINT_WEIGHT_NAMES = "_checkpoint_weight_names"
+"""Model attribute: the checkpoint tensor names cold start fed to the model's
+``load_weights``, which every full weight update has to deliver again."""
+
+
+@contextmanager
+def record_checkpoint_weight_names(model: nn.Module) -> Iterator[None]:
+    """Record the names of the checkpoint tensors the loader feeds to
+    ``model.load_weights``, on the model, when the load succeeds.
+
+    These are what a cold start on a new checkpoint reads, whatever the model
+    then does with them (fused into another parameter, one expert of many,
+    skipped, a draft's head). Names the model declares unused
+    (``is_unused_checkpoint_weight``) are left out. Nothing is recorded when
+    no tensor is fed (dummy weights, a loader that does not feed
+    ``load_weights``)."""
+    load_weights = getattr(model, "load_weights", None)
+    if load_weights is None:
+        yield
+        return
+    names: set[str] = set()
+    own = model.__dict__.get("load_weights")
+
+    def fed(weights: Iterable[tuple[str, torch.Tensor]]):
+        for name, tensor in weights:
+            names.add(name)
+            yield name, tensor
+
+    model.load_weights = lambda weights, *a, **kw: load_weights(fed(weights), *a, **kw)
+    try:
+        yield
+    finally:
+        if own is None:
+            del model.load_weights
+        else:
+            model.load_weights = own
+    unused = getattr(model, "is_unused_checkpoint_weight", None)
+    if unused is not None:
+        names = {name for name in names if not unused(name)}
+    if names:
+        setattr(model, CHECKPOINT_WEIGHT_NAMES, names)
 
 
 def log_model_inspection(model: nn.Module) -> None:

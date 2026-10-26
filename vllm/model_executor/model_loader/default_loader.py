@@ -44,8 +44,6 @@ from vllm.tracing import instrument
 from vllm.transformers_utils.repo_utils import list_filtered_repo_files
 
 if TYPE_CHECKING:
-    import regex as re
-
     from vllm.model_executor.models.utils import WeightsMapper
 
 logger = init_logger(__name__)
@@ -509,100 +507,66 @@ class DefaultModelLoader(BaseModelLoader):
             "Loading weights took %.2f seconds",
             self.counter_after_loading_weights - self.counter_before_loading_weights,
         )
-        quantized = model_config.quantization is not None
-        # Cold start raises by default only for unquantized models; weight
-        # updates are always checked against the recorded names.
-        self.track_weights_loading(
-            model,
-            loaded_weights,
-            quantized=quantized,
-            check=(
-                self.enable_weights_track
-                if self.enable_weights_track is not None
-                else not quantized
-            ),
+        # We only enable strict check for non-quantized models
+        # that have loaded weights tracking by default.
+        default_enable_weights_track = (
+            model_config.quantization is None and loaded_weights is not None
         )
+        enable_weights_track = (
+            self.enable_weights_track
+            if self.enable_weights_track is not None
+            else default_enable_weights_track
+        )
+        if enable_weights_track:
+            self.track_weights_loading(
+                model, loaded_weights, quantized=model_config.quantization is not None
+            )
 
     def track_weights_loading(
         self,
         model: nn.Module,
         loaded_weights: set[str] | None,
         quantized: bool = False,
-        check: bool = True,
     ) -> None:
-        if loaded_weights is None:
-            return
-        # Recorded whether or not cold start raises: a weight update must
-        # deliver every checkpoint weight, so updates always run this check.
-        setattr(model, _REQUIRED_ATTR, checkpoint_weight_names(model, quantized))
-        if check:
-            check_all_weights_loaded(model, loaded_weights)
-
-
-_REQUIRED_ATTR = "_checkpoint_weight_names"
-
-
-def checkpoint_weight_names(model: nn.Module, quantized: bool) -> set[str]:
-    """Names of the parameters a checkpoint has to initialize: all of them
-    except those a checkpoint may not carry."""
-    names = {name for name, _ in model.named_parameters()}
-    # ignore online quantization scales
-    for name, module in model.named_modules():
-        quant_method = getattr(module, "quant_method", None)
-        has_online_quant = getattr(quant_method, "uses_meta_device", False)
-        has_postprocess_quant = getattr(
-            quant_method, "process_weights_after_loading", None
-        )
-        # ignore kv_cache scale and online quant scale,
-        # which can be missing in checkpoints
-        if has_online_quant or has_postprocess_quant:
-            for param_name, param in module.named_parameters():
-                # On a quantized model, every parameter has to come from
-                # the checkpoint except those a checkpoint cannot carry:
-                # - online quantization (uses_meta_device) quantizes the
-                #   weights while loading, so its parameters do not map
-                #   to checkpoint tensors;
-                # - KV-cache quantization parameters (BaseKVCacheMethod)
-                #   fall back to defaults when a checkpoint has none;
-                # - empty placeholders hold no data, e.g. the qzeros
-                #   moe_wna16 registers for symmetric GPTQ;
-                # - _CONFIG_BUILT_PARAMS come from the quantization config;
-                # - parameters marked checkpoint_optional by their quant
-                #   method, e.g. the input scales of weight-only W4A16 NVFP4.
-                # Unquantized models, where this check runs by default,
-                # keep the module-wide exemption.
-                if (
-                    quantized
-                    and not has_online_quant
-                    and not isinstance(quant_method, BaseKVCacheMethod)
-                    and param.numel() > 0
-                    and not getattr(param, "checkpoint_optional", False)
-                    and param_name.rsplit(".", 1)[-1] not in _CONFIG_BUILT_PARAMS
-                ):
-                    continue
-                names.discard(f"{name}.{param_name}" if name else param_name)
-    return names
-
-
-def check_all_weights_loaded(
-    model: nn.Module,
-    loaded: set[str],
-    exclude: re.Pattern[str] | None = None,
-    source: str = "checkpoint",
-) -> None:
-    """Raise unless ``loaded`` covers every parameter the model's cold start
-    required from its checkpoint, ignoring names ``exclude`` matches.
-
-    A no-op only when the model's loader reports no names (``load_weights``
-    returned None at cold start).
-    """
-    required: set[str] | None = getattr(model, _REQUIRED_ATTR, None)
-    if required is None:
-        return
-    missing = required - loaded
-    if exclude is not None:
-        missing = {name for name in missing if not exclude.search(name)}
-    if missing:
-        raise ValueError(
-            f"Following weights were not initialized from {source}: {sorted(missing)}"
-        )
+        weights_to_load = {name for name, _ in model.named_parameters()}
+        if loaded_weights is not None:
+            # ignore online quantization scales
+            for name, module in model.named_modules():
+                quant_method = getattr(module, "quant_method", None)
+                has_online_quant = getattr(quant_method, "uses_meta_device", False)
+                has_postprocess_quant = getattr(
+                    quant_method, "process_weights_after_loading", None
+                )
+                # ignore kv_cache scale and online quant scale,
+                # which can be missing in checkpoints
+                if has_online_quant or has_postprocess_quant:
+                    for param_name, param in module.named_parameters():
+                        # On a quantized model, every parameter has to come from
+                        # the checkpoint except those a checkpoint cannot carry:
+                        # - online quantization (uses_meta_device) quantizes the
+                        #   weights while loading, so its parameters do not map
+                        #   to checkpoint tensors;
+                        # - KV-cache quantization parameters (BaseKVCacheMethod)
+                        #   fall back to defaults when a checkpoint has none;
+                        # - empty placeholders hold no data, e.g. the qzeros
+                        #   moe_wna16 registers for symmetric GPTQ;
+                        # - _CONFIG_BUILT_PARAMS come from the quantization config.
+                        # Unquantized models, where this check runs by default,
+                        # keep the module-wide exemption.
+                        if (
+                            quantized
+                            and not has_online_quant
+                            and not isinstance(quant_method, BaseKVCacheMethod)
+                            and param.numel() > 0
+                            and param_name.rsplit(".", 1)[-1]
+                            not in _CONFIG_BUILT_PARAMS
+                        ):
+                            continue
+                        full_name = f"{name}.{param_name}" if name else param_name
+                        loaded_weights.add(full_name)
+            weights_not_loaded = weights_to_load - loaded_weights
+            if weights_not_loaded:
+                raise ValueError(
+                    "Following weights were not initialized from "
+                    f"checkpoint: {weights_not_loaded}"
+                )

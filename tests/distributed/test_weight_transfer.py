@@ -22,7 +22,6 @@ import ray
 import torch
 from torch.multiprocessing.reductions import reduce_tensor
 
-from vllm.config.load import LoadConfig
 from vllm.config.parallel import ParallelConfig
 from vllm.config.weight_transfer import WeightTransferConfig
 from vllm.distributed.weight_transfer import (
@@ -68,7 +67,9 @@ from vllm.distributed.weight_transfer.sparse_nccl_engine import (
     SparseNCCLWeightTransferUpdateInfo,
     SparseWeightPatch,
 )
-from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
+from vllm.model_executor.model_loader.base_loader import (
+    record_checkpoint_weight_names,
+)
 from vllm.model_executor.model_loader.weight_utils import stash_weight_part
 from vllm.platforms import current_platform
 from vllm.utils.nccl import _nccl_has_no_cache
@@ -243,22 +244,37 @@ def test_nccl_shutdown_destroys_communicator_once(engine_type):
 
 
 class TestUpdateCompleteness:
-    """An update reruns the cold-start completeness checks once, over the names
-    all its `load_weights` calls (one per tensor here) initialized, before the
-    reload is finalized."""
+    """A full update must deliver every checkpoint tensor its cold start fed
+    to `load_weights`, minus the unsynced ones, whatever `load_weights`
+    reports; checked once, before the reload is finalized."""
 
-    NAMES = ["a.weight", "b.weight", "engram.weight"]
+    # experts.* load into one fused parameter; mtp.* is declared unused; the
+    # model's `audio` parameter is set up in __init__, never fed
+    COLD = [
+        "experts.0.gate_proj.weight",
+        "experts.0.up_proj.weight",
+        "experts.1.gate_proj.weight",
+        "experts.1.up_proj.weight",
+        "b.weight",
+        "engram.weight",
+        "mtp.0.weight",
+    ]
+    FULL = COLD[:-1]
 
     @staticmethod
     def _engine(
-        monkeypatch, reports_names: bool, finalized: list
+        monkeypatch, cold: list[str] | None, reports_names: bool, finalized: list
     ) -> NCCLWeightTransferEngine:
         import vllm.model_executor.model_loader.reload as reload
 
+        def finalize(*_):
+            if finalized and finalized[-1] == "fail":
+                finalized[-1] = "failed"
+                raise RuntimeError("post-load processing failed")
+            finalized.append("ok")
+
         monkeypatch.setattr(reload, "initialize_layerwise_reload", lambda *_: None)
-        monkeypatch.setattr(
-            reload, "finalize_layerwise_reload", lambda *_: finalized.append(1)
-        )
+        monkeypatch.setattr(reload, "finalize_layerwise_reload", finalize)
         monkeypatch.setattr(torch.cuda, "current_stream", lambda *_, **__: None)
         for name in ("synchronize", "reset_peak_memory_stats"):
             monkeypatch.setattr(torch.accelerator, name, lambda *_: None)
@@ -268,20 +284,25 @@ class TestUpdateCompleteness:
         class Model(torch.nn.Module):
             def __init__(self):
                 super().__init__()
-                for name in ("a", "b", "engram"):
+                for name in ("experts", "b", "engram", "audio"):
                     self.add_module(name, torch.nn.Linear(2, 2, bias=False))
 
+            def is_unused_checkpoint_weight(self, name: str) -> bool:
+                return name.startswith("mtp.")
+
             def load_weights(self, weights):
-                names = {name for name, _ in weights}
-                if "a.weight_scale" in names:  # first part of a two-part weight
-                    stash_weight_part(self.a, "a", "scale", torch.ones(1))
-                    names = {"a.weight"}
+                names = set()
+                for name, _ in weights:
+                    if name == "b.weight_scale":  # first part of a two-part weight
+                        stash_weight_part(self.b, "b", "scale", torch.ones(1))
+                    elif not name.startswith("mtp."):
+                        names.add(name.split(".")[0] + ".weight")
                 return names if reports_names else None
 
         model = Model()
-        DefaultModelLoader(LoadConfig()).track_weights_loading(
-            model, set(TestUpdateCompleteness.NAMES)
-        )
+        if cold is not None:
+            with record_checkpoint_weight_names(model):
+                model.load_weights((name, torch.zeros(2, 2)) for name in cold)
         engine = NCCLWeightTransferEngine(
             WeightTransferConfig(backend="nccl"),
             create_mock_vllm_config(),
@@ -291,27 +312,8 @@ class TestUpdateCompleteness:
         engine.model_update_group = MagicMock()
         return engine
 
-    @pytest.mark.parametrize(
-        "sent,exclude,reports_names,missing",
-        [
-            (NAMES, "", True, None),
-            (["a.weight", "engram.weight"], "", True, "b.weight"),
-            (["a.weight", "b.weight"], r"[.]?engram[.]", True, None),
-            (["a.weight"], "", False, None),
-            (["a.weight_scale", "b.weight", "engram.weight"], "", True, "has"),
-        ],
-        ids=[
-            "full",
-            "missing-raises",
-            "unsynced-excluded",
-            "names-unreported",
-            "unpaired-part-raises",
-        ],
-    )
-    def test_nccl_update(self, monkeypatch, sent, exclude, reports_names, missing):
-        monkeypatch.setenv("VLLM_DIRECT_RELOAD_EXCLUDE_REGEX", exclude)
-        finalized: list = []
-        engine = self._engine(monkeypatch, reports_names, finalized)
+    @staticmethod
+    def _update(engine: NCCLWeightTransferEngine, sent: list[str]) -> None:
         engine.start_weight_update()
         engine.receive_weights(
             NCCLWeightTransferUpdateInfo(
@@ -320,13 +322,53 @@ class TestUpdateCompleteness:
                 shapes=[[2, 2]] * len(sent),
             )
         )
-        if missing is None:
-            engine.finish_weight_update()
-            assert finalized == [1]
+        engine.finish_weight_update()
+
+    @pytest.mark.parametrize(
+        "sent,exclude,reports_names,error",
+        [
+            (FULL, "", True, None),
+            (["experts.0.gate_proj.weight", *FULL[4:]], "", True, "up_proj"),
+            (FULL[:4] + FULL[5:], "", True, "'b.weight'"),
+            (FULL[:2] + FULL[4:], "", False, "experts.1.gate_proj"),
+            (FULL[:5], r"[.]?engram[.]", True, None),
+            (FULL, r"[.]?engram[.]", True, "declares unsynced"),
+            (["b.weight_scale", *FULL], "", True, "has"),
+        ],
+        ids=[
+            "full",
+            "one-expert-shard-raises",
+            "unquantized-partial-raises",
+            "names-unreported-still-checked",
+            "unsynced-not-required",
+            "unsynced-delivered-raises",
+            "unpaired-part-raises",
+        ],
+    )
+    def test_nccl_update(self, monkeypatch, sent, exclude, reports_names, error):
+        monkeypatch.setenv("VLLM_DIRECT_RELOAD_EXCLUDE_REGEX", exclude)
+        finalized: list = []
+        engine = self._engine(monkeypatch, self.COLD, reports_names, finalized)
+        if error is None:
+            self._update(engine, sent)
+            assert finalized == ["ok"]
             return
-        with pytest.raises(ValueError, match=missing):
-            engine.finish_weight_update()
+        with pytest.raises(ValueError, match=error):
+            self._update(engine, sent)
         assert finalized == []  # raised before post-load processing
+
+    def test_without_cold_start_names_first_successful_update_is_required(
+        self, monkeypatch
+    ):
+        # dummy weights: nothing fed at cold start
+        finalized: list = ["fail"]
+        engine = self._engine(monkeypatch, None, True, finalized)
+        with pytest.raises(RuntimeError, match="post-load"):
+            self._update(engine, self.FULL[:2])  # failed: not adopted
+        self._update(engine, self.FULL)
+        with pytest.raises(ValueError, match="'b.weight'"):
+            self._update(engine, self.FULL[:4])
+        assert finalized == ["failed", "ok"]
 
 
 class TestNCCLEngineParsing:
