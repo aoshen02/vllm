@@ -43,25 +43,49 @@ def _children(o: Any) -> list[tuple[tuple[str, Any], Any]]:
     return out
 
 
-def collect_side_tensors(layer: torch.nn.Module) -> dict[Path, torch.Tensor]:
-    """Every tensor reachable from the layer's non-module attributes, by path."""
+Clean = dict[int, tuple[int, Any]]
+
+
+def collect_side_tensors(
+    layer: torch.nn.Module, clean: Clean | None = None
+) -> dict[Path, torch.Tensor]:
+    """Every tensor reachable from the layer's non-module attributes, by path.
+
+    ``clean`` is shared by the calls of one pass over a model's modules and
+    must not outlive it. It records objects proven tensor-free (by id, with
+    the depth they were proven at, and the object to keep the id valid), so
+    objects every layer references, e.g. a quantization config with a dict
+    per checkpoint layer, are walked once per pass instead of once per layer.
+    An object proven tensor-free at depth d holds no tensor within the depth
+    limit at any depth >= d, so skipping it finds the same tensors."""
     found: dict[Path, torch.Tensor] = {}
     seen: set[int] = set()
+    if clean is None:
+        clean = {}
 
-    def walk(o: Any, path: Path, depth: int) -> None:
+    def walk(o: Any, path: Path, depth: int) -> bool:
+        """Record the tensors under ``o``; True iff it is proven tensor-free."""
         if isinstance(o, torch.Tensor):
             found[path] = o
-            return
+            return False
         if (
             depth > _MAX_DEPTH
             or o is None
             or isinstance(o, (str, bytes, int, float, bool, torch.nn.Module, type))
-            or id(o) in seen
         ):
-            return
+            return True
+        known = clean.get(id(o))
+        if known is not None and known[0] <= depth:
+            return True
+        if id(o) in seen:
+            return False  # walked on another path of this layer: not proven here
         seen.add(id(o))
+        tensor_free = True
         for key, child in _children(o):
-            walk(child, path + (key,), depth + 1)
+            tensor_free = walk(child, path + (key,), depth + 1) and tensor_free
+        if tensor_free:
+            clean[id(o)] = (depth, o)
+        return tensor_free
 
     for name, value in vars(layer).items():
         if (
@@ -105,25 +129,31 @@ def _layout(t: torch.Tensor) -> tuple:
     return (tuple(t.shape), t.stride(), t.dtype, t.device)
 
 
-def snapshot_side_tensors(layer: torch.nn.Module) -> dict[Path, torch.Tensor]:
+def snapshot_side_tensors(
+    layer: torch.nn.Module, clean: Clean | None = None
+) -> dict[Path, torch.Tensor]:
     """Device tensors reachable from the layer's non-module attributes, by
     path. Aliases, not the objects: `x.data = y` later leaves them on the
-    storage graphs captured."""
+    storage graphs captured. ``clean``: see `collect_side_tensors`."""
     return {
         path: t.detach()
-        for path, t in collect_side_tensors(layer).items()
+        for path, t in collect_side_tensors(layer, clean).items()
         if t.device.type not in ("cpu", "meta")
     }
 
 
 @torch.no_grad()
 def pin_side_tensors(
-    layer: torch.nn.Module, before: dict[Path, torch.Tensor]
+    layer: torch.nn.Module,
+    before: dict[Path, torch.Tensor],
+    clean: Clean | None = None,
 ) -> list[str]:
     """Put every snapshotted path back on its startup storage, holding the
     rerun's values. Returns the paths that cannot be pinned: gone, or now a
-    tensor of a different shape, stride, dtype or device."""
-    after = collect_side_tensors(layer)
+    tensor of a different shape, stride, dtype or device. ``clean``: see
+    `collect_side_tensors`; pinning only writes on paths to tensors, so the
+    objects it proved tensor-free stay so."""
+    after = collect_side_tensors(layer, clean)
     failed = []
     for path, old in before.items():
         t = after.get(path)

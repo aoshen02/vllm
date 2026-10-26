@@ -350,6 +350,7 @@ def _snapshot_side_state(model: torch.nn.Module, skipped_ids: Set[int]):
     from .side_state import snapshot_side_tensors
 
     out = []
+    clean: dict = {}  # tensor-free objects shared by the modules, walked once
     for name, module in model.named_modules():
         if id(module) in skipped_ids:
             continue
@@ -360,7 +361,7 @@ def _snapshot_side_state(model: torch.nn.Module, skipped_ids: Set[int]):
             and not hasattr(t, "_ckpt_layout")
             and t.device.type not in ("cpu", "meta")
         }
-        out.append((name, module, registered, snapshot_side_tensors(module)))
+        out.append((name, module, registered, snapshot_side_tensors(module, clean)))
     return out
 
 
@@ -371,6 +372,7 @@ def _pin_side_state(pinned) -> list[str]:
     from .side_state import pin_side_tensors
 
     failed = []
+    clean: dict = {}
     for name, module, registered, side in pinned:
         prefix = f"{name}." if name else ""
         for n, old in registered.items():
@@ -392,5 +394,7 @@ def _pin_side_state(pinned) -> list[str]:
                 cur.data = old
             else:
                 module._buffers[n] = old
-        failed += [prefix + p.lstrip(".") for p in pin_side_tensors(module, side)]
+        failed += [
+            prefix + p.lstrip(".") for p in pin_side_tensors(module, side, clean)
+        ]
     return failed

@@ -433,6 +433,52 @@ class TestSideState:
         _reload(model, {"s.weight": torch.rand(4, 4)})
 
 
+class _CountedDict(dict):
+    walks = 0
+
+    def items(self):
+        type(self).walks += 1
+        return super().items()
+
+
+class TestSideWalk:
+    """One pass over the modules walks a tensor-free object they all reference
+    (a quantization config) once, and still finds every tensor."""
+
+    def test_shared_tensor_free_object_walked_once(self):
+        from vllm.model_executor.model_loader.reload.side_state import (
+            collect_side_tensors,
+        )
+
+        _CountedDict.walks = 0
+        config = _CountedDict({f"layers.{i}": {"bits": 4} for i in range(8)})
+        holder = {"t": torch.ones(2)}
+        clean: dict = {}
+        for _ in range(3):
+            layer = torch.nn.Module()
+            layer.quant_config, layer.holder = config, holder
+            found = collect_side_tensors(layer, clean)
+            assert list(found) == [(("a", "holder"), ("k", "t"))]
+        assert _CountedDict.walks == 1
+
+    def test_proven_deeper_is_walked_when_reached_shallower(self):
+        from vllm.model_executor.model_loader.reload.side_state import (
+            _MAX_DEPTH,
+            collect_side_tensors,
+        )
+
+        shared = {"k": {"t": torch.ones(2)}}
+        deep: object = shared
+        for _ in range(_MAX_DEPTH - 1):  # shared at the depth limit: no tensor
+            deep = [deep]
+        first, second = torch.nn.Module(), torch.nn.Module()
+        first.deep, second.shared = deep, shared
+        clean: dict = {}
+        assert collect_side_tensors(first, clean) == {}
+        found = collect_side_tensors(second, clean)
+        assert list(found) == [(("a", "shared"), ("k", "k"), ("k", "t"))]
+
+
 class TestLoudChecks:
     def test_cached_tensor_cannot_change_layout(self):
         from vllm.model_executor.model_loader.weight_utils import set_cached_tensor
