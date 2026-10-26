@@ -1109,48 +1109,11 @@ class RoutedExperts(PluggableLayer):
     def load_weights(
         self, weights: Iterable[tuple[str, torch.Tensor]]
     ) -> Iterable[str]:
-        # Per-expert checkpoint tensors of one parameter and shard are loaded
-        # together, in runs of consecutive experts (see _load_expert_run).
+        # Per-expert checkpoint tensors of one parameter and shard that this
+        # layer's weight_loader loads are deferred, then loaded together in
+        # runs of consecutive experts (see _load_expert_run).
         runs: dict[tuple[str, str, str], list[tuple[int, torch.Tensor]]] = {}
         params: dict[str, torch.nn.Parameter] = {}
-        yield from self._load_weights_unbatched(weights, runs, params)
-        for (param_name, weight_name, shard_id), items in runs.items():
-            param = params[param_name]
-            loader = inspect.unwrap(param.weight_loader)
-            if (
-                getattr(loader, "__self__", None) is not self
-                or getattr(loader, "__func__", None) is not type(self).weight_loader
-            ):
-                # a loader that may not take num_experts: one expert per call
-                for expert_id, loaded_expert in sorted(items, key=lambda i: i[0]):
-                    if param.weight_loader(
-                        param=param,
-                        loaded_weight=loaded_expert,
-                        weight_name=weight_name,
-                        shard_id=shard_id,
-                        expert_id=expert_id,
-                        return_success=True,
-                    ):
-                        yield param_name
-                continue
-            for start, stacked in _expert_runs(items):
-                if param.weight_loader(
-                    param=param,
-                    loaded_weight=stacked,
-                    weight_name=weight_name,
-                    shard_id=shard_id,
-                    expert_id=start,
-                    return_success=True,
-                    num_experts=stacked.shape[0],
-                ):
-                    yield param_name
-
-    def _load_weights_unbatched(
-        self,
-        weights: Iterable[tuple[str, torch.Tensor]],
-        runs: dict[tuple[str, str, str], list[tuple[int, torch.Tensor]]],
-        params: dict[str, torch.nn.Parameter],
-    ) -> Iterable[str]:
         expert_mapping = self.get_expert_mapping(include_fused=True)
         mapping_by_expert = _index_expert_mapping(expert_mapping)
 
@@ -1224,9 +1187,9 @@ class RoutedExperts(PluggableLayer):
                         shard_index
                     ].unsqueeze(0)
                     start = expert_id
-                elif loaded_weight.dim() == 2:
+                elif loaded_weight.dim() == 2 and _loads_expert_runs(param, self):
                     # one expert's weight: deferred, loaded with its neighbours
-                    # by load_weights
+                    # below
                     params[param_name] = param
                     runs.setdefault((param_name, weight_name, shard_id), []).append(
                         (expert_id, loaded_weight)
@@ -1258,6 +1221,20 @@ class RoutedExperts(PluggableLayer):
                             self.layer_name,
                         )
                         yield param_name
+
+        for (param_name, weight_name, shard_id), items in runs.items():
+            param = params[param_name]
+            for start, stacked in _expert_runs(items):
+                if param.weight_loader(
+                    param=param,
+                    loaded_weight=stacked,
+                    weight_name=weight_name,
+                    shard_id=shard_id,
+                    expert_id=start,
+                    return_success=True,
+                    num_experts=stacked.shape[0],
+                ):
+                    yield param_name
 
     def get_expert_mapping(
         self,
@@ -1605,6 +1582,21 @@ RoutedExperts.weight_loader.supports_moe_loading = True  # type: ignore[attr-def
 # experts per batched load: bounds the stacking copy when the per-expert tensors
 # are not adjacent in memory
 _EXPERT_RUN = 64
+
+
+def _loads_expert_runs(param: torch.nn.Parameter, experts: object) -> bool:
+    """Whether ``param`` loads through ``experts``' own RoutedExperts
+    weight_loader, which takes runs of experts (``num_experts``). Other
+    loaders (overrides, wrappers, model-specific loaders) load one expert per
+    call, in checkpoint order."""
+    loader = getattr(param, "weight_loader", None)
+    if loader is None:
+        return False
+    loader = inspect.unwrap(loader)
+    return (
+        getattr(loader, "__self__", None) is experts
+        and getattr(loader, "__func__", None) is RoutedExperts.weight_loader
+    )
 
 
 def _expert_runs(
