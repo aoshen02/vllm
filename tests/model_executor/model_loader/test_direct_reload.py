@@ -25,7 +25,6 @@ from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBa
 from vllm.model_executor.model_loader.reload.direct import (
     begin_direct_reload,
     finish_direct_reload,
-    record_load_names,
 )
 from vllm.model_executor.model_loader.utils import process_weights_after_loading
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
@@ -154,7 +153,6 @@ def _cold_start(weights: dict[str, torch.Tensor], **kwargs) -> _ToyModel:
     """As ``BaseModelLoader.load_model`` does."""
     with _DEVICE:
         model = _ToyModel(**kwargs)
-    record_load_names(model)
     model.load_weights(weights.items())
     process_weights_after_loading(model, _MODEL_CONFIG, _DEVICE)
     return model

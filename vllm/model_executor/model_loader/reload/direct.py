@@ -11,8 +11,10 @@ tensors and the cold-start post-load processing runs once at the end:
 - ``begin`` views tensors whose layout post-load processing changed back to
   their checkpoint layout, on the same storage;
 - ``finish`` reruns ``process_weights_after_loading`` for every module, as
-  cold start does, raises if an address moved, and warns about checkpoint
-  names cold start loaded that this update did not deliver.
+  cold start does, and raises if an address moved.
+
+Whether the update delivered every weight is checked by the weight transfer
+engine, once per update, with the cold-start completeness check.
 
 A reload is exactly as correct as a cold start: no module is skipped because
 it "received nothing" (a loader may bypass the parameter's ``weight_loader``,
@@ -25,7 +27,7 @@ Selected with ``VLLM_RELOAD_MODE=direct``.
 """
 
 import os
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterator
 
 import regex as re
 import torch
@@ -39,7 +41,6 @@ __all__ = [
     "direct_reload_enabled",
     "finish_direct_reload",
     "record_checkpoint_layout",
-    "record_load_names",
     "record_runtime_addresses",
     "unsynced_weights_regex",
 ]
@@ -80,36 +81,12 @@ def _addresses(model: torch.nn.Module) -> dict[str, int]:
     return out
 
 
-def record_load_names(model: torch.nn.Module) -> None:
-    """Record the names passed through the model's own ``load_weights`` (cold
-    start: before loading; reloads: from ``begin`` to ``finish``)."""
-    names: set[str] = set()
-    load_weights = model.load_weights
-
-    def recording(weights: Iterable[tuple[str, torch.Tensor]], *args, **kwargs):
-        def named():
-            for name, tensor in weights:
-                names.add(name)
-                yield name, tensor
-
-        return load_weights(named(), *args, **kwargs)
-
-    model.load_weights = recording
-    model._direct_load_names = names
-
-
-def _pop_load_names(model: torch.nn.Module) -> set[str]:
-    model.__dict__.pop("load_weights", None)  # back to the class method
-    return model.__dict__.pop("_direct_load_names", set())
-
-
 def record_checkpoint_layout(model: torch.nn.Module) -> None:
     """Cold start, before post-load processing: remember each tensor's
     checkpoint layout. Runs once; reloads reuse the cold-start record."""
     if getattr(model, "_direct_layout_recorded", False):
         return
     model._direct_layout_recorded = True
-    model._direct_cold_names = _pop_load_names(model)
     registered: list[tuple[torch.nn.Module, str, bool, torch.Tensor]] = []
     for module_name, module in model.named_modules():
         for local, t, is_param in _own_tensors(module):
@@ -230,17 +207,15 @@ def begin_direct_reload(model: torch.nn.Module) -> None:
             t.data = view  # no zeroing: the full sync rewrites the checkpoint region
             restored += 1
 
-    record_load_names(model)
     logger.info("direct reload: %d tensors viewed back to checkpoint layout", restored)
 
 
 @torch.no_grad()
 def finish_direct_reload(model: torch.nn.Module, model_config) -> None:
-    """Rerun cold-start post-load processing, then check names and addresses."""
+    """Rerun cold-start post-load processing, then check addresses."""
     from vllm.model_executor.model_loader.utils import process_weights_after_loading
 
     torch.accelerator.synchronize()  # engines may write on other streams
-    received = _pop_load_names(model)
 
     # A module the trainer deliberately does not sync (every checkpoint tensor
     # matches the exclude regex) keeps its kernel layout and skips
@@ -296,19 +271,8 @@ def finish_direct_reload(model: torch.nn.Module, model_config) -> None:
             "direct reload: %d excluded modules kept their kernel layout", len(skipped)
         )
 
-    missing = sorted(
-        n
-        for n in model._direct_cold_names - received
-        if excluded is None or not excluded.search(n)
-    )
     current = _addresses(model)
     moved = sorted(n for n, p in model._direct_addresses.items() if current.get(n) != p)
-    if missing:
-        logger.warning(
-            "direct reload: %d checkpoint names not received, e.g. %s",
-            len(missing),
-            missing[:8],
-        )
     # kernels and captured graphs would keep reading the old storage
     if moved and os.environ.get("VLLM_DIRECT_RELOAD_ALLOW_MOVED") != "1":
         raise RuntimeError(f"direct reload: {len(moved)} tensors moved: {moved[:8]}")
