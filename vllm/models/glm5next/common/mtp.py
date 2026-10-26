@@ -294,6 +294,12 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
             name = name.replace(f"model.layers.{spec_layer}.", "model.")
         return name
 
+    def is_unused_checkpoint_weight(self, name: str) -> bool:
+        # load_weights' rule: only the spec (MTP) layers are loaded
+        if name.startswith("model.language_model."):
+            name = name.replace("model.language_model.", "model.", 1)
+        return get_spec_layer_idx_from_weight_name(self.config, name) is None
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         stacked_params_mapping = [
             ("gate_up_proj", "gate_proj", 0),

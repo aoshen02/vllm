@@ -209,6 +209,33 @@ class TestRecordCheckpointWeightNames:
         assert model.__dict__.get("load_weights") is own
 
 
+@pytest.mark.parametrize(
+    "model_cls,name,unused",
+    [
+        ("deepseek", "model.layers.2.eh_proj.weight", False),
+        ("deepseek", "model.layers.0.mlp.gate.weight", True),
+        ("deepseek", "model.embed_tokens.weight", False),  # loaded under PP
+        ("glm5next", "model.layers.2.eh_proj.weight", False),
+        ("glm5next", "model.language_model.layers.2.eh_proj.weight", False),
+        ("glm5next", "model.language_model.layers.1.mlp.gate.weight", True),
+        ("glm5next", "model.embed_tokens.weight", True),
+    ],
+)
+def test_mtp_draft_declares_target_layers_unused(model_cls, name, unused):
+    # a draft loaded from the target checkpoint is fed the whole target; a
+    # draft update need not deliver what its loader skips
+    from types import SimpleNamespace
+    from typing import Any
+
+    from vllm.model_executor.models.deepseek_mtp import DeepSeekMTP
+    from vllm.models.glm5next.common.mtp import Glm5NextMTP
+
+    cls: Any = {"deepseek": DeepSeekMTP, "glm5next": Glm5NextMTP}[model_cls]
+    config = SimpleNamespace(num_hidden_layers=2, num_nextn_predict_layers=1)
+    draft = SimpleNamespace(config=config)
+    assert cls.is_unused_checkpoint_weight(draft, name) is unused
+
+
 def test_moe_runner_reports_registered_expert_names():
     # AutoWeightsLoader prefixes these names, so they must include routed_experts.
     class Experts(nn.Module):
