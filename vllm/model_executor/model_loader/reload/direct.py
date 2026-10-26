@@ -161,7 +161,8 @@ def _register(module, name: str, is_param: bool, t: torch.Tensor | None) -> None
         module.register_buffer(name, t)
 
 
-def _unsupported(model: torch.nn.Module) -> str | None:
+def _unsupported(model: torch.nn.Module, skipped: Set[int]) -> str | None:
+    from vllm.model_executor.layers.attention import is_deferred_attention_layer
     from vllm.model_executor.layers.quantization.online.fp8 import OnlineLinearBase
     from vllm.model_executor.layers.quantization.online.moe_base import (
         OnlineMoEMethodBase,
@@ -170,9 +171,21 @@ def _unsupported(model: torch.nn.Module) -> str | None:
     if model._direct_pre_processed:
         return "weights loaded pre-processed (IPC weight cache)"
     for name, module in model.named_modules():
+        if id(module) in skipped:
+            continue
         method = getattr(module, "quant_method", None)
         if isinstance(method, (OnlineLinearBase, OnlineMoEMethodBase)):
             return f"{name}: online quantization ({type(method).__name__})"
+        # post-processing moves host weights to the device and back into new
+        # host tensors (`device_loading_context`): their storage would move
+        processed_on_device = is_deferred_attention_layer(module) or (
+            isinstance(method, QuantizeMethodBase) and method.requires_device_loading
+        )
+        if processed_on_device and any(
+            p.device.type == "cpu" or getattr(p, "_vllm_is_uva_offloaded", False)
+            for p in module.parameters()
+        ):
+            return f"{name}: CPU-offloaded weights"
     return None
 
 
@@ -258,11 +271,10 @@ def begin_direct_reload(model: torch.nn.Module) -> None:
     """Make every tensor writable by its checkpoint weight loader."""
     if not getattr(model, "_direct_layout_recorded", False):
         raise RuntimeError("direct reload: no checkpoint layout was recorded")
-    if (reason := _unsupported(model)) is not None:
-        raise NotImplementedError(f"direct reload: {reason}")
-
     # modules the trainer does not sync keep their runtime state untouched
     skipped = model._direct_skipped = _unsynced_modules(model)
+    if (reason := _unsupported(model, skipped)) is not None:
+        raise NotImplementedError(f"direct reload: {reason}")
 
     # checkpoint names post-load processing deleted or replaced: register the
     # checkpoint tensors again so the model's loader finds them; the rerun at

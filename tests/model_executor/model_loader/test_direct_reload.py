@@ -708,6 +708,17 @@ class TestLoudChecks:
         with pytest.raises(RuntimeError, match=r"moved: \['s.cache'\]"):
             _reload(model, {"s.weight": torch.rand(4, 4)})
 
+    def test_cpu_offloaded_weights_refused(self):
+        # post-processing would move them to the device and back into new
+        # host tensors on every reload
+        model = _tree_cold_start(
+            lambda: _Tree({"s": _with_weight(_Layer(lambda layer: None))}),
+            {"s.weight": torch.rand(2, 2)},
+        )
+        model.s.weight.data = model.s.weight.data.cpu()
+        with pytest.raises(NotImplementedError, match="s: CPU-offloaded weights"):
+            begin_direct_reload(model)
+
     def test_pre_processed_weights_refused(self):
         from vllm.model_executor.utils import weights_already_processed
 
