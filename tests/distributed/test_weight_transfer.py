@@ -363,6 +363,21 @@ class TestUpdateCompleteness:
             self._update(engine, sent)
         assert finalized == []  # raised before post-load processing
 
+    def test_unsynced_name_raises_before_any_bucket_is_received(self, monkeypatch):
+        # raising mid-broadcast would leave the trainer blocked in it
+        monkeypatch.setenv("VLLM_DIRECT_RELOAD_EXCLUDE_REGEX", r"[.]?engram[.]")
+        engine = self._engine(monkeypatch, self.COLD, True, [])
+        engine.start_weight_update()
+        with pytest.raises(ValueError, match="declares unsynced"):
+            engine.receive_weights(
+                NCCLWeightTransferUpdateInfo(
+                    names=self.FULL,  # engram.weight last
+                    dtype_names=["float32"] * len(self.FULL),
+                    shapes=[[2, 2]] * len(self.FULL),
+                )
+            )
+        engine.model_update_group.broadcast.assert_not_called()
+
     @pytest.mark.parametrize(
         "sent", [FULL[:4], FULL], ids=["partial", "delivers-unsynced"]
     )
