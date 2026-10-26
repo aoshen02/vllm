@@ -277,6 +277,28 @@ def _unsynced_modules(model: torch.nn.Module) -> set[int]:
             "modules, without a module whose post-load processing reads them: "
             f"{bad[:8]}"
         )
+    # A checkpoint name the regex matches must lie in a skipped module: one
+    # fused or renamed in vLLM (gate_proj -> gate_up_proj) is not skipped,
+    # and its rerun would convert the kept kernel bytes again.
+    tails = {
+        ".".join(parts[i:])
+        for name, module in modules
+        if id(module) in skipped
+        for parts in [name.split(".")]
+        for i in range(len(parts))
+    }
+    ckpt_names = getattr(model, "_checkpoint_weight_names", None) or ()
+    stray = sorted(
+        n
+        for n in ckpt_names
+        if excluded.search(n) and n.rpartition(".")[0] not in tails
+    )
+    if stray:
+        raise DirectReloadRefused(
+            "direct reload: VLLM_DIRECT_RELOAD_EXCLUDE_REGEX must cover whole "
+            "modules; these checkpoint names match it but their module is not "
+            f"skipped (fused or renamed in vLLM?): {stray[:8]}"
+        )
     return skipped
 
 
