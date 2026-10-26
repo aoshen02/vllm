@@ -29,6 +29,7 @@ Selected with ``VLLM_RELOAD_MODE=direct``.
 """
 
 import functools
+import math
 import os
 from collections.abc import Iterator, Set
 
@@ -534,7 +535,7 @@ def finish_direct_reload(model: torch.nn.Module, model_config) -> None:
     moved += sorted(
         f"{n} (host scalar {v} -> {scalars.get(n)})"
         for n, v in model._direct_host_scalars.items()
-        if scalars.get(n) != v
+        if not _same_float(scalars.get(n), v)
     )
     # kernels and captured graphs would keep reading the old storage
     if moved:
@@ -549,6 +550,10 @@ def finish_direct_reload(model: torch.nn.Module, model_config) -> None:
             type(model).__name__,
             len(adopted),
         )
+
+
+def _same_float(a: float | None, b: float) -> bool:
+    return a == b or (a is not None and math.isnan(a) and math.isnan(b))
 
 
 def _host_scalars(model: torch.nn.Module) -> dict[str, float]:

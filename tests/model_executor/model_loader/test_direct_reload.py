@@ -829,6 +829,13 @@ class TestLoudChecks:
         with pytest.raises(RuntimeError, match=r"s._k_scale_float \(host scalar"):
             _reload(model, {"s.weight": torch.rand(4, 4) + 2})
 
+    def test_nan_host_scalar_is_unchanged(self):
+        def fn(layer):  # e.g. an unset optional scale
+            layer._o_scale = float("nan")
+
+        model = _one_layer(fn, torch.rand(4, 4))
+        _reload(model, {"s.weight": torch.rand(4, 4)})
+
     def test_side_tensor_new_view_of_same_storage_moves(self):
         def fn(layer):  # graphs read the startup view, the layer a transposed one
             if layer.quant_method.runs == 1:
