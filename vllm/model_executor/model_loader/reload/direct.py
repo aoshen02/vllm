@@ -367,6 +367,11 @@ def begin_direct_reload(model: torch.nn.Module) -> None:
     views = _checkpoint_views(model, skipped, dropped)
 
     # nothing above modified the model
+    # The derived tensors captured graphs read, as served (before any view
+    # back), kept until a finish succeeds: a retry after an update that
+    # failed midway pins into them, not into the failed rerun's allocations.
+    if "_direct_side_state" not in model.__dict__:
+        model._direct_side_state = _snapshot_side_state(model)
     model._direct_skipped = skipped
     for module, name, is_param, t in dropped:
         _register(module, name, is_param, t)
@@ -407,12 +412,7 @@ def finish_direct_reload(model: torch.nn.Module, model_config) -> None:
         (p.device for p in model.parameters() if p.device.type == "cuda"),
         torch.accelerator.current_accelerator(),
     )
-    # The storages captured graphs read, taken before the first rerun and kept
-    # until a finish succeeds: a retry after a finish that failed midway pins
-    # into them, not into the failed rerun's allocations.
-    pinned = model.__dict__.get("_direct_side_state")
-    if pinned is None:
-        pinned = model._direct_side_state = _snapshot_side_state(model)
+    pinned = model._direct_side_state  # taken by the first begin
     global _rerunning
     _rerunning = True
     try:
@@ -440,10 +440,10 @@ def finish_direct_reload(model: torch.nn.Module, model_config) -> None:
 
 
 def _snapshot_side_state(model: torch.nn.Module):
-    """Before the rerun: each module's derived device tensors (`side_state`),
-    as aliases of their storage. CUDA graphs captured at cold start read
-    these storages, so the rerun's values have to land in them. Skipped
-    modules too: the model-level hook still runs over them."""
+    """Before the update modifies the model: each module's derived device
+    tensors (`side_state`), as aliases of their storage and view. CUDA graphs
+    captured at cold start read these, so the rerun's values have to land in
+    them. Skipped modules too: the model-level hook still runs over them."""
     from .side_state import SideWalk, snapshot_side_tensors
 
     side_walk = SideWalk()

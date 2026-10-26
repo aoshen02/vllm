@@ -558,6 +558,23 @@ class TestSideState:
             assert t.data_ptr() == before[name], f"{name} moved"
             assert torch.equal(t, fresh[name]), f"{name} differs"
 
+    def test_reference_to_a_relaid_checkpoint_weight(self):
+        # e.g. moe_quant_config holding a scale whose layout processing
+        # changes: begin views the scale back, the rerun lays it out again
+        def fn(layer):
+            replace_parameter(layer, "weight", layer.weight.reshape(2, 8) * 2)
+            layer.cfg = {"w": layer.weight, "w_t": layer.weight.t()}
+
+        model = _one_layer(fn, torch.rand(4, 4))
+        before = {n: t.data_ptr() for n, t in _side(model.s).items()}
+        new = torch.rand(4, 4)
+        _reload(model, {"s.weight": new})
+        after, fresh = _side(model.s), _side(_one_layer(fn, new).s)
+        assert sorted(after) == sorted(before) == sorted(fresh)
+        for name, t in after.items():
+            assert t.data_ptr() == before[name], f"{name} moved"
+            assert torch.equal(t, fresh[name]), f"{name} differs"
+
     @staticmethod
     def _resized(layer):
         layer.cache = torch.zeros(layer.quant_method.runs, device=_DEVICE)
