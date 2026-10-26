@@ -363,6 +363,15 @@ class WeightTransferEngine(ABC, Generic[TInitInfo, TUpdateInfo]):
     `start_weight_update`/`finish_weight_update`. Engines that apply weights in
     place (e.g. sparse patches) leave those methods as no-ops.
 
+    A direct reload (`VLLM_RELOAD_MODE=direct`) equals a cold start on the
+    delivered checkpoint, so an update must deliver every checkpoint tensor
+    cold start fed to `load_weights`, or exclude it with
+    `VLLM_DIRECT_RELOAD_EXCLUDE_REGEX` (which keeps its module's cold-start
+    state). This holds for MTP/draft and confidence heads too: a trainer that
+    freezes one excludes it. `disable_mtp_completeness_check` only lets one
+    `load_weights` call (one bucket) carry part of a head; `_complete_update`
+    checks the update as a whole.
+
     Subclasses should define:
         init_info_cls: Type of backend-specific initialization info
         update_info_cls: Type of backend-specific update info
@@ -557,8 +566,10 @@ class WeightTransferEngine(ABC, Generic[TInitInfo, TUpdateInfo]):
             if missing:
                 raise ValueError(
                     f"weight update did not deliver {len(missing)} checkpoint "
-                    f"tensors its cold start loaded: {sorted(missing)[:16]}; if "
-                    "the trainer does not sync them, set "
+                    f"tensors its cold start loaded: {sorted(missing)[:16]}. An "
+                    "update must deliver every checkpoint tensor cold start "
+                    "loaded, or exclude it; if the trainer does not sync these "
+                    "(e.g. a frozen MTP head), set "
                     f"VLLM_DIRECT_RELOAD_EXCLUDE_REGEX='{_exclude_regex(missing)}'"
                 )
         check_weight_parts_complete(model)
