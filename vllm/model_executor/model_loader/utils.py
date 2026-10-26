@@ -156,11 +156,12 @@ def process_weights_after_loading(
         direct_reload_enabled,
         record_checkpoint_layout,
         record_runtime_addresses,
-        rerunning_post_load,
     )
 
-    # a direct reload keeps the tie cold start decided (and checks it holds)
-    if not rerunning_post_load():
+    # Direct reload never ties by equality, cold start included: whether two
+    # copies are equal is a property of one checkpoint, and a reload must
+    # equal a cold start on the next one, whose copies may differ.
+    if not direct_reload_enabled():
         maybe_retie_word_embeddings(model, model_config)
 
     if direct_reload_enabled():

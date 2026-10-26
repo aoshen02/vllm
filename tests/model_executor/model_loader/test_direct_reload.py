@@ -761,7 +761,8 @@ def test_retry_after_aborted_update_matches_cold_start():
 
 class _TiedModel(torch.nn.Module):
     """A config that ties the word embeddings over a checkpoint that ships
-    an lm_head: built untied, re-tied after loading if the two are equal."""
+    an lm_head: built untied (outside direct mode, re-tied if the two are
+    equal)."""
 
     def __init__(self):
         from vllm.model_executor.layers.vocab_parallel_embedding import (
@@ -790,8 +791,8 @@ _TIED_CONFIG = SimpleNamespace(
 
 @pytest.mark.usefixtures("dist_init")
 class TestTiedEmbeddings:
-    """Cold start decides the tie; a reload keeps it, and refuses an update
-    for which a cold start would decide otherwise."""
+    """Direct reload never re-ties by equality, cold start included: equal
+    copies in one checkpoint say nothing about the next one."""
 
     @staticmethod
     def _cold_start(embed, head) -> _TiedModel:
@@ -801,41 +802,22 @@ class TestTiedEmbeddings:
         process_weights_after_loading(model, _TIED_CONFIG, _DEVICE)
         return model
 
-    @staticmethod
-    def _reload(model, embed, head) -> None:
+    @pytest.mark.parametrize("equal", [True, False], ids=["equal", "different"])
+    def test_copies_stay_untied(self, equal):
+        w = torch.rand(16, 4)
+        model = self._cold_start(w, w)
+        assert model.lm_head.weight is not model.embed.weight
+        ptrs = model.embed.weight.data_ptr(), model.lm_head.weight.data_ptr()
+        embed, head = torch.rand(16, 4), torch.rand(16, 4)
+        if equal:
+            head = embed
         begin_direct_reload(model)
         model.load_weights([("embed.weight", embed), ("lm_head.weight", head)])
         finish_direct_reload(model, _TIED_CONFIG)
-
-    def test_tied_update_with_equal_copies(self):
-        w = torch.rand(16, 4)
-        model = self._cold_start(w, w)
-        assert model.lm_head.weight is model.embed.weight
-        ptr = model.embed.weight.data_ptr()
-        new = torch.rand(16, 4)
-        for _ in range(2):  # the per-update write record is reset
-            self._reload(model, new, new)
-        assert model.lm_head.weight is model.embed.weight
-        assert model.embed.weight.data_ptr() == ptr
-        assert torch.equal(model.embed.weight[:16], new.to(_DEVICE))  # padded
-
-    def test_tied_update_with_different_copies_raises(self):
-        w = torch.rand(16, 4)
-        model = self._cold_start(w, w)
-        begin_direct_reload(model)
-        with pytest.raises(ValueError, match="would untie them"):
-            model.load_weights(
-                [("embed.weight", torch.rand(16, 4)), ("lm_head.weight", w)]
-            )
-
-    def test_untied_update_with_equal_copies_stays_untied(self):
-        # re-tying on reload would move lm_head.weight
-        model = self._cold_start(torch.rand(16, 4), torch.rand(16, 4))
-        assert model.lm_head.weight is not model.embed.weight
-        new = torch.rand(16, 4)
-        self._reload(model, new, new)
-        assert model.lm_head.weight is not model.embed.weight
-        assert torch.equal(model.lm_head.weight, model.embed.weight)
+        fresh = self._cold_start(embed, head)
+        assert (model.embed.weight.data_ptr(), model.lm_head.weight.data_ptr()) == ptrs
+        assert torch.equal(model.embed.weight, fresh.embed.weight)
+        assert torch.equal(model.lm_head.weight, fresh.lm_head.weight)
 
 
 class TestAbortedUpdate:

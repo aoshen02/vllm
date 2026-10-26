@@ -146,47 +146,6 @@ def record_runtime_addresses(model: torch.nn.Module) -> None:
             len(dropped),
             [f"{type(m).__name__}.{n}" for m, n, *_ in dropped[:4]],
         )
-    model._direct_tied = _guard_tied_writes(model)
-
-
-def _guard_tied_writes(model: torch.nn.Module) -> list[torch.Tensor]:
-    """Cold start decided whether the lm_head is the input embedding's tensor
-    (`maybe_retie_word_embeddings`); reloads keep that decision. A cold start
-    on an update whose two copies differ would untie them, so a tied tensor
-    must receive the same bytes every time an update writes it."""
-    from vllm.model_executor.layers.vocab_parallel_embedding import (
-        ParallelLMHead,
-        VocabParallelEmbedding,
-    )
-    from vllm.model_executor.model_loader.weight_utils import default_weight_loader
-
-    def weights(cls, exclude=()):
-        for m in model.modules():
-            w = getattr(m, "weight", None)
-            if isinstance(m, cls) and not isinstance(m, exclude) and w is not None:
-                yield w
-
-    inputs = {id(w) for w in weights(VocabParallelEmbedding, ParallelLMHead)}
-    tied = {id(w): w for w in weights(ParallelLMHead) if id(w) in inputs}
-    for w in tied.values():
-        loader = getattr(w, "weight_loader", default_weight_loader)
-
-        def load(param, loaded_weight, *args, _load=loader, **kwargs):
-            if not getattr(param, "_direct_written", False):
-                param._direct_written = True
-                return _load(param, loaded_weight, *args, **kwargs)
-            first = param.detach().clone()
-            _load(param, loaded_weight, *args, **kwargs)
-            if not torch.equal(first, param):
-                raise ValueError(
-                    "direct reload: the update delivers different lm_head and "
-                    "input embedding weights, which share one tensor since "
-                    "cold start; a cold start on them would untie them. "
-                    "Restart the server to serve them."
-                )
-
-        w.weight_loader = load
-    return list(tied.values())
 
 
 def _own_tensors(module: torch.nn.Module):
@@ -384,8 +343,6 @@ def begin_direct_reload(model: torch.nn.Module) -> None:
         _register(module, name, is_param, t)
     for t, view in views:
         t.data = view  # no zeroing: the full sync rewrites the checkpoint region
-    for t in getattr(model, "_direct_tied", ()):
-        t._direct_written = False
     logger.info(
         "direct reload: %d tensors viewed back to checkpoint layout", len(views)
     )
