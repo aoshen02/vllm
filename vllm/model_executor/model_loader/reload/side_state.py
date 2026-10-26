@@ -17,38 +17,58 @@ storage and rebinds that tensor object to it (`t.data = startup`), so every
 holder of the object reads the startup storage.
 """
 
+import functools
 from typing import Any
 
 import torch
 
-__all__ = ["pin_side_tensors", "snapshot_side_tensors"]
+__all__ = ["SideWalk", "pin_side_tensors", "snapshot_side_tensors"]
 
 Path = tuple[tuple[str, Any], ...]
 
-_MAX_DEPTH = 6
-_SKIP_MODULE_PREFIXES = (
-    "vllm.config",
-    "transformers",
-    "tokenizers",
-    "torch",
-    "threading",
-    "logging",
-)
+_MAX_DEPTH = 16
+# packages whose own classes hold no tensors derived from the weights
+_LIBRARIES = {"transformers", "tokenizers", "torch", "threading", "logging"}
 _SKIP_LAYER_ATTRS = {"_parameters", "_buffers", "_modules", "training"}
 
 
 _OPAQUE: dict[type, bool] = {}
 
 
+@functools.cache
+def _tensor_free_bases() -> frozenset[type]:
+    """Tokenizer, processor and configuration bases. Their subclasses, vLLM's
+    included, hold no model tensors: the cached tokenizer a multimodal model
+    root keeps subclasses one, with ~250k BPE merges."""
+    import transformers
+
+    from vllm.tokenizers.protocol import TokenizerLike
+
+    names = (
+        "PreTrainedConfig",
+        "PreTrainedTokenizerBase",
+        "ProcessorMixin",
+        "FeatureExtractionMixin",
+        "ImageProcessingMixin",
+    )
+    return frozenset(
+        [TokenizerLike]
+        + [getattr(transformers, n) for n in names if hasattr(transformers, n)]
+    )
+
+
 def _opaque(cls: type) -> bool:
-    """Library objects that hold no derived device tensors (configs,
-    tokenizers, locks, loggers), also when vLLM subclasses them: the cached
-    tokenizer a multimodal model root keeps is a vLLM subclass of a
-    transformers tokenizer, with ~250k BPE merges."""
+    """Objects that hold no derived device tensors: classes of the libraries
+    above (by top-level package, so `transformers_modules`, where
+    trust_remote_code classes live, is walked), vLLM's configuration classes,
+    and subclasses of tokenizer, processor and configuration bases."""
     opaque = _OPAQUE.get(cls)
     if opaque is None:
-        opaque = _OPAQUE[cls] = any(
-            (c.__module__ or "").startswith(_SKIP_MODULE_PREFIXES) for c in cls.__mro__
+        module = cls.__module__ or ""
+        opaque = _OPAQUE[cls] = (
+            module.partition(".")[0] in _LIBRARIES
+            or module.startswith("vllm.config")
+            or not _tensor_free_bases().isdisjoint(cls.__mro__)
         )
     return opaque
 
@@ -68,50 +88,55 @@ def _children(o: Any) -> list[tuple[tuple[str, Any], Any]]:
     return out
 
 
-Clean = dict[int, tuple[int, Any]]
+class SideWalk:
+    """State shared by the walks of one pass over a model's modules; it must
+    not outlive the pass.
+
+    ``clean`` holds the objects proven tensor-free (by id, with the object to
+    keep the id valid), so objects every layer references, e.g. a
+    quantization config with a dict per checkpoint layer, are walked once per
+    pass instead of once per layer. A proof covers the object's whole
+    reachable graph, so it holds at any depth. ``truncated`` counts the
+    objects left unwalked at the depth limit: never proven, never pinned."""
+
+    def __init__(self) -> None:
+        self.clean: dict[int, Any] = {}
+        self.truncated = 0
 
 
 def collect_side_tensors(
-    layer: torch.nn.Module, clean: Clean | None = None
+    layer: torch.nn.Module, side_walk: SideWalk | None = None
 ) -> dict[Path, torch.Tensor]:
     """The layer's derived tensors, by path: registered tensors without a
     checkpoint layout (the address check covers the checkpoint ones), and
-    every tensor reachable from its non-module attributes.
-
-    ``clean`` is shared by the calls of one pass over a model's modules and
-    must not outlive it. It records objects proven tensor-free (by id, with
-    the depth they were proven at, and the object to keep the id valid), so
-    objects every layer references, e.g. a quantization config with a dict
-    per checkpoint layer, are walked once per pass instead of once per layer.
-    An object proven tensor-free at depth d holds no tensor within the depth
-    limit at any depth >= d, so skipping it finds the same tensors."""
+    every tensor reachable from its non-module attributes."""
     found: dict[Path, torch.Tensor] = {}
-    seen: set[int] = set()
-    if clean is None:
-        clean = {}
+    seen: dict[int, int] = {}  # id -> the shallowest depth it was walked at
+    state = side_walk if side_walk is not None else SideWalk()
+    clean = state.clean
 
     def walk(o: Any, path: Path, depth: int) -> bool:
         """Record the tensors under ``o``; True iff it is proven tensor-free."""
         if isinstance(o, torch.Tensor):
             found[path] = o
             return False
-        if (
-            depth > _MAX_DEPTH
-            or o is None
-            or isinstance(o, (str, bytes, int, float, bool, torch.nn.Module, type))
+        if o is None or isinstance(
+            o, (str, bytes, int, float, bool, torch.nn.Module, type)
         ):
             return True
-        known = clean.get(id(o))
-        if known is not None and known[0] <= depth:
+        if id(o) in clean:
             return True
-        if id(o) in seen:
-            return False  # walked on another path of this layer: not proven here
-        seen.add(id(o))
+        if depth > _MAX_DEPTH:
+            state.truncated += 1
+            return False
+        if seen.get(id(o), depth + 1) <= depth:
+            return False  # walked on a path at most as deep: not proven here
+        seen[id(o)] = depth  # first reached, or shallower than before: walk
         tensor_free = True
         for key, child in _children(o):
             tensor_free = walk(child, path + (key,), depth + 1) and tensor_free
         if tensor_free:
-            clean[id(o)] = (depth, o)
+            clean[id(o)] = o
         return tensor_free
 
     for registered in (layer._parameters, layer._buffers):
@@ -134,14 +159,13 @@ def _layout(t: torch.Tensor) -> tuple:
 
 
 def snapshot_side_tensors(
-    layer: torch.nn.Module, clean: Clean | None = None
+    layer: torch.nn.Module, side_walk: SideWalk | None = None
 ) -> dict[Path, torch.Tensor]:
     """The layer's derived device tensors, by path. Aliases, not the objects:
-    `x.data = y` later leaves them on the storage graphs captured.
-    ``clean``: see `collect_side_tensors`."""
+    `x.data = y` later leaves them on the storage graphs captured."""
     return {
         path: t.detach()
-        for path, t in collect_side_tensors(layer, clean).items()
+        for path, t in collect_side_tensors(layer, side_walk).items()
         if t.device.type not in ("cpu", "meta")
     }
 
@@ -150,24 +174,22 @@ def snapshot_side_tensors(
 def pin_side_tensors(
     layer: torch.nn.Module,
     before: dict[Path, torch.Tensor],
-    clean: Clean | None = None,
+    side_walk: SideWalk | None = None,
 ) -> list[str]:
     """Put the tensor at every snapshotted path back on its startup storage,
     holding the rerun's values. Returns the paths that cannot be pinned: gone,
-    or now a tensor of a different shape, stride, dtype or device.
-    ``clean``: see `collect_side_tensors`; pinning changes no object but
-    tensors, so the objects it proved tensor-free stay so."""
-    after = collect_side_tensors(layer, clean)
+    or now a tensor of a different shape, stride, dtype or device. Pinning
+    changes no object but tensors, so objects the pass proved tensor-free
+    stay so."""
+    after = collect_side_tensors(layer, side_walk)
     failed = []
     for path, old in before.items():
         t = after.get(path)
-        if t is not None and t.untyped_storage().data_ptr() == (
-            old.untyped_storage().data_ptr()
-        ):
-            continue
         if t is None or _layout(t) != _layout(old):
             failed.append(_fmt(path))
             continue
+        if t.data_ptr() == old.data_ptr():
+            continue  # the same view of the startup storage
         old.copy_(t)
         t.data = old  # every holder of `t`, seen by the walk or not
     return failed

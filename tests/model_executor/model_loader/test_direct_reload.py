@@ -447,55 +447,86 @@ class TestSideWalk:
 
     def test_shared_tensor_free_object_walked_once(self):
         from vllm.model_executor.model_loader.reload.side_state import (
+            SideWalk,
             collect_side_tensors,
         )
 
         _CountedDict.walks = 0
         config = _CountedDict({f"layers.{i}": {"bits": 4} for i in range(8)})
         holder = {"t": torch.ones(2)}
-        clean: dict = {}
+        side_walk = SideWalk()
         for _ in range(3):
             layer = torch.nn.Module()
             layer.quant_config, layer.holder = config, holder
-            found = collect_side_tensors(layer, clean)
+            found = collect_side_tensors(layer, side_walk)
             assert list(found) == [(("a", "holder"), ("k", "t"))]
         assert _CountedDict.walks == 1
 
-    def test_proven_deeper_is_walked_when_reached_shallower(self):
+    @staticmethod
+    def _nested(o: object, depth: int) -> object:
+        for _ in range(depth):
+            o = [o]
+        return o
+
+    @pytest.mark.parametrize("same_layer", [False, True], ids=["two-layers", "one"])
+    def test_reached_at_the_depth_limit_then_shallower(self, same_layer):
         from vllm.model_executor.model_loader.reload.side_state import (
             _MAX_DEPTH,
+            SideWalk,
             collect_side_tensors,
         )
 
         shared = {"k": {"t": torch.ones(2)}}
-        deep: object = shared
-        for _ in range(_MAX_DEPTH - 1):  # shared at the depth limit: no tensor
-            deep = [deep]
+        deep = self._nested(shared, _MAX_DEPTH - 1)  # the tensor is past the limit
         first, second = torch.nn.Module(), torch.nn.Module()
-        first.deep, second.shared = deep, shared
-        clean: dict = {}
-        assert collect_side_tensors(first, clean) == {}
-        found = collect_side_tensors(second, clean)
-        assert list(found) == [(("a", "shared"), ("k", "k"), ("k", "t"))]
+        first.a_deep = deep
+        (first if same_layer else second).b_shared = shared
+        side_walk = SideWalk()
+        found = collect_side_tensors(first, side_walk)
+        if not same_layer:
+            assert found == {}
+            found = collect_side_tensors(second, side_walk)
+        assert list(found) == [(("a", "b_shared"), ("k", "k"), ("k", "t"))]
 
-    def test_library_subclass_is_not_walked(self):
-        # e.g. vLLM's cached tokenizer subclasses a transformers tokenizer
-        from transformers import PreTrainedConfig
+    def test_depth_limit_is_not_a_proof(self):
+        from vllm.model_executor.model_loader.reload.side_state import (
+            _MAX_DEPTH,
+            SideWalk,
+            collect_side_tensors,
+        )
+
+        layer = torch.nn.Module()
+        layer.deep = self._nested(torch.ones(2), _MAX_DEPTH + 1)
+        side_walk = SideWalk()
+        assert collect_side_tensors(layer, side_walk) == {}
+        assert side_walk.truncated == 1 and side_walk.clean == {}
+
+    @pytest.mark.parametrize(
+        "base", ["tokenizer", "config", "vllm-subclass", "remote-code"]
+    )
+    def test_library_objects(self, base):
+        # the cached tokenizer of a multimodal root subclasses a transformers
+        # tokenizer; any other subclass, or a trust_remote_code class, may
+        # hold a derived tensor
+        import transformers
 
         from vllm.model_executor.model_loader.reload.side_state import (
             collect_side_tensors,
         )
 
-        class _Subclass(PreTrainedConfig):
-            pass
-
-        _CountedDict.walks = 0
-        library_object = _Subclass()
-        library_object.merges = _CountedDict({"a": ("b", "c")})
+        parent = {
+            "tokenizer": transformers.PreTrainedTokenizerBase,
+            "config": transformers.PreTrainedConfig,
+            "vllm-subclass": transformers.GenerationConfig,
+            "remote-code": object,
+        }[base]
+        module = "transformers_modules.m.x" if base == "remote-code" else __name__
+        obj: object = object.__new__(type("Holder", (parent,), {"__module__": module}))
+        object.__setattr__(obj, "t", torch.ones(2))
         layer = torch.nn.Module()
-        layer.tokenizer = library_object
-        assert collect_side_tensors(layer) == {}
-        assert _CountedDict.walks == 0
+        layer.holder = obj
+        found = collect_side_tensors(layer)
+        assert bool(found) is (base in ("vllm-subclass", "remote-code"))
 
 
 class TestLoudChecks:
@@ -517,6 +548,17 @@ class TestLoudChecks:
 
         model = _one_layer(fn, torch.rand(4, 4))
         with pytest.raises(RuntimeError, match=r"moved: \['s.weight'\]"):
+            _reload(model, {"s.weight": torch.rand(4, 4)})
+
+    def test_side_tensor_new_view_of_same_storage_moves(self):
+        def fn(layer):  # graphs read the startup view, the layer a transposed one
+            if layer.quant_method.runs == 1:
+                layer.cache = layer.weight * 2
+            else:
+                layer.cache = layer.cache.t()
+
+        model = _one_layer(fn, torch.rand(4, 4))
+        with pytest.raises(RuntimeError, match=r"moved: \['s.cache'\]"):
             _reload(model, {"s.weight": torch.rand(4, 4)})
 
     def test_pre_processed_weights_refused(self):

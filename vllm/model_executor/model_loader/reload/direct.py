@@ -325,25 +325,42 @@ def _snapshot_side_state(model: torch.nn.Module, skipped_ids: Set[int]):
     """Before the rerun: each processed module's derived device tensors
     (`side_state`), as aliases of their storage. CUDA graphs captured at cold
     start read these storages, so the rerun's values have to land in them."""
-    from .side_state import snapshot_side_tensors
+    from .side_state import SideWalk, snapshot_side_tensors
 
-    clean: dict = {}  # tensor-free objects shared by the modules, walked once
-    return [
-        (name, module, snapshot_side_tensors(module, clean))
+    side_walk = SideWalk()
+    pinned = [
+        (name, module, snapshot_side_tensors(module, side_walk))
         for name, module in model.named_modules()
         if id(module) not in skipped_ids
     ]
+    _log_truncated(side_walk, "snapshot")
+    return pinned
 
 
 def _pin_side_state(pinned) -> list[str]:
     """After the rerun: copy every derived tensor the rerun reallocated into
     its startup storage and rebind it there. Returns the tensors that cannot
     be pinned (gone, or a different layout)."""
-    from .side_state import pin_side_tensors
+    from .side_state import SideWalk, pin_side_tensors
 
-    clean: dict = {}
-    return [
+    side_walk = SideWalk()
+    failed = [
         f"{name}.{path}" if name else path
         for name, module, side in pinned
-        for path in (p.lstrip(".") for p in pin_side_tensors(module, side, clean))
+        for path in (p.lstrip(".") for p in pin_side_tensors(module, side, side_walk))
     ]
+    _log_truncated(side_walk, "pin")
+    return failed
+
+
+def _log_truncated(side_walk, what: str) -> None:
+    from .side_state import _MAX_DEPTH
+
+    if side_walk.truncated:
+        logger.warning(
+            "direct reload: the side-state %s walk stopped at depth %d on %d "
+            "objects; tensors below them are not pinned",
+            what,
+            _MAX_DEPTH,
+            side_walk.truncated,
+        )
