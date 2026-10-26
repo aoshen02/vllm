@@ -25,6 +25,7 @@ from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.model_loader import get_model
+from vllm.model_executor.model_loader.reload.direct import direct_reload_enabled
 from vllm.model_executor.model_loader.utils import get_draft_load_config
 from vllm.model_executor.models import (
     supports_multimodal,
@@ -1445,7 +1446,9 @@ class SpecDecodeBaseProposer:
                         " draft model."
                     )
                 elif (
-                    isinstance(target_embed_tokens.weight, torch.Tensor)
+                    # a direct weight update may change one of two copies
+                    not direct_reload_enabled()
+                    and isinstance(target_embed_tokens.weight, torch.Tensor)
                     and isinstance(self.model.model.embed_tokens.weight, torch.Tensor)
                     # TODO: Offload to CPU for comparison to avoid extra GPU memory
                     # usage in CI testing environments with limited GPU memory
@@ -1522,7 +1525,8 @@ class SpecDecodeBaseProposer:
                     "Sharing target model lm_head weights with the draft model."
                 )
             elif (
-                hasattr(target_language_model, "lm_head")
+                not direct_reload_enabled()
+                and hasattr(target_language_model, "lm_head")
                 and hasattr(target_language_model.lm_head, "weight")
                 and hasattr(self.model.lm_head, "weight")
                 and isinstance(target_language_model.lm_head.weight, torch.Tensor)

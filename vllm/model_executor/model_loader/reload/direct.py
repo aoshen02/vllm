@@ -184,6 +184,7 @@ def _register(module, name: str, is_param: bool, t: torch.Tensor | None) -> None
 
 
 def _unsupported(model: torch.nn.Module, skipped: Set[int]) -> str | None:
+    from vllm.config import get_current_vllm_config_or_none
     from vllm.model_executor.layers.attention import is_deferred_attention_layer
     from vllm.model_executor.layers.quantization.online.fp8 import OnlineLinearBase
     from vllm.model_executor.layers.quantization.online.moe_base import (
@@ -192,6 +193,10 @@ def _unsupported(model: torch.nn.Module, skipped: Set[int]) -> str | None:
 
     if model._direct_pre_processed:
         return "weights loaded pre-processed (IPC weight cache)"
+    config = get_current_vllm_config_or_none()
+    if config is not None and config.parallel_config.enable_eplb:
+        # loading places experts as at cold start, routing keeps EPLB's map
+        return "EPLB rearranges experts after cold start"
     for name, module in model.named_modules():
         if id(module) in skipped:
             continue

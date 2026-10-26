@@ -10,6 +10,7 @@ from vllm.model_executor.layers.quantization.online.lm_head import (
     quantized_lm_head_copy,
 )
 from vllm.model_executor.model_loader import get_model
+from vllm.model_executor.model_loader.reload.direct import direct_reload_enabled
 from vllm.model_executor.model_loader.utils import get_draft_load_config
 from vllm.model_executor.models.utils import PPMissingLayer
 from vllm.v1.worker.gpu.spec_decode.utils import get_pp_safe_draft_load_config
@@ -23,7 +24,8 @@ def _should_share(eagle: nn.Module, flag: str, draft, target) -> bool:
     """
     if not getattr(eagle, flag, False):
         return True
-    if draft is None or target is None:
+    # a direct weight update may change one of two copies equal now
+    if draft is None or target is None or direct_reload_enabled():
         return False
     # torch.equal on GPU allocates a bool mask the size of the input.
     # Use the faster GPU path when there is plenty of headroom;

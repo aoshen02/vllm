@@ -859,6 +859,31 @@ class TestLoudChecks:
         with pytest.raises(DirectReloadRefused, match="pre-processed"):
             begin_direct_reload(model)
 
+    def test_eplb_refused(self, monkeypatch):
+        # EPLB moves experts after cold start; loading places them as cold
+        # start did while routing keeps the rearranged map
+        import vllm.config
+
+        model = _one_layer(None, torch.rand(4, 4))
+        config = SimpleNamespace(parallel_config=SimpleNamespace(enable_eplb=True))
+        monkeypatch.setattr(
+            vllm.config, "get_current_vllm_config_or_none", lambda: config
+        )
+        with pytest.raises(DirectReloadRefused, match="EPLB"):
+            begin_direct_reload(model)
+
+    @pytest.mark.parametrize("mode", ["direct", "layerwise"])
+    def test_draft_keeps_its_own_copy_equal_to_the_target(self, monkeypatch, mode):
+        # an EAGLE draft head shared by equality would take the draft's
+        # updates into the target
+        from vllm.v1.worker.gpu.spec_decode.eagle.utils import _should_share
+
+        monkeypatch.setenv("VLLM_RELOAD_MODE", mode)
+        head = SimpleNamespace(weight=torch.ones(2))
+        draft = SimpleNamespace(has_own_lm_head=True)
+        shared = _should_share(draft, "has_own_lm_head", head, head)
+        assert shared is (mode == "layerwise")
+
     @pytest.mark.parametrize("refusal", ["exclusion", "bad-regex", "storage-size"])
     def test_refused_begin_leaves_the_model_untouched(self, monkeypatch, refusal):
         # the worker keeps serving a model whose update was refused
