@@ -7,7 +7,8 @@ layers to meta and rebuilding them, the loader writes straight into the live
 tensors and the cold-start post-load processing runs once at the end:
 
 - cold start records each tensor's checkpoint layout (before post-load
-  processing) and every tensor's address (after it);
+  processing); the first ``begin`` records every address the model serves
+  with (after the runner wired a draft to the target's modules);
 - ``begin`` views tensors whose layout post-load processing changed back to
   their checkpoint layout, on the same storage;
 - ``finish`` reruns ``process_weights_after_loading`` for every module, as
@@ -128,12 +129,11 @@ def record_checkpoint_layout(model: torch.nn.Module) -> None:
 
 
 def record_runtime_addresses(model: torch.nn.Module) -> None:
-    """Cold start, after post-load processing: remember every address, and
-    keep the checkpoint tensors post-load processing unregistered (deleted, or
-    replaced under the same name) so each reload can register them again."""
-    if hasattr(model, "_direct_addresses"):
+    """Cold start, after post-load processing: keep the checkpoint tensors
+    post-load processing unregistered (deleted, or replaced under the same
+    name) so each reload can register them again."""
+    if hasattr(model, "_direct_dropped"):
         return
-    model._direct_addresses = _addresses(model)
     dropped = [
         entry
         for entry in model.__dict__.pop("_direct_registered", [])
@@ -357,6 +357,10 @@ def begin_direct_reload(model: torch.nn.Module) -> None:
     # failed midway pins into them, not into the failed rerun's allocations.
     if "_direct_side_state" not in model.__dict__:
         model._direct_side_state = _snapshot_side_state(model)
+    # Likewise every address as served: a draft shares the target's embedding
+    # and lm_head only after its own cold start (llm_base_proposer)
+    if "_direct_addresses" not in model.__dict__:
+        model._direct_addresses = _addresses(model)
     model._direct_skipped = skipped
     _refuse_writes(model, skipped)
     for module, name, is_param, t in dropped:

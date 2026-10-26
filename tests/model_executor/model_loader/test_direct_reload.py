@@ -856,6 +856,29 @@ class TestTiedEmbeddings:
         assert torch.equal(model.lm_head.weight, fresh.lm_head.weight)
 
 
+def test_draft_wired_to_target_modules_after_cold_start():
+    # the proposer replaces a draft's embedding with the target's after the
+    # draft's cold start; updates compare against the addresses it serves with
+    draft = _tree_cold_start(
+        lambda: _Tree(
+            {"emb": _with_weight(_Layer(None)), "s": _with_weight(_Layer(None))}
+        ),
+        {"emb.weight": torch.rand(2, 2), "s.weight": torch.rand(2, 2)},
+    )
+    target_emb = _tree_cold_start(
+        lambda: _Tree({"emb": _with_weight(_Layer(None))}),
+        {"emb.weight": torch.rand(2, 2)},
+    ).emb
+    del draft.emb
+    draft.emb = target_emb
+    ptr = draft.emb.weight.data_ptr()
+    new = torch.rand(2, 2)
+    for _ in range(2):
+        _reload(draft, {"s.weight": new})
+    assert draft.emb.weight.data_ptr() == ptr
+    assert torch.equal(draft.s.weight, new.to(_DEVICE))
+
+
 class TestAbortedUpdate:
     def test_retry_after_failed_finish_pins_into_startup_storage(self):
         """The first rerun replaces a plain cache, then raises; the retry
