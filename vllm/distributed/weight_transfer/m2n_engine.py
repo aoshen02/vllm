@@ -457,7 +457,6 @@ class M2NWeightTransferEngine(
 
     def start_weight_update(self) -> None:
         """Set up reloading when the update needs it (`_reloads`)."""
-        self._begin_delivery_tracking()
         if not self._reloads():
             return
         from vllm.model_executor.model_loader.reload import (
@@ -467,13 +466,11 @@ class M2NWeightTransferEngine(
         initialize_layerwise_reload(self.model)
 
     def finish_weight_update(self) -> None:
-        """Check the update delivered every weight, then finalize reloading
-        when the update needs it (`_reloads`)."""
+        """Finalize reloading when the update needs it (`_reloads`)."""
         from vllm.model_executor.model_loader.reload import finalize_layerwise_reload
 
-        with self._complete_update():
-            if self._reloads():
-                finalize_layerwise_reload(self.model, self.model_config)
+        if self._reloads():
+            finalize_layerwise_reload(self.model, self.model_config)
 
     def receive_weights(self, update_info: M2NWeightTransferUpdateInfo) -> None:
         """Receive each requested parameter using its initialization-time plan."""
@@ -487,6 +484,8 @@ class M2NWeightTransferEngine(
         ):
             raise TypeError("nccl_m2n update names must be a list of strings")
 
+        from vllm.model_executor.model_loader.reload.direct import record_delivered
+
         requested = []
         for name in update_info.names:
             index = self._index.get(name)
@@ -497,7 +496,8 @@ class M2NWeightTransferEngine(
                 )
             requested.append((name, index))
         # recorded before any is written: direct destinations bypass load_weights
-        self._record_delivered(name for name, _ in requested)
+        for name, _ in requested:
+            record_delivered(self.model, name)
 
         from vllm.model_executor.model_loader.mtp_validation import (
             disable_mtp_completeness_check,

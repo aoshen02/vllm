@@ -178,19 +178,16 @@ class NCCLWeightTransferEngine(
 
         t0 = time.perf_counter()
         initialize_layerwise_reload(self.model)
-        self._begin_delivery_tracking()
         self._busy_s = time.perf_counter() - t0
 
     def finish_weight_update(self) -> None:
-        """Check the update delivered every weight, then finalize layerwise
-        reloading."""
+        """Finalize layerwise reloading after all weights have been received."""
         from vllm.model_executor.model_loader.reload import (
             finalize_layerwise_reload,
         )
 
         t0 = time.perf_counter()
-        with self._complete_update():
-            finalize_layerwise_reload(self.model, self.model_config)
+        finalize_layerwise_reload(self.model, self.model_config)
         finish_s = time.perf_counter() - t0
         # server busy time: the calls, not the trainer's time between them
         logger.info(
@@ -227,7 +224,10 @@ class NCCLWeightTransferEngine(
             update_info = self._last_update_info.get(self.model, update_info)
         # before any bucket arrives: a refusal mid-broadcast would leave the
         # trainer blocked in its broadcast
-        self._record_delivered(update_info.names)
+        from vllm.model_executor.model_loader.reload.direct import record_delivered
+
+        for name in update_info.names:
+            record_delivered(self.model, name)
 
         from vllm.model_executor.model_loader.mtp_validation import (
             disable_mtp_completeness_check,

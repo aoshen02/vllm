@@ -460,6 +460,43 @@ class TestExclusionRule:
         assert model.layers[0].engram.proj.quant_method.runs == 1
 
 
+class TestCompleteness:
+    """The reload lifecycle checks that an update delivered every checkpoint
+    name cold start fed to ``load_weights``, whoever feeds it: an engine, or
+    ``reload_weights`` with an iterator."""
+
+    @staticmethod
+    def _cold_start() -> _ToyModel:
+        from vllm.model_executor.model_loader.base_loader import (
+            record_checkpoint_weight_names,
+        )
+
+        with _DEVICE:
+            model = _ToyModel()
+        with record_checkpoint_weight_names(model):
+            model.load_weights(_checkpoint().items())
+        process_weights_after_loading(model, _MODEL_CONFIG, _DEVICE)
+        return model
+
+    def test_partial_iterator_reload_raises_before_post_load(self):
+        from vllm.model_executor.model_loader.reload.inplace import reload_weights
+
+        model = self._cold_start()
+        before, runs = _state(model), _runs(model)
+        new = _checkpoint(1.01)
+        config = SimpleNamespace(
+            model_config=_MODEL_CONFIG, load_config=None, lora_config=None
+        )
+        partial = (item for item in new.items() if item[0] != "proj.weight")
+        with pytest.raises(ValueError, match=r"did not deliver 1 .*'proj.weight'"):
+            reload_weights(config, model, partial, None, True)
+        assert _runs(model) == runs  # nothing converted again
+        reload_weights(config, model, iter(new.items()), None, True)
+        after = _state(model)
+        _assert_same(after, _state(_cold_start(new)))
+        assert _ptrs(after) == _ptrs(before)
+
+
 class TestMovedAddress:
     def test_rebinding_pwal_raises(self):
         model = _cold_start(_checkpoint(rebind=True), rebind=True)

@@ -246,8 +246,8 @@ def test_nccl_shutdown_destroys_communicator_once(engine_type):
 class TestUpdateCompleteness:
     """A direct reload must deliver every checkpoint tensor its cold start fed
     to `load_weights`, minus the unsynced ones, whatever `load_weights`
-    reports; checked once, before the reload is finalized. Layerwise reloads
-    check nothing."""
+    reports; checked once by the reload lifecycle, before post-load
+    processing. Layerwise reloads check nothing."""
 
     # experts.* load into one fused parameter; mtp.* is declared unused; the
     # model's `audio` parameter is set up in __init__, never fed
@@ -271,6 +271,7 @@ class TestUpdateCompleteness:
         mode: str = "direct",
     ) -> NCCLWeightTransferEngine:
         import vllm.model_executor.model_loader.reload as reload
+        import vllm.model_executor.model_loader.utils as loader_utils
 
         def finalize(*_):
             if finalized and finalized[-1] == "fail":
@@ -279,8 +280,9 @@ class TestUpdateCompleteness:
             finalized.append("ok")
 
         monkeypatch.setenv("VLLM_RELOAD_MODE", mode)
-        monkeypatch.setattr(reload, "initialize_layerwise_reload", lambda *_: None)
-        monkeypatch.setattr(reload, "finalize_layerwise_reload", finalize)
+        if mode != "direct":  # direct mode runs its real lifecycle
+            monkeypatch.setattr(reload, "initialize_layerwise_reload", lambda *_: None)
+            monkeypatch.setattr(reload, "finalize_layerwise_reload", finalize)
         monkeypatch.setattr(torch.cuda, "current_stream", lambda *_, **__: None)
         for name in ("synchronize", "reset_peak_memory_stats"):
             monkeypatch.setattr(torch.accelerator, name, lambda *_: None)
@@ -316,6 +318,14 @@ class TestUpdateCompleteness:
             model,
         )
         engine.model_update_group = MagicMock()
+        if mode == "direct":  # cold start's post-load processing, then rerun's
+            pwal = loader_utils.process_weights_after_loading
+            pwal(model, engine.model_config, torch.device("cpu"))
+            monkeypatch.setattr(
+                loader_utils,
+                "process_weights_after_loading",
+                lambda *a: (finalize(), pwal(*a)),
+            )
         return engine
 
     @staticmethod

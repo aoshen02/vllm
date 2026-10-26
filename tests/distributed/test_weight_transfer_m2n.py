@@ -875,7 +875,6 @@ class TestWireTypes:
         monkeypatch.setenv("VLLM_RELOAD_MODE", mode)
         engine = object.__new__(M2NWeightTransferEngine)
         engine.model = torch.nn.Module()
-        engine.model._checkpoint_weight_names = set()  # an empty checkpoint
         engine.model_config = None
         engine._uses_load_weights = uses_load_weights
 
