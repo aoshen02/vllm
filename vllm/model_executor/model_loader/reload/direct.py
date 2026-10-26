@@ -41,6 +41,7 @@ __all__ = [
     "record_checkpoint_layout",
     "record_load_names",
     "record_runtime_addresses",
+    "unsynced_weights_regex",
 ]
 
 
@@ -48,8 +49,9 @@ def direct_reload_enabled() -> bool:
     return os.environ.get("VLLM_RELOAD_MODE", "layerwise") == "direct"
 
 
-def _excluded() -> "re.Pattern[str] | None":
-    """Names the trainer deliberately does not sync (e.g. Engram)."""
+def unsynced_weights_regex() -> "re.Pattern[str] | None":
+    """Names the trainer deliberately does not sync (e.g. Engram); weight
+    updates do not have to deliver them."""
     pattern = os.environ.get("VLLM_DIRECT_RELOAD_EXCLUDE_REGEX", "")
     return re.compile(pattern) if pattern else None
 
@@ -205,7 +207,7 @@ def begin_direct_reload(model: torch.nn.Module) -> None:
         _register(module, name, is_param, t)
     model._direct_reregistered = reregistered
 
-    excluded = _excluded()
+    excluded = unsynced_weights_regex()
     restored = 0
     for name, t in _loadable_tensors(model):
         layout = getattr(t, "_ckpt_layout", None)
@@ -243,7 +245,7 @@ def finish_direct_reload(model: torch.nn.Module, model_config) -> None:
     # A module the trainer deliberately does not sync (every checkpoint tensor
     # matches the exclude regex) keeps its kernel layout and skips
     # post-processing, which would otherwise convert converted bytes again.
-    excluded = _excluded()
+    excluded = unsynced_weights_regex()
     skipped: list[torch.nn.Module] = []
     for module_name, module in model.named_modules():
         own = [

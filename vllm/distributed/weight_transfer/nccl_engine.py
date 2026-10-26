@@ -178,6 +178,7 @@ class NCCLWeightTransferEngine(
         torch.accelerator.synchronize()
         t0 = time.perf_counter()
         initialize_layerwise_reload(self.model)
+        self._begin_loaded_tracking()
         torch.accelerator.synchronize()
         self._wu_prof = {
             "start_s": time.perf_counter() - t0,
@@ -188,11 +189,13 @@ class NCCLWeightTransferEngine(
         }
 
     def finish_weight_update(self) -> None:
-        """Finalize layerwise reloading after all weights have been received."""
+        """Check the update delivered every weight, then finalize layerwise
+        reloading."""
         from vllm.model_executor.model_loader.reload import (
             finalize_layerwise_reload,
         )
 
+        self._check_update_complete()
         torch.accelerator.synchronize()
         t0 = time.perf_counter()
         finalize_layerwise_reload(self.model, self.model_config)
@@ -250,7 +253,7 @@ class NCCLWeightTransferEngine(
 
         prof = getattr(self, "_wu_prof", None)
         t_recv = time.perf_counter()
-        model_load = self.model.load_weights
+        model_load = self._load_weights
 
         def timed_load(weights):
             # host time inside load_weights (GPU work is async on the stream)

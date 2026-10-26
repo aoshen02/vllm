@@ -447,6 +447,7 @@ class M2NWeightTransferEngine(
         `load_weights`, so a plan with no fallback entries has nothing to
         reload.
         """
+        self._begin_loaded_tracking()
         if not self._uses_load_weights:
             return
         from vllm.model_executor.model_loader.reload import (
@@ -456,7 +457,9 @@ class M2NWeightTransferEngine(
         initialize_layerwise_reload(self.model)
 
     def finish_weight_update(self) -> None:
-        """Finalize layerwise reloading when the plan uses fallback entries."""
+        """Check the update delivered every weight, then finalize layerwise
+        reloading when the plan uses fallback entries."""
+        self._check_update_complete()
         if not self._uses_load_weights:
             return
         from vllm.model_executor.model_loader.reload import finalize_layerwise_reload
@@ -526,12 +529,18 @@ class M2NWeightTransferEngine(
             if has_fallback:
                 # Some model loaders keep invocation-local state to combine
                 # related checkpoint tensors, so preserve one iterable scope.
-                self.model.load_weights(received_weights)
+                self._load_weights(received_weights)
             else:
                 # The iterator performs the reshards. With nothing to yield to
                 # `load_weights`, exhaust it here to execute direct transfers.
                 for _ in received_weights:
                     pass
+        # direct destinations are parameters, written in place under their name
+        self._record_loaded(
+            name
+            for name, index in requested
+            if self._parameter_destinations[index].direct
+        )
 
     def _reshard(
         self,

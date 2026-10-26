@@ -22,6 +22,7 @@ import ray
 import torch
 from torch.multiprocessing.reductions import reduce_tensor
 
+from vllm.config.load import LoadConfig
 from vllm.config.parallel import ParallelConfig
 from vllm.config.weight_transfer import WeightTransferConfig
 from vllm.distributed.weight_transfer import (
@@ -67,6 +68,7 @@ from vllm.distributed.weight_transfer.sparse_nccl_engine import (
     SparseNCCLWeightTransferUpdateInfo,
     SparseWeightPatch,
 )
+from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
 from vllm.platforms import current_platform
 from vllm.utils.nccl import _nccl_has_no_cache
 from vllm.utils.network_utils import get_open_port
@@ -237,6 +239,78 @@ def test_nccl_shutdown_destroys_communicator_once(engine_type):
 
     group.destroy.assert_called_once_with()
     assert engine.model_update_group is None
+
+
+class TestUpdateCompleteness:
+    """An update reruns the cold-start completeness check once, over the names
+    all its `load_weights` calls (one per tensor here) initialized."""
+
+    NAMES = ["a.weight", "b.weight", "engram.weight"]
+
+    @staticmethod
+    def _engine(monkeypatch, reports_names: bool) -> NCCLWeightTransferEngine:
+        import vllm.model_executor.model_loader.reload as reload
+
+        for name in ("initialize_layerwise_reload", "finalize_layerwise_reload"):
+            monkeypatch.setattr(reload, name, lambda *_: None)
+        monkeypatch.setattr(torch.cuda, "current_stream", lambda *_, **__: None)
+        for name in ("synchronize", "reset_peak_memory_stats"):
+            monkeypatch.setattr(torch.accelerator, name, lambda *_: None)
+        for name in ("memory_allocated", "max_memory_allocated"):
+            monkeypatch.setattr(torch.accelerator, name, lambda *_: 0)
+
+        class Model(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                for name in ("a", "b", "engram"):
+                    self.add_module(name, torch.nn.Linear(2, 2, bias=False))
+
+            def load_weights(self, weights):
+                names = {name for name, _ in weights}
+                return names if reports_names else None
+
+        model = Model()
+        DefaultModelLoader(LoadConfig()).track_weights_loading(
+            model, set(TestUpdateCompleteness.NAMES)
+        )
+        engine = NCCLWeightTransferEngine(
+            WeightTransferConfig(backend="nccl"),
+            create_mock_vllm_config(),
+            torch.device("cpu"),
+            model,
+        )
+        engine.model_update_group = MagicMock()
+        return engine
+
+    @pytest.mark.parametrize(
+        "sent,exclude,reports_names,missing",
+        [
+            (NAMES, "", True, None),
+            (["a.weight", "engram.weight"], "", True, "b.weight"),
+            (["a.weight", "b.weight"], r"[.]?engram[.]", True, None),
+            (["a.weight"], "", False, None),
+        ],
+        ids=["full", "missing-raises", "unsynced-excluded", "names-unreported"],
+    )
+    def test_nccl_update(self, monkeypatch, sent, exclude, reports_names, missing):
+        monkeypatch.setenv("VLLM_DIRECT_RELOAD_EXCLUDE_REGEX", exclude)
+        engine = self._engine(monkeypatch, reports_names)
+        engine.start_weight_update()
+        engine.receive_weights(
+            NCCLWeightTransferUpdateInfo(
+                names=sent,
+                dtype_names=["float32"] * len(sent),
+                shapes=[[2, 2]] * len(sent),
+            )
+        )
+        if missing is None:
+            engine.finish_weight_update()
+            return
+        with pytest.raises(
+            ValueError, match="not initialized from the weight update"
+        ) as e:
+            engine.finish_weight_update()
+        assert missing in str(e.value)
 
 
 class TestNCCLEngineParsing:

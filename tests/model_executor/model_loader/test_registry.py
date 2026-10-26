@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import pytest
+import regex as re
 import torch
 from torch import nn
 
@@ -12,7 +13,10 @@ from vllm.model_executor.layers.linear import UnquantizedLinearMethod
 from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod
 from vllm.model_executor.model_loader import get_model_loader, register_model_loader
 from vllm.model_executor.model_loader.base_loader import BaseModelLoader
-from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
+from vllm.model_executor.model_loader.default_loader import (
+    DefaultModelLoader,
+    check_all_weights_loaded,
+)
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 
@@ -145,6 +149,52 @@ def test_weights_track_keeps_unquantized_models_unchanged():
     model.norm = _layer(weight=(4,))
     assert _track(model, {"norm.weight"}, quantized=False) == ""
     assert "norm.weight" in _track(model, set(), quantized=False)
+
+
+class TestCheckAllWeightsLoaded:
+    """A weight update reruns the check its cold start ran, on the names the
+    update delivered."""
+
+    @staticmethod
+    def _cold_started() -> nn.Module:
+        model = nn.Module()
+        model.proj = _layer(_QuantMethod(), weight=(4, 4), weight_scale_inv=(1, 1))
+        model.attn = _layer(BaseKVCacheMethod(None), k_scale=())
+        model.engram = _layer(weight=(4,))
+        cold = {"proj.weight", "proj.weight_scale_inv", "engram.weight"}
+        assert _track(model, cold, quantized=True) == ""
+        return model
+
+    @pytest.mark.parametrize(
+        "loaded,exclude,missing",
+        [
+            ({"proj.weight", "proj.weight_scale_inv", "engram.weight"}, None, ""),
+            ({"proj.weight", "engram.weight"}, None, "proj.weight_scale_inv"),
+            ({"proj.weight", "proj.weight_scale_inv"}, r"^engram\.", ""),
+            ({"proj.weight"}, r"^engram\.", "proj.weight_scale_inv"),
+        ],
+        ids=[
+            "complete",
+            "missing-raises",
+            "excluded-ignored",
+            "exclude-only-covers-its-names",
+        ],
+    )
+    def test_update(self, loaded, exclude, missing):
+        model = self._cold_started()
+        pattern = re.compile(exclude) if exclude else None
+        if not missing:
+            check_all_weights_loaded(model, loaded, pattern, source="the update")
+            return
+        with pytest.raises(ValueError, match="not initialized from the update") as e:
+            check_all_weights_loaded(model, loaded, pattern, source="the update")
+        assert missing in str(e.value) and "attn" not in str(e.value)
+
+    def test_unchecked_cold_start_leaves_updates_unchecked(self):
+        # quantized without enable_weights_track: cold start ran no check
+        model = nn.Module()
+        model.proj = _layer(_QuantMethod(), weight=(4, 4))
+        check_all_weights_loaded(model, set())
 
 
 def test_moe_runner_reports_registered_expert_names():

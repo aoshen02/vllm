@@ -164,13 +164,16 @@ class IPCWeightTransferEngine(
         )
 
         initialize_layerwise_reload(self.model)
+        self._begin_loaded_tracking()
 
     def finish_weight_update(self) -> None:
-        """Finalize layerwise reloading after all weights have been received."""
+        """Check the update delivered every weight, then finalize layerwise
+        reloading."""
         from vllm.model_executor.model_loader.reload import (
             finalize_layerwise_reload,
         )
 
+        self._check_update_complete()
         finalize_layerwise_reload(self.model, self.model_config)
         # Every reduce_tensor call is a fresh export with its own refcount
         # slot, so releasing once per update always balances this update's
@@ -242,7 +245,7 @@ class IPCWeightTransferEngine(
         )
 
         with disable_mtp_completeness_check():
-            self.model.load_weights(weights)
+            self._load_weights(weights)
 
     def shutdown(self) -> None:
         self._packed_importer.close()

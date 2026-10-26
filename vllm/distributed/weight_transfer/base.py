@@ -3,7 +3,7 @@
 """Base class for weight transfer engines."""
 
 from abc import ABC, abstractmethod
-from collections.abc import Collection, Iterator
+from collections.abc import Collection, Iterable, Iterator
 from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING,
@@ -354,6 +354,10 @@ class WeightTransferEngine(ABC, Generic[TInitInfo, TUpdateInfo]):
 
     supports_draft_weight_update: bool = True
 
+    _update_loaded: set[str] | None = None
+    """Names the current update initialized; None outside an update or when
+    the model's `load_weights` does not report them."""
+
     defers_processing: bool = False
     """Whether `update_weights` returns before the weights are on the device.
 
@@ -403,6 +407,51 @@ class WeightTransferEngine(ABC, Generic[TInitInfo, TUpdateInfo]):
         self.model = model
         self._default_model_config = self.model_config
         self._default_model = model
+
+    def _begin_loaded_tracking(self) -> None:
+        """Start collecting the names one checkpoint-format update loads.
+
+        Called by `start_weight_update` of engines that deliver the full
+        checkpoint per update, paired with `_check_update_complete`.
+        """
+        self._update_loaded = set()
+
+    def _load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> Any:
+        """`model.load_weights`, recording the names it initialized."""
+        loaded = self.model.load_weights(weights)
+        if loaded is None:
+            self._update_loaded = None  # untracked, as at cold start
+        else:
+            self._record_loaded(loaded)
+        return loaded
+
+    def _record_loaded(self, names: Iterable[str]) -> None:
+        """Record names an engine wrote without `load_weights`."""
+        if self._update_loaded is not None:
+            self._update_loaded.update(names)
+
+    def _check_update_complete(self) -> None:
+        """Run the cold-start completeness check once over the whole update.
+
+        One update spans many `load_weights` calls (one per bucket), each a
+        part of the checkpoint, so the check runs on their union, at the
+        granularity cold start checks: the whole load. Names the trainer
+        deliberately does not sync (`VLLM_DIRECT_RELOAD_EXCLUDE_REGEX`) are
+        not required. Raises like cold start on a missing name.
+        """
+        loaded, self._update_loaded = self._update_loaded, None
+        if loaded is None:
+            return
+        from vllm.model_executor.model_loader.default_loader import (
+            check_all_weights_loaded,
+        )
+        from vllm.model_executor.model_loader.reload.direct import (
+            unsynced_weights_regex,
+        )
+
+        check_all_weights_loaded(
+            self.model, loaded, unsynced_weights_regex(), source="the weight update"
+        )
 
     def set_weight_update_target(
         self,
