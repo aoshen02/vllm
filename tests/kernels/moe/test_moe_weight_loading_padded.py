@@ -21,6 +21,7 @@ from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
 from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
     UnquantizedFusedMoEMethod,
 )
+from vllm.model_executor.model_loader.weight_utils import discard_weight_parts
 
 from .utils import make_dummy_moe_config
 
@@ -806,6 +807,37 @@ class TestPerTensorScaleCoercion:
         # numel > 1 must fail loudly instead of silently picking an element.
         with pytest.raises(RuntimeError):
             RoutedExperts._to_scalar(torch.tensor([0.1, 0.2]))
+
+
+class TestW13InputScalePairing:
+    """compressed-tensors: w1 and w3 input scales share one slot and must be
+    equal; they are compared within one load, not with the scale the
+    previous load left in the slot."""
+
+    @pytest.mark.parametrize(
+        "loads,error",
+        [
+            ([[("w1", 2.0), ("w3", 2.0)], [("w3", 3.0), ("w1", 3.0)]], False),
+            ([[("w1", 2.0), ("w3", 2.0)], [("w1", 3.0), ("w3", 4.0)]], True),
+        ],
+        ids=["reload-with-new-scales", "unequal-raises"],
+    )
+    def test_pairs_within_one_load(self, loads, error):
+        experts = torch.nn.Module()
+
+        def run():
+            for load in loads:
+                discard_weight_parts(experts)  # a reload starts
+                for shard_id, value in load:
+                    RoutedExperts._check_w13_input_scales(
+                        experts, 0, shard_id, torch.tensor(value)
+                    )
+
+        if not error:
+            run()
+            return
+        with pytest.raises(ValueError, match="must be equal"):
+            run()
 
 
 class TestPaddingZeroedOnEveryLoad:
