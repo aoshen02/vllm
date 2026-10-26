@@ -1592,6 +1592,14 @@ class TestModuleSource:
         assert [name for name, _ in pairs] == ["w"]
         assert torch.equal(pairs[0][1], w)
 
+    def test_tied_parameter_is_sent_under_each_name(self):
+        # a direct reload requires a tied lm_head's checkpoint name too
+        module = _module_with(("embed", torch.ones(2)))
+        module.head = module.embed
+        source = ModuleSource(module)
+        assert [m.name for m in source.metadata()] == ["embed", "head"]
+        assert [n for n, _ in source] == ["embed", "head"]
+
     def test_source_is_reiterable(self):
         source = ModuleSource(_module_with(("w", torch.zeros(2))))
         assert [n for n, _ in source] == [n for n, _ in source] == ["w"]

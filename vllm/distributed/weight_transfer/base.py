@@ -248,6 +248,9 @@ class WeightSource(ABC):
 class ModuleSource(WeightSource):
     """`WeightSource` over `module.named_parameters()` — the common case.
 
+    A tied parameter is sent under each of its names (a tied ``lm_head`` as
+    well as the embedding): a direct reload requires every checkpoint name.
+
     Handles both plain dense modules and FSDP-sharded ones with no special
     casing: iteration all-gathers each `DTensor` via `full_tensor()` (a
     collective) and passes regular tensors through. `metadata()` reads the
@@ -260,11 +263,11 @@ class ModuleSource(WeightSource):
     def metadata(self) -> list[ParamMeta]:
         return [
             ParamMeta(name, p.dtype, tuple(p.shape))
-            for name, p in self._module.named_parameters()
+            for name, p in self._module.named_parameters(remove_duplicate=False)
         ]
 
     def __iter__(self) -> Iterator[tuple[str, torch.Tensor]]:
-        for name, param in self._module.named_parameters():
+        for name, param in self._module.named_parameters(remove_duplicate=False):
             yield name, materialize_full_tensor(param)
 
 

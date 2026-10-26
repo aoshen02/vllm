@@ -403,6 +403,21 @@ class TestExclusionRule:
         assert model.proj.quant_method.runs == 2
         assert torch.equal(model.proj.weight, new.to(_DEVICE))
 
+    def test_excluding_a_tied_head_refuses(self, monkeypatch):
+        # the embedding's update writes the tensor the excluded head shares
+        monkeypatch.setenv("VLLM_DIRECT_RELOAD_EXCLUDE_REGEX", r"^lm_head\.")
+
+        def build():
+            embed, head = _with_weight(_Layer(None)), _Layer(None)
+            head.weight = embed.weight
+            return _Tree({"embed": embed, "lm_head": head})
+
+        model = _tree_cold_start(build, {"embed.weight": torch.rand(2, 2)})
+        before = _state(model)
+        with pytest.raises(DirectReloadRefused, match=r"shares.*\['lm_head.weight'"):
+            begin_direct_reload(model)
+        _assert_same(_state(model), before, addresses=True)
+
     def test_skipped_module_skips_its_descendants(self, monkeypatch):
         monkeypatch.setenv("VLLM_DIRECT_RELOAD_EXCLUDE_REGEX", r"^engram\.")
         model = _tree_cold_start(

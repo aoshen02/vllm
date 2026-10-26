@@ -343,6 +343,20 @@ def _unsynced_modules(model: torch.nn.Module) -> set[int]:
     for _, module in modules:
         if id(module) not in skipped and visit(module) == (True, False):
             skipped.update(id(m) for m in module.modules())
+    # a tensor a synced module shares (a tied lm_head) is written by the update
+    synced = {id(t) for _, t in _loadable_tensors(model, skipped)}
+    tied = [
+        f"{name}.{local}"
+        for name, module in modules
+        if id(module) in skipped
+        for local, t, _ in _own_tensors(module)
+        if id(t) in synced
+    ]
+    if tied:
+        raise DirectReloadRefused(
+            "direct reload: VLLM_DIRECT_RELOAD_EXCLUDE_REGEX excludes tensors "
+            f"a synced module shares, which must be delivered: {tied[:8]}"
+        )
 
     def reads_skipped(module: torch.nn.Module) -> bool:
         method = getattr(module, "quant_method", None)
