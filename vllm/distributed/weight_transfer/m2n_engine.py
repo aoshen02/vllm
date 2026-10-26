@@ -440,15 +440,25 @@ class M2NWeightTransferEngine(
             not destination.direct for destination in self._parameter_destinations
         )
 
-    def start_weight_update(self) -> None:
-        """Set up layerwise reloading, but only if some parameter needs it.
+    def _reloads(self) -> bool:
+        """Whether an update runs the reload lifecycle.
 
-        Directly-resharded parameters are written in place and never go through
-        `load_weights`, so a plan with no fallback entries has nothing to
-        reload.
+        Layerwise reloading exists for `load_weights`: directly-resharded
+        parameters are written in place, so a plan with no fallback entries
+        skips it. A direct reload runs it whatever wrote the weights: its
+        finish reruns post-load processing and checks addresses, as a cold
+        start on the new weights would.
         """
+        from vllm.model_executor.model_loader.reload.direct import (
+            direct_reload_enabled,
+        )
+
+        return self._uses_load_weights or direct_reload_enabled()
+
+    def start_weight_update(self) -> None:
+        """Set up reloading when the update needs it (`_reloads`)."""
         self._begin_delivery_tracking()
-        if not self._uses_load_weights:
+        if not self._reloads():
             return
         from vllm.model_executor.model_loader.reload import (
             initialize_layerwise_reload,
@@ -457,12 +467,12 @@ class M2NWeightTransferEngine(
         initialize_layerwise_reload(self.model)
 
     def finish_weight_update(self) -> None:
-        """Check the update delivered every weight, then finalize layerwise
-        reloading when the plan uses fallback entries."""
+        """Check the update delivered every weight, then finalize reloading
+        when the update needs it (`_reloads`)."""
         from vllm.model_executor.model_loader.reload import finalize_layerwise_reload
 
         with self._complete_update():
-            if self._uses_load_weights:
+            if self._reloads():
                 finalize_layerwise_reload(self.model, self.model_config)
 
     def receive_weights(self, update_info: M2NWeightTransferUpdateInfo) -> None:
