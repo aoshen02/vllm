@@ -24,8 +24,31 @@ __all__ = ["pin_side_tensors", "snapshot_side_tensors"]
 Path = tuple[tuple[str, Any], ...]
 
 _MAX_DEPTH = 6
-_SKIP_MODULE_PREFIXES = ("vllm.config", "transformers", "torch", "threading", "logging")
+_SKIP_MODULE_PREFIXES = (
+    "vllm.config",
+    "transformers",
+    "tokenizers",
+    "torch",
+    "threading",
+    "logging",
+)
 _SKIP_LAYER_ATTRS = {"_parameters", "_buffers", "_modules", "training"}
+
+
+_OPAQUE: dict[type, bool] = {}
+
+
+def _opaque(cls: type) -> bool:
+    """Library objects that hold no derived device tensors (configs,
+    tokenizers, locks, loggers), also when vLLM subclasses them: the cached
+    tokenizer a multimodal model root keeps is a vLLM subclass of a
+    transformers tokenizer, with ~250k BPE merges."""
+    opaque = _OPAQUE.get(cls)
+    if opaque is None:
+        opaque = _OPAQUE[cls] = any(
+            (c.__module__ or "").startswith(_SKIP_MODULE_PREFIXES) for c in cls.__mro__
+        )
+    return opaque
 
 
 def _children(o: Any) -> list[tuple[tuple[str, Any], Any]]:
@@ -33,7 +56,7 @@ def _children(o: Any) -> list[tuple[tuple[str, Any], Any]]:
         return [(("i", i), v) for i, v in enumerate(o)]
     if isinstance(o, dict):
         return [(("k", k), v) for k, v in o.items()]
-    if (type(o).__module__ or "").startswith(_SKIP_MODULE_PREFIXES):
+    if _opaque(type(o)):
         return []
     d = getattr(o, "__dict__", None)
     out = [(("a", k), v) for k, v in d.items()] if isinstance(d, dict) else []

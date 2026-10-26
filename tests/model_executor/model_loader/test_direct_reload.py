@@ -478,6 +478,25 @@ class TestSideWalk:
         found = collect_side_tensors(second, clean)
         assert list(found) == [(("a", "shared"), ("k", "k"), ("k", "t"))]
 
+    def test_library_subclass_is_not_walked(self):
+        # e.g. vLLM's cached tokenizer subclasses a transformers tokenizer
+        from transformers import PreTrainedConfig
+
+        from vllm.model_executor.model_loader.reload.side_state import (
+            collect_side_tensors,
+        )
+
+        class _Subclass(PreTrainedConfig):
+            pass
+
+        _CountedDict.walks = 0
+        library_object = _Subclass()
+        library_object.merges = _CountedDict({"a": ("b", "c")})
+        layer = torch.nn.Module()
+        layer.tokenizer = library_object
+        assert collect_side_tensors(layer) == {}
+        assert _CountedDict.walks == 0
+
 
 class TestLoudChecks:
     def test_cached_tensor_cannot_change_layout(self):
