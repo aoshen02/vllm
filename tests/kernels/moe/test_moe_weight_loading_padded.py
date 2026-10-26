@@ -865,3 +865,52 @@ class TestPaddingZeroedOnEveryLoad:
         rows = slice(tp_rank * real, (tp_rank + 1) * real)
         assert torch.equal(cold[:real], gate[rows])
         assert torch.equal(cold[padded : padded + real], up[rows])
+
+    @pytest.mark.parametrize("tp_rank", [0, 1], ids=["rank0", "rank1"])
+    def test_batched_expert_run_zeroes_padding(self, tp_rank):
+        # A run of consecutive experts loads in one narrow-and-copy with an
+        # expert dim in front: the intermediate padding between gate and up and
+        # the hidden padding must come out as per expert into zeros.
+        tp, real, padded, hidden, hidden_padded, num = 2, 6, 8, 4, 5, 3
+        experts = object.__new__(RoutedExperts)
+        torch.nn.Module.__init__(experts)
+        experts.moe_config = make_dummy_moe_config(num_experts=num)
+        experts.moe_config.moe_parallel_config.tp_size = tp
+        experts.moe_config.moe_parallel_config.tp_rank = tp_rank
+        experts.expert_map_manager = SimpleNamespace(map_global_to_local=lambda e: e)
+        experts.quant_method = SimpleNamespace()
+        experts.quant_config = None
+        experts._fused_shared_expert_quantizer = None
+
+        def per_expert(*args, **kwargs):
+            raise AssertionError("the run fell back to per-expert loading")
+
+        experts.weight_loader = per_expert  # type: ignore[method-assign]
+        gate, up = (torch.randn(num, tp * real, hidden) for _ in range(2))
+        down = torch.randn(num, hidden, tp * real)
+        loads = (("w1", gate, 0), ("w3", up, 0), ("w2", down, 1))
+        shapes = {
+            "w13": (num, 2 * padded, hidden_padded),
+            "w2": (num, hidden_padded, padded),
+        }
+        cold = {k: torch.zeros(s) for k, s in shapes.items()}
+        stale = {k: torch.full(s, 7.0) for k, s in shapes.items()}
+        for shard_id, weight, shard_dim in loads:
+            key = "w2" if shard_id == "w2" else "w13"
+            for e in range(num):
+                experts._load_model_weight_or_group_weight_scale(
+                    shard_dim=shard_dim,
+                    expert_data=cold[key][e],
+                    shard_id=shard_id,
+                    loaded_weight=weight[e],
+                    tp_rank=tp_rank,
+                )
+            param = torch.nn.Parameter(stale[key], requires_grad=False)
+            assert experts._load_expert_run(
+                param, weight, f"{key}_weight", shard_id, 0, num
+            )
+        rows = slice(tp_rank * real, (tp_rank + 1) * real)
+        assert torch.equal(cold["w13"][:, :real, :hidden], gate[:, rows])
+        assert torch.equal(cold["w2"][:, :hidden, :real], down[:, :, rows])
+        for key in shapes:
+            assert torch.equal(stale[key], cold[key]), key
