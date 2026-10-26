@@ -22,12 +22,16 @@ import pytest
 import torch
 
 from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
+from vllm.model_executor.model_loader.reload import initialize_layerwise_reload
 from vllm.model_executor.model_loader.reload.direct import (
     begin_direct_reload,
     finish_direct_reload,
 )
 from vllm.model_executor.model_loader.utils import process_weights_after_loading
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from vllm.model_executor.model_loader.weight_utils import (
+    default_weight_loader,
+    stash_weight_part,
+)
 from vllm.model_executor.utils import replace_parameter
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
@@ -292,3 +296,20 @@ class TestMovedAddress:
         _reload(model, new)
         fresh = _state(_cold_start(new, rebind=True))
         _assert_same(_state(model), fresh)
+
+
+class TestAbortedUpdate:
+    def test_parked_part_does_not_pair_with_next_update(self):
+        """A part parked by an update that never finished is dropped when the
+        next update begins, so the next update's other part waits for its own."""
+        model = _cold_start(_checkpoint())
+        initialize_layerwise_reload(model)  # update N parks a weight, then aborts
+        stale = torch.full((2, 2), 7.0, device=_DEVICE)
+        assert stash_weight_part(model.attn, "wk", "weight", stale) is None
+
+        initialize_layerwise_reload(model)  # update N + 1
+        scale = torch.ones(1, device=_DEVICE)
+        assert stash_weight_part(model.attn, "wk", "scale", scale) is None
+        fresh = torch.full((2, 2), 3.0, device=_DEVICE)
+        entry = stash_weight_part(model.attn, "wk", "weight", fresh)
+        assert entry is not None and torch.equal(entry["weight"], fresh)
