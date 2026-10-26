@@ -277,9 +277,11 @@ def _unsynced_modules(model: torch.nn.Module) -> set[int]:
             "modules, without a module whose post-load processing reads them: "
             f"{bad[:8]}"
         )
-    # A checkpoint name the regex matches must lie in a skipped module: one
-    # fused or renamed in vLLM (gate_proj -> gate_up_proj) is not skipped,
-    # and its rerun would convert the kept kernel bytes again.
+    # A checkpoint name the regex matches must lie in a skipped module, or
+    # below one (a skipped module's descendants are skipped, renamed or not:
+    # DSv4.1 engram.embed -> engram.embed_tokens). One fused or renamed in
+    # vLLM (gate_proj -> gate_up_proj) is not skipped, and its rerun would
+    # convert the kept kernel bytes again.
     tails = {
         ".".join(parts[i:])
         for name, module in modules
@@ -291,7 +293,10 @@ def _unsynced_modules(model: torch.nn.Module) -> set[int]:
     stray = sorted(
         n
         for n in ckpt_names
-        if excluded.search(n) and n.rpartition(".")[0] not in tails
+        if excluded.search(n)
+        and not any(
+            ".".join(n.split(".")[:i]) in tails for i in range(1, n.count(".") + 1)
+        )
     )
     if stray:
         raise DirectReloadRefused(

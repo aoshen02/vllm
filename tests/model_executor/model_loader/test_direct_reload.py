@@ -463,9 +463,9 @@ class TestExclusionRule:
         "regex,modules,ckpt,refused",
         [
             (
-                r"[.]engram[.]",
-                ["layers.0.attn", "layers.0.engram", "layers.0.engram.proj"],
-                ["layers.0.attn", "layers.0.engram", "layers.0.engram.proj"],
+                r"[.]engram[.]",  # the loader renames engram.embed
+                ["model.layers.0.attn", "model.layers.0.engram.embed_tokens"],
+                ["layers.0.attn", "layers.0.engram.embed"],
                 False,
             ),
             (
