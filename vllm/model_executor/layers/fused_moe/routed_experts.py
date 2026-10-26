@@ -1120,9 +1120,28 @@ class RoutedExperts(PluggableLayer):
     ) -> Iterable[str]:
         # Per-expert checkpoint tensors of one parameter and shard that this
         # layer's weight_loader loads are deferred, then loaded together in
-        # runs of consecutive experts (see _load_expert_run).
+        # runs of consecutive experts (see _load_expert_run), once the deferred
+        # tensors reach _EXPERT_RUN_BYTES and at the end.
         runs: dict[tuple[str, str, str], list[tuple[int, torch.Tensor]]] = {}
         params: dict[str, torch.nn.Parameter] = {}
+        deferred_bytes = 0
+
+        def load_runs() -> Iterable[str]:
+            for (param_name, weight_name, shard_id), items in runs.items():
+                param = params[param_name]
+                for start, stacked in _expert_runs(items):
+                    if param.weight_loader(
+                        param=param,
+                        loaded_weight=stacked,
+                        weight_name=weight_name,
+                        shard_id=shard_id,
+                        expert_id=start,
+                        return_success=True,
+                        num_experts=stacked.shape[0],
+                    ):
+                        yield param_name
+            runs.clear()
+
         expert_mapping = self.get_expert_mapping(include_fused=True)
         mapping_by_expert = _index_expert_mapping(expert_mapping)
 
@@ -1203,6 +1222,11 @@ class RoutedExperts(PluggableLayer):
                     runs.setdefault((param_name, weight_name, shard_id), []).append(
                         (expert_id, loaded_weight)
                     )
+                    deferred_bytes += loaded_weight.nbytes
+                    if deferred_bytes >= _EXPERT_RUN_BYTES:
+                        # bound what the input iterable keeps alive
+                        yield from load_runs()
+                        deferred_bytes = 0
                     continue
                 else:
                     # loaded_weight is a single expert weight, so we add a dummy expert
@@ -1231,19 +1255,7 @@ class RoutedExperts(PluggableLayer):
                         )
                         yield param_name
 
-        for (param_name, weight_name, shard_id), items in runs.items():
-            param = params[param_name]
-            for start, stacked in _expert_runs(items):
-                if param.weight_loader(
-                    param=param,
-                    loaded_weight=stacked,
-                    weight_name=weight_name,
-                    shard_id=shard_id,
-                    expert_id=start,
-                    return_success=True,
-                    num_experts=stacked.shape[0],
-                ):
-                    yield param_name
+        yield from load_runs()
 
     def get_expert_mapping(
         self,
@@ -1591,6 +1603,9 @@ RoutedExperts.weight_loader.supports_moe_loading = True  # type: ignore[attr-def
 # experts per batched load: bounds the stacking copy when the per-expert tensors
 # are not adjacent in memory
 _EXPERT_RUN = 64
+# deferred per-expert bytes after which the runs load: bounds the input
+# tensors (on the device with some loaders) kept alive while deferring
+_EXPERT_RUN_BYTES = 1 << 30
 
 
 def _loads_expert_runs(param: torch.nn.Parameter, experts: object) -> bool:
