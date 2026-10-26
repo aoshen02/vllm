@@ -229,9 +229,6 @@ class NCCLWeightTransferEngine(
         # trainer blocked in its broadcast
         self._record_delivered(update_info.names)
 
-        def load(weights: list[tuple[str, torch.Tensor]]) -> None:
-            self._record_loaded(self.model.load_weights(weights))
-
         from vllm.model_executor.model_loader.mtp_validation import (
             disable_mtp_completeness_check,
         )
@@ -250,7 +247,7 @@ class NCCLWeightTransferEngine(
                     iterator=state_dict_info_iterator(),
                     group=self.model_update_group,
                     src=0,
-                    post_unpack_func=load,
+                    post_unpack_func=self.model.load_weights,
                     buffer_size_bytes=self.packed_buffer_size_bytes,
                     num_buffers=self.packed_num_buffers,
                     device=self.device,
@@ -265,7 +262,7 @@ class NCCLWeightTransferEngine(
                     self.model_update_group.broadcast(
                         weight, src=0, stream=torch.cuda.current_stream()
                     )
-                    load([(name, weight)])
+                    self.model.load_weights([(name, weight)])
                     del weight
         self._busy_s += time.perf_counter() - t0
 

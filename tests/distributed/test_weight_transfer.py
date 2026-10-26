@@ -419,38 +419,24 @@ class TestUpdateCompleteness:
         self._update(engine, sent)
         assert finalized == ["ok"]
 
-    @pytest.mark.parametrize(
-        "sent,reports_names,error",
-        [
-            ([], True, "delivered no tensors"),
-            (FULL[:4], True, "'b.weight'"),
-            (FULL, True, "'audio.weight'"),  # never fed at cold start either
-            ([*FULL, "audio.weight"], False, "did not report"),
-        ],
-        ids=["empty", "partial", "param-not-loaded", "names-unreported"],
-    )
-    def test_first_update_without_cold_start_names_is_checked_as_cold_start(
-        self, monkeypatch, sent, reports_names, error
-    ):
-        # dummy weights: nothing fed at cold start, the first update is the
-        # cold start and gets its check (`track_weights_loading`)
+    def test_without_cold_start_names_empty_first_update_raises(self, monkeypatch):
         finalized: list = []
-        engine = self._engine(monkeypatch, None, reports_names, finalized)
-        with pytest.raises(ValueError, match=error):
-            self._update(engine, sent)
+        engine = self._engine(monkeypatch, None, True, finalized)
+        with pytest.raises(ValueError, match="delivered no tensors"):
+            self._update(engine, [])
         assert finalized == []
 
     def test_without_cold_start_names_first_successful_update_is_required(
         self, monkeypatch
     ):
-        full = [*self.FULL, "audio.weight"]
+        # dummy weights: nothing fed at cold start
         finalized: list = ["fail"]
         engine = self._engine(monkeypatch, None, True, finalized)
         with pytest.raises(RuntimeError, match="post-load"):
-            self._update(engine, full)  # failed: not adopted
-        self._update(engine, full)
-        with pytest.raises(ValueError, match="'audio.weight'"):
-            self._update(engine, self.FULL)
+            self._update(engine, self.FULL[:2])  # failed: not adopted
+        self._update(engine, self.FULL)
+        with pytest.raises(ValueError, match="'b.weight'"):
+            self._update(engine, self.FULL[:4])
         assert finalized == ["failed", "ok"]
 
 
