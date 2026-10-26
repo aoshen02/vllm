@@ -194,6 +194,11 @@ class AsyncIntermediateTensors(IntermediateTensors):
 
 
 class Worker(WorkerBase):
+    _incomplete_updates: frozenset[str] = frozenset()
+    """Models ("target", "draft") a weight update started on and did not
+    complete. Updates modify the weights in place without a rollback, so these
+    models may hold a mix of old and new weights: they must not run."""
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -1325,6 +1330,8 @@ class Worker(WorkerBase):
     def execute_model(
         self, scheduler_output: "SchedulerOutput"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
+        if scheduler_output.total_num_scheduled_tokens > 0:
+            self._check_weights_complete()
         # Wait for the previous step's sends so this forward pass cannot
         # overwrite buffers they are still reading.
         if self._pp_send_work:
@@ -1452,6 +1459,7 @@ class Worker(WorkerBase):
         )
 
     def execute_dummy_batch(self) -> None:
+        self._check_weights_complete()
         num_tokens = getattr(self.model_runner, "uniform_decode_query_len", 1)
         self.model_runner._dummy_run(
             num_tokens,
@@ -1496,6 +1504,15 @@ class Worker(WorkerBase):
             tensorizer_config=tensorizer_config,
             model_config=self.model_config,
         )
+
+    def _check_weights_complete(self) -> None:
+        if self._incomplete_updates:
+            raise RuntimeError(
+                "A weight update of the "
+                f"{' and '.join(sorted(self._incomplete_updates))} model did not "
+                "complete, so its weights may be partly updated; the worker "
+                "refuses to run the model until a weight update completes."
+            )
 
     def _check_weight_transfer_engine(self) -> None:
         if self.weight_transfer_engine is None:
@@ -1568,6 +1585,7 @@ class Worker(WorkerBase):
                 # Load through the unquantized target head, as without
                 # draft_lm_head_quantization; finish re-derives the copies.
                 share_source_lm_heads(draft_model)
+            self._incomplete_updates |= {"draft" if is_draft else "target"}
             self.weight_transfer_engine.start_weight_update()
         except BaseException:
             self.weight_transfer_engine.reset_weight_update_target()
@@ -1610,12 +1628,7 @@ class Worker(WorkerBase):
                     local_update_info = update_info
                 self.weight_transfer_engine.update_weights(local_update_info)
             except BaseException:
-                self._weight_update_active = False
-                self.weight_transfer_engine.reset_weight_update_target()
-                if self._weight_update_is_draft and (
-                    (draft_model := self.get_draft_model()) is not None
-                ):
-                    restore_quantized_lm_heads(draft_model, refresh=False)
+                self._end_weight_update(completed=False)
                 raise
 
     def finish_weight_update(self) -> None:
@@ -1629,17 +1642,30 @@ class Worker(WorkerBase):
             )
 
         with set_current_vllm_config(self.vllm_config):
-            self.weight_transfer_engine.finish_weight_update()
-            self.weight_transfer_engine.reset_weight_update_target()
-            self._weight_update_active = False
-            if self._weight_update_is_draft and (
-                (draft_model := self.get_draft_model()) is not None
-            ):
-                restore_quantized_lm_heads(draft_model)
+            try:
+                self.weight_transfer_engine.finish_weight_update()
+            except BaseException:
+                self._end_weight_update(completed=False)
+                raise
+            self._end_weight_update(completed=True)
 
         # Weight transfer bypasses GPUModelRunner.reload_weights().
         if not self._weight_update_is_draft:
             self.model_runner.reset_lora_state()
+
+    def _end_weight_update(self, completed: bool) -> None:
+        """End the session; a later one may retry a failed update."""
+        assert self.weight_transfer_engine is not None
+        self.weight_transfer_engine.reset_weight_update_target()
+        self._weight_update_active = False
+        if completed:
+            self._incomplete_updates -= {
+                "draft" if self._weight_update_is_draft else "target"
+            }
+        if self._weight_update_is_draft and (
+            (draft_model := self.get_draft_model()) is not None
+        ):
+            restore_quantized_lm_heads(draft_model, refresh=completed)
 
     def shutdown(self) -> None:
         gc.unfreeze()

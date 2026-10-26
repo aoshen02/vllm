@@ -457,3 +457,13 @@ class TestLoudChecks:
             model = _one_layer(None, torch.rand(4, 4))
         with pytest.raises(NotImplementedError, match="pre-processed"):
             begin_direct_reload(model)
+
+
+def test_retry_after_aborted_update_matches_cold_start():
+    # Direct reload has no rollback: a failed update leaves the model partly
+    # updated (the worker refuses to run it), and the next full update repairs it.
+    model = _cold_start(_checkpoint())
+    begin_direct_reload(model)
+    model.load_weights(list(_checkpoint(1.01).items())[:3])  # update aborts
+    _reload(model, _checkpoint(1.01))
+    _assert_same(_state(model), _state(_cold_start(_checkpoint(1.01))))

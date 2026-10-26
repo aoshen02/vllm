@@ -22,6 +22,7 @@ class _RecordingEngine:
 
     def __init__(self, raise_on_update: bool = False):
         self.raise_on_update = raise_on_update
+        self.raise_on_finish = False
         self.started = False
         self.finished = False
         self.closed = False
@@ -45,6 +46,8 @@ class _RecordingEngine:
 
     def finish_weight_update(self) -> None:
         self._record_config()
+        if self.raise_on_finish:
+            raise ValueError("boom")
         self.finished = True
 
     def reset_weight_update_target(self) -> None:
@@ -244,3 +247,28 @@ def test_missing_engine_raises():
     worker = _make_worker(None)
     with pytest.raises(RuntimeError, match="Weight transfer not configured"):
         Worker.start_weight_update(worker)
+
+
+@pytest.mark.parametrize("fail", ["update", "finish"])
+def test_failed_update_refuses_to_run_until_an_update_completes(fail):
+    # Updates write the weights in place without a rollback (direct reload),
+    # so after a failure the model may hold a mix of old and new weights.
+    engine = _RecordingEngine(raise_on_update=fail == "update")
+    engine.raise_on_finish = fail == "finish"
+    worker = _make_worker(engine)
+    Worker._check_weights_complete(worker)
+
+    Worker.start_weight_update(worker)
+    with pytest.raises(ValueError, match="boom"):
+        Worker.update_weights(worker, {"names": ["w"]})
+        Worker.finish_weight_update(worker)
+    assert worker._weight_update_active is False
+    with pytest.raises(RuntimeError, match="refuses to run the model"):
+        Worker._check_weights_complete(worker)
+
+    # a retry that completes makes the worker usable again
+    engine.raise_on_update = engine.raise_on_finish = False
+    Worker.start_weight_update(worker)
+    Worker.update_weights(worker, {"names": ["w"]})
+    Worker.finish_weight_update(worker)
+    Worker._check_weights_complete(worker)
