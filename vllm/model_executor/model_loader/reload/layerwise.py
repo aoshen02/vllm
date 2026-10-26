@@ -98,13 +98,8 @@ def initialize_layerwise_reload(model: torch.nn.Module):
     3. Run quantization processing if applicable
     4. Copy processed values back to original tensor storage
     """
-    from .direct import (
-        begin_direct_reload,
-        direct_reload_enabled,
-        unsynced_weights_regex,
-    )
+    from .direct import begin_direct_reload, direct_reload_enabled
 
-    unsynced_weights_regex()  # a malformed pattern refuses before any change
     # Parts parked by an update that never finished must not pair with this one
     discard_weight_parts(model)
 

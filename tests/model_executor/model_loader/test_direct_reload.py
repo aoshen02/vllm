@@ -879,6 +879,20 @@ class TestLoudChecks:
         assert not hasattr(model, "_direct_skipped")
 
 
+def test_layerwise_reload_ignores_the_direct_regex(monkeypatch):
+    from vllm.model_executor.model_loader.reload import (
+        finalize_layerwise_reload,
+        record_metadata_for_reloading,
+    )
+
+    monkeypatch.setenv("VLLM_RELOAD_MODE", "layerwise")
+    monkeypatch.setenv("VLLM_DIRECT_RELOAD_EXCLUDE_REGEX", "[")
+    model = torch.nn.Linear(2, 2)
+    record_metadata_for_reloading(model)
+    initialize_layerwise_reload(model)
+    finalize_layerwise_reload(model, SimpleNamespace(dtype=torch.float32))
+
+
 def test_retry_after_aborted_update_matches_cold_start():
     # Direct reload has no rollback: a failed update leaves the model partly
     # updated (the worker refuses to run it), and the next full update repairs it.
