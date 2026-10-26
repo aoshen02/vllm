@@ -1,18 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Keep tensors held outside a layer's parameters and buffers at their
-startup storage across a reload.
+"""Keep a layer's derived tensors at their startup storage across a reload.
 
-`process_weights_after_loading` often stores tensors on objects hanging off
-the layer rather than registering them: `quant_method.moe_quant_config`,
+`process_weights_after_loading` derives tensors from the checkpoint and
+registers them (kernel constants, derived scales) or stores them on objects
+hanging off the layer: `quant_method.moe_quant_config`,
 `quant_method.moe_kernel`, experts objects, plain layer attributes. A reload
-reruns it, so those objects end up pointing at freshly allocated tensors,
-while CUDA graphs captured at startup keep reading the startup storage.
+reruns it, so the layer ends up holding freshly allocated tensors, while CUDA
+graphs captured at startup keep reading the startup storage.
 
-One rule: before the rerun, `snapshot_side_tensors` records every device
-tensor reachable from the layer's attributes, by attribute path, as an alias
-of its storage; after the rerun, `pin_side_tensors` copies the tensor found at
-the same path into that storage and puts the alias back at the path.
+One rule: before the rerun, `snapshot_side_tensors` records every derived
+device tensor of the layer (registered without a checkpoint layout, or
+reachable from its attributes) by path, as an alias of its storage; after the
+rerun, `pin_side_tensors` copies the tensor found at the same path into that
+storage and rebinds that tensor object to it (`t.data = startup`), so every
+holder of the object reads the startup storage.
 """
 
 from typing import Any
@@ -72,7 +74,9 @@ Clean = dict[int, tuple[int, Any]]
 def collect_side_tensors(
     layer: torch.nn.Module, clean: Clean | None = None
 ) -> dict[Path, torch.Tensor]:
-    """Every tensor reachable from the layer's non-module attributes, by path.
+    """The layer's derived tensors, by path: registered tensors without a
+    checkpoint layout (the address check covers the checkpoint ones), and
+    every tensor reachable from its non-module attributes.
 
     ``clean`` is shared by the calls of one pass over a model's modules and
     must not outlive it. It records objects proven tensor-free (by id, with
@@ -110,6 +114,10 @@ def collect_side_tensors(
             clean[id(o)] = (depth, o)
         return tensor_free
 
+    for registered in (layer._parameters, layer._buffers):
+        for name, t in registered.items():
+            if t is not None and not hasattr(t, "_ckpt_layout"):
+                found[(("a", name),)] = t
     for name, value in vars(layer).items():
         if (
             name in _SKIP_LAYER_ATTRS
@@ -121,33 +129,6 @@ def collect_side_tensors(
     return found
 
 
-def _get(o: Any, key: tuple[str, Any]) -> Any:
-    kind, k = key
-    return getattr(o, k) if kind == "a" else o[k]
-
-
-def _with(o: Any, key: tuple[str, Any], value: Any) -> Any:
-    """Set `key` on `o`; returns the container to keep (a new one for tuples)."""
-    kind, k = key
-    if kind == "a":
-        object.__setattr__(o, k, value)
-        return o
-    if isinstance(o, tuple):
-        items = list(o)
-        items[k] = value
-        return type(o)(*items) if hasattr(o, "_fields") else type(o)(items)
-    o[k] = value
-    return o
-
-
-def _set_path(root: Any, path: Path, value: Any) -> Any:
-    if len(path) == 1:
-        return _with(root, path[0], value)
-    child = _get(root, path[0])
-    new_child = _set_path(child, path[1:], value)
-    return root if new_child is child else _with(root, path[0], new_child)
-
-
 def _layout(t: torch.Tensor) -> tuple:
     return (tuple(t.shape), t.stride(), t.dtype, t.device)
 
@@ -155,9 +136,9 @@ def _layout(t: torch.Tensor) -> tuple:
 def snapshot_side_tensors(
     layer: torch.nn.Module, clean: Clean | None = None
 ) -> dict[Path, torch.Tensor]:
-    """Device tensors reachable from the layer's non-module attributes, by
-    path. Aliases, not the objects: `x.data = y` later leaves them on the
-    storage graphs captured. ``clean``: see `collect_side_tensors`."""
+    """The layer's derived device tensors, by path. Aliases, not the objects:
+    `x.data = y` later leaves them on the storage graphs captured.
+    ``clean``: see `collect_side_tensors`."""
     return {
         path: t.detach()
         for path, t in collect_side_tensors(layer, clean).items()
@@ -171,11 +152,11 @@ def pin_side_tensors(
     before: dict[Path, torch.Tensor],
     clean: Clean | None = None,
 ) -> list[str]:
-    """Put every snapshotted path back on its startup storage, holding the
-    rerun's values. Returns the paths that cannot be pinned: gone, or now a
-    tensor of a different shape, stride, dtype or device. ``clean``: see
-    `collect_side_tensors`; pinning only writes on paths to tensors, so the
-    objects it proved tensor-free stay so."""
+    """Put the tensor at every snapshotted path back on its startup storage,
+    holding the rerun's values. Returns the paths that cannot be pinned: gone,
+    or now a tensor of a different shape, stride, dtype or device.
+    ``clean``: see `collect_side_tensors`; pinning changes no object but
+    tensors, so the objects it proved tensor-free stay so."""
     after = collect_side_tensors(layer, clean)
     failed = []
     for path, old in before.items():
@@ -188,7 +169,7 @@ def pin_side_tensors(
             failed.append(_fmt(path))
             continue
         old.copy_(t)
-        _set_path(layer, path, old)
+        t.data = old  # every holder of `t`, seen by the walk or not
     return failed
 
 

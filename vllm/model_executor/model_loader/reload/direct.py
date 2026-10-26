@@ -322,59 +322,28 @@ def finish_direct_reload(model: torch.nn.Module, model_config) -> None:
 
 
 def _snapshot_side_state(model: torch.nn.Module, skipped_ids: Set[int]):
-    """Before the rerun: each processed module's derived device tensors, i.e.
-    registered tensors not loaded from the checkpoint (kernel constants,
-    derived scales) and tensors reachable from its plain attributes, as
-    aliases of their storage. CUDA graphs captured at cold start read these
-    storages, so the rerun's values have to land in them."""
+    """Before the rerun: each processed module's derived device tensors
+    (`side_state`), as aliases of their storage. CUDA graphs captured at cold
+    start read these storages, so the rerun's values have to land in them."""
     from .side_state import snapshot_side_tensors
 
-    out = []
     clean: dict = {}  # tensor-free objects shared by the modules, walked once
-    for name, module in model.named_modules():
-        if id(module) in skipped_ids:
-            continue
-        registered = {
-            n: t.detach()
-            for n, t in list(module._parameters.items()) + list(module._buffers.items())
-            if t is not None
-            and not hasattr(t, "_ckpt_layout")
-            and t.device.type not in ("cpu", "meta")
-        }
-        out.append((name, module, registered, snapshot_side_tensors(module, clean)))
-    return out
+    return [
+        (name, module, snapshot_side_tensors(module, clean))
+        for name, module in model.named_modules()
+        if id(module) not in skipped_ids
+    ]
 
 
 def _pin_side_state(pinned) -> list[str]:
     """After the rerun: copy every derived tensor the rerun reallocated into
-    its startup storage and point the module back at that storage. Returns
-    the tensors that cannot be pinned (gone, or a different layout)."""
+    its startup storage and rebind it there. Returns the tensors that cannot
+    be pinned (gone, or a different layout)."""
     from .side_state import pin_side_tensors
 
-    failed = []
     clean: dict = {}
-    for name, module, registered, side in pinned:
-        prefix = f"{name}." if name else ""
-        for n, old in registered.items():
-            cur = _registered(module, n)
-            if cur is None or (
-                cur.untyped_storage().data_ptr() == old.untyped_storage().data_ptr()
-            ):
-                continue  # gone: the address check names it
-            if (cur.shape, cur.stride(), cur.dtype, cur.device) != (
-                old.shape,
-                old.stride(),
-                old.dtype,
-                old.device,
-            ):
-                failed.append(prefix + n)
-                continue
-            old.copy_(cur)
-            if n in module._parameters:
-                cur.data = old
-            else:
-                module._buffers[n] = old
-        failed += [
-            prefix + p.lstrip(".") for p in pin_side_tensors(module, side, clean)
-        ]
-    return failed
+    return [
+        f"{name}.{path}" if name else path
+        for name, module, side in pinned
+        for path in (p.lstrip(".") for p in pin_side_tensors(module, side, clean))
+    ]
