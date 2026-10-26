@@ -69,6 +69,7 @@ from vllm.distributed.weight_transfer.sparse_nccl_engine import (
     SparseWeightPatch,
 )
 from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
+from vllm.model_executor.model_loader.weight_utils import stash_weight_part
 from vllm.platforms import current_platform
 from vllm.utils.nccl import _nccl_has_no_cache
 from vllm.utils.network_utils import get_open_port
@@ -242,17 +243,22 @@ def test_nccl_shutdown_destroys_communicator_once(engine_type):
 
 
 class TestUpdateCompleteness:
-    """An update reruns the cold-start completeness check once, over the names
-    all its `load_weights` calls (one per tensor here) initialized."""
+    """An update reruns the cold-start completeness checks once, over the names
+    all its `load_weights` calls (one per tensor here) initialized, before the
+    reload is finalized."""
 
     NAMES = ["a.weight", "b.weight", "engram.weight"]
 
     @staticmethod
-    def _engine(monkeypatch, reports_names: bool) -> NCCLWeightTransferEngine:
+    def _engine(
+        monkeypatch, reports_names: bool, finalized: list
+    ) -> NCCLWeightTransferEngine:
         import vllm.model_executor.model_loader.reload as reload
 
-        for name in ("initialize_layerwise_reload", "finalize_layerwise_reload"):
-            monkeypatch.setattr(reload, name, lambda *_: None)
+        monkeypatch.setattr(reload, "initialize_layerwise_reload", lambda *_: None)
+        monkeypatch.setattr(
+            reload, "finalize_layerwise_reload", lambda *_: finalized.append(1)
+        )
         monkeypatch.setattr(torch.cuda, "current_stream", lambda *_, **__: None)
         for name in ("synchronize", "reset_peak_memory_stats"):
             monkeypatch.setattr(torch.accelerator, name, lambda *_: None)
@@ -267,6 +273,9 @@ class TestUpdateCompleteness:
 
             def load_weights(self, weights):
                 names = {name for name, _ in weights}
+                if "a.weight_scale" in names:  # first part of a two-part weight
+                    stash_weight_part(self.a, "a", "scale", torch.ones(1))
+                    names = {"a.weight"}
                 return names if reports_names else None
 
         model = Model()
@@ -289,12 +298,20 @@ class TestUpdateCompleteness:
             (["a.weight", "engram.weight"], "", True, "b.weight"),
             (["a.weight", "b.weight"], r"[.]?engram[.]", True, None),
             (["a.weight"], "", False, None),
+            (["a.weight_scale", "b.weight", "engram.weight"], "", True, "has"),
         ],
-        ids=["full", "missing-raises", "unsynced-excluded", "names-unreported"],
+        ids=[
+            "full",
+            "missing-raises",
+            "unsynced-excluded",
+            "names-unreported",
+            "unpaired-part-raises",
+        ],
     )
     def test_nccl_update(self, monkeypatch, sent, exclude, reports_names, missing):
         monkeypatch.setenv("VLLM_DIRECT_RELOAD_EXCLUDE_REGEX", exclude)
-        engine = self._engine(monkeypatch, reports_names)
+        finalized: list = []
+        engine = self._engine(monkeypatch, reports_names, finalized)
         engine.start_weight_update()
         engine.receive_weights(
             NCCLWeightTransferUpdateInfo(
@@ -305,12 +322,11 @@ class TestUpdateCompleteness:
         )
         if missing is None:
             engine.finish_weight_update()
+            assert finalized == [1]
             return
-        with pytest.raises(
-            ValueError, match="not initialized from the weight update"
-        ) as e:
+        with pytest.raises(ValueError, match=missing):
             engine.finish_weight_update()
-        assert missing in str(e.value)
+        assert finalized == []  # raised before post-load processing
 
 
 class TestNCCLEngineParsing:

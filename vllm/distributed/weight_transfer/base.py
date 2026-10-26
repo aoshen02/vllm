@@ -431,27 +431,40 @@ class WeightTransferEngine(ABC, Generic[TInitInfo, TUpdateInfo]):
             self._update_loaded.update(names)
 
     def _check_update_complete(self) -> None:
-        """Run the cold-start completeness check once over the whole update.
+        """Run the cold-start completeness checks once over the whole update.
+
+        Must run before the reload is finalized: post-load processing of a
+        weight that did not arrive would rewrite its runtime bytes in place
+        (direct reload views them as checkpoint bytes), which cannot be
+        undone.
 
         One update spans many `load_weights` calls (one per bucket), each a
         part of the checkpoint, so the check runs on their union, at the
         granularity cold start checks: the whole load. Names the trainer
         deliberately does not sync (`VLLM_DIRECT_RELOAD_EXCLUDE_REGEX`) are
-        not required. Raises like cold start on a missing name.
+        not required. Raises like cold start on a missing name, and on a
+        multi-tensor weight whose parts did not all arrive.
         """
-        loaded, self._update_loaded = self._update_loaded, None
-        if loaded is None:
-            return
-        from vllm.model_executor.model_loader.default_loader import (
-            check_all_weights_loaded,
-        )
-        from vllm.model_executor.model_loader.reload.direct import (
-            unsynced_weights_regex,
+        from vllm.model_executor.model_loader.weight_utils import (
+            check_weight_parts_complete,
         )
 
-        check_all_weights_loaded(
-            self.model, loaded, unsynced_weights_regex(), source="the weight update"
-        )
+        loaded, self._update_loaded = self._update_loaded, None
+        if loaded is not None:
+            from vllm.model_executor.model_loader.default_loader import (
+                check_all_weights_loaded,
+            )
+            from vllm.model_executor.model_loader.reload.direct import (
+                unsynced_weights_regex,
+            )
+
+            check_all_weights_loaded(
+                self.model,
+                loaded,
+                unsynced_weights_regex(),
+                source="the weight update",
+            )
+        check_weight_parts_complete(self.model)
 
     def set_weight_update_target(
         self,
