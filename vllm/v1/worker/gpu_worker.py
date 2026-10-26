@@ -1681,14 +1681,14 @@ class Worker(WorkerBase):
         with set_current_vllm_config(self.vllm_config):
             try:
                 self.weight_transfer_engine.finish_weight_update()
+                # Weight transfer bypasses GPUModelRunner.reload_weights().
+                # This also refreshes draft heads derived from the target.
+                if not self._weight_update_is_draft:
+                    self.model_runner.reset_lora_state()
             except BaseException:
                 self._end_weight_update(completed=False)
                 raise
             self._end_weight_update(completed=True)
-
-        # Weight transfer bypasses GPUModelRunner.reload_weights().
-        if not self._weight_update_is_draft:
-            self.model_runner.reset_lora_state()
 
     def _end_weight_update(self, completed: bool) -> None:
         """End the session; a later one may retry a failed update."""

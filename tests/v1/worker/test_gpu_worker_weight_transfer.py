@@ -321,6 +321,23 @@ def test_failed_draft_head_restore_keeps_the_draft_incomplete(monkeypatch):
         Worker._check_weights_complete(worker)
 
 
+def test_failed_target_derived_refresh_keeps_the_target_incomplete(monkeypatch):
+    # the V2 runner's reset_lora_state re-derives the draft's quantized heads
+    # from the updated target
+    worker = _make_worker(_RecordingEngine())
+
+    def refresh():
+        raise torch.OutOfMemoryError("quantized head copy")
+
+    monkeypatch.setattr(worker.model_runner, "reset_lora_state", refresh)
+    Worker.start_weight_update(worker)
+    with pytest.raises(torch.OutOfMemoryError):
+        Worker.finish_weight_update(worker)
+    assert worker._weight_update_active is False
+    with pytest.raises(RuntimeError, match="target model did not complete"):
+        Worker._check_weights_complete(worker)
+
+
 @pytest.mark.parametrize(
     "from_disk,checkpoint_format,clears",
     [(True, True, True), (False, True, False), (True, False, False)],
