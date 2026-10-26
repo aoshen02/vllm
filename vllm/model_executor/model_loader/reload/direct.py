@@ -422,23 +422,30 @@ def _snapshot_side_state(model: torch.nn.Module):
     """Before the update modifies the model: each module's derived device
     tensors (`side_state`), as aliases of their storage and view. CUDA graphs
     captured at cold start read these, so the rerun's values have to land in
-    them. Skipped modules too: the model-level hook still runs over them."""
-    from .side_state import SideWalk, snapshot_side_tensors
+    them. Skipped modules too: the model-level hook still runs over them.
+    Refuses when the walk stops at its depth limit: what lies below could
+    not be pinned."""
+    from .side_state import _MAX_DEPTH, SideWalk, snapshot_side_tensors
 
     side_walk = SideWalk()
     pinned = [
         (name, module, snapshot_side_tensors(module, side_walk))
         for name, module in model.named_modules()
     ]
-    _log_truncated(side_walk, "snapshot")
+    if side_walk.truncated:
+        raise DirectReloadRefused(
+            f"direct reload: the side-state walk stopped at depth {_MAX_DEPTH} "
+            f"on {len(side_walk.truncated)} objects; derived tensors below them "
+            "could not be pinned"
+        )
     return pinned
 
 
 def _pin_side_state(pinned) -> list[str]:
     """After the rerun: copy every derived tensor the rerun reallocated into
     its startup storage and rebind it there. Returns the tensors that cannot
-    be pinned (gone, or a different layout)."""
-    from .side_state import SideWalk, pin_side_tensors
+    be pinned (gone, a different layout, or past the walk's depth limit)."""
+    from .side_state import _MAX_DEPTH, SideWalk, pin_side_tensors
 
     side_walk = SideWalk()
     failed = [
@@ -446,18 +453,7 @@ def _pin_side_state(pinned) -> list[str]:
         for name, module, side in pinned
         for path in (p.lstrip(".") for p in pin_side_tensors(module, side, side_walk))
     ]
-    _log_truncated(side_walk, "pin")
-    return failed
-
-
-def _log_truncated(side_walk, what: str) -> None:
-    from .side_state import _MAX_DEPTH
-
     if side_walk.truncated:
-        logger.warning(
-            "direct reload: the side-state %s walk stopped at depth %d on %d "
-            "objects; tensors below them are not pinned",
-            what,
-            _MAX_DEPTH,
-            side_walk.truncated,
-        )
+        n = len(side_walk.truncated)
+        failed.append(f"<{n} objects past depth {_MAX_DEPTH}>")
+    return failed

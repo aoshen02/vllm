@@ -15,6 +15,11 @@ reachable from its attributes) by path, as an alias of its storage; after the
 rerun, `pin_side_tensors` copies the tensor found at the same path into that
 storage and rebinds that tensor object to it (`t.data = startup`), so every
 holder of the object reads the startup storage.
+
+A walk that stops at its depth limit refuses the reload. Out of scope (not
+walked, so a tensor held only there is not pinned): `functools.partial`
+arguments, closure cells, and `__slots__` of a base class whose subclass
+declares its own.
 """
 
 import functools
@@ -96,12 +101,14 @@ class SideWalk:
     keep the id valid), so objects every layer references, e.g. a
     quantization config with a dict per checkpoint layer, are walked once per
     pass instead of once per layer. A proof covers the object's whole
-    reachable graph, so it holds at any depth. ``truncated`` counts the
-    objects left unwalked at the depth limit: never proven, never pinned."""
+    reachable graph, so it holds at any depth. ``truncated`` holds the
+    objects reached only past the depth limit, never walked in the pass:
+    never proven, never pinned."""
 
     def __init__(self) -> None:
         self.clean: dict[int, Any] = {}
-        self.truncated = 0
+        self.walked: dict[int, Any] = {}
+        self.truncated: dict[int, Any] = {}
 
 
 def collect_side_tensors(
@@ -127,11 +134,14 @@ def collect_side_tensors(
         if id(o) in clean:
             return True
         if depth > _MAX_DEPTH:
-            state.truncated += 1
+            if id(o) not in state.walked:
+                state.truncated[id(o)] = o
             return False
         if seen.get(id(o), depth + 1) <= depth:
             return False  # walked on a path at most as deep: not proven here
         seen[id(o)] = depth  # first reached, or shallower than before: walk
+        state.walked[id(o)] = o
+        state.truncated.pop(id(o), None)
         tensor_free = True
         for key, child in _children(o):
             tensor_free = walk(child, path + (key,), depth + 1) and tensor_free

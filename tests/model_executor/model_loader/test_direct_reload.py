@@ -644,6 +644,7 @@ class TestSideWalk:
             assert found == {}
             found = collect_side_tensors(second, side_walk)
         assert list(found) == [(("a", "b_shared"), ("k", "k"), ("k", "t"))]
+        assert not side_walk.truncated  # walked after all: nothing unpinned
 
     def test_depth_limit_is_not_a_proof(self):
         from vllm.model_executor.model_loader.reload.side_state import (
@@ -656,8 +657,20 @@ class TestSideWalk:
         layer.deep = self._nested(torch.ones(2), _MAX_DEPTH + 1)
         side_walk = SideWalk()
         assert collect_side_tensors(layer, side_walk) == {}
-        assert side_walk.truncated == 1
+        assert len(side_walk.truncated) == 1
         assert not any(isinstance(o, list) for o in side_walk.clean.values())
+
+    def test_truncated_walk_refuses_the_update(self):
+        from vllm.model_executor.model_loader.reload.side_state import _MAX_DEPTH
+
+        def fn(layer):  # a derived tensor below the depth limit
+            layer.deep = self._nested(layer.weight * 2, _MAX_DEPTH + 1)
+
+        model = _one_layer(fn, torch.rand(4, 4))
+        before = _state(model)
+        with pytest.raises(DirectReloadRefused, match="stopped at depth"):
+            begin_direct_reload(model)
+        _assert_same(_state(model), before, addresses=True)
 
     @pytest.mark.parametrize(
         "base", ["tokenizer", "config", "vllm-subclass", "remote-code"]
