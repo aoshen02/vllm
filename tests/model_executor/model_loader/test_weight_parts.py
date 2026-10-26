@@ -4,6 +4,7 @@
 updates send one bucket per call); its parts pair up across calls."""
 
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 import torch
@@ -154,3 +155,33 @@ def test_molmo_embedding_halves_split_across_calls(module_name):
     assert [n for n, _ in first] == ["x"]
     assert name == "model.embed_tokens.weight"
     torch.testing.assert_close(merged, torch.cat([emb, new_emb]))
+
+
+@pytest.mark.parametrize("shipped", [True, False], ids=["shipped", "omitted"])
+def test_bert_decoder_from_embeddings_only_when_omitted(monkeypatch, shipped):
+    # the embeddings and the decoder may arrive in different calls
+    import vllm.model_executor.models.bert as bert
+
+    class Loader:
+        def __init__(self, model):
+            pass
+
+        def load_weights(self, weights, mapper=None):
+            return {name for name, _ in weights}
+
+    monkeypatch.setattr(bert, "AutoWeightsLoader", Loader)
+    emb, decoder = torch.ones(3, 2), torch.zeros(3, 2)
+    model = SimpleNamespace(
+        decoder_in_checkpoint=False,
+        hf_to_vllm_mapper=None,
+        bert=SimpleNamespace(
+            embeddings=SimpleNamespace(word_embeddings=SimpleNamespace(weight=emb))
+        ),
+        mlm_head=SimpleNamespace(decoder=SimpleNamespace(weight=decoder)),
+    )
+    cls: Any = bert.BertForMaskedLM
+    if shipped:
+        cls.load_weights(model, [("mlm_head.decoder.weight", decoder)])
+    cls.load_weights(model, [("bert.embeddings.word_embeddings.weight", emb)])
+    cls.process_weights_after_loading(model)
+    assert torch.equal(decoder, torch.zeros(3, 2) if shipped else emb)
