@@ -792,14 +792,18 @@ class TestLoadWeightsExpertMapping:
 
 
 class TestExpertRunRetention:
-    """Deferred per-expert tensors load once they reach _EXPERT_RUN_BYTES,
-    so the input iterable's tensors are not all kept alive until it ends."""
+    """Deferred per-expert tensors load once the storages they keep alive
+    reach _EXPERT_RUN_BYTES, so the input iterable's tensors are not all kept
+    alive until it ends."""
 
-    def test_deferred_experts_load_in_bounded_batches(self, monkeypatch):
+    @pytest.mark.parametrize(
+        "rows", [2, 64], ids=["own-storage", "view-of-a-larger-storage"]
+    )
+    def test_deferred_experts_load_in_bounded_batches(self, monkeypatch, rows):
         from vllm.model_executor.layers.fused_moe import routed_experts
 
-        num, shape = 16, (2, 3)
-        cap = 4 * torch.zeros(shape).nbytes
+        num = 16
+        cap = 4 * torch.zeros(rows, 3).nbytes
         monkeypatch.setattr(routed_experts, "_loads_expert_runs", lambda *_: True)
         monkeypatch.setattr(routed_experts, "_EXPERT_RUN_BYTES", cap)
         mapping = TestLoadWeightsExpertMapping._mapping()
@@ -822,7 +826,8 @@ class TestExpertRunRetention:
         def weights():
             for e in range(num):
                 pending.append(e - len(loaded))
-                yield f"{e}.gate_proj.weight", torch.full(shape, float(e))
+                # each expert a view of its own storage of `rows` rows
+                yield f"{e}.gate_proj.weight", torch.full((rows, 3), float(e))[:2]
 
         assert set(RoutedExperts.load_weights(experts, weights())) == {"w13_weight"}
         assert max(pending) < 4

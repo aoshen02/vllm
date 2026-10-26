@@ -1124,10 +1124,11 @@ class RoutedExperts(PluggableLayer):
     ) -> Iterable[str]:
         # Per-expert checkpoint tensors of one parameter and shard that this
         # layer's weight_loader loads are deferred, then loaded together in
-        # runs of consecutive experts (see _load_expert_run), once the deferred
-        # tensors reach _EXPERT_RUN_BYTES and at the end.
+        # runs of consecutive experts (see _load_expert_run), once the storages
+        # the deferred tensors keep alive reach _EXPERT_RUN_BYTES and at the end.
         runs: dict[tuple[str, str, str], list[tuple[int, torch.Tensor]]] = {}
         params: dict[str, torch.nn.Parameter] = {}
+        retained: set[int] = set()  # data_ptr of each deferred tensor's storage
         deferred_bytes = 0
 
         def load_runs() -> Iterable[str]:
@@ -1226,10 +1227,15 @@ class RoutedExperts(PluggableLayer):
                     runs.setdefault((param_name, weight_name, shard_id), []).append(
                         (expert_id, loaded_weight)
                     )
-                    deferred_bytes += loaded_weight.nbytes
+                    # a view keeps its whole storage alive
+                    storage = loaded_weight.untyped_storage()
+                    if storage.data_ptr() not in retained:
+                        retained.add(storage.data_ptr())
+                        deferred_bytes += storage.nbytes()
                     if deferred_bytes >= _EXPERT_RUN_BYTES:
                         # bound what the input iterable keeps alive
                         yield from load_runs()
+                        retained.clear()
                         deferred_bytes = 0
                     continue
                 else:
