@@ -21,7 +21,10 @@ from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
 from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
     UnquantizedFusedMoEMethod,
 )
-from vllm.model_executor.model_loader.weight_utils import discard_weight_parts
+from vllm.model_executor.model_loader.weight_utils import (
+    discard_weight_parts,
+    finalize_model_weights,
+)
 
 from .utils import make_dummy_moe_config
 
@@ -859,8 +862,15 @@ class TestW13InputScalePairing:
         [
             ([[("w1", 2.0), ("w3", 2.0)], [("w3", 3.0), ("w1", 3.0)]], False),
             ([[("w1", 2.0), ("w3", 2.0)], [("w1", 3.0), ("w3", 4.0)]], True),
+            ([[("w1", 2.0)], [("w1", 3.0)]], False),
+            ([[("w3", 2.0)], [("w1", 3.0), ("w3", 3.0)]], False),
         ],
-        ids=["reload-with-new-scales", "unequal-raises"],
+        ids=[
+            "reload-with-new-scales",
+            "unequal-raises",
+            "single-scale-checkpoint",
+            "unpaired-scale-forgotten-at-reload",
+        ],
     )
     def test_pairs_within_one_load(self, loads, error):
         experts = torch.nn.Module()
@@ -875,6 +885,8 @@ class TestW13InputScalePairing:
 
         if not error:
             run()
+            # an unpaired scale loads alone, as before pairing: no raise
+            finalize_model_weights(experts)
             return
         with pytest.raises(ValueError, match="must be equal"):
             run()
