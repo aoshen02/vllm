@@ -361,7 +361,7 @@ class WeightTransferEngine(ABC, Generic[TInitInfo, TUpdateInfo]):
     supports_draft_weight_update: bool = True
 
     _delivered: set[str] | None = None
-    """Checkpoint names the current full update delivered; None outside one."""
+    """Checkpoint names the current direct reload delivered; None outside one."""
 
     _unsynced: "re.Pattern[str] | None" = None
 
@@ -416,20 +416,27 @@ class WeightTransferEngine(ABC, Generic[TInitInfo, TUpdateInfo]):
         self._default_model = model
 
     def _begin_delivery_tracking(self) -> None:
-        """Start collecting the checkpoint names one full update delivers.
+        """Start collecting the checkpoint names one update delivers.
 
-        Called by `start_weight_update` of engines that deliver the full
-        checkpoint per update, paired with `_complete_update`.
+        Called by `start_weight_update`, paired with `_complete_update`. Only a
+        direct reload tracks: it must be full. Layerwise reloads keep their
+        upstream behaviour, partial updates included.
         """
         from vllm.model_executor.model_loader.reload.direct import (
+            direct_reload_enabled,
             unsynced_weights_regex,
         )
 
+        if not direct_reload_enabled():
+            self._delivered = None
+            return
         self._delivered = set()
         self._unsynced = unsynced_weights_regex()
 
     def _load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> Any:
         """`model.load_weights`, recording the names of the tensors it is fed."""
+        if self._delivered is None:
+            return self.model.load_weights(weights)
         if isinstance(weights, Sequence):
             self._record_delivered(name for name, _ in weights)
             return self.model.load_weights(weights)
@@ -447,7 +454,7 @@ class WeightTransferEngine(ABC, Generic[TInitInfo, TUpdateInfo]):
         (`VLLM_DIRECT_RELOAD_EXCLUDE_REGEX`) raises: a reload leaves those
         tensors in their runtime layout, which checkpoint bytes are not."""
         if self._delivered is None:
-            return  # outside start/finish: `_complete_update` raises
+            return  # not a direct reload
         for name in names:
             if self._unsynced is not None and self._unsynced.search(name):
                 raise ValueError(
@@ -460,6 +467,8 @@ class WeightTransferEngine(ABC, Generic[TInitInfo, TUpdateInfo]):
     def _complete_update(self) -> Iterator[None]:
         """Raise unless the update delivered every checkpoint tensor the
         model's cold start was fed, then run the caller's finalization.
+
+        A no-op outside a direct reload (`_begin_delivery_tracking`).
 
         Runs before the reload is finalized: post-load processing of a weight
         that did not arrive would rewrite its runtime bytes in place (direct
@@ -475,10 +484,16 @@ class WeightTransferEngine(ABC, Generic[TInitInfo, TUpdateInfo]):
         from vllm.model_executor.model_loader.base_loader import (
             CHECKPOINT_WEIGHT_NAMES,
         )
+        from vllm.model_executor.model_loader.reload.direct import (
+            direct_reload_enabled,
+        )
         from vllm.model_executor.model_loader.weight_utils import (
             check_weight_parts_complete,
         )
 
+        if not direct_reload_enabled():
+            yield
+            return
         delivered, self._delivered = self._delivered, None
         assert delivered is not None, "no weight update in progress"
         model = self.model
