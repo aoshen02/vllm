@@ -150,7 +150,7 @@ class NCCLWeightTransferEngine(
         self.packed_num_buffers = DEFAULT_PACKED_NUM_BUFFERS
         # Metadata of the last update per model, reused by empty update info.
         self._last_update_info: dict[torch.nn.Module, NCCLWeightTransferUpdateInfo] = {}
-        self._update_started = 0.0  # perf_counter at start_weight_update
+        self._busy_s = 0.0  # this update's start and receive calls (WU_PROFILE)
 
     def init_transfer_engine(self, init_info: NCCLWeightTransferInitInfo) -> None:
         """Initialize NCCL process group with the trainer and record the
@@ -176,9 +176,10 @@ class NCCLWeightTransferEngine(
             initialize_layerwise_reload,
         )
 
-        self._update_started = time.perf_counter()
+        t0 = time.perf_counter()
         initialize_layerwise_reload(self.model)
         self._begin_delivery_tracking()
+        self._busy_s = time.perf_counter() - t0
 
     def finish_weight_update(self) -> None:
         """Check the update delivered every weight, then finalize layerwise
@@ -190,14 +191,15 @@ class NCCLWeightTransferEngine(
         t0 = time.perf_counter()
         with self._complete_update():
             finalize_layerwise_reload(self.model, self.model_config)
-        t1 = time.perf_counter()
+        finish_s = time.perf_counter() - t0
+        # server busy time: the calls, not the trainer's time between them
         logger.info(
             "WU_PROFILE mode=%s rank=%d transfer_s=%.3f finish_s=%.3f total_s=%.3f",
             os.environ.get("VLLM_RELOAD_MODE", "layerwise"),
             torch.distributed.get_rank() if torch.distributed.is_initialized() else 0,
-            t0 - self._update_started,
-            t1 - t0,
-            t1 - self._update_started,
+            self._busy_s,
+            finish_s,
+            self._busy_s + finish_s,
         )
 
     def receive_weights(self, update_info: NCCLWeightTransferUpdateInfo) -> None:
@@ -213,6 +215,7 @@ class NCCLWeightTransferEngine(
                         and shapes; empty to reuse the previous call's
 
         """
+        t0 = time.perf_counter()
         if self.model_update_group is None:
             raise RuntimeError(
                 "NCCL weight transfer not initialized. "
@@ -264,6 +267,7 @@ class NCCLWeightTransferEngine(
                     )
                     load([(name, weight)])
                     del weight
+        self._busy_s += time.perf_counter() - t0
 
     def shutdown(self) -> None:
         if self.model_update_group is not None:

@@ -363,6 +363,36 @@ class TestUpdateCompleteness:
             self._update(engine, sent)
         assert finalized == []  # raised before post-load processing
 
+    def test_profile_reports_busy_time(self, monkeypatch):
+        # total_s is the server's time in start, receive and finish calls,
+        # not the wall time from start to finish (trainer idle time between)
+        import vllm.distributed.weight_transfer.nccl_engine as nccl_engine
+
+        clock = [0.0]
+        monkeypatch.setattr(nccl_engine.time, "perf_counter", lambda: clock[0])
+        engine = self._engine(monkeypatch, self.COLD, True, [], "layerwise")
+        load = engine.model.load_weights
+
+        def slow_load(weights):
+            clock[0] += 2.0
+            return load(weights)
+
+        engine.model.load_weights = slow_load
+        lines: list[str] = []
+        monkeypatch.setattr(
+            nccl_engine.logger, "info", lambda fmt, *a: lines.append(fmt % a)
+        )
+        engine.start_weight_update()
+        for name in self.FULL[:2]:
+            clock[0] += 100.0  # trainer busy, server idle
+            engine.receive_weights(
+                NCCLWeightTransferUpdateInfo(
+                    names=[name], dtype_names=["float32"], shapes=[[2, 2]]
+                )
+            )
+        engine.finish_weight_update()
+        assert lines[-1].endswith("transfer_s=4.000 finish_s=0.000 total_s=4.000")
+
     def test_unsynced_name_raises_before_any_bucket_is_received(self, monkeypatch):
         # raising mid-broadcast would leave the trainer blocked in it
         monkeypatch.setenv("VLLM_DIRECT_RELOAD_EXCLUDE_REGEX", r"[.]?engram[.]")
