@@ -335,6 +335,23 @@ class RoutedExperts(PluggableLayer):
         # reduce to a 0-D scalar. numel > 1 raises instead of broadcasting.
         return loaded_weight.reshape(())
 
+    def _check_w13_input_scales(
+        self, expert_id: int, shard_id: str, loaded_weight: torch.Tensor
+    ) -> None:
+        """w1 and w3 share one input scale slot, so their checkpoint scales
+        must be equal. Pair them within one load: on a reload the slot holds
+        the previous load's scale."""
+        from vllm.model_executor.model_loader.weight_utils import stash_weight_part
+
+        pair = stash_weight_part(
+            self, f"w13_input_scale.{expert_id}", shard_id, loaded_weight, ("w1", "w3")
+        )
+        if pair is not None and (pair["w1"] - pair["w3"]).abs() > 1e-5:
+            raise ValueError(
+                "input_scales of w1 and w3 of a layer "
+                f"must be equal. But got {pair['w1']} vs. {pair['w3']}"
+            )
+
     def _load_per_tensor_weight_scale(
         self,
         shard_id: str,
@@ -868,16 +885,8 @@ class RoutedExperts(PluggableLayer):
                 )
                 return True if return_success else None
 
-            if (
-                "compressed" in quant_method_name.lower()
-                and param.data[expert_id] != 1
-                and (param.data[expert_id] - loaded_weight).abs() > 1e-5
-            ):
-                raise ValueError(
-                    "input_scales of w1 and w3 of a layer "
-                    f"must be equal. But got {param.data[expert_id]} "
-                    f"vs. {loaded_weight}"
-                )
+            if "compressed" in quant_method_name.lower() and shard_id != "w2":
+                self._check_w13_input_scales(expert_id, shard_id, loaded_weight)
 
             self._load_single_value(
                 param=param,
