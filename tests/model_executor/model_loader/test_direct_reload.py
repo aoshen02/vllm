@@ -729,7 +729,7 @@ class TestLoudChecks:
         with pytest.raises(DirectReloadRefused, match="pre-processed"):
             begin_direct_reload(model)
 
-    @pytest.mark.parametrize("refusal", ["exclusion", "storage-size"])
+    @pytest.mark.parametrize("refusal", ["exclusion", "bad-regex", "storage-size"])
     def test_refused_begin_leaves_the_model_untouched(self, monkeypatch, refusal):
         # the worker keeps serving a model whose update was refused
         model = _cold_start(_checkpoint())
@@ -737,6 +737,8 @@ class TestLoudChecks:
             monkeypatch.setenv(
                 "VLLM_DIRECT_RELOAD_EXCLUDE_REGEX", r"^nvfp4\.weight_scale_2$"
             )
+        elif refusal == "bad-regex":
+            monkeypatch.setenv("VLLM_DIRECT_RELOAD_EXCLUDE_REGEX", "[")
         else:  # proj is viewed back first, in module order
             shape, stride, dtype, offset = model.mimo.weight._ckpt_layout
             model.mimo.weight._ckpt_layout = ((64, 64), (64, 1), dtype, offset)

@@ -69,9 +69,16 @@ def direct_reload_enabled() -> bool:
 
 def unsynced_weights_regex() -> "re.Pattern[str] | None":
     """Names the trainer deliberately does not sync (e.g. Engram); weight
-    updates do not have to deliver them."""
+    updates do not have to deliver them. A malformed pattern refuses the
+    update before anything is modified (`begin_direct_reload` compiles it
+    first)."""
     pattern = os.environ.get("VLLM_DIRECT_RELOAD_EXCLUDE_REGEX", "")
-    return re.compile(pattern) if pattern else None
+    try:
+        return re.compile(pattern) if pattern else None
+    except re.error as e:
+        raise DirectReloadRefused(
+            f"VLLM_DIRECT_RELOAD_EXCLUDE_REGEX={pattern!r} is not a regex: {e}"
+        ) from e
 
 
 def _loadable_tensors(
