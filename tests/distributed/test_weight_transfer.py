@@ -345,8 +345,8 @@ class TestUpdateCompleteness:
         [
             (FULL, "", True, None),
             (["experts.0.gate_proj.weight", *FULL[4:]], "", True, "up_proj"),
-            # lists the names, and an exclusion regex for them
-            (FULL[:4] + FULL[5:], "", True, r"'b.weight'.*REGEX='\^\(b\)\("),
+            # lists the names and the rule, suggests no regex
+            (FULL[:4] + FULL[5:], "", True, r"\['b.weight'\]. Deliver them, or"),
             (FULL[:2] + FULL[4:], "", False, "experts.1.gate_proj"),
             (FULL[:5], r"[.]?engram[.]", True, None),
             (FULL, r"[.]?engram[.]", True, "declares unsynced"),

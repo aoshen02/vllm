@@ -77,10 +77,11 @@ def unsynced_weights_regex() -> "re.Pattern[str] | None":
     first).
 
     The regex must name whole vLLM modules (`_unsynced_modules`) or
-    checkpoint-only names (MTP layers the served model does not load, a
-    tied ``lm_head``). A regex naming only some checkpoint parts of a fused
-    module (``gate_proj`` of ``gate_up_proj``) is a configuration error that
-    nothing detects: the module is not skipped and reconverts its bytes."""
+    checkpoint-only names (MTP layers the served model does not load); a
+    tied ``lm_head`` must be delivered. A regex naming only some checkpoint
+    parts of a fused module (``gate_proj`` of ``gate_up_proj``) is a
+    configuration error that nothing detects: the module is not skipped and
+    reconverts its bytes."""
     pattern = os.environ.get("VLLM_DIRECT_RELOAD_EXCLUDE_REGEX", "")
     try:
         return re.compile(pattern) if pattern else None
@@ -278,23 +279,13 @@ def _check_delivered(model: torch.nn.Module) -> set[str] | None:
     if missing:
         raise ValueError(
             f"weight update did not deliver {len(missing)} checkpoint tensors "
-            f"its cold start loaded: {missing[:16]}. An update must deliver "
-            "every checkpoint tensor cold start loaded, or exclude it with "
-            f"VLLM_DIRECT_RELOAD_EXCLUDE_REGEX='{_exclude_regex(missing)}'"
+            f"its cold start loaded: {missing[:16]}. Deliver them, or exclude "
+            "them with VLLM_DIRECT_RELOAD_EXCLUDE_REGEX, which must name whole "
+            "vLLM modules or checkpoint-only names (MTP layers the served model "
+            "does not load); a tied lm_head must be delivered"
         )
     check_weight_parts_complete(model)
     return delivered if required is None else None
-
-
-def _exclude_regex(names: list[str]) -> str:
-    """A VLLM_DIRECT_RELOAD_EXCLUDE_REGEX matching ``names``: their module
-    paths, each cut after its first layer index (``model.layers.61``)."""
-    prefixes = set()
-    for name in names:
-        parts = name.split(".")[:-1] or [name]
-        index = next((i for i, p in enumerate(parts) if p.isdigit()), None)
-        prefixes.add(".".join(parts if index is None else parts[: index + 1]))
-    return rf"^({'|'.join(re.escape(p) for p in sorted(prefixes))})(\.|$)"
 
 
 def _unsynced_modules(model: torch.nn.Module) -> set[int]:
@@ -368,8 +359,8 @@ def _unsynced_modules(model: torch.nn.Module) -> set[int]:
     if bad:
         raise DirectReloadRefused(
             "direct reload: VLLM_DIRECT_RELOAD_EXCLUDE_REGEX must name whole "
-            "vLLM modules or checkpoint-only names (unused MTP layers, a tied "
-            "lm_head), without a module whose post-load processing reads them: "
+            "vLLM modules or checkpoint-only names (unused MTP layers), "
+            "without a module whose post-load processing reads them: "
             f"{bad[:8]}"
         )
     return skipped
