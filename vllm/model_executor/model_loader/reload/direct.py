@@ -357,15 +357,12 @@ def finish_direct_reload(model: torch.nn.Module, model_config) -> None:
 
     # Unsynced modules keep their kernel layout and skip post-processing,
     # which would otherwise convert converted bytes again.
-    skipped_ids = model.__dict__.pop("_direct_skipped")
-    skipped = [m for m in model.modules() if id(m) in skipped_ids]
-    for module in skipped:
-        module._direct_skip_pwal = True
+    skipped = model.__dict__.pop("_direct_skipped")
     # One-shot "already processed" guards (R7) would make the rerun below a
     # no-op and leave the freshly written checkpoint layout in place.
     cleared = 0
     for module in model.modules():
-        if id(module) not in skipped_ids and module.__dict__.pop(
+        if id(module) not in skipped and module.__dict__.pop(
             "_already_called_process_weights_after_loading", None
         ):
             cleared += 1
@@ -380,11 +377,9 @@ def finish_direct_reload(model: torch.nn.Module, model_config) -> None:
     global _rerunning
     _rerunning = True
     try:
-        process_weights_after_loading(model, model_config, device)
+        process_weights_after_loading(model, model_config, device, skipped)
     finally:
         _rerunning = False
-        for module in skipped:
-            module.__dict__.pop("_direct_skip_pwal", None)
     unpinned = _pin_side_state(pinned)
     # hand the receive buffers and post-load temporaries back to the driver:
     # the next update's NCCL group allocates outside the caching allocator

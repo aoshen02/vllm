@@ -138,9 +138,13 @@ def initialize_model(
 
 
 def process_weights_after_loading(
-    model: nn.Module, model_config: ModelConfig, target_device: torch.device
+    model: nn.Module,
+    model_config: ModelConfig,
+    target_device: torch.device,
+    skipped: set[int] | frozenset[int] = frozenset(),
 ) -> None:
-    """Post-process loaded weights into runtime format.
+    """Post-process loaded weights into runtime format, but not modules in
+    ``skipped`` (ids of a direct reload's unsynced modules).
 
     Under ``weights_already_processed`` (weight cache IPC loader), quant
     methods skip tensor transforms and must declare
@@ -169,7 +173,7 @@ def process_weights_after_loading(
 
     for name, module in model.named_modules():
         quant_method = getattr(module, "quant_method", None)
-        if getattr(module, "_direct_skip_pwal", False):
+        if id(module) in skipped:
             continue  # direct reload: nothing written here, kernel layout kept
         if isinstance(quant_method, QuantizeMethodBase):
             if (
@@ -214,7 +218,7 @@ def process_weights_after_loading(
     # encoder. NOTE: Happens after other modules so we can easily decompress
     # weights.
     for _, module in model.named_modules():
-        if getattr(module, "_direct_skip_pwal", False):
+        if id(module) in skipped:
             continue
         if is_deferred_attention_layer(module):
             # TODO(lucas): see if there is a way to unify the signatures
