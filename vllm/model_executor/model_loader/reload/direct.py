@@ -361,6 +361,7 @@ def begin_direct_reload(model: torch.nn.Module) -> None:
     # and lm_head only after its own cold start (llm_base_proposer)
     if "_direct_addresses" not in model.__dict__:
         model._direct_addresses = _addresses(model)
+        model._direct_host_scalars = _host_scalars(model)
     model._direct_skipped = skipped
     _refuse_writes(model, skipped)
     for module, name, is_param, t in dropped:
@@ -416,10 +417,29 @@ def finish_direct_reload(model: torch.nn.Module, model_config) -> None:
     current = _addresses(model)
     moved = sorted(n for n, p in model._direct_addresses.items() if current.get(n) != p)
     moved += sorted(unpinned)
+    scalars = _host_scalars(model)
+    moved += sorted(
+        f"{n} (host scalar {v} -> {scalars.get(n)})"
+        for n, v in model._direct_host_scalars.items()
+        if scalars.get(n) != v
+    )
     # kernels and captured graphs would keep reading the old storage
     if moved:
         raise RuntimeError(f"direct reload: {len(moved)} tensors moved: {moved[:8]}")
     del model._direct_side_state
+
+
+def _host_scalars(model: torch.nn.Module) -> dict[str, float]:
+    """Python floats on modules, e.g. the KV-cache scales FlashInfer folds into
+    bmm1/bmm2_scale: kernels take them as host arguments, which captured
+    graphs (and backends caching the products) keep, so a reload must not
+    change them."""
+    return {
+        f"{name}.{k}": v
+        for name, module in model.named_modules()
+        for k, v in vars(module).items()
+        if type(v) is float
+    }
 
 
 def _snapshot_side_state(model: torch.nn.Module):

@@ -735,6 +735,16 @@ class TestLoudChecks:
         with pytest.raises(RuntimeError, match=r"s.b \(aliasing changed\)"):
             _reload(model, {"s.weight": torch.rand(4, 4)})
 
+    def test_weight_derived_host_scalar_change_raises(self):
+        # an fp8 KV-cache scale read to a Python float, as kv_cache.py does
+        def fn(layer):
+            layer._k_scale_float = layer.weight.abs().amax().item()
+
+        model = _one_layer(fn, torch.rand(4, 4))
+        _reload(model, {"s.weight": model.s.weight.clone()})  # same: fine
+        with pytest.raises(RuntimeError, match=r"s._k_scale_float \(host scalar"):
+            _reload(model, {"s.weight": torch.rand(4, 4) + 2})
+
     def test_side_tensor_new_view_of_same_storage_moves(self):
         def fn(layer):  # graphs read the startup view, the layer a transposed one
             if layer.quant_method.runs == 1:
