@@ -1602,6 +1602,7 @@ def discard_weight_parts(model: torch.nn.Module) -> None:
     with the next update's parts. Called when a reload starts."""
     for module in model.modules():
         module.__dict__.pop("_pending_weight_parts", None)
+        module.__dict__.pop("_w13_input_scales", None)  # RoutedExperts
 
 
 def check_weight_parts_complete(model: torch.nn.Module) -> None:

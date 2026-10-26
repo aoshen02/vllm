@@ -340,16 +340,20 @@ class RoutedExperts(PluggableLayer):
     ) -> None:
         """w1 and w3 share one input scale slot, so their checkpoint scales
         must be equal. Pair them within one load: on a reload the slot holds
-        the previous load's scale."""
-        from vllm.model_executor.model_loader.weight_utils import stash_weight_part
-
-        pair = stash_weight_part(
-            self, f"w13_input_scale.{expert_id}", shard_id, loaded_weight, ("w1", "w3")
-        )
-        if pair is not None and (pair["w1"] - pair["w3"]).abs() > 1e-5:
+        the previous load's scale. A checkpoint may carry only one of them;
+        it then loads alone, as before, so an unpaired scale is not an error.
+        ``discard_weight_parts`` forgets the pairs when a reload starts."""
+        seen = self.__dict__.setdefault(_W13_INPUT_SCALES, {})
+        value = loaded_weight.item()
+        other = seen.get(expert_id)
+        if other is None or other[0] == shard_id:
+            seen[expert_id] = (shard_id, value)
+            return
+        del seen[expert_id]
+        if abs(other[1] - value) > 1e-5:
             raise ValueError(
                 "input_scales of w1 and w3 of a layer "
-                f"must be equal. But got {pair['w1']} vs. {pair['w3']}"
+                f"must be equal. But got {other[1]} vs. {value}"
             )
 
     def _load_per_tensor_weight_scale(
@@ -1599,6 +1603,9 @@ class RoutedExperts(PluggableLayer):
 # Mark the RoutedExperts weight_loader as supporting MoE-specific parameters
 RoutedExperts.weight_loader.supports_moe_loading = True  # type: ignore[attr-defined]
 
+
+# RoutedExperts attribute: w1/w3 input scales of the current load, by expert
+_W13_INPUT_SCALES = "_w13_input_scales"
 
 # experts per batched load: bounds the stacking copy when the per-expert tensors
 # are not adjacent in memory
