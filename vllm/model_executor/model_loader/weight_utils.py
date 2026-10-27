@@ -1534,7 +1534,7 @@ def set_cached_tensor(
     it. Post-load hooks rerun on every weight reload while CUDA graphs keep
     the address captured at startup, so refill the existing tensor in place
     when it matches ``new`` in shape, dtype and device. Otherwise replace it;
-    a direct reload then reports it as moved (its side-state pin)."""
+    a direct reload then reports it as moved."""
     cached = getattr(owner, name, None)
     if (
         isinstance(cached, torch.Tensor)

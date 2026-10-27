@@ -15,7 +15,9 @@ tensors and the cold-start post-load processing runs once at the end:
   ``finish``, as cold start records them;
 - ``finish`` raises unless the update delivered every name cold start was
   fed, then reruns ``process_weights_after_loading`` for every module, as
-  cold start does, and raises if an address moved.
+  cold start does, and raises if an address moved: of a parameter, a buffer,
+  or a derived tensor held elsewhere (`side_state`). Post-load processing has
+  to refill those in place; nothing moves them back.
 
 A reload is exactly as correct as a cold start: no module is skipped because
 it "received nothing" (a loader may bypass the parameter's ``weight_loader``,
@@ -39,6 +41,8 @@ import torch
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
 from vllm.model_executor.utils import is_weights_pre_processed
+
+from .side_state import side_tensor_addresses
 
 logger = init_logger(__name__)
 
@@ -308,8 +312,7 @@ def _unsynced_modules(model: torch.nn.Module) -> set[int]:
     The model-level hook (`finalize_model_weights`) still runs: it belongs
     to the whole model, which a reload never skips. Like at cold start it
     sees the skipped modules in kernel layout, holding their cold-start
-    bytes, and any derived tensor it reallocates for them is pinned (their
-    side state is snapshotted with every other module's).
+    bytes, and must refill any derived tensor it keeps for them in place.
     """
     from vllm.model_executor.layers.attention import is_deferred_attention_layer
 
@@ -454,11 +457,11 @@ def begin_direct_reload(model: torch.nn.Module) -> None:
     views = _checkpoint_views(model, skipped, dropped)
 
     # nothing above modified the model
-    # The derived tensors captured graphs read, as served (before any view
+    # Where captured graphs read derived tensors, as served (before any view
     # back), kept until a finish succeeds: a retry after an update that
-    # failed midway pins into them, not into the failed rerun's allocations.
-    if "_direct_side_state" not in model.__dict__:
-        model._direct_side_state = _snapshot_side_state(model)
+    # failed midway still compares with the served addresses.
+    if "_direct_side_tensors" not in model.__dict__:
+        model._direct_side_tensors = side_tensor_addresses(model)
     # Likewise every address as served: a draft shares the target's embedding
     # and lm_head only after its own cold start (llm_base_proposer)
     if "_direct_addresses" not in model.__dict__:
@@ -504,9 +507,7 @@ def finish_direct_reload(model: torch.nn.Module, model_config) -> None:
         (p.device for p in model.parameters() if p.device.type == "cuda"),
         torch.accelerator.current_accelerator(),
     )
-    pinned = model._direct_side_state  # taken by the first begin
     process_weights_after_loading(model, model_config, device, skipped)
-    unpinned = _pin_side_state(pinned)
     # hand the receive buffers and post-load temporaries back to the driver:
     # the next update's NCCL group allocates outside the caching allocator
     torch.accelerator.empty_cache()
@@ -517,7 +518,10 @@ def finish_direct_reload(model: torch.nn.Module, model_config) -> None:
 
     current = _addresses(model)
     moved = sorted(n for n, p in model._direct_addresses.items() if current.get(n) != p)
-    moved += sorted(unpinned)
+    side = side_tensor_addresses(model)
+    moved += sorted(
+        n for n, a in model._direct_side_tensors.items() if side.get(n) != a
+    )
     scalars = _host_scalars(model)
     moved += sorted(
         f"{n} (host scalar {v} -> {scalars.get(n)})"
@@ -526,8 +530,9 @@ def finish_direct_reload(model: torch.nn.Module, model_config) -> None:
     )
     # kernels and captured graphs would keep reading the old storage
     if moved:
+        logger.error("direct reload: tensors moved: %s", moved)
         raise RuntimeError(f"direct reload: {len(moved)} tensors moved: {moved[:8]}")
-    del model._direct_side_state
+    del model._direct_side_tensors
     if adopted is not None:
         setattr(model, CHECKPOINT_WEIGHT_NAMES, adopted)
         logger.warning(
@@ -554,44 +559,3 @@ def _host_scalars(model: torch.nn.Module) -> dict[str, float]:
         for k, v in vars(module).items()
         if type(v) is float
     }
-
-
-def _snapshot_side_state(model: torch.nn.Module):
-    """Before the update modifies the model: each module's derived device
-    tensors (`side_state`), as aliases of their storage and view. CUDA graphs
-    captured at cold start read these, so the rerun's values have to land in
-    them. Skipped modules too: the model-level hook still runs over them.
-    Refuses when the walk stops at its depth limit: what lies below could
-    not be pinned."""
-    from .side_state import _MAX_DEPTH, SideWalk, snapshot_side_tensors
-
-    side_walk = SideWalk()
-    pinned = [
-        (name, module, snapshot_side_tensors(module, side_walk))
-        for name, module in model.named_modules()
-    ]
-    if side_walk.truncated:
-        raise DirectReloadRefused(
-            f"direct reload: the side-state walk stopped at depth {_MAX_DEPTH} "
-            f"on {len(side_walk.truncated)} objects; derived tensors below them "
-            "could not be pinned"
-        )
-    return pinned
-
-
-def _pin_side_state(pinned) -> list[str]:
-    """After the rerun: copy every derived tensor the rerun reallocated into
-    its startup storage and rebind it there. Returns the tensors that cannot
-    be pinned (gone, a different layout, or past the walk's depth limit)."""
-    from .side_state import _MAX_DEPTH, SideWalk, pin_side_tensors
-
-    side_walk = SideWalk()
-    failed = [
-        f"{name}.{path}" if name else path
-        for name, module, side in pinned
-        for path in (p.lstrip(".") for p in pin_side_tensors(module, side, side_walk))
-    ]
-    if side_walk.truncated:
-        n = len(side_walk.truncated)
-        failed.append(f"<{n} objects past depth {_MAX_DEPTH}>")
-    return failed

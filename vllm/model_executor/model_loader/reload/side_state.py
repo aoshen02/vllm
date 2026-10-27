@@ -1,40 +1,36 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Keep a layer's derived tensors at their startup storage across a reload.
+"""Find the derived tensors a reload would move.
 
-`process_weights_after_loading` derives tensors from the checkpoint and
-registers them (kernel constants, derived scales) or stores them on objects
-hanging off the layer: `quant_method.moe_quant_config`,
-`quant_method.moe_kernel`, experts objects, plain layer attributes. A reload
-reruns it, so the layer ends up holding freshly allocated tensors, while CUDA
-graphs captured at startup keep reading the startup storage.
+`process_weights_after_loading` derives tensors from the checkpoint and keeps
+some outside the modules' parameters and buffers: on
+`quant_method.moe_quant_config`, on kernel and experts objects, as plain layer
+attributes. A reload reruns it while CUDA graphs captured at startup keep
+reading the startup storage, so such a tensor must be refilled in place
+(`set_cached_tensor`, `replace_parameter`, `copy_`).
 
-One rule: before the rerun, `snapshot_side_tensors` records every derived
-device tensor of the layer (registered without a checkpoint layout, or
-reachable from its attributes) by path, as an alias of its storage; after the
-rerun, `pin_side_tensors` copies the tensor found at the same path into that
-storage and rebinds that tensor object to it (`t.data = startup`), so every
-holder of the object reads the startup storage.
-
-A walk that stops at its depth limit refuses the reload. Out of scope (not
-walked, so a tensor held only there is not pinned): `functools.partial`
-arguments, closure cells, and `__slots__` of a base class whose subclass
-declares its own.
+`side_tensor_addresses` records where each of them lives, by path, so a
+direct reload raises when the rerun moved one. Not walked: runtime state not
+derived from weights (KV and state caches, workspaces, communicators),
+library and configuration objects, objects nested deeper than 16 attributes,
+`functools.partial` arguments and closure cells.
 """
 
 import functools
+from collections import deque
 from typing import Any
 
+import regex as re
 import torch
 
-__all__ = ["SideWalk", "pin_side_tensors", "snapshot_side_tensors"]
-
-Path = tuple[tuple[str, Any], ...]
+__all__ = ["side_tensor_addresses"]
 
 _MAX_DEPTH = 16
 # packages whose own classes hold no tensors derived from the weights
 _LIBRARIES = {"transformers", "tokenizers", "torch", "threading", "logging"}
 _SKIP_LAYER_ATTRS = {"_parameters", "_buffers", "_modules", "training"}
+# runtime state a reload does not touch (attention, mamba and indexer caches)
+_RUNTIME_ATTRS = re.compile(r"kv_cache|workspace")
 
 
 _OPAQUE: dict[type, bool] = {}
@@ -66,153 +62,59 @@ def _opaque(cls: type) -> bool:
     """Objects that hold no derived device tensors: classes of the libraries
     above (by top-level package, so `transformers_modules`, where
     trust_remote_code classes live, is walked), vLLM's configuration classes,
-    and subclasses of tokenizer, processor and configuration bases."""
+    process groups and communicators (`vllm.distributed`), and subclasses of
+    tokenizer, processor and configuration bases."""
     opaque = _OPAQUE.get(cls)
     if opaque is None:
         module = cls.__module__ or ""
         opaque = _OPAQUE[cls] = (
             module.partition(".")[0] in _LIBRARIES
-            or module.startswith("vllm.config")
+            or module.startswith(("vllm.config", "vllm.distributed"))
             or not _tensor_free_bases().isdisjoint(cls.__mro__)
         )
     return opaque
 
 
-def _children(o: Any) -> list[tuple[tuple[str, Any], Any]]:
+def _children(o: Any) -> list[tuple[str, Any]]:
     if isinstance(o, (list, tuple)):
-        return [(("i", i), v) for i, v in enumerate(o)]
+        return [(f"[{i}]", v) for i, v in enumerate(o)]
     if isinstance(o, dict):
-        return [(("k", k), v) for k, v in o.items()]
+        return [(f"[{k!r}]", v) for k, v in o.items()]
     if _opaque(type(o)):
         return []
     d = getattr(o, "__dict__", None)
-    out = [(("a", k), v) for k, v in d.items()] if isinstance(d, dict) else []
+    attrs = list(d.items()) if isinstance(d, dict) else []
     for k in getattr(type(o), "__slots__", ()):
         if isinstance(k, str) and hasattr(o, k):
-            out.append((("a", k), getattr(o, k)))
-    return out
+            attrs.append((k, getattr(o, k)))
+    return [(f".{k}", v) for k, v in attrs if not _RUNTIME_ATTRS.search(k)]
 
 
-class SideWalk:
-    """State shared by the walks of one pass over a model's modules; it must
-    not outlive the pass.
-
-    ``clean`` holds the objects proven tensor-free (by id, with the object to
-    keep the id valid), so objects every layer references, e.g. a
-    quantization config with a dict per checkpoint layer, are walked once per
-    pass instead of once per layer. A proof covers the object's whole
-    reachable graph, so it holds at any depth. ``truncated`` holds the
-    objects reached only past the depth limit, never walked in the pass:
-    never proven, never pinned."""
-
-    def __init__(self) -> None:
-        self.clean: dict[int, Any] = {}
-        self.walked: dict[int, Any] = {}
-        self.truncated: dict[int, Any] = {}
-
-
-def collect_side_tensors(
-    layer: torch.nn.Module, side_walk: SideWalk | None = None
-) -> dict[Path, torch.Tensor]:
-    """The layer's derived tensors, by path: registered tensors without a
-    checkpoint layout (the address check covers the checkpoint ones), and
-    every tensor reachable from its non-module attributes."""
-    found: dict[Path, torch.Tensor] = {}
-    seen: dict[int, int] = {}  # id -> the shallowest depth it was walked at
-    state = side_walk if side_walk is not None else SideWalk()
-    clean = state.clean
-
-    def walk(o: Any, path: Path, depth: int) -> bool:
-        """Record the tensors under ``o``; True iff it is proven tensor-free."""
+def side_tensor_addresses(model: torch.nn.Module) -> dict[str, tuple]:
+    """Address and layout of every device tensor reachable from the modules'
+    non-module attributes, by the shallowest path that reaches it."""
+    out: dict[str, tuple] = {}
+    queue: deque[tuple[Any, str, int]] = deque()
+    for name, module in model.named_modules():
+        for attr, value in vars(module).items():
+            if (
+                attr in _SKIP_LAYER_ATTRS
+                or attr.startswith(("_forward", "_direct"))  # _direct: reload's
+                or "hooks" in attr
+                or _RUNTIME_ATTRS.search(attr)
+            ):
+                continue
+            queue.append((value, f"{name}.{attr}" if name else attr, 1))
+    seen: set[int] = set()
+    while queue:  # breadth first: each object once, at its shallowest depth
+        o, path, depth = queue.popleft()
+        if id(o) in seen or depth > _MAX_DEPTH:
+            continue
         if isinstance(o, torch.Tensor):
-            found[path] = o
-            return False
-        if o is None or isinstance(
-            o, (str, bytes, int, float, bool, torch.nn.Module, type)
-        ):
-            return True
-        if id(o) in clean:
-            return True
-        if depth > _MAX_DEPTH:
-            if id(o) not in state.walked:
-                state.truncated[id(o)] = o
-            return False
-        if seen.get(id(o), depth + 1) <= depth:
-            return False  # walked on a path at most as deep: not proven here
-        seen[id(o)] = depth  # first reached, or shallower than before: walk
-        state.walked[id(o)] = o
-        state.truncated.pop(id(o), None)
-        tensor_free = True
-        for key, child in _children(o):
-            tensor_free = walk(child, path + (key,), depth + 1) and tensor_free
-        if tensor_free:
-            clean[id(o)] = o
-        return tensor_free
-
-    for registered in (layer._parameters, layer._buffers):
-        for name, t in registered.items():
-            if t is not None and not hasattr(t, "_ckpt_layout"):
-                found[(("a", name),)] = t
-    for name, value in vars(layer).items():
-        if (
-            name in _SKIP_LAYER_ATTRS
-            or name.startswith(("_forward", "_direct"))  # _direct: reload records
-            or "hooks" in name
-        ):
-            continue
-        walk(value, (("a", name),), 1)
-    return found
-
-
-def _layout(t: torch.Tensor) -> tuple:
-    return (tuple(t.shape), t.stride(), t.dtype, t.device)
-
-
-def snapshot_side_tensors(
-    layer: torch.nn.Module, side_walk: SideWalk | None = None
-) -> dict[Path, torch.Tensor]:
-    """The layer's derived device tensors, by path. Aliases, not the objects:
-    `x.data = y` later leaves them on the storage graphs captured."""
-    return {
-        path: t.detach()
-        for path, t in collect_side_tensors(layer, side_walk).items()
-        if t.device.type not in ("cpu", "meta")
-    }
-
-
-@torch.no_grad()
-def pin_side_tensors(
-    layer: torch.nn.Module,
-    before: dict[Path, torch.Tensor],
-    side_walk: SideWalk | None = None,
-) -> list[str]:
-    """Put the tensor at every snapshotted path back on its startup storage,
-    holding the rerun's values. Returns the paths that cannot be pinned: gone,
-    or now a tensor of a different shape, stride, dtype or device, or whose
-    aliasing changed (two startup tensors sharing an address now hold
-    different tensors, or the reverse: copying both into one storage would
-    lose one). Pinning changes no object but tensors, so objects the pass
-    proved tensor-free stay so."""
-    after = collect_side_tensors(layer, side_walk)
-    failed: list[str] = []
-    pins: list[tuple[torch.Tensor, torch.Tensor]] = []
-    fwd: dict[int, int] = {}  # startup address -> live address, and back
-    back: dict[int, int] = {}
-    for path, old in before.items():
-        t = after.get(path)
-        if t is None or _layout(t) != _layout(old):
-            failed.append(_fmt(path))
-            continue
-        s, a = old.data_ptr(), t.data_ptr()
-        if old.numel() and (fwd.setdefault(s, a) != a or back.setdefault(a, s) != s):
-            return failed + [f"{_fmt(path)} (aliasing changed)"]
-        pins.append((old, t))
-    for old, t in pins:
-        if t.data_ptr() != old.data_ptr():  # else: the startup view already
-            old.copy_(t)
-            t.data = old  # every holder of `t`, seen by the walk or not
-    return failed
-
-
-def _fmt(path: Path) -> str:
-    return "".join(f".{k}" if kind == "a" else f"[{k!r}]" for kind, k in path)
+            seen.add(id(o))
+            if o.device.type not in ("cpu", "meta") and o.numel():
+                out[path] = (o.data_ptr(), tuple(o.shape), o.stride(), o.dtype)
+        elif not isinstance(o, (str, bytes, int, float, bool, torch.nn.Module, type)):
+            seen.add(id(o))
+            queue.extend((v, path + k, depth + 1) for k, v in _children(o))
+    return out

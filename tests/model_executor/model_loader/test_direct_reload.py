@@ -19,6 +19,7 @@ addresses.
 from types import SimpleNamespace
 
 import pytest
+import regex as re
 import torch
 
 from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
@@ -28,9 +29,11 @@ from vllm.model_executor.model_loader.reload.direct import (
     begin_direct_reload,
     finish_direct_reload,
 )
+from vllm.model_executor.model_loader.reload.side_state import _MAX_DEPTH
 from vllm.model_executor.model_loader.utils import process_weights_after_loading
 from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader,
+    set_cached_tensor,
     stash_weight_part,
 )
 from vllm.model_executor.utils import replace_parameter
@@ -62,7 +65,8 @@ class _Method(QuantizeMethodBase):
 
 
 def _derive_w_uk(layer):  # (a): a separate tensor derived from the child
-    layer.W_UK = (layer.kv_b.weight.float() * layer.k_scale).t().contiguous()
+    w_uk = (layer.kv_b.weight.float() * layer.k_scale).t().contiguous()
+    set_cached_tensor(layer, "W_UK", w_uk)
 
 
 def _transpose(layer):  # (b): kernel layout differs from the checkpoint's
@@ -342,7 +346,7 @@ class _Attn(torch.nn.Module):
         self.q = _with_weight(_Layer(lambda layer: None))
 
     def process_weights_after_loading(self, dtype):
-        self.W = self.kv_b.weight * 3 + self.q.weight
+        set_cached_tensor(self, "W", self.kv_b.weight * 3 + self.q.weight)
 
 
 class _Tree(torch.nn.Module):
@@ -474,8 +478,9 @@ class TestExclusionRule:
         the Engram module."""
 
         def hook(model):
-            model.broadcast = model.layers[0].attn.weight.sum(0)
-            model.layers[0].engram.cache = model.layers[0].engram.weight * 2
+            engram = model.layers[0].engram  # in place, as the model does
+            set_cached_tensor(model, "broadcast", model.layers[0].attn.weight.sum(0))
+            set_cached_tensor(engram, "cache", engram.weight * 2)
 
         def build():
             model = _Tree(
@@ -581,28 +586,43 @@ def _one_layer(fn, weight, hook=None) -> _OneLayer:
     return model
 
 
-def _side(module: torch.nn.Module) -> dict[str, torch.Tensor]:
+def _side(model: torch.nn.Module) -> dict[str, tuple]:
     from vllm.model_executor.model_loader.reload.side_state import (
-        collect_side_tensors,
+        side_tensor_addresses,
     )
 
-    tensors = {str(p): t for p, t in collect_side_tensors(module).items()}
-    tensors.update(module.named_buffers(recurse=False))
-    return tensors
+    return side_tensor_addresses(model)
 
 
-def _side_refs(layer):  # registered derived buffer, side refs and views of it
+def _views(layer):  # side refs and views of a weight refilled in place
     replace_parameter(layer, "weight", layer.weight * 1)
-    layer.register_buffer("kc", layer.weight.sum().reshape(1) * 2)
-    layer.cfg = {
-        "kc": layer.kc,
-        "kc_u8": layer.kc.view(torch.uint8),
-        "w": layer.weight,
-        "d": layer.weight * 3,
-    }
+    layer.cfg = {"w": layer.weight, "w_t": layer.weight.t()}
+    layer.cfg["w_u8"] = layer.weight.view(torch.uint8)
 
 
-def _data_rebind(layer):  # `x.data = fresh` on a side tensor (J)
+def _relaid(layer):  # a scale whose layout processing changes (moe_quant_config)
+    replace_parameter(layer, "weight", layer.weight.reshape(2, 8) * 2)
+    layer.cfg = {"w": layer.weight, "w_t": layer.weight.t()}
+
+
+def _cached(layer):
+    set_cached_tensor(layer, "cache", layer.weight * 2)
+    layer.cfg = {"c": layer.cache}
+
+
+def _root_cached(model):  # model-level hook, root has no quant_method
+    set_cached_tensor(model, "derived", model.s.weight * 2)
+
+
+def _plain(layer):
+    layer.cache = layer.weight * 2
+
+
+def _in_dict(layer):
+    layer.cfg = {"d": layer.weight * 3}
+
+
+def _data_rebind(layer):  # `x.data = fresh`: same object, new storage
     fresh = layer.weight * 2
     if getattr(layer, "cache", None) is None:
         layer.cache = fresh
@@ -610,67 +630,83 @@ def _data_rebind(layer):  # `x.data = fresh` on a side tensor (J)
         layer.cache.data = fresh
 
 
-def _root_cache(model):  # model-level hook, root has no quant_method (B)
+def _resized(layer):
+    runs = layer.quant_method.runs
+    set_cached_tensor(layer, "cache", torch.zeros(runs, device=_DEVICE))
+
+
+def _dropped(layer):
+    runs = layer.quant_method.runs
+    layer.cache = torch.zeros(2, device=_DEVICE) if runs == 1 else None
+
+
+def _new_view(layer):  # graphs read the startup view, the layer a transposed one
+    if layer.quant_method.runs == 1:
+        layer.cache = layer.weight * 2
+    else:
+        layer.cache = layer.cache.t()
+
+
+def _registered(layer):
+    layer.register_buffer("kc", layer.weight.sum().reshape(1))
+
+
+def _root_plain(model):
     model.derived = model.s.weight * 2
 
 
-class TestSideState:
-    """Derived tensors outside the checkpoint stay at their cold-start
-    storage and hold the values a cold start on the new weights computes."""
+def _noop(layer):
+    pass
+
+
+class TestSideTensors:
+    """A derived tensor outside the checkpoint must be refilled in place: the
+    reload raises, naming it, when post-load processing moved it."""
 
     @pytest.mark.parametrize(
-        "fn,hook,module",
+        "fn,hook",
         [
-            (_side_refs, None, "s"),
-            (_data_rebind, None, "s"),
-            (lambda layer: None, _root_cache, ""),
+            (_views, None),
+            (_relaid, None),
+            (_cached, None),
+            (_noop, _root_cached),
         ],
-        ids=["buffer-and-views", "data-rebind", "model-root"],
+        ids=["views", "relaid-weight", "cached", "model-root"],
     )
-    def test_pinned(self, fn, hook, module):
+    def test_refilled_in_place(self, fn, hook):
         model = _one_layer(fn, torch.rand(4, 4), hook)
-        before = {
-            n: t.data_ptr() for n, t in _side(model.get_submodule(module)).items()
-        }
+        before = _side(model)
         new = torch.rand(4, 4)
         _reload(model, {"s.weight": new})
-        after = _side(model.get_submodule(module))
-        fresh = _side(_one_layer(fn, new, hook).get_submodule(module))
-        assert sorted(after) == sorted(before) == sorted(fresh)
-        for name, t in after.items():
-            assert t.data_ptr() == before[name], f"{name} moved"
-            assert torch.equal(t, fresh[name]), f"{name} differs"
+        assert before and _side(model) == before
+        _assert_same(_state(model), _state(_one_layer(fn, new, hook)))
 
-    def test_reference_to_a_relaid_checkpoint_weight(self):
-        # e.g. moe_quant_config holding a scale whose layout processing
-        # changes: begin views the scale back, the rerun lays it out again
-        def fn(layer):
-            replace_parameter(layer, "weight", layer.weight.reshape(2, 8) * 2)
-            layer.cfg = {"w": layer.weight, "w_t": layer.weight.t()}
-
-        model = _one_layer(fn, torch.rand(4, 4))
-        before = {n: t.data_ptr() for n, t in _side(model.s).items()}
-        new = torch.rand(4, 4)
-        _reload(model, {"s.weight": new})
-        after, fresh = _side(model.s), _side(_one_layer(fn, new).s)
-        assert sorted(after) == sorted(before) == sorted(fresh)
-        for name, t in after.items():
-            assert t.data_ptr() == before[name], f"{name} moved"
-            assert torch.equal(t, fresh[name]), f"{name} differs"
-
-    @staticmethod
-    def _resized(layer):
-        layer.cache = torch.zeros(layer.quant_method.runs, device=_DEVICE)
-
-    @staticmethod
-    def _dropped(layer):
-        runs = layer.quant_method.runs
-        layer.cache = torch.zeros(2, device=_DEVICE) if runs == 1 else None
-
-    @pytest.mark.parametrize("fn", ["_resized", "_dropped"])
-    def test_unpinnable_raises(self, fn):
-        model = _one_layer(getattr(self, fn), torch.rand(4, 4))
-        with pytest.raises(RuntimeError, match=r"moved: \['s.cache'\]"):
+    @pytest.mark.parametrize(
+        "fn,hook,moved",
+        [
+            (_plain, None, "s.cache"),
+            (_in_dict, None, "s.cfg['d']"),
+            (_data_rebind, None, "s.cache"),
+            (_resized, None, "s.cache"),
+            (_dropped, None, "s.cache"),
+            (_new_view, None, "s.cache"),
+            (_registered, None, "s.kc"),
+            (_noop, _root_plain, "derived"),
+        ],
+        ids=[
+            "plain",
+            "in-a-dict",
+            "data-rebind",
+            "cached-new-layout",
+            "gone",
+            "new-view",
+            "registered",
+            "model-root",
+        ],
+    )
+    def test_moved_raises(self, fn, hook, moved):
+        model = _one_layer(fn, torch.rand(4, 4), hook)
+        with pytest.raises(RuntimeError, match=re.escape(f"moved: {[moved]}")):
             _reload(model, {"s.weight": torch.rand(4, 4)})
 
 
@@ -682,79 +718,63 @@ class _CountedDict(dict):
         return super().items()
 
 
+def _nested(o: object, depth: int) -> object:
+    for _ in range(depth):
+        o = [o]
+    return o
+
+
+def _walk(**attrs) -> dict[str, tuple]:
+    """Side tensors of a two-layer model; ``l<i>__<attr>=value`` sets
+    ``attr`` on layer ``i``."""
+    model = torch.nn.ModuleList([torch.nn.Module(), torch.nn.Module()])
+    for name, value in attrs.items():
+        layer, attr = name.split("__")
+        setattr(model[int(layer[1:])], attr, value)
+    return _side(model)
+
+
 class TestSideWalk:
-    """One pass over the modules walks a tensor-free object they all reference
-    (a quantization config) once, and still finds every tensor."""
-
-    def test_shared_tensor_free_object_walked_once(self):
-        from vllm.model_executor.model_loader.reload.side_state import (
-            SideWalk,
-            collect_side_tensors,
-        )
-
+    def test_shared_object_walked_once(self):
+        # a quantization config with a dict per checkpoint layer, referenced
+        # by every layer
         _CountedDict.walks = 0
         config = _CountedDict({f"layers.{i}": {"bits": 4} for i in range(8)})
-        holder = {"t": torch.ones(2)}
-        side_walk = SideWalk()
-        for _ in range(3):
-            layer = torch.nn.Module()
-            layer.quant_config, layer.holder = config, holder
-            found = collect_side_tensors(layer, side_walk)
-            assert list(found) == [(("a", "holder"), ("k", "t"))]
+        holder = {"t": torch.ones(2, device=_DEVICE)}
+        found = _walk(l0__config=config, l0__holder=holder, l1__config=config)
+        assert list(found) == ["0.holder['t']"]
         assert _CountedDict.walks == 1
 
-    @staticmethod
-    def _nested(o: object, depth: int) -> object:
-        for _ in range(depth):
-            o = [o]
-        return o
-
     @pytest.mark.parametrize("same_layer", [False, True], ids=["two-layers", "one"])
-    def test_reached_at_the_depth_limit_then_shallower(self, same_layer):
-        from vllm.model_executor.model_loader.reload.side_state import (
-            _MAX_DEPTH,
-            SideWalk,
-            collect_side_tensors,
-        )
+    def test_shallowest_path(self, same_layer):
+        shared = {"t": torch.ones(2, device=_DEVICE)}
+        deep = _nested(shared, _MAX_DEPTH)  # the tensor is past the limit here
+        layer = 0 if same_layer else 1
+        found = _walk(l0__deep=deep, **{f"l{layer}__shared": shared})
+        assert list(found) == [f"{layer}.shared['t']"]
 
-        shared = {"k": {"t": torch.ones(2)}}
-        deep = self._nested(shared, _MAX_DEPTH - 1)  # the tensor is past the limit
-        first, second = torch.nn.Module(), torch.nn.Module()
-        first.a_deep = deep
-        (first if same_layer else second).b_shared = shared
-        side_walk = SideWalk()
-        found = collect_side_tensors(first, side_walk)
-        if not same_layer:
-            assert found == {}
-            found = collect_side_tensors(second, side_walk)
-        assert list(found) == [(("a", "b_shared"), ("k", "k"), ("k", "t"))]
-        assert not side_walk.truncated  # walked after all: nothing unpinned
+    @pytest.mark.parametrize(
+        "depth,found", [(_MAX_DEPTH - 1, True), (_MAX_DEPTH, False)]
+    )
+    def test_depth_limit(self, depth, found):
+        t = torch.ones(2, device=_DEVICE)
+        assert bool(_walk(l0__deep=_nested(t, depth))) is found
 
-    def test_depth_limit_is_not_a_proof(self):
-        from vllm.model_executor.model_loader.reload.side_state import (
-            _MAX_DEPTH,
-            SideWalk,
-            collect_side_tensors,
-        )
-
-        layer = torch.nn.Module()
-        layer.deep = self._nested(torch.ones(2), _MAX_DEPTH + 1)
-        side_walk = SideWalk()
-        assert collect_side_tensors(layer, side_walk) == {}
-        assert len(side_walk.truncated) == 1
-        assert not any(isinstance(o, list) for o in side_walk.clean.values())
-
-    def test_truncated_walk_refuses_the_update(self):
-        from vllm.model_executor.model_loader.reload.side_state import _MAX_DEPTH
-
-        def fn(layer):  # a derived tensor below the depth limit
-            layer.deep = self._nested(layer.weight * 2, _MAX_DEPTH + 1)
-
-        model = _one_layer(fn, torch.rand(4, 4))
-        before = _state(model)
-        with pytest.raises(DirectReloadRefused, match="stopped at depth"):
-            begin_direct_reload(model)
-        _assert_same(_state(model), before, addresses=True)
+    @pytest.mark.parametrize(
+        "attr,module",
+        [
+            ("kv_cache", __name__),
+            ("_workspace_buffer", __name__),
+            ("parallel_group", "vllm.distributed.device_communicators.x"),
+            ("holder", __name__),
+        ],
+        ids=["kv-cache", "workspace", "communicator", "walked"],
+    )
+    def test_runtime_state(self, attr, module):
+        holder = type("Holder", (), {"__module__": module})()
+        holder.buffer = torch.ones(2, device=_DEVICE)
+        found = _walk(**{f"l0__{attr}": holder})
+        assert bool(found) is (attr == "holder")
 
     @pytest.mark.parametrize(
         "base", ["tokenizer", "config", "vllm-subclass", "remote-code"]
@@ -765,10 +785,6 @@ class TestSideWalk:
         # hold a derived tensor
         import transformers
 
-        from vllm.model_executor.model_loader.reload.side_state import (
-            collect_side_tensors,
-        )
-
         parent = {
             "tokenizer": transformers.PreTrainedTokenizerBase,
             "config": transformers.PreTrainedConfig,
@@ -777,25 +793,12 @@ class TestSideWalk:
         }[base]
         module = "transformers_modules.m.x" if base == "remote-code" else __name__
         obj: object = object.__new__(type("Holder", (parent,), {"__module__": module}))
-        object.__setattr__(obj, "t", torch.ones(2))
-        layer = torch.nn.Module()
-        layer.holder = obj
-        found = collect_side_tensors(layer)
+        object.__setattr__(obj, "t", torch.ones(2, device=_DEVICE))
+        found = _walk(l0__holder=obj)
         assert bool(found) is (base in ("vllm-subclass", "remote-code"))
 
 
 class TestLoudChecks:
-    def test_cached_tensor_cannot_change_layout(self):
-        from vllm.model_executor.model_loader.weight_utils import set_cached_tensor
-
-        def fn(layer):
-            runs = layer.quant_method.runs
-            set_cached_tensor(layer, "cache", torch.zeros(runs, device=_DEVICE))
-
-        model = _one_layer(fn, torch.rand(4, 4))
-        with pytest.raises(RuntimeError, match=r"moved: \['s.cache'\]"):
-            _reload(model, {"s.weight": torch.rand(4, 4)})
-
     def test_same_address_new_layout_moves(self):
         def fn(layer):  # same storage, flattened only on reloads
             if layer.quant_method.runs > 1:
@@ -803,20 +806,6 @@ class TestLoudChecks:
 
         model = _one_layer(fn, torch.rand(4, 4))
         with pytest.raises(RuntimeError, match=r"moved: \['s.weight'\]"):
-            _reload(model, {"s.weight": torch.rand(4, 4)})
-
-    @pytest.mark.parametrize("split", [True, False], ids=["split", "merged"])
-    def test_side_tensor_aliasing_change_raises(self, split):
-        # a cold start on the new weights gives a and b separate values; one
-        # startup storage cannot hold both (or the reverse: one tensor pinned
-        # into two storages ends up reading only the last)
-        def fn(layer):
-            shared = (layer.quant_method.runs == 1) == split
-            layer.a = layer.weight * 2
-            layer.b = layer.a if shared else layer.weight * 3
-
-        model = _one_layer(fn, torch.rand(4, 4))
-        with pytest.raises(RuntimeError, match=r"s.b \(aliasing changed\)"):
             _reload(model, {"s.weight": torch.rand(4, 4)})
 
     def test_weight_derived_host_scalar_change_raises(self):
@@ -835,17 +824,6 @@ class TestLoudChecks:
 
         model = _one_layer(fn, torch.rand(4, 4))
         _reload(model, {"s.weight": torch.rand(4, 4)})
-
-    def test_side_tensor_new_view_of_same_storage_moves(self):
-        def fn(layer):  # graphs read the startup view, the layer a transposed one
-            if layer.quant_method.runs == 1:
-                layer.cache = layer.weight * 2
-            else:
-                layer.cache = layer.cache.t()
-
-        model = _one_layer(fn, torch.rand(4, 4))
-        with pytest.raises(RuntimeError, match=r"moved: \['s.cache'\]"):
-            _reload(model, {"s.weight": torch.rand(4, 4)})
 
     def test_cpu_offloaded_weights_refused(self):
         # post-processing would move them to the device and back into new
@@ -1020,9 +998,9 @@ def test_draft_wired_to_target_modules_after_cold_start():
 
 
 class TestAbortedUpdate:
-    def test_retry_after_failed_finish_pins_into_startup_storage(self):
+    def test_retry_after_failed_finish_compares_with_startup(self):
         """The first rerun replaces a plain cache, then raises; the retry
-        still leaves the value in the storage graphs captured at cold start."""
+        still compares with the storage graphs captured at cold start."""
 
         def fn(layer):
             layer.cache = layer.weight * 2
@@ -1030,14 +1008,10 @@ class TestAbortedUpdate:
                 raise RuntimeError("failed rerun")
 
         model = _one_layer(fn, torch.rand(4, 4))
-        startup = model.s.cache.data_ptr()
-        new = torch.rand(4, 4)
         with pytest.raises(RuntimeError, match="failed rerun"):
-            _reload(model, {"s.weight": new})
-        assert model.s.cache.data_ptr() != startup
-        _reload(model, {"s.weight": new})
-        assert model.s.cache.data_ptr() == startup
-        assert torch.equal(model.s.cache, _one_layer(fn, new).s.cache)
+            _reload(model, {"s.weight": torch.rand(4, 4)})
+        with pytest.raises(RuntimeError, match=re.escape("moved: ['s.cache']")):
+            _reload(model, {"s.weight": torch.rand(4, 4)})
 
     def test_parked_part_does_not_pair_with_next_update(self):
         """A part parked by an update that never finished is dropped when the
