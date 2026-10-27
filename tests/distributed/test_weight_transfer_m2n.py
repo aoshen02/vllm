@@ -743,6 +743,8 @@ class TestWireTypes:
                     self.loaded = [(name, tensor.clone()) for name, tensor in received]
 
         model = CoupledModel()
+        # a direct reload in progress (`begin_direct_reload`)
+        model.__dict__["_direct_delivery"] = (set(), None)
         direct = torch.zeros(1)
         engine = object.__new__(M2NWeightTransferEngine)
         engine._handle = object()
@@ -782,8 +784,43 @@ class TestWireTypes:
         assert [name for name, _ in model.loaded] == ["pair.weight", "pair.scale"]
         assert [tensor.item() for _, tensor in model.loaded] == [1, 3]
         assert direct.item() == 2
+        # written in place, not by `load_weights`: recorded as delivered
+        assert model.__dict__["_direct_delivery"][0] == {"direct"}
         assert reshard_order == ["pair.weight", "direct", "pair.scale"]
         assert stream.synchronize.call_count == 2
+
+    @pytest.mark.parametrize(
+        "mode,uses_load_weights,reloads",
+        [
+            ("layerwise", False, False),
+            ("layerwise", True, True),
+            ("direct", False, True),
+        ],
+        ids=["layerwise-all-direct", "layerwise-fallback", "direct-all-direct"],
+    )
+    def test_reload_lifecycle_runs_when_needed(
+        self, monkeypatch, mode, uses_load_weights, reloads
+    ):
+        # A direct reload reruns post-load processing even when every
+        # parameter was resharded in place.
+        import vllm.model_executor.model_loader.reload as reload
+
+        calls = []
+        for name, step in (
+            ("initialize_layerwise_reload", "begin"),
+            ("finalize_layerwise_reload", "finish"),
+        ):
+            monkeypatch.setattr(reload, name, lambda *_, s=step: calls.append(s))
+        monkeypatch.setenv("VLLM_RELOAD_MODE", mode)
+        engine = object.__new__(M2NWeightTransferEngine)
+        engine.model = torch.nn.Module()
+        engine.model_config = None
+        engine._uses_load_weights = uses_load_weights
+
+        engine.start_weight_update()
+        engine.finish_weight_update()
+
+        assert calls == (["begin", "finish"] if reloads else [])
 
     def test_trainer_rank_must_be_a_trainer_rank(self):
         """A trainer rank must fall within the trainer portion of the group."""

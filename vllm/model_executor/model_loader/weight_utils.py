@@ -1573,16 +1573,26 @@ def discard_weight_parts(model: torch.nn.Module) -> None:
         module.__dict__.pop("_pending_weight_parts", None)
 
 
-def finalize_model_weights(model: torch.nn.Module) -> None:
-    """Run once after a full load or reload: reject multi-tensor weights whose
-    parts never all arrived, then run the model-level post-load hook."""
+def check_weight_parts_complete(model: torch.nn.Module) -> None:
+    """Raise on multi-tensor weights whose parts never all arrived. Weight
+    updates call this before post-load processing, which would otherwise run
+    on the stale half."""
     incomplete = [
         f"{key} (has {sorted(entry)})"
         for module in model.modules()
-        for key, entry in module.__dict__.pop("_pending_weight_parts", {}).items()
+        for key, entry in module.__dict__.get("_pending_weight_parts", {}).items()
     ]
     if incomplete:
         raise ValueError(f"Incomplete multi-tensor weights: {incomplete}")
+
+
+def finalize_model_weights(model: torch.nn.Module) -> None:
+    """Run once after a full load or reload: reject multi-tensor weights whose
+    parts never all arrived, then run the model-level post-load hook."""
+    try:
+        check_weight_parts_complete(model)
+    finally:
+        discard_weight_parts(model)
     if hasattr(model, "process_weights_after_loading"):
         model.process_weights_after_loading()
 

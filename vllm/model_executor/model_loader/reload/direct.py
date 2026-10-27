@@ -9,8 +9,12 @@ post-load processing runs once at the end:
 - cold start records each tensor's checkpoint layout (before post-load
   processing);
 - ``begin`` views tensors whose layout post-load processing changed back to
-  their checkpoint layout, on the same storage;
-- ``finish`` reruns ``process_weights_after_loading`` for every module, as
+  their checkpoint layout, on the same storage, and records the checkpoint
+  names fed to ``model.load_weights`` until ``finish``;
+- ``finish`` raises unless the update delivered every name cold start was
+  fed (`record_checkpoint_weight_names`), except those
+  ``VLLM_DIRECT_RELOAD_EXCLUDE_REGEX`` names, then reruns
+  ``process_weights_after_loading`` for every module, as
   cold start does. Post-load processing has to refill derived tensors in
   place (captured CUDA graphs keep their startup addresses); nothing moves
   them back.
@@ -24,7 +28,9 @@ Delivery contract: an update must deliver every checkpoint tensor of each
 module whose post-load processing changes the tensor's layout or is not
 idempotent (it would convert the kept runtime bytes again). A tensor without
 such processing (e.g. an embedding table the trainer keeps frozen) may be left
-out and keeps its bytes. Nothing checks this contract here.
+out and keeps its bytes; the update names it in
+``VLLM_DIRECT_RELOAD_EXCLUDE_REGEX``. ``finish`` checks the names, not which
+tensors may be left out.
 
 Post-load processing must keep every checkpoint tensor registered under its
 checkpoint name (`replace_parameter`, `retire_parameter`): a reload loads it
@@ -35,6 +41,7 @@ Selected with ``VLLM_RELOAD_MODE=direct``.
 
 from collections.abc import Iterator
 
+import regex as re
 import torch
 
 import vllm.envs as envs
@@ -48,6 +55,7 @@ __all__ = [
     "direct_reload_enabled",
     "finish_direct_reload",
     "record_checkpoint_layout",
+    "record_delivered",
 ]
 
 
@@ -92,6 +100,85 @@ def record_checkpoint_layout(model: torch.nn.Module) -> None:
             t._ckpt_layout = (tuple(t.shape), t.stride(), t.dtype, t.storage_offset())
 
 
+def _excluded_names() -> "re.Pattern[str] | None":
+    """``VLLM_DIRECT_RELOAD_EXCLUDE_REGEX``: checkpoint names an update may
+    leave out (e.g. a frozen Engram table)."""
+    pattern = envs.VLLM_DIRECT_RELOAD_EXCLUDE_REGEX
+    try:
+        return re.compile(pattern) if pattern else None
+    except re.error as e:
+        raise ValueError(
+            f"VLLM_DIRECT_RELOAD_EXCLUDE_REGEX={pattern!r} is not a regex: {e}"
+        ) from e
+
+
+def record_delivered(model: torch.nn.Module, name: str) -> None:
+    """Record that the current direct reload delivered checkpoint tensor
+    ``name``; a no-op outside one. ``model.load_weights`` calls this for
+    every tensor it is fed; an engine writing a tensor without it (m2n
+    reshards) calls it."""
+    delivery = model.__dict__.get("_direct_delivery")
+    if delivery is not None:
+        delivery[0].add(name)
+
+
+def _track_delivery(model: torch.nn.Module, excluded) -> None:
+    """Until finish, feed ``model.load_weights`` through `record_delivered`,
+    as `record_checkpoint_weight_names` does at cold start: whoever loads
+    the update (an engine, ``reload_weights``) is checked alike."""
+    model._direct_delivery = (set(), excluded)
+    load_weights = getattr(model, "load_weights", None)
+    if load_weights is None or getattr(load_weights, "_direct_tracked", False):
+        return
+
+    def tracked(weights, *args, **kwargs):
+        def fed():
+            for name, tensor in weights:
+                record_delivered(model, name)
+                yield name, tensor
+
+        return load_weights(fed(), *args, **kwargs)
+
+    tracked._direct_tracked = True  # type: ignore[attr-defined]
+    model.load_weights = tracked
+
+
+def _check_delivered(model: torch.nn.Module) -> set[str] | None:
+    """Before any post-load processing, which would convert the runtime
+    bytes of a tensor that did not arrive again (they are viewed as
+    checkpoint bytes): raise unless the update delivered every checkpoint
+    name cold start fed to ``load_weights``, except the excluded ones, and
+    every part of each multi-tensor weight. A model cold start fed nothing
+    (dummy weights) adopts the first update's names, returned here; an empty
+    first update raises."""
+    from vllm.model_executor.model_loader.base_loader import CHECKPOINT_WEIGHT_NAMES
+    from vllm.model_executor.model_loader.weight_utils import (
+        check_weight_parts_complete,
+    )
+
+    delivered, excluded = model.__dict__.pop("_direct_delivery")
+    required: set[str] | None = getattr(model, CHECKPOINT_WEIGHT_NAMES, None)
+    if required is None and not delivered:
+        raise ValueError(
+            "the first weight update delivered no tensors; with no checkpoint "
+            "loaded at cold start it must deliver all of them"
+        )
+    missing = sorted(
+        n
+        for n in (required or set()) - delivered
+        if excluded is None or not excluded.search(n)
+    )
+    if missing:
+        raise ValueError(
+            f"weight update did not deliver {len(missing)} checkpoint tensors "
+            f"its cold start loaded: {missing[:16]}. Deliver them, or name them "
+            "in VLLM_DIRECT_RELOAD_EXCLUDE_REGEX if their modules have no "
+            "layout-changing post-load processing"
+        )
+    check_weight_parts_complete(model)
+    return delivered if required is None else None
+
+
 def _checkpoint_views(
     model: torch.nn.Module,
 ) -> list[tuple[torch.Tensor, torch.Tensor]]:
@@ -134,8 +221,10 @@ def begin_direct_reload(model: torch.nn.Module) -> None:
         # storage after `begin`: post-load processing would write it there
         raise RuntimeError("direct reload: draft_lm_head_quantization is not supported")
     views = _checkpoint_views(model)
+    excluded = _excluded_names()
 
     # nothing above modified the model
+    _track_delivery(model, excluded)
     for t, view in views:
         t.data = view  # no zeroing: the full sync rewrites the checkpoint region
     logger.info(
@@ -145,9 +234,12 @@ def begin_direct_reload(model: torch.nn.Module) -> None:
 
 @torch.no_grad()
 def finish_direct_reload(model: torch.nn.Module, model_config) -> None:
-    """Rerun cold-start post-load processing."""
+    """Check the update was complete, then rerun cold-start post-load
+    processing."""
+    from vllm.model_executor.model_loader.base_loader import CHECKPOINT_WEIGHT_NAMES
     from vllm.model_executor.model_loader.utils import process_weights_after_loading
 
+    adopted = _check_delivered(model)
     torch.accelerator.synchronize()  # engines may write on other streams
 
     # One-shot "already processed" guards (R7) would make the rerun below a
@@ -164,3 +256,12 @@ def finish_direct_reload(model: torch.nn.Module, model_config) -> None:
         torch.accelerator.current_accelerator(),
     )
     process_weights_after_loading(model, model_config, device)
+    if adopted is not None:
+        setattr(model, CHECKPOINT_WEIGHT_NAMES, adopted)
+        logger.warning(
+            "Cold start loaded no checkpoint: the first weight update of %s "
+            "must have been complete; later ones must deliver its %d "
+            "checkpoint tensors",
+            type(model).__name__,
+            len(adopted),
+        )

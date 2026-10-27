@@ -319,6 +319,7 @@ if TYPE_CHECKING:
     VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY: bool = False
     VLLM_WEIGHT_OFFLOADING_DISABLE_UVA: bool = False
     VLLM_RELOAD_MODE: Literal["layerwise", "direct"] = "layerwise"
+    VLLM_DIRECT_RELOAD_EXCLUDE_REGEX: str = ""
     VLLM_KV_OFFLOAD_MAX_BATCH_DESCRIPTORS: int = 0
     VLLM_WSL2_ENABLE_PIN_MEMORY: bool = False
     VLLM_DISABLE_LOG_LOGO: bool = False
@@ -2198,6 +2199,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # tensors and reruns post-load processing in place.
     "VLLM_RELOAD_MODE": env_with_choices(
         "VLLM_RELOAD_MODE", "layerwise", ["layerwise", "direct"]
+    ),
+    # Direct reload: checkpoint names an update may leave out (frozen tensors
+    # whose modules have no post-load processing). Unset: every name must be
+    # delivered.
+    "VLLM_DIRECT_RELOAD_EXCLUDE_REGEX": lambda: os.getenv(
+        "VLLM_DIRECT_RELOAD_EXCLUDE_REGEX", ""
     ),
     # Max descriptors per CPU-KV-offload batch-memcpy call. 0 = platform default
     # (ROCm chunks at 8192, since hipMemcpyBatchAsync faults above that on

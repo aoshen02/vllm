@@ -11,7 +11,11 @@ from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
 from vllm.model_executor.layers.linear import UnquantizedLinearMethod
 from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod
 from vllm.model_executor.model_loader import get_model_loader, register_model_loader
-from vllm.model_executor.model_loader.base_loader import BaseModelLoader
+from vllm.model_executor.model_loader.base_loader import (
+    CHECKPOINT_WEIGHT_NAMES,
+    BaseModelLoader,
+    record_checkpoint_weight_names,
+)
 from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
@@ -145,6 +149,91 @@ def test_weights_track_keeps_unquantized_models_unchanged():
     model.norm = _layer(weight=(4,))
     assert _track(model, {"norm.weight"}, quantized=False) == ""
     assert "norm.weight" in _track(model, set(), quantized=False)
+
+
+class TestRecordCheckpointWeightNames:
+    """Cold start records the checkpoint names fed to `load_weights` (what a
+    weight update must deliver), not what `load_weights` reports."""
+
+    @pytest.mark.parametrize(
+        "fed,instance_loader,raises,recorded",
+        [
+            (
+                ["a.weight", "a.weight_scale"],
+                False,
+                False,
+                {"a.weight", "a.weight_scale"},
+            ),
+            (["a.weight", "mtp.0.weight"], True, False, {"a.weight"}),
+            (
+                ["a.weight", "layers.0.rotary_emb.inv_freq"],
+                False,
+                False,
+                {"a.weight"},
+            ),
+            ([], False, False, None),
+            (["a.weight"], False, True, None),
+        ],
+        ids=[
+            "fed-not-reported",
+            "unused-dropped",
+            "rotary-cache-dropped",
+            "nothing-fed",
+            "load-failed",
+        ],
+    )
+    def test_record(self, fed, instance_loader, raises, recorded):
+        class Model(nn.Module):
+            def load_weights(self, weights):
+                for name, _ in weights:
+                    if raises:
+                        raise RuntimeError("load failed")
+                return {"a.weight"}
+
+            def is_unused_checkpoint_weight(self, name):
+                return name.startswith("mtp.")
+
+        model = Model()
+        own = None
+        if instance_loader:  # a loader set on the instance, not the class
+            own = model.__dict__["load_weights"] = lambda w: Model.load_weights(
+                model, w
+            )
+        try:
+            with record_checkpoint_weight_names(model):
+                model.load_weights((name, torch.zeros(1)) for name in fed)
+        except RuntimeError:
+            assert raises
+        assert getattr(model, CHECKPOINT_WEIGHT_NAMES, None) == recorded
+        # the model's own loader is back
+        assert model.__dict__.get("load_weights") is own
+
+
+@pytest.mark.parametrize(
+    "model_cls,name,unused",
+    [
+        ("deepseek", "model.layers.2.eh_proj.weight", False),
+        ("deepseek", "model.layers.0.mlp.gate.weight", True),
+        ("deepseek", "model.embed_tokens.weight", False),  # loaded under PP
+        ("glm5next", "model.layers.2.eh_proj.weight", False),
+        ("glm5next", "model.language_model.layers.2.eh_proj.weight", False),
+        ("glm5next", "model.language_model.layers.1.mlp.gate.weight", True),
+        ("glm5next", "model.embed_tokens.weight", True),
+    ],
+)
+def test_mtp_draft_declares_target_layers_unused(model_cls, name, unused):
+    # a draft loaded from the target checkpoint is fed the whole target; a
+    # draft update need not deliver what its loader skips
+    from types import SimpleNamespace
+    from typing import Any
+
+    from vllm.model_executor.models.deepseek_mtp import DeepSeekMTP
+    from vllm.models.glm5next.common.mtp import Glm5NextMTP
+
+    cls: Any = {"deepseek": DeepSeekMTP, "glm5next": Glm5NextMTP}[model_cls]
+    config = SimpleNamespace(num_hidden_layers=2, num_nextn_predict_layers=1)
+    draft = SimpleNamespace(config=config)
+    assert cls.is_unused_checkpoint_weight(draft, name) is unused
 
 
 def test_moe_runner_reports_registered_expert_names():
