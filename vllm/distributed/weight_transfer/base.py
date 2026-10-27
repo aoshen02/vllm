@@ -316,6 +316,9 @@ class ModuleSource(WeightSource):
 
     The mesh ranks are taken as trainer ranks, so the default process group's
     ranks must be the `TrainerInitInfo.rank`s.
+
+    A tied parameter is sent under each of its names (a tied ``lm_head`` as
+    well as the embedding): a direct reload checks every checkpoint name.
     """
 
     def __init__(self, module: torch.nn.Module) -> None:
@@ -324,7 +327,7 @@ class ModuleSource(WeightSource):
     @cached_property
     def metadata(self) -> list[ParamMeta]:
         metas = []
-        for name, p in self._module.named_parameters():
+        for name, p in self._module.named_parameters(remove_duplicate=False):
             layout = _dtensor_layout(p)
             if layout is None:
                 metas.append(ParamMeta(name, p.dtype, tuple(p.shape)))
@@ -343,12 +346,12 @@ class ModuleSource(WeightSource):
         return metas
 
     def iter_full(self) -> Iterator[tuple[str, torch.Tensor]]:
-        for name, param in self._module.named_parameters():
+        for name, param in self._module.named_parameters(remove_duplicate=False):
             if _is_member(param):
                 yield name, materialize_full_tensor(param)
 
     def iter_local(self) -> Iterator[tuple[str, torch.Tensor]]:
-        for name, param in self._module.named_parameters():
+        for name, param in self._module.named_parameters(remove_duplicate=False):
             if not _is_member(param):
                 continue
             layout = _dtensor_layout(param)
@@ -438,6 +441,15 @@ class WeightTransferEngine(ABC, Generic[TInitInfo, TUpdateInfo]):
     checkpoint-format engines) is opted into per engine by running it inside
     `start_weight_update`/`finish_weight_update`. Engines that apply weights in
     place (e.g. sparse patches) leave those methods as no-ops.
+
+    A direct reload (`VLLM_RELOAD_MODE=direct`) checks that an update
+    delivered every checkpoint tensor cold start fed to `load_weights`, except
+    the names `VLLM_DIRECT_RELOAD_EXCLUDE_REGEX` matches (frozen tensors whose
+    modules have no layout-changing post-load processing, which keep their
+    cold-start bytes). This holds for MTP/draft and confidence heads too.
+    `disable_mtp_completeness_check` only lets one `load_weights` call (one
+    bucket) carry part of a head; the reload's finish (`finish_direct_reload`)
+    checks the update as a whole.
 
     Subclasses should define:
         init_info_cls: Type of backend-specific initialization info

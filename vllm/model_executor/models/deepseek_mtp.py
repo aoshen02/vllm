@@ -301,6 +301,13 @@ class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts, SupportsPP):
     ) -> torch.Tensor | None:
         return self.model.compute_logits(hidden_states, spec_step_idx)
 
+    def is_unused_checkpoint_weight(self, name: str) -> bool:
+        # load_weights' rule: target layers are skipped, embed_tokens is not
+        return (
+            get_spec_layer_idx_from_weight_name(self.config, name) is None
+            and "embed_tokens" not in name
+        )
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         stacked_params_mapping = [
             ("gate_up_proj", "gate_proj", 0),
