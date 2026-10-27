@@ -483,11 +483,10 @@ class _MuseSparkNvFp4Scales:
             and self.gemm1_alpha is None
             and self.gemm1_beta is None
         ), "MuseSpark NVFP4 MoE does not support SwiGLU clamp/alpha/beta"
-        layer.register_parameter(
-            "g1_scale_c",
-            torch.nn.Parameter(self._compute_g1_scale_c(), requires_grad=False),
+        # a weight reload refills it in place: captured graphs read it
+        self.g1_scale_c = replace_parameter(
+            layer, "g1_scale_c", self._compute_g1_scale_c()
         )
-        self.g1_scale_c = layer.g1_scale_c
 
 
 class MuseSparkTrtLlmNvFp4Experts(_MuseSparkNvFp4Scales, TrtLlmNvFp4ExpertsMonolithic):
@@ -643,15 +642,28 @@ class MuseSparkModelOptNvFp4FusedMoE(ModelOptNvFp4FusedMoE):
         # Collapsed to the global max and repeated per expert.
         a13 = a13_scale[0:1]
         a2 = a2_scale[0:1]
-        g1_alphas = (a13 * w13_weight_scale_2[:, 0]).contiguous()
-        g1_scale_c = (a13 * w13_weight_scale_2[:, 1] / a2).contiguous()
-        g2_alphas = (a2 * layer.w2_weight_scale_2.data).contiguous()
+        # Kernels read these: a weight reload refills them in place.
+        consts = {
+            "_g1_alphas": (a13 * w13_weight_scale_2[:, 0]).contiguous(),
+            "_g1_scale_c": (a13 * w13_weight_scale_2[:, 1] / a2).contiguous(),
+            "_g2_alphas": (a2 * layer.w2_weight_scale_2.data).contiguous(),
+            "_a1_gscale": 1.0 / a13,
+            "_a2_gscale": 1.0 / a2,
+        }
+        for name, value in consts.items():
+            layer.__dict__.setdefault(name, None)  # a plain attribute
+            consts[name] = replace_parameter(layer, name, value)
+        g1_alphas, g1_scale_c, g2_alphas = (
+            consts["_g1_alphas"],
+            consts["_g1_scale_c"],
+            consts["_g2_alphas"],
+        )
 
         base_config = nvfp4_moe_quant_config(
             g1_alphas=g1_alphas,
             g2_alphas=g2_alphas,
-            a1_gscale=1.0 / a13,
-            a2_gscale=1.0 / a2,
+            a1_gscale=consts["_a1_gscale"],
+            a2_gscale=consts["_a2_gscale"],
             w1_scale=layer.w13_weight_scale,
             w2_scale=layer.w2_weight_scale,
             # The TRT-LLM kernel rejects swizzled activation scale factors.
