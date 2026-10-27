@@ -15,9 +15,8 @@ tensors and the cold-start post-load processing runs once at the end:
   ``finish``, as cold start records them;
 - ``finish`` raises unless the update delivered every name cold start was
   fed, then reruns ``process_weights_after_loading`` for every module, as
-  cold start does, and raises if an address moved: of a parameter, a buffer,
-  or a derived tensor held elsewhere (`side_state`). Post-load processing has
-  to refill those in place; nothing moves them back.
+  cold start does, and raises if an address moved. Post-load processing
+  has to refill derived tensors in place; nothing moves them back.
 
 A reload is exactly as correct as a cold start: no module is skipped because
 it "received nothing" (a loader may bypass the parameter's ``weight_loader``,
@@ -41,8 +40,6 @@ import torch
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
 from vllm.model_executor.utils import is_weights_pre_processed
-
-from .side_state import side_tensors
 
 logger = init_logger(__name__)
 
@@ -111,12 +108,8 @@ def _addresses(model: torch.nn.Module) -> dict[str, tuple]:
     tensors += model.named_buffers(remove_duplicate=False)
     for name, t in tensors:
         if t is not None and t.device.type == "cuda" and t.numel():
-            out[name] = _where(t)
+            out[name] = (t.data_ptr(), tuple(t.shape), t.stride(), t.dtype)
     return out
-
-
-def _where(t: torch.Tensor) -> tuple:
-    return (t.data_ptr(), tuple(t.shape), t.stride(), t.dtype)
 
 
 def record_checkpoint_layout(model: torch.nn.Module) -> None:
@@ -461,12 +454,7 @@ def begin_direct_reload(model: torch.nn.Module) -> None:
     views = _checkpoint_views(model, skipped, dropped)
 
     # nothing above modified the model
-    # The derived tensors captured graphs read, as served (before any view
-    # back), kept until a finish succeeds: a retry after an update that
-    # failed midway still compares with the served ones.
-    if "_direct_side_tensors" not in model.__dict__:
-        model._direct_side_tensors = side_tensors(model)
-    # Likewise every address as served: a draft shares the target's embedding
+    # Every address as served: a draft shares the target's embedding
     # and lm_head only after its own cold start (llm_base_proposer)
     if "_direct_addresses" not in model.__dict__:
         model._direct_addresses = _addresses(model)
@@ -522,9 +510,6 @@ def finish_direct_reload(model: torch.nn.Module, model_config) -> None:
 
     current = _addresses(model)
     moved = sorted(n for n, p in model._direct_addresses.items() if current.get(n) != p)
-    side = {n: _where(t) for n, t in side_tensors(model).items()}
-    served = model._direct_side_tensors
-    moved += sorted(n for n, t in served.items() if side.get(n) != _where(t))
     scalars = _host_scalars(model)
     moved += sorted(
         f"{n} (host scalar {v} -> {scalars.get(n)})"
@@ -535,7 +520,6 @@ def finish_direct_reload(model: torch.nn.Module, model_config) -> None:
     if moved:
         logger.error("direct reload: tensors moved: %s", moved)
         raise RuntimeError(f"direct reload: {len(moved)} tensors moved: {moved[:8]}")
-    del model._direct_side_tensors
     if adopted is not None:
         setattr(model, CHECKPOINT_WEIGHT_NAMES, adopted)
         logger.warning(
