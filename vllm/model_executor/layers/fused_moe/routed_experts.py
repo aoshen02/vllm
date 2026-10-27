@@ -565,15 +565,9 @@ class RoutedExperts(PluggableLayer):
             tp_size = self.moe_config.moe_parallel_config.tp_size
             loaded_per_rank = loaded_weight.shape[shard_dim] // tp_size
             start_offset = loaded_per_rank * tp_rank
-            available = loaded_weight.shape[shard_dim] - start_offset
-            if available <= 0:
-                # No checkpoint rows for this TP rank (last rank with
-                # padding): its whole shard is padding, zero it
-                start = 0 if shard_id == "w1" else shard_size
-                expert_data.narrow(shard_dim, start, shard_size).zero_()
-                return
-            narrow_size = min(loaded_per_rank, available)
-            loaded_weight = loaded_weight.narrow(shard_dim, start_offset, narrow_size)
+            loaded_weight = loaded_weight.narrow(
+                shard_dim, start_offset, loaded_per_rank
+            )
         # Narrow parameter and load.
         # w1, gate_proj: Load into first logical weight of w13.
         if shard_id == "w1":
@@ -608,14 +602,9 @@ class RoutedExperts(PluggableLayer):
             tp_size = self.moe_config.moe_parallel_config.tp_size
             loaded_per_rank = loaded_weight.shape[shard_dim] // tp_size
             start_offset = loaded_per_rank * tp_rank
-            available = loaded_weight.shape[shard_dim] - start_offset
-            if available <= 0:
-                # No checkpoint columns for this TP rank (last rank with
-                # padding): its whole shard is padding, zero it
-                expert_data.zero_()
-                return
-            narrow_size = min(loaded_per_rank, available)
-            loaded_weight = loaded_weight.narrow(shard_dim, start_offset, narrow_size)
+            loaded_weight = loaded_weight.narrow(
+                shard_dim, start_offset, loaded_per_rank
+            )
         # w2, down_proj: Load into only logical weight of w2.
         hidden_dim = self._get_hidden_dim(shard_dim, expert_data.ndim)
         expert_data = self._narrow_expert_data_for_padding(
