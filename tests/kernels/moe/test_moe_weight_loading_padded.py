@@ -806,3 +806,62 @@ class TestPerTensorScaleCoercion:
         # numel > 1 must fail loudly instead of silently picking an element.
         with pytest.raises(RuntimeError):
             RoutedExperts._to_scalar(torch.tensor([0.1, 0.2]))
+
+
+class TestPaddingZeroedOnEveryLoad:
+    """A reload writes into storage that holds earlier bytes (the previous
+    load, or post-load processing's output under direct reload). Padding the
+    checkpoint does not cover must come out as on a cold load into zeros."""
+
+    @pytest.mark.parametrize(
+        "padded,loaded,hidden_dim,shard_dim",
+        [
+            ((3072, 1024), (2688, 1024), 0, None),
+            ((1024, 3072), (1024, 2688), 1, None),
+            ((3072, 1024), (2688, 896), 0, 1),
+            ((4, 3072, 1024), (4, 2688, 896), 1, 2),
+        ],
+        ids=["hidden-rows", "hidden-cols", "hidden-and-shard", "all-experts"],
+    )
+    def test_narrow_zeroes_stale_padding(self, padded, loaded, hidden_dim, shard_dim):
+        weight = torch.randn(loaded)
+        cold, stale = torch.zeros(padded), torch.full(padded, 7.0)
+        for expert_data in (cold, stale):
+            RoutedExperts._narrow_expert_data_for_padding(
+                expert_data, weight, hidden_dim=hidden_dim, shard_dim=shard_dim
+            ).copy_(weight)
+        assert torch.equal(stale, cold)
+
+    def test_zero_padding_false_keeps_caller_fill(self):
+        expert_data = torch.ones(8, 4)
+        weight = torch.randn(6, 4)
+        RoutedExperts._narrow_expert_data_for_padding(
+            expert_data, weight, hidden_dim=0, zero_padding=False
+        ).copy_(weight)
+        assert torch.equal(expert_data[6:], torch.ones(2, 4))
+
+    @pytest.mark.parametrize("tp_rank", [0, 1], ids=["rank0", "rank1"])
+    def test_w13_intermediate_padding_between_gate_and_up(self, tp_rank):
+        # MXFP4-style rounding: 576 rows per rank padded to 640, so w13 holds
+        # gate in [0, 576), padding [576, 640), up in [640, 1216), padding after
+        tp, real, padded, hidden = 2, 576, 640, 16
+        experts = object.__new__(RoutedExperts)
+        torch.nn.Module.__init__(experts)
+        experts.moe_config = make_dummy_moe_config()
+        experts.moe_config.moe_parallel_config.tp_size = tp
+        gate, up = torch.randn(tp * real, hidden), torch.randn(tp * real, hidden)
+        cold = torch.zeros(2 * padded, hidden)
+        stale = torch.full((2 * padded, hidden), 7.0)
+        for expert_data in (cold, stale):
+            for shard_id, weight in (("w1", gate), ("w3", up)):
+                experts._load_w13(
+                    expert_data=expert_data,
+                    shard_dim=0,
+                    shard_id=shard_id,
+                    loaded_weight=weight,
+                    tp_rank=tp_rank,
+                )
+        assert torch.equal(stale, cold)
+        rows = slice(tp_rank * real, (tp_rank + 1) * real)
+        assert torch.equal(cold[:real], gate[rows])
+        assert torch.equal(cold[padded : padded + real], up[rows])
