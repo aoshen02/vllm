@@ -30,6 +30,12 @@ Post-load processing must keep every checkpoint tensor registered under its
 checkpoint name (`replace_parameter`, `retire_parameter`): a reload loads it
 by that name.
 
+Online quantization (a BF16 checkpoint quantized at load) is the one case the
+kernel storage cannot hold the checkpoint tensor. Those modules reload the
+way they cold start: the layerwise path stages the checkpoint tensors on the
+side, quantizes once the module is complete and copies the result into the
+kernel tensors, so their addresses are kept too.
+
 Selected with ``VLLM_RELOAD_MODE=direct``.
 """
 
@@ -41,6 +47,8 @@ import vllm.envs as envs
 from vllm.config import get_current_vllm_config_or_none
 from vllm.logger import init_logger
 from vllm.model_executor.utils import _extent, is_weights_pre_processed
+
+from .layerwise import finalize_layerwise_processing, stage_layer_for_reload
 
 logger = init_logger(__name__)
 
@@ -139,6 +147,14 @@ def begin_direct_reload(model: torch.nn.Module) -> None:
     logger.info(
         "direct reload: %d tensors viewed back to checkpoint layout", len(views)
     )
+    for layer in _online_quant_layers(model):
+        stage_layer_for_reload(layer)
+
+
+def _online_quant_layers(model: torch.nn.Module) -> Iterator[torch.nn.Module]:
+    for module in model.modules():
+        if getattr(getattr(module, "quant_method", None), "uses_meta_device", False):
+            yield module
 
 
 @torch.no_grad()
@@ -148,10 +164,17 @@ def finish_direct_reload(model: torch.nn.Module, model_config) -> None:
 
     torch.accelerator.synchronize()  # engines may write on other streams
 
+    # online-quantized modules: quantize what arrived, or keep the kernel
+    # tensors of one the update left out; their one-shot guard stays, the
+    # rerun below must not quantize the kernel bytes again
+    finalize_layerwise_processing(model, model_config)
+    online = set(_online_quant_layers(model))
+
     # One-shot "already processed" guards would make the rerun below a no-op
     # and leave the freshly written checkpoint layout in place.
     for module in model.modules():
-        module.__dict__.pop("_already_called_process_weights_after_loading", None)
+        if module not in online:
+            module.__dict__.pop("_already_called_process_weights_after_loading", None)
 
     device = next(
         (p.device for p in model.parameters() if p.device.type == "cuda"),

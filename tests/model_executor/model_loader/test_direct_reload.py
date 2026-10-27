@@ -9,7 +9,9 @@ post-load processing has the hazards found on real models:
 (c) the model's loader writes a weight without its ``weight_loader`` (MiMo);
 (d) post-load processing consumes a checkpoint tensor, which stays
     registered as a retired parameter (NVFP4 ``weight_scale_2``);
-(e) post-load processing that must never run on converted bytes (packing).
+(e) post-load processing that must never run on converted bytes (packing);
+(f) online quantization: the kernel tensor cannot hold the checkpoint tensor,
+    which is staged and quantized as at cold start.
 
 Invariant: a reload equals a cold start on the new weights, at the startup
 addresses.
@@ -24,10 +26,14 @@ from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBa
 from vllm.model_executor.model_loader.reload import (
     direct,
     initialize_layerwise_reload,
+    record_metadata_for_reloading,
 )
 from vllm.model_executor.model_loader.reload.direct import (
     begin_direct_reload,
     finish_direct_reload,
+)
+from vllm.model_executor.model_loader.reload.layerwise import (
+    initialize_online_processing,
 )
 from vllm.model_executor.model_loader.utils import process_weights_after_loading
 from vllm.model_executor.model_loader.weight_utils import (
@@ -91,6 +97,12 @@ def _pack(layer):  # (e): not idempotent, must never run on converted bytes
     replace_parameter(layer, "weight", (layer.weight * 2).t().contiguous())
 
 
+def _quantize_int8(layer):  # (f): bf16 checkpoint tensor, int8 kernel tensor
+    scale = layer.weight.float().abs().amax() / 127
+    replace_parameter(layer, "weight", (layer.weight / scale).round().to(torch.int8))
+    replace_parameter(layer, "weight_scale", scale)
+
+
 _SHAPES = {
     "attn.kv_b.weight": ((8, 4), torch.bfloat16),
     "proj.weight": ((4, 6), torch.bfloat16),
@@ -98,6 +110,7 @@ _SHAPES = {
     "nvfp4.weight": ((4, 4), torch.bfloat16),
     "nvfp4.weight_scale_2": ((), torch.float32),
     "engram.weight": ((3, 5), torch.bfloat16),
+    "online.weight": ((4, 4), torch.bfloat16),
 }
 _PWAL = {
     "attn.kv_b": None,
@@ -105,7 +118,22 @@ _PWAL = {
     "mimo": _requantize,
     "nvfp4": _consume_scale_2,
     "engram": _pack,
+    "online": _quantize_int8,
 }
+
+
+class _OnlineMethod(_Method):
+    """As the online quantization methods: the checkpoint tensor lives on the
+    meta device, is staged by the layerwise loaders and quantized once, when
+    the layer is complete."""
+
+    uses_meta_device = True
+
+    def process_weights_after_loading(self, layer):
+        if getattr(layer, "_already_called_process_weights_after_loading", False):
+            return
+        super().process_weights_after_loading(layer)
+        layer._already_called_process_weights_after_loading = True
 
 
 class _Layer(torch.nn.Module):
@@ -126,6 +154,14 @@ class _ToyModel(torch.nn.Module):
                 if not hasattr(parent, part):
                     parent.add_module(part, _Layer(_PWAL[".".join(path[: i + 1])]))
                 parent = getattr(parent, part)
+            if name.startswith("online."):
+                parent.quant_method = _OnlineMethod(_PWAL["online"])
+                param = torch.nn.Parameter(
+                    torch.empty(shape, dtype=dtype, device="meta"), False
+                )
+                parent.register_parameter(local, param)
+                initialize_online_processing(parent)  # as create_weights does
+                continue
             param = torch.nn.Parameter(torch.empty(shape, dtype=dtype), False)
             parent.register_parameter(local, param)
 
@@ -154,6 +190,7 @@ def _cold_start(weights: dict[str, torch.Tensor]) -> _ToyModel:
     """As ``BaseModelLoader.load_model`` does."""
     with _DEVICE:
         model = _ToyModel()
+        record_metadata_for_reloading(model)
     model.load_weights(weights.items())
     process_weights_after_loading(model, _MODEL_CONFIG, _DEVICE)
     return model
@@ -242,6 +279,7 @@ class TestReloadEqualsColdStart:
             ["mimo.weight", "mimo.weight_scale"],
             ["nvfp4.weight", "nvfp4.global_scale"],
             ["engram.weight"],
+            ["online.weight", "online.weight_scale"],
         ],
         ids=[
             "a-parent-derived",
@@ -249,6 +287,7 @@ class TestReloadEqualsColdStart:
             "c-loader-bypass",
             "d-consumed-scale",
             "e-not-idempotent",
+            "f-online-quant",
         ],
     )
     def test_new_checkpoint_hazard(self, names):
