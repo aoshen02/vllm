@@ -22,34 +22,20 @@ def test_compute_logits_local_applies_output_transform() -> None:
     )
 
 
-def test_nvidia_router_multiplier_folds_once_per_load():
-    """The gate weight holds the folded multiplier after every load, a reload
-    of the raw weight included, and a post-load rerun alone never folds twice."""
-    from types import SimpleNamespace
-
+def test_nvidia_router_multiplier_folds_on_every_load():
+    """The router weight holds the folded multiplier after every load of the
+    raw weight, a reload included."""
     from vllm.models.muse_spark.nvidia.model import MuseSpark1xMoE
 
     moe = MuseSpark1xMoE.__new__(MuseSpark1xMoE)
     nn.Module.__init__(moe)
     moe.router = nn.Linear(4, 3, bias=False)
     moe.router.weight_loader = lambda param, w: param.data.copy_(w)
-    moe.moe_router = SimpleNamespace(router_output_multiplier=2.0)
     moe.router_output_multiplier = 2.0
-    moe._router_multiplier_folded = False
-    moe.router.weight.weight_loader = moe._load_router_weight  # as __init__ wires
     raw = torch.randn(3, 4)
-
-    def load_and_fold() -> torch.Tensor:
-        moe.router.weight.weight_loader(moe.router.weight, raw)
-        moe.fold_router_output_multiplier()
-        return moe.router.weight.detach().clone()
-
-    cold = load_and_fold()
-    torch.testing.assert_close(cold, raw * 2.0)
-    assert moe.moe_router.router_output_multiplier is None
-    moe.fold_router_output_multiplier()  # rerun without a reload
-    torch.testing.assert_close(moe.router.weight.detach(), cold)
-    torch.testing.assert_close(load_and_fold(), cold)  # reload
+    for _ in range(2):  # cold start, reload
+        moe._load_router_weight(moe.router.weight, raw)
+        torch.testing.assert_close(moe.router.weight.detach(), raw * 2.0)
 
 
 def test_nvidia_nvfp4_moe_constants_keep_addresses(monkeypatch):

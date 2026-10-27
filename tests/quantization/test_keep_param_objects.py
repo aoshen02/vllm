@@ -275,7 +275,11 @@ class TestExpertsKeepConstants:
             ),
             (
                 _EXP + "trtllm_fp8_moe.TrtLlmFp8ExpertsMonolithic",
-                ["_g1_alphas", "_g2_alphas", "_g1_scale_c"],
+                ["_g1_alphas", "_g2_alphas", "_g1_scale_c", "gemm1_alpha"],
+            ),
+            (
+                _EXP + "trtllm_nvfp4_moe.TrtLlmNvFp4ExpertsMonolithic",
+                ["g1_scale_c", "gemm1_alpha", "gemm1_beta", "gemm1_clamp_limit"],
             ),
             (
                 _EXP + "flashinfer_cutlass_moe.FlashInferExperts",
@@ -286,7 +290,13 @@ class TestExpertsKeepConstants:
                 ["per_token_global_scale"],
             ),
         ],
-        ids=["trtllm-mxfp4", "trtllm-fp8", "flashinfer-cutlass", "cutedsl"],
+        ids=[
+            "trtllm-mxfp4",
+            "trtllm-fp8",
+            "trtllm-nvfp4",
+            "flashinfer-cutlass",
+            "cutedsl",
+        ],
     )
     def test_rebuilt_experts_keep_addresses(self, cls_path, names):
         layer = torch.nn.Module()

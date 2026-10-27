@@ -1047,9 +1047,7 @@ def refresh_post_load_caches(model: nn.Module) -> None:
     """Rebuild caches derived from loaded weights (KDA merged conv weight,
     indexer fp32 head gate). Runs after every load and reload."""
     for module in model.modules():
-        if module is not model and callable(
-            getattr(module, "refresh_post_load_cache", None)
-        ):
+        if callable(getattr(module, "refresh_post_load_cache", None)):
             module.refresh_post_load_cache()
 
 

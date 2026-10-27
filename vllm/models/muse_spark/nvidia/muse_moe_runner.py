@@ -466,6 +466,8 @@ class _MuseSparkNvFp4Scales:
     gemm1_clamp_limit: torch.Tensor | None
     gemm1_alpha: torch.Tensor | None
     gemm1_beta: torch.Tensor | None
+    # g1_scale_c is registered below; there is no SwiGLU constant to keep
+    kept_constants: tuple[str, ...] = ()
 
     def _compute_g1_scale_c(self) -> torch.Tensor:
         quant_config = self.quant_config

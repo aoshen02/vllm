@@ -42,6 +42,15 @@ logger = init_logger(__name__)
 class TrtLlmNvFp4ExpertsBase:
     """NvFp4 TRTLLM-Gen MoE kernels. Supports modular and monolithic interface."""
 
+    # process_weights_after_loading registers them as layer parameters; quant
+    # methods that skip it (Quark) keep the constructor's tensors this way
+    kept_constants: tuple[str, ...] = (
+        "g1_scale_c",
+        "gemm1_alpha",
+        "gemm1_beta",
+        "gemm1_clamp_limit",
+    )
+
     def __init__(
         self,
         moe_config: FusedMoEConfig,
