@@ -7,7 +7,8 @@ checkpoint-format tensors straight into the live tensors and the cold-start
 post-load processing runs once at the end:
 
 - cold start records each tensor's checkpoint layout (before post-load
-  processing);
+  processing); the first ``begin`` records every address the model serves
+  with (after the runner wired a draft to the target's modules);
 - ``begin`` views tensors whose layout post-load processing changed back to
   their checkpoint layout, on the same storage, and records the checkpoint
   names fed to ``model.load_weights`` until ``finish``;
@@ -15,9 +16,9 @@ post-load processing runs once at the end:
   fed (`record_checkpoint_weight_names`), except those
   ``VLLM_DIRECT_RELOAD_EXCLUDE_REGEX`` names, then reruns
   ``process_weights_after_loading`` for every module, as
-  cold start does. Post-load processing has to refill derived tensors in
-  place (captured CUDA graphs keep their startup addresses); nothing moves
-  them back.
+  cold start does, and raises if an address or a host float moved.
+  Post-load processing has to refill derived tensors in place (captured CUDA
+  graphs keep their startup addresses); nothing moves them back.
 
 A reload is exactly as correct as a cold start on the delivered weights: no
 module is skipped because it "received nothing" (a loader may bypass the
@@ -39,6 +40,7 @@ by that name.
 Selected with ``VLLM_RELOAD_MODE=direct``.
 """
 
+import math
 from collections.abc import Iterator
 
 import regex as re
@@ -82,6 +84,34 @@ def _loadable_tensors(model: torch.nn.Module) -> Iterator[tuple[str, torch.Tenso
                 continue
             seen.add(id(tensor))
             yield (f"{module_name}.{name}" if module_name else name), tensor
+
+
+def _addresses(model: torch.nn.Module) -> dict[str, tuple]:
+    """Where kernels and captured graphs read each tensor, and how."""
+    out: dict[str, tuple] = {}
+    tensors = list(model.named_parameters(remove_duplicate=False))
+    tensors += model.named_buffers(remove_duplicate=False)
+    for name, t in tensors:
+        if t is not None and t.device.type == "cuda" and t.numel():
+            out[name] = (t.data_ptr(), tuple(t.shape), t.stride(), t.dtype)
+    return out
+
+
+def _host_scalars(model: torch.nn.Module) -> dict[str, float]:
+    """Python floats on modules, e.g. the KV-cache scales FlashInfer folds into
+    bmm1/bmm2_scale: kernels take them as host arguments, which captured
+    graphs (and backends caching the products) keep, so a reload must not
+    change them."""
+    return {
+        f"{name}.{k}": v
+        for name, module in model.named_modules()
+        for k, v in vars(module).items()
+        if type(v) is float
+    }
+
+
+def _same_float(a: float | None, b: float) -> bool:
+    return a == b or (a is not None and math.isnan(a) and math.isnan(b))
 
 
 def record_checkpoint_layout(model: torch.nn.Module) -> None:
@@ -224,6 +254,11 @@ def begin_direct_reload(model: torch.nn.Module) -> None:
     excluded = _excluded_names()
 
     # nothing above modified the model
+    # Every address as served: a draft shares the target's embedding
+    # and lm_head only after its own cold start (llm_base_proposer)
+    if "_direct_addresses" not in model.__dict__:
+        model._direct_addresses = _addresses(model)
+        model._direct_host_scalars = _host_scalars(model)
     _track_delivery(model, excluded)
     for t, view in views:
         t.data = view  # no zeroing: the full sync rewrites the checkpoint region
@@ -234,8 +269,8 @@ def begin_direct_reload(model: torch.nn.Module) -> None:
 
 @torch.no_grad()
 def finish_direct_reload(model: torch.nn.Module, model_config) -> None:
-    """Check the update was complete, then rerun cold-start post-load
-    processing."""
+    """Check the update was complete, rerun cold-start post-load processing,
+    then check addresses and host floats."""
     from vllm.model_executor.model_loader.base_loader import CHECKPOINT_WEIGHT_NAMES
     from vllm.model_executor.model_loader.utils import process_weights_after_loading
 
@@ -256,6 +291,19 @@ def finish_direct_reload(model: torch.nn.Module, model_config) -> None:
         torch.accelerator.current_accelerator(),
     )
     process_weights_after_loading(model, model_config, device)
+
+    current = _addresses(model)
+    moved = sorted(n for n, p in model._direct_addresses.items() if current.get(n) != p)
+    scalars = _host_scalars(model)
+    moved += sorted(
+        f"{n} (host scalar {v} -> {scalars.get(n)})"
+        for n, v in model._direct_host_scalars.items()
+        if not _same_float(scalars.get(n), v)
+    )
+    # kernels and captured graphs would keep reading the old storage
+    if moved:
+        logger.error("direct reload: tensors moved: %s", moved)
+        raise RuntimeError(f"direct reload: {len(moved)} tensors moved: {moved[:8]}")
     if adopted is not None:
         setattr(model, CHECKPOINT_WEIGHT_NAMES, adopted)
         logger.warning(
