@@ -1,6 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import logging
 import os
+import subprocess
+import sys
+import textwrap
 import time
 from unittest.mock import MagicMock, patch
 
@@ -116,3 +120,63 @@ def test_start_watch_dog_with_dump_dir(tmp_path):
         )
     finally:
         wd.stop()
+
+
+def test_disable_restarts_deadline_without_polling(tmp_path):
+    with patch("vllm.utils.watch_dog.time.monotonic", side_effect=[10.0, 30.0]):
+        watchdog = ThreadedWatchDog(
+            "engine_0",
+            WatchdogConfig(dump_dir=str(tmp_path)),
+            logging.getLogger(__name__),
+        )
+        with watchdog.disable():
+            pass
+    assert watchdog.last_feed_time == 30.0
+
+
+@pytest.mark.parametrize("failure", ["none", "diagnostic", "logging"])
+def test_fatal_watchdog_exits_stalled_process(failure):
+    script = textwrap.dedent(
+        f"""
+        import logging
+        import threading
+        from vllm.config import WatchdogConfig
+        from vllm.utils.watch_dog import start_watch_dog
+
+        logging.basicConfig(level=logging.ERROR)
+        watchdog = start_watch_dog(
+            "stalled_engine",
+            WatchdogConfig(timeout=1, check_interval=1, abort_on_timeout=True),
+            logging.getLogger("watchdog_test"),
+        )
+        if {failure!r} == "diagnostic":
+            def diagnostic_failure(reason):
+                raise OSError("diagnostic unavailable")
+            watchdog.set_handler(diagnostic_failure)
+        if {failure!r} == "logging":
+            class BrokenHandler(logging.Handler):
+                def emit(self, record):
+                    raise OSError("logging unavailable")
+            logging.getLogger("watchdog_test").addHandler(BrokenHandler())
+        print("READY", flush=True)
+        threading.Event().wait()
+        """
+    )
+    process = subprocess.Popen(
+        [sys.executable, "-c", script],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        stdout, stderr = process.communicate(timeout=30)
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.communicate()
+    assert process.returncode == 1
+    assert "READY" in stdout
+    if failure != "logging":
+        assert "stalled_engine stalled" in stderr
+    if failure != "diagnostic":
+        assert "_check_loop" in stderr
