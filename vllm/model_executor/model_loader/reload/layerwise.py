@@ -98,10 +98,18 @@ def initialize_layerwise_reload(model: torch.nn.Module):
     3. Run quantization processing if applicable
     4. Copy processed values back to original tensor storage
     """
+    from .direct import begin_direct_reload, direct_reload_enabled
+
+    # Parts parked by an update that never finished must not pair with this one
+    discard_weight_parts(model)
+
+    if direct_reload_enabled():
+        begin_direct_reload(model)
+        return
+
     # disable torchao reloading to avoid infinite recursion
     model._original_do_torchao_reload = getattr(model, "_do_torchao_reload", False)
     model._do_torchao_reload = False
-    discard_weight_parts(model)
 
     for layer in model.modules():
         info = get_layerwise_info(layer)
@@ -290,6 +298,11 @@ def finalize_layerwise_processing(model: torch.nn.Module, model_config: ModelCon
 
 
 def finalize_layerwise_reload(model: torch.nn.Module, model_config: ModelConfig):
+    from .direct import direct_reload_enabled, finish_direct_reload
+
+    if direct_reload_enabled():
+        finish_direct_reload(model, model_config)
+        return
     finalize_layerwise_processing(model, model_config)
     finalize_model_weights(model)
 
