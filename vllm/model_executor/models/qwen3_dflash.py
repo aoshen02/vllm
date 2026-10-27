@@ -33,7 +33,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from vllm.model_executor.model_loader.weight_utils import make_attention_sink
-from vllm.model_executor.utils import replace_parameter
+from vllm.model_executor.utils import refill_derived
 from vllm.multimodal.inputs import NestedTensors
 from vllm.platforms import current_platform
 from vllm.transformers_utils.config import set_default_rope_theta
@@ -534,13 +534,13 @@ class DFlashQwen3Model(nn.Module):
             if has_bias:
                 kv_biases = [a.qkv_proj.bias[a.q_size :] for a in layers_attn]
                 kv_bias = torch.cat(kv_biases, dim=0)
-        replace_parameter(self, "_fused_kv_weight", kv_weight)
-        replace_parameter(self, "_fused_kv_bias", kv_bias)
+        refill_derived(self, "_fused_kv_weight", kv_weight)
+        refill_derived(self, "_fused_kv_bias", kv_bias)
 
         # K-norm weights stacked into one contiguous [num_layers, head_dim]
         # tensor so the per-layer K-norm runs as a single grouped kernel.
         k_norm = torch.stack([a.k_norm.weight.data for a in layers_attn], dim=0)
-        replace_parameter(self, "_k_norm_weights", k_norm.contiguous())
+        refill_derived(self, "_k_norm_weights", k_norm.contiguous())
 
     def _build_fused_kv_buffers(self) -> None:
         """Build fused weight buffers for precompute_and_store_context_kv.

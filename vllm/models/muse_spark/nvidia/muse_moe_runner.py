@@ -58,7 +58,7 @@ from vllm.model_executor.layers.quantization.modelopt import (
 from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
     activation_to_flashinfer_int,
 )
-from vllm.model_executor.utils import replace_parameter
+from vllm.model_executor.utils import refill_derived, replace_parameter
 from vllm.models.muse_spark.common.moe import (  # noqa: F401 re-exported
     MuseSpark1xRouter,
     MuseSparkConsolidatedRoutedExperts,
@@ -643,27 +643,21 @@ class MuseSparkModelOptNvFp4FusedMoE(ModelOptNvFp4FusedMoE):
         a13 = a13_scale[0:1]
         a2 = a2_scale[0:1]
         # Kernels read these: a weight reload refills them in place.
-        consts = {
-            "_g1_alphas": (a13 * w13_weight_scale_2[:, 0]).contiguous(),
-            "_g1_scale_c": (a13 * w13_weight_scale_2[:, 1] / a2).contiguous(),
-            "_g2_alphas": (a2 * layer.w2_weight_scale_2.data).contiguous(),
-            "_a1_gscale": 1.0 / a13,
-            "_a2_gscale": 1.0 / a2,
-        }
-        for name, value in consts.items():
-            layer.__dict__.setdefault(name, None)  # a plain attribute
-            consts[name] = replace_parameter(layer, name, value)
-        g1_alphas, g1_scale_c, g2_alphas = (
-            consts["_g1_alphas"],
-            consts["_g1_scale_c"],
-            consts["_g2_alphas"],
+        g1_alphas = refill_derived(
+            layer, "_g1_alphas", (a13 * w13_weight_scale_2[:, 0]).contiguous()
+        )
+        g1_scale_c = refill_derived(
+            layer, "_g1_scale_c", (a13 * w13_weight_scale_2[:, 1] / a2).contiguous()
+        )
+        g2_alphas = refill_derived(
+            layer, "_g2_alphas", (a2 * layer.w2_weight_scale_2.data).contiguous()
         )
 
         base_config = nvfp4_moe_quant_config(
             g1_alphas=g1_alphas,
             g2_alphas=g2_alphas,
-            a1_gscale=consts["_a1_gscale"],
-            a2_gscale=consts["_a2_gscale"],
+            a1_gscale=refill_derived(layer, "_a1_gscale", 1.0 / a13),
+            a2_gscale=refill_derived(layer, "_a2_gscale", 1.0 / a2),
             w1_scale=layer.w13_weight_scale,
             w2_scale=layer.w2_weight_scale,
             # The TRT-LLM kernel rejects swizzled activation scale factors.

@@ -539,14 +539,13 @@ class FusedMoEExperts(ABC):
         with its fresh values. Quant methods build a new experts object on every
         post-load rerun (each weight reload), while captured CUDA graphs keep
         reading the tensors of the first one."""
-        from vllm.model_executor.utils import replace_parameter
+        from vllm.model_executor.utils import refill_derived
 
         for name in self.kept_constants:
             value = getattr(self, name, None)
             if isinstance(value, torch.Tensor):
                 key = "_experts_" + name.lstrip("_")
-                layer.__dict__.setdefault(key, None)  # a plain attribute
-                setattr(self, name, replace_parameter(layer, key, value))
+                setattr(self, name, refill_derived(layer, key, value))
 
     def _uses_post_gemm2_hook(self, num_tokens: int) -> bool:
         return self.post_gemm2_hook is not None and num_tokens > 0

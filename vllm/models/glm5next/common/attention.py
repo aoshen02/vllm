@@ -29,7 +29,7 @@ from vllm.model_executor.models.deepseek_v2 import (
     DeepseekV32IndexerCache,
     yarn_get_mscale,
 )
-from vllm.model_executor.utils import maybe_disable_graph_partition, replace_parameter
+from vllm.model_executor.utils import maybe_disable_graph_partition, refill_derived
 from vllm.models.glm5next.nvidia.ops.kpool_compress import fwht128_quant_fp8
 from vllm.models.glm5next.sparse_indexer import SparseAttnIndexerKpool
 from vllm.platforms import current_platform
@@ -303,7 +303,7 @@ class Indexer(nn.Module):
             .contiguous()
             .float()
         )
-        replace_parameter(self, "_wp_fp32", wp)
+        refill_derived(self, "_wp_fp32", wp)
 
     def forward(
         self, hidden_states: torch.Tensor, qr: torch.Tensor, positions, rotary_emb

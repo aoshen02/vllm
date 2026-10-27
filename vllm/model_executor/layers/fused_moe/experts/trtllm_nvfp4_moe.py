@@ -150,11 +150,6 @@ class TrtLlmNvFp4ExpertsBase:
         return self.quant_config.g1_alphas * self.quant_config.a2_gscale
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        # this object is rebuilt on every rerun: keep the constants the folds
-        # below read at their startup addresses too
-        for name in ("_gemm1_clamp_limit_unfolded", "_gemm1_beta_unfolded"):
-            layer.__dict__.setdefault(name, None)  # a plain attribute, not a param
-            setattr(self, name, replace_parameter(layer, name, getattr(self, name)))
         if not is_weights_pre_processed():
             layer.w13_weight_scale_2.data.mul_(layer.w13_input_scale)
             layer.w2_weight_scale_2.data.mul_(layer.w2_input_scale)

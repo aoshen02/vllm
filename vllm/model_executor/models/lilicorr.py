@@ -26,7 +26,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.model_executor.model_loader.mtp_validation import (
     is_mtp_completeness_check_enabled,
 )
-from vllm.model_executor.utils import replace_parameter
+from vllm.model_executor.utils import refill_derived
 
 from .nemotron_h import NemotronHMLP
 from .qwen3_dflash import DFlashQwen3ForCausalLM, DFlashQwen3Model
@@ -269,7 +269,7 @@ class LiLiCorrHead(nn.Module):
         Reruns on every weight reload and refills them in place: captured CUDA
         graphs keep the addresses from startup."""
         topk = self.candidate_topk
-        replace_parameter(
+        refill_derived(
             self, "_attn_bias", self._build_attention_bias(device=device, dtype=dtype)
         )
         # Both projections consume the same candidate features f:
@@ -277,14 +277,14 @@ class LiLiCorrHead(nn.Module):
         #   incoming = W_in @ f + b_in
         # Stack weights and biases to compute both in one linear call. score()
         # splits the result and normalizes the two vectors separately.
-        replace_parameter(
+        refill_derived(
             self,
             "_fused_edge_weight",
             torch.cat([self.out_head.weight, self.in_head.weight], dim=0)
             .to(device=device, dtype=dtype)
             .contiguous(),
         )
-        replace_parameter(
+        refill_derived(
             self,
             "_fused_edge_bias",
             torch.cat([self.out_head.bias, self.in_head.bias], dim=0)

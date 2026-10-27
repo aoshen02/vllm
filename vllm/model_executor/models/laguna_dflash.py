@@ -28,7 +28,7 @@ from vllm.model_executor.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from vllm.model_executor.models.interfaces import EagleModelMixin, SupportsEagle3
-from vllm.model_executor.utils import replace_parameter
+from vllm.model_executor.utils import refill_derived
 from vllm.multimodal.inputs import NestedTensors
 
 from .laguna import LagunaDecoderLayer
@@ -174,14 +174,14 @@ class DFlashLagunaModel(DFlashQwen3Model, EagleModelMixin):
                 kv_biases = torch.stack(
                     [a.qkv_proj.bias[a.q_size :] for a in layers_attn], dim=0
                 ).contiguous()
-        replace_parameter(self, "_kv_weights", kv_weights)
-        replace_parameter(self, "_kv_biases", kv_biases)
+        refill_derived(self, "_kv_weights", kv_weights)
+        refill_derived(self, "_kv_biases", kv_biases)
         input_norms = [layer.input_layernorm.weight.data for layer in self.layers]
-        replace_parameter(
+        refill_derived(
             self, "_input_layernorm_weights", torch.stack(input_norms).contiguous()
         )
         k_norms = [a.k_norm.weight.data for a in layers_attn]
-        replace_parameter(self, "_k_norm_weights", torch.stack(k_norms).contiguous())
+        refill_derived(self, "_k_norm_weights", torch.stack(k_norms).contiguous())
 
     def _project_context_kv(
         self,

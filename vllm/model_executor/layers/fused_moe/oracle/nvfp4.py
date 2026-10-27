@@ -584,12 +584,10 @@ def make_nvfp4_moe_quant_config(
     a1_gscale: torch.Tensor | None = 1.0 / a13_scale
     a2_gscale: torch.Tensor | None = 1.0 / a2_scale
     if layer is not None:  # kernels read these: a weight reload refills them
-        from vllm.model_executor.utils import replace_parameter
+        from vllm.model_executor.utils import refill_derived
 
-        for name in ("_a1_gscale", "_a2_gscale"):  # plain attributes
-            layer.__dict__.setdefault(name, None)
-        a1_gscale = replace_parameter(layer, "_a1_gscale", a1_gscale)
-        a2_gscale = replace_parameter(layer, "_a2_gscale", a2_gscale)
+        a1_gscale = refill_derived(layer, "_a1_gscale", a1_gscale)
+        a2_gscale = refill_derived(layer, "_a2_gscale", a2_gscale)
 
     # Pass w13_scale_2 / w2_scale_2 directly as g1/g2_alphas.
     # The expert's process_weights_after_loading will fuse activation

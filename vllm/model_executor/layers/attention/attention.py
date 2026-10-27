@@ -132,7 +132,7 @@ def _largest_kernel_block_within(
 
 def set_default_quant_scales(layer: nn.Module, register_buffer: bool = False) -> None:
     """Sets default quantization scales for the layer."""
-    from vllm.model_executor.utils import replace_parameter
+    from vllm.model_executor.utils import refill_derived
 
     if register_buffer:
         layer.register_buffer("_k_scale", torch.tensor(1.0, dtype=torch.float32))
@@ -151,10 +151,9 @@ def set_default_quant_scales(layer: nn.Module, register_buffer: bool = False) ->
     layer._q_scale_float = 1.0
     layer._k_scale_float = 1.0
     layer._v_scale_float = 1.0
-    # post-load processing calls this again on every weight reload: refill
+    # post-load processing calls this again on every weight reload
     for name in ("_k_scale_cpu", "_v_scale_cpu"):
-        layer.__dict__.setdefault(name, None)  # a plain attribute, not a param
-        replace_parameter(layer, name, torch.tensor(1.0, dtype=torch.float32))
+        refill_derived(layer, name, torch.tensor(1.0, dtype=torch.float32))
     layer._prob_scale_float = 1.0
 
 

@@ -41,6 +41,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 )
 from vllm.model_executor.utils import (
     move_parameter,
+    refill_derived,
     replace_parameter,
     set_kernel_parameter,
 )
@@ -806,10 +807,8 @@ def make_fp8_moe_quant_config(
         if layer is not None:  # kernels read these: a weight reload refills them
             g1_alphas = replace_parameter(layer, "g1_alphas", g1_alphas)
             g2_alphas = replace_parameter(layer, "g2_alphas", g2_alphas)
-            for name in ("_a1_gscale", "_a2_gscale"):  # plain attributes
-                layer.__dict__.setdefault(name, None)
-            a1_gscale = replace_parameter(layer, "_a1_gscale", a1_gscale)
-            a2_gscale = replace_parameter(layer, "_a2_gscale", a2_gscale)
+            a1_gscale = refill_derived(layer, "_a1_gscale", a1_gscale)
+            a2_gscale = refill_derived(layer, "_a2_gscale", a2_gscale)
         return fp8_w8a8_moe_quant_config(
             w1_scale=w1_scale,
             w2_scale=w2_scale,

@@ -23,7 +23,7 @@ from vllm.model_executor.model_loader.mtp_validation import (
     is_mtp_completeness_check_enabled,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
-from vllm.model_executor.utils import replace_parameter
+from vllm.model_executor.utils import refill_derived
 
 from .gemma4_mtp import Gemma4MTPAttention, Gemma4MTPDecoderLayer
 from .qwen3_dflash import (
@@ -245,10 +245,10 @@ class Gemma4DSparkModel(DFlashQwen3Model):
             k_weight = torch.cat([p.weight for p in self._context_k_projs])
             if has_bias:
                 k_bias = torch.cat([p.bias for p in self._context_k_projs])
-        replace_parameter(self, "_fused_k_weight", k_weight)
-        replace_parameter(self, "_fused_k_bias", k_bias)
+        refill_derived(self, "_fused_k_weight", k_weight)
+        refill_derived(self, "_fused_k_bias", k_bias)
         k_norm = torch.stack([a.k_norm.weight.data for a in layers_attn], dim=0)
-        replace_parameter(self, "_k_norm_weights", k_norm.contiguous())
+        refill_derived(self, "_k_norm_weights", k_norm.contiguous())
         # v_norm has no learnable scale; ones matching the K-norm call shape.
         if getattr(self, "_v_norm_weights", None) is None:
             self._v_norm_weights = torch.ones_like(self._k_norm_weights)

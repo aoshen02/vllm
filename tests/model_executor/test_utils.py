@@ -17,6 +17,7 @@ from vllm.model_executor.utils import (
     get_live_param,
     kernel_parameters,
     move_parameter,
+    refill_derived,
     replace_parameter,
     retire_parameter,
     set_kernel_parameter,
@@ -393,48 +394,25 @@ def test_transposed_kept_param_keeps_checkpoint_dims(single_rank_tp: None) -> No
     assert (weight.input_dim, weight.output_dim) == (1, 0)
 
 
-class TestReplaceKeepsKind:
-    """A buffer or plain attribute derived from the weights (what kernels and
-    captured graphs read) is refilled in place when the layout matches, and
-    never turns into a parameter."""
+class TestRefillDerived:
+    """A tensor derived from the weights (a buffer or plain attribute kernels
+    read) is refilled in place when the layout matches, so captured graphs keep
+    its address, and never becomes a parameter."""
 
-    @staticmethod
-    def _layer(kind: str) -> torch.nn.Module:
+    @pytest.mark.parametrize("kind", ["buffer", "attr", "absent"])
+    @pytest.mark.parametrize(
+        "shape,in_place", [((2, 3), True), ((3, 3), False)], ids=["same", "new"]
+    )
+    def test_refill(self, kind, shape, in_place):
         layer = torch.nn.Module()
-        if kind == "param":
-            layer.t = torch.nn.Parameter(torch.zeros(2, 3), requires_grad=False)
-        elif kind == "buffer":
+        if kind == "buffer":
             layer.register_buffer("t", torch.zeros(2, 3), persistent=False)
         elif kind == "attr":
             layer.t = torch.zeros(2, 3)
-        else:  # declared, not built yet
-            layer.t = None
-        return layer
-
-    @pytest.mark.parametrize("kind", ["param", "buffer", "attr", "none-attr"])
-    @pytest.mark.parametrize(
-        "new,in_place",
-        [
-            (torch.full((2, 3), 2.0), True),
-            (torch.full((3, 3), 2.0), False),
-            (None, False),
-        ],
-        ids=["same-layout", "new-layout", "none"],
-    )
-    def test_kind_kept(self, kind, new, in_place):
-        layer = self._layer(kind)
-        old = layer.t
-        ptr = None if old is None else old.data_ptr()
-        held = replace_parameter(layer, "t", new)
+        old = getattr(layer, "t", None)
+        held = refill_derived(layer, "t", torch.full(shape, 2.0))
         assert held is layer.t
-        if new is None:
-            assert layer.t is None
-        else:
-            assert held is not None
-            torch.testing.assert_close(held, new)
-            same = old is not None and held.data_ptr() == ptr
-            assert same == (in_place and old is not None)
-        assert ("t" in dict(layer.named_parameters())) == (
-            kind == "param" and new is not None
-        )
+        torch.testing.assert_close(held, torch.full(shape, 2.0))
+        assert (held is old) == (in_place and old is not None)
         assert ("t" in layer._buffers) == (kind == "buffer")
+        assert not dict(layer.named_parameters())

@@ -29,7 +29,7 @@ from vllm.model_executor.models.utils import (
     get_draft_quant_config,
     maybe_prefix,
 )
-from vllm.model_executor.utils import replace_parameter
+from vllm.model_executor.utils import refill_derived
 from vllm.models.muse_spark.common.layers import (
     MuseSpark1xRMSNorm,
     materialize_residual_path_constants,
@@ -180,7 +180,7 @@ class MuseSparkDSparkModel(DFlashQwen3Model):
             attn.qkv_proj.weight[attn.q_size : attn.q_size + 2 * attn.kv_size]
             for attn in layers_attn
         ]
-        replace_parameter(self, "_stacked_kv_weight", torch.stack(kv, dim=0))
+        refill_derived(self, "_stacked_kv_weight", torch.stack(kv, dim=0))
         self._num_attn_layers = len(layers_attn)
         self._kv_size = attn0.kv_size
         self._head_dim = attn0.head_dim

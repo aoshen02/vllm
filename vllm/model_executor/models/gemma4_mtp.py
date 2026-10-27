@@ -44,7 +44,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from vllm.model_executor.utils import replace_parameter
+from vllm.model_executor.utils import refill_derived
 from vllm.sequence import IntermediateTensors
 
 from .gemma4 import Gemma4MLP, _get_text_config
@@ -602,7 +602,7 @@ class Gemma4MTP(nn.Module):
         # indices at their startup addresses: refill the gather in place, and
         # build the indices (constant token ids) only once.
         if self._stable_full_lm_head_weight is not None:
-            replace_parameter(
+            refill_derived(
                 self,
                 "_stable_full_lm_head_weight",
                 self._gather_full_lm_head_weight(),

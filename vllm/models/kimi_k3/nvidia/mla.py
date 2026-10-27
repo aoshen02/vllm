@@ -75,7 +75,11 @@ from vllm.model_executor.layers.quantization import (
     resolve_quant_method,
 )
 from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding, get_rope
-from vllm.model_executor.utils import is_weights_pre_processed, replace_parameter
+from vllm.model_executor.utils import (
+    is_weights_pre_processed,
+    refill_derived,
+    replace_parameter,
+)
 from vllm.models.common.ops import fused_q_kv_rmsnorm
 from vllm.models.kimi_k3.nvidia.low_latency_gemm import try_low_latency_gemm
 from vllm.models.kimi_k3.nvidia.ops.fused_mla_key_concat_kv_cache import (
@@ -479,7 +483,7 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         ):
             inv = scale.reciprocal().reshape(1)
             if name in self._buffers:
-                replace_parameter(self, name, inv)
+                refill_derived(self, name, inv)
             else:
                 self.register_buffer(name, inv, persistent=False)
 
