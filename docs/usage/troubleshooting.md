@@ -40,6 +40,19 @@ If other strategies don't solve the problem, it's likely that the vLLM instance 
 - `export NCCL_DEBUG=TRACE` to turn on more logging for NCCL.
 - `export VLLM_TRACE_FUNCTION=1` to record all function calls for inspection in the log files to tell which function crashes or hangs. (WARNING: This flag will slow down the token generation by **over 100x**. Do not use unless absolutely needed.)
 
+## Fail fast on stalled engine or worker processes
+
+Use `--watchdog-config '{"timeout":300,"abort_on_timeout":true}'` to terminate a
+process that stops making progress for the configured timeout. Idle input waits
+do not count as stalled work. The parent process detects the failure through its
+normal liveness handling; outstanding requests fail rather than waiting forever.
+Hard termination skips local finalizers, so this is an opt-in recovery policy.
+
+Set `dump_dir` to save diagnostic stack traces. Without a directory, fatal
+timeout diagnostics go to stderr. By default, `abort_on_timeout` is false:
+setting only `dump_dir` retains the existing diagnostic-only behavior, and
+leaving both unset disables the watchdog.
+
 ## Breakpoints
 
 Setting normal `pdb` breakpoints may not work in vLLM's codebase if they are executed in a subprocess. You will experience something like:

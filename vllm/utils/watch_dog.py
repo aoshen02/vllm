@@ -39,13 +39,14 @@ class NoopWatchDog(WatchDog):
 
 
 class ThreadedWatchDog(WatchDog):
-    """Dumps the stacks of all threads when not fed within the timeout."""
+    """Reports stalled progress and optionally terminates the process."""
 
     def __init__(self, name: str, watchdog_config: WatchdogConfig, logger: Logger):
         self.name = name
         self.timeout = watchdog_config.timeout
         self.check_interval = watchdog_config.check_interval
         self.dump_dir = watchdog_config.dump_dir
+        self.abort_on_timeout = watchdog_config.abort_on_timeout
         self.dump_file = os.path.join(
             self.dump_dir, f"VLLM_STACK_DUMP_for_{name}_{os.getpid()}.log"
         )
@@ -71,6 +72,7 @@ class ThreadedWatchDog(WatchDog):
         try:
             yield
         finally:
+            self.feed()
             self.active = True
 
     def handle_failure(self, reason: str) -> None:
@@ -83,6 +85,9 @@ class ThreadedWatchDog(WatchDog):
 
     def dump_stack(self, reason: str) -> None:
         try:
+            if not self.dump_dir:
+                faulthandler.dump_traceback(all_threads=True)
+                return
             os.makedirs(self.dump_dir, exist_ok=True)
             with open(self.dump_file, "a") as f:
                 f.write(
@@ -119,7 +124,20 @@ class ThreadedWatchDog(WatchDog):
                 and self.last_timeout_log < self.last_feed_time
             ):
                 self.last_timeout_log = now
-                self.handle_failure("feed timeout")
+                try:
+                    self.handle_failure("feed timeout")
+                finally:
+                    if self.abort_on_timeout:
+                        try:
+                            self.logger.error(
+                                "[Watchdog]%s stalled for %s seconds; "
+                                "terminating pid %d",
+                                self.name,
+                                self.timeout,
+                                os.getpid(),
+                            )
+                        finally:
+                            os._exit(1)
 
     def start(self) -> None:
         if self.thread is not None and self.thread.is_alive():
@@ -154,12 +172,12 @@ def start_watch_dog(
     watchdog_config: WatchdogConfig,
     logger: Logger,
 ) -> WatchDog:
-    """Start the process-wide watchdog if ``watchdog_config.dump_dir`` is set.
+    """Start the watchdog when stack dumps or fatal timeouts are enabled.
 
     Returns the WatchDog singleton either way.
     """
     global _watch_dog
-    if not watchdog_config.dump_dir:
+    if not watchdog_config.dump_dir and not watchdog_config.abort_on_timeout:
         return _watch_dog
 
     logger.info(

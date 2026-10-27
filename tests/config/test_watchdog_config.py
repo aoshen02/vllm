@@ -14,14 +14,18 @@ def test_watchdog_config_defaults():
     assert config.timeout == 300
     assert config.check_interval == 10
     assert config.dump_dir == ""
+    assert config.abort_on_timeout is False
 
 
 def test_watchdog_config_custom_values():
     """Verify non-default watchdog parameters are honored."""
-    config = WatchdogConfig(timeout=60, check_interval=5, dump_dir="/tmp/dumps")
+    config = WatchdogConfig(
+        timeout=60, check_interval=5, dump_dir="/tmp/dumps", abort_on_timeout=True
+    )
     assert config.timeout == 60
     assert config.check_interval == 5
     assert config.dump_dir == "/tmp/dumps"
+    assert config.abort_on_timeout is True
 
 
 @pytest.mark.parametrize(
