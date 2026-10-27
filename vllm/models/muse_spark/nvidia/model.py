@@ -436,6 +436,8 @@ class MuseSpark1xMoE(nn.Module):
         self.route_scale = config.routed_scaling_factor
 
         self.router_output_multiplier = config.output_multiplier
+        self._router_multiplier_folded = False
+        self.router.weight.weight_loader = self._load_router_weight
 
         self.moe_router = MuseSpark1xRouter(
             top_k=config.num_experts_per_tok,
@@ -623,13 +625,20 @@ class MuseSpark1xMoE(nn.Module):
         if self.use_mega_moe:
             self.experts.finalize_weights()
 
+    def _load_router_weight(
+        self, param: nn.Parameter, loaded_weight: torch.Tensor
+    ) -> None:
+        self.router.weight_loader(param, loaded_weight)
+        self._router_multiplier_folded = False
+
     def fold_router_output_multiplier(self) -> None:
-        """Fold the router output multiplier into the gate weight; idempotent."""
-        if self.router_output_multiplier is None:
+        """Fold the router output multiplier into the gate weight, once per
+        load of it (a weight reload writes the raw weight again)."""
+        if self._router_multiplier_folded or self.router_output_multiplier is None:
             return
         with torch.no_grad():
             self.router.weight.mul_(self.router_output_multiplier)
-        self.router_output_multiplier = None
+        self._router_multiplier_folded = True
         self.moe_router.router_output_multiplier = None
 
     def shards_pooler(self, num_tokens: int) -> bool:
