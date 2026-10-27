@@ -9,8 +9,8 @@ attributes. A reload reruns it while CUDA graphs captured at startup keep
 reading the startup storage, so such a tensor must be refilled in place
 (`set_cached_tensor`, `replace_parameter`, `copy_`).
 
-`side_tensor_addresses` records where each of them lives, by path, so a
-direct reload raises when the rerun moved one. Not walked: runtime state not
+`side_tensors` finds each of them, by path, so a direct reload raises when
+the rerun moved one. Not walked: runtime state not
 derived from weights (KV and state caches, workspaces, communicators),
 library and configuration objects, objects nested deeper than 16 attributes,
 `functools.partial` arguments and closure cells.
@@ -23,7 +23,7 @@ from typing import Any
 import regex as re
 import torch
 
-__all__ = ["side_tensor_addresses"]
+__all__ = ["side_tensors"]
 
 _MAX_DEPTH = 16
 # packages whose own classes hold no tensors derived from the weights
@@ -90,10 +90,11 @@ def _children(o: Any) -> list[tuple[str, Any]]:
     return [(f".{k}", v) for k, v in attrs if not _RUNTIME_ATTRS.search(k)]
 
 
-def side_tensor_addresses(model: torch.nn.Module) -> dict[str, tuple]:
-    """Address and layout of every device tensor reachable from the modules'
-    non-module attributes, by the shallowest path that reaches it."""
-    out: dict[str, tuple] = {}
+def side_tensors(model: torch.nn.Module) -> dict[str, torch.Tensor]:
+    """Every device tensor reachable from the modules' non-module attributes,
+    by the shallowest path that reaches it, as an alias: holding it keeps its
+    storage from being reused, so a moved tensor cannot look unmoved."""
+    out: dict[str, torch.Tensor] = {}
     queue: deque[tuple[Any, str, int]] = deque()
     for name, module in model.named_modules():
         for attr, value in vars(module).items():
@@ -113,7 +114,7 @@ def side_tensor_addresses(model: torch.nn.Module) -> dict[str, tuple]:
         if isinstance(o, torch.Tensor):
             seen.add(id(o))
             if o.device.type not in ("cpu", "meta") and o.numel():
-                out[path] = (o.data_ptr(), tuple(o.shape), o.stride(), o.dtype)
+                out[path] = o.detach()
         elif not isinstance(o, (str, bytes, int, float, bool, torch.nn.Module, type)):
             seen.add(id(o))
             queue.extend((v, path + k, depth + 1) for k, v in _children(o))

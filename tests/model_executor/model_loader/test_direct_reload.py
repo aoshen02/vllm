@@ -587,11 +587,11 @@ def _one_layer(fn, weight, hook=None) -> _OneLayer:
 
 
 def _side(model: torch.nn.Module) -> dict[str, tuple]:
-    from vllm.model_executor.model_loader.reload.side_state import (
-        side_tensor_addresses,
-    )
+    from vllm.model_executor.model_loader.reload.side_state import side_tensors
 
-    return side_tensor_addresses(model)
+    return {
+        n: (t.data_ptr(), t.shape, t.stride()) for n, t in side_tensors(model).items()
+    }
 
 
 def _views(layer):  # side refs and views of a weight refilled in place

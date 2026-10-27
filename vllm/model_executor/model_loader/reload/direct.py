@@ -42,7 +42,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
 from vllm.model_executor.utils import is_weights_pre_processed
 
-from .side_state import side_tensor_addresses
+from .side_state import side_tensors
 
 logger = init_logger(__name__)
 
@@ -111,8 +111,12 @@ def _addresses(model: torch.nn.Module) -> dict[str, tuple]:
     tensors += model.named_buffers(remove_duplicate=False)
     for name, t in tensors:
         if t is not None and t.device.type == "cuda" and t.numel():
-            out[name] = (t.data_ptr(), tuple(t.shape), t.stride(), t.dtype)
+            out[name] = _where(t)
     return out
+
+
+def _where(t: torch.Tensor) -> tuple:
+    return (t.data_ptr(), tuple(t.shape), t.stride(), t.dtype)
 
 
 def record_checkpoint_layout(model: torch.nn.Module) -> None:
@@ -457,11 +461,11 @@ def begin_direct_reload(model: torch.nn.Module) -> None:
     views = _checkpoint_views(model, skipped, dropped)
 
     # nothing above modified the model
-    # Where captured graphs read derived tensors, as served (before any view
+    # The derived tensors captured graphs read, as served (before any view
     # back), kept until a finish succeeds: a retry after an update that
-    # failed midway still compares with the served addresses.
+    # failed midway still compares with the served ones.
     if "_direct_side_tensors" not in model.__dict__:
-        model._direct_side_tensors = side_tensor_addresses(model)
+        model._direct_side_tensors = side_tensors(model)
     # Likewise every address as served: a draft shares the target's embedding
     # and lm_head only after its own cold start (llm_base_proposer)
     if "_direct_addresses" not in model.__dict__:
@@ -518,10 +522,9 @@ def finish_direct_reload(model: torch.nn.Module, model_config) -> None:
 
     current = _addresses(model)
     moved = sorted(n for n, p in model._direct_addresses.items() if current.get(n) != p)
-    side = side_tensor_addresses(model)
-    moved += sorted(
-        n for n, a in model._direct_side_tensors.items() if side.get(n) != a
-    )
+    side = {n: _where(t) for n, t in side_tensors(model).items()}
+    served = model._direct_side_tensors
+    moved += sorted(n for n, t in served.items() if side.get(n) != _where(t))
     scalars = _host_scalars(model)
     moved += sorted(
         f"{n} (host scalar {v} -> {scalars.get(n)})"
