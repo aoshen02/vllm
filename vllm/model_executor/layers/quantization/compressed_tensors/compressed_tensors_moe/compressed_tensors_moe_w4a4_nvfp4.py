@@ -206,6 +206,8 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
 
     def process_weights_after_loading(self, layer: RoutedExperts) -> None:
         """Convert NVFP4 MoE weights into kernel format and setup the kernel."""
+        from vllm.model_executor.model_loader.weight_utils import set_cached_tensor
+
         # NOTE(rob): wN_weight_packed -> wN_weight is because ModularKernelMethod
         # requires this naming convention. However, the name change breaks
         # reloading because the state dict no longer matches disk. Once we
@@ -259,8 +261,9 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
         replace_parameter(layer, "w2_weight_scale", w2_scale)
         replace_parameter(layer, "w13_weight_scale_2", w13_scale_2)
         replace_parameter(layer, "w2_weight_scale_2", w2_scale_2)
-        layer.w13_input_scale = a13_scale
-        layer.w2_input_scale = a2_scale
+        # kernels read them: a weight reload refills them in place
+        set_cached_tensor(layer, "w13_input_scale", a13_scale)
+        set_cached_tensor(layer, "w2_input_scale", a2_scale)
 
         # Setup modular kernel.
         self.moe_quant_config = self.get_fused_moe_quant_config(layer)
