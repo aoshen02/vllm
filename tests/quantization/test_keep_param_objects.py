@@ -3,6 +3,7 @@
 """PWAL keeps the parameter objects (class and loader attributes) it converts."""
 
 from collections.abc import Callable
+from typing import Any
 
 import pytest
 import torch
@@ -244,3 +245,100 @@ def test_forced_backend_keeps_param_objects(
     default_vllm_config.kernel_config.linear_backend = backend
     default_vllm_config.kernel_config.moe_backend = backend
     _check_keeps_param_objects(build, default_vllm_config)
+
+
+def _experts(cls_path: str, values: dict) -> Any:
+    """An experts object as its constructor leaves it, without running it."""
+    import importlib
+
+    module, name = cls_path.rsplit(".", 1)
+    obj = object.__new__(getattr(importlib.import_module(module), name))
+    for attr, value in values.items():
+        setattr(obj, attr, value)
+    return obj
+
+
+_EXP = "vllm.model_executor.layers.fused_moe.experts."
+
+
+class TestExpertsKeepConstants:
+    """Quant methods build a new experts object on every post-load rerun; the
+    constants captured CUDA graphs read stay at the first object's addresses,
+    refilled with the fresh values, and never become parameters."""
+
+    @pytest.mark.parametrize(
+        "cls_path,names",
+        [
+            (
+                _EXP + "trtllm_mxfp4_moe.TrtLlmMxfp4ExpertsModular",
+                ["gemm1_alpha", "gemm1_beta", "gemm1_clamp_limit"],
+            ),
+            (
+                _EXP + "trtllm_fp8_moe.TrtLlmFp8ExpertsMonolithic",
+                ["_g1_alphas", "_g2_alphas", "_g1_scale_c"],
+            ),
+            (
+                _EXP + "flashinfer_cutlass_moe.FlashInferExperts",
+                ["gemm1_clamp_limit", "gemm1_alpha", "gemm1_beta", "fake_input_scale"],
+            ),
+            (
+                _EXP + "flashinfer_cutedsl_moe.FlashInferCuteDSLExperts",
+                ["per_token_global_scale"],
+            ),
+        ],
+        ids=["trtllm-mxfp4", "trtllm-fp8", "flashinfer-cutlass", "cutedsl"],
+    )
+    def test_rebuilt_experts_keep_addresses(self, cls_path, names):
+        layer = torch.nn.Module()
+        layer.w = torch.nn.Parameter(torch.zeros(2), requires_grad=False)
+        first = _experts(cls_path, {n: torch.full((4,), 1.0) for n in names})
+        first.keep_constants(layer)
+        ptrs = {n: getattr(first, n).data_ptr() for n in names}
+        second = _experts(cls_path, {n: torch.full((4,), 2.0) for n in names})
+        second.keep_constants(layer)
+        for n in names:
+            kept = getattr(second, n)
+            assert kept.data_ptr() == ptrs[n]
+            torch.testing.assert_close(kept, torch.full((4,), 2.0))
+        assert [n for n, _ in layer.named_parameters()] == ["w"]
+
+    def test_absent_constant_is_skipped(self):
+        layer = torch.nn.Module()
+        experts = _experts(
+            _EXP + "trtllm_mxfp4_moe.TrtLlmMxfp4ExpertsModular",
+            {"gemm1_alpha": None, "gemm1_beta": None, "gemm1_clamp_limit": None},
+        )
+        experts.keep_constants(layer)
+        assert not hasattr(layer, "_experts_gemm1_alpha")
+
+
+def test_fp8_flashinfer_cutlass_scales_refilled_in_place():
+    """FP8 per-tensor FlashInfer CUTLASS: g1/g2 alphas stay the registered
+    parameters and the inverse activation scales stay plain attributes, at
+    their first addresses."""
+    from vllm.model_executor.layers.fused_moe.oracle.fp8 import (
+        Fp8MoeBackend,
+        make_fp8_moe_quant_config,
+    )
+
+    layer = torch.nn.Module()
+
+    def build(scale: float):
+        return make_fp8_moe_quant_config(
+            Fp8MoeBackend.FLASHINFER_CUTLASS,
+            w1_scale=torch.full((4,), scale),
+            w2_scale=torch.full((4,), scale),
+            a1_scale=torch.full((1,), scale),
+            a2_scale=torch.full((1,), scale),
+            layer=layer,
+        )
+
+    build(1.0)
+    names = ("g1_alphas", "g2_alphas", "_a1_gscale", "_a2_gscale")
+    ptrs = {n: getattr(layer, n).data_ptr() for n in names}
+    build(2.0)
+    for n in names:
+        assert getattr(layer, n).data_ptr() == ptrs[n]
+    torch.testing.assert_close(layer.g1_alphas, torch.full((4,), 4.0))
+    torch.testing.assert_close(layer._a2_gscale, torch.full((1,), 0.5))
+    assert sorted(n for n, _ in layer.named_parameters()) == ["g1_alphas", "g2_alphas"]
