@@ -28,6 +28,7 @@ from vllm.model_executor.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from vllm.model_executor.models.interfaces import EagleModelMixin, SupportsEagle3
+from vllm.model_executor.utils import replace_parameter
 from vllm.multimodal.inputs import NestedTensors
 
 from .laguna import LagunaDecoderLayer
@@ -62,6 +63,11 @@ def _get_dflash_layer_types(config) -> tuple[str, ...]:
 
 @support_torch_compile
 class DFlashLagunaModel(DFlashQwen3Model, EagleModelMixin):
+    # weight-derived, refilled in place on every reload
+    _kv_weights: torch.Tensor | None = None
+    _kv_biases: torch.Tensor | None = None
+    _input_layernorm_weights: torch.Tensor | None = None
+
     def __init__(
         self,
         *,
@@ -159,22 +165,23 @@ class DFlashLagunaModel(DFlashQwen3Model, EagleModelMixin):
     ) -> None:
         self._context_qkv_projs = [a.qkv_proj for a in layers_attn]
         self._context_q_sizes = [a.q_size for a in layers_attn]
-        self._kv_weights: torch.Tensor | None = None
-        self._kv_biases: torch.Tensor | None = None
+        kv_weights = kv_biases = None
         if _reads_raw_weights(self._context_qkv_projs):
-            self._kv_weights = torch.stack(
+            kv_weights = torch.stack(
                 [a.qkv_proj.weight[a.q_size :] for a in layers_attn], dim=0
             ).contiguous()
             if has_bias:
-                self._kv_biases = torch.stack(
+                kv_biases = torch.stack(
                     [a.qkv_proj.bias[a.q_size :] for a in layers_attn], dim=0
                 ).contiguous()
-        self._input_layernorm_weights = torch.stack(
-            [layer.input_layernorm.weight.data for layer in self.layers], dim=0
-        ).contiguous()
-        self._k_norm_weights = torch.stack(
-            [a.k_norm.weight.data for a in layers_attn], dim=0
-        ).contiguous()
+        replace_parameter(self, "_kv_weights", kv_weights)
+        replace_parameter(self, "_kv_biases", kv_biases)
+        input_norms = [layer.input_layernorm.weight.data for layer in self.layers]
+        replace_parameter(
+            self, "_input_layernorm_weights", torch.stack(input_norms).contiguous()
+        )
+        k_norms = [a.k_norm.weight.data for a in layers_attn]
+        replace_parameter(self, "_k_norm_weights", torch.stack(k_norms).contiguous())
 
     def _project_context_kv(
         self,

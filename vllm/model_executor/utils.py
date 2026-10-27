@@ -97,7 +97,7 @@ def replace_parameter(
     layer: torch.nn.Module,
     param_name: str,
     new_tensor: torch.Tensor | None,
-):
+) -> torch.Tensor | None:
     """Replace a parameter of a layer while maintaining the ability to reload the
     weight. Called within implementations of the `process_weights_after_loading` method.
 
@@ -106,8 +106,13 @@ def replace_parameter(
     dtype and device match, which preserves ``data_ptr`` for captured CUDA graphs;
     otherwise a smaller ``new_tensor`` is copied into the parameter's own storage
     (so the loaded storage never shrinks), else ``.data`` is rebound to it. A new
-    parameter is registered only if none exists under ``param_name``, or if the
-    existing one is an online requantization source (released after conversion).
+    parameter is registered only if nothing exists under ``param_name``, or if
+    the existing one is an online requantization source (released after
+    conversion).
+
+    A buffer or a plain tensor attribute (e.g. a cache derived from the weights
+    that kernels read) is updated by the same rule and keeps its kind: it never
+    becomes a parameter. Returns the tensor now held under ``param_name``.
 
     Custom attributes set on ``new_tensor`` (e.g. kernel dispatch flags such as
     ``is_shuffled``) are carried over to the parameter, except ``weight_loader``,
@@ -127,7 +132,7 @@ def replace_parameter(
     # If new_tensor is None, set the parameter to None
     if new_tensor is None:
         setattr(layer, param_name, None)
-        return
+        return None
 
     old_param: torch.nn.Parameter | None = getattr(layer, param_name, None)
 
@@ -146,7 +151,7 @@ def replace_parameter(
     # Keep the object, except online requantization sources (released later)
     # and meta params (no storage; `.data` cannot be rebound to a real tensor).
     if (
-        isinstance(old_param, torch.nn.Parameter)
+        isinstance(old_param, torch.Tensor)
         and not getattr(old_param, "requantization_source", False)
         and not (old_param.is_meta and not new_tensor.is_meta)
     ):
@@ -163,7 +168,15 @@ def replace_parameter(
             old_param.data = _in_own_storage(old_param, new_tensor)
         for attr_name, attr in new_tensor_attrs.items():
             setattr(old_param, attr_name, attr)
-        return
+        return old_param
+
+    # an existing buffer or plain attribute (possibly None) keeps its kind
+    if not isinstance(old_param, torch.nn.Parameter) and (
+        old_param is not None
+        or (hasattr(layer, param_name) and param_name not in layer._parameters)
+    ):
+        setattr(layer, param_name, new_tensor)
+        return new_tensor
 
     new_param = torch.nn.Parameter(new_tensor, requires_grad=False)
 
@@ -175,6 +188,7 @@ def replace_parameter(
         set_weight_attrs(new_param, {"weight_loader": weight_loader})
 
     setattr(layer, param_name, new_param)
+    return new_param
 
 
 def move_parameter(layer: torch.nn.Module, src_name: str, dst_name: str) -> None:
