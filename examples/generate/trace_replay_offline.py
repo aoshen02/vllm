@@ -14,16 +14,17 @@ How it works:
   2. Set ``SamplingParams.trace_decode_token_ids`` to the list of decode
      token IDs you want to force.
   3. The engine will output exactly those tokens and stop.  ``max_tokens``
-     is overwritten with the trace length, and the trace is truncated if it
-     does not fit within ``max_model_len``.  EOS tokens inside the trace
-     sequence do **not** halt generation early.
+     becomes ``min(len(trace), max_tokens)``, so set ``max_tokens`` to at
+     least the trace length (the default of 16 truncates longer traces).  The
+     trace is truncated if it does not fit within ``max_model_len``.  EOS
+     tokens inside the trace sequence do **not** halt generation early.
 
 Requires model runner V2.  Requests are rejected with ``ValueError`` when
 combined with any of:
   * n > 1                     * Speculative decoding
   * prompt_logprobs           * Structured outputs
-  * repetition_detection      * thinking_token_budget
-  * bad_words
+  * prompt_logprob_token_ids  * thinking_token_budget
+  * repetition_detection      * bad_words
 
 Typical use-cases:
   * Reproduce exact outputs from a previous run for benchmarking.
@@ -83,6 +84,8 @@ def run_trace_replay(llm: LLM, prompt: str, decode_token_ids: list[int]) -> None
     sampling_params = SamplingParams(
         # Provide the decode tokens to replay.
         trace_decode_token_ids=decode_token_ids,
+        # max_tokens caps the replay; the default of 16 would truncate.
+        max_tokens=len(decode_token_ids),
         # Request top-5 logprobs so we can inspect the distribution.
         logprobs=5,
     )
