@@ -667,6 +667,7 @@ class MuseSparkModelOptNvFp4FusedMoE(ModelOptNvFp4FusedMoE):
             backend=self.nvfp4_backend,
             routing_tables=layer._expert_routing_tables(),
         )
+        self.moe_kernel.fused_experts.keep_constants(layer)
         _attach_post_expert_finalize(self)
         self.moe_kernel.fused_experts.process_weights_after_loading(layer)
 
@@ -724,6 +725,7 @@ class MuseSparkModelOptNvFp4FusedMoE(ModelOptNvFp4FusedMoE):
             backend=NvFp4MoeBackend.MARLIN,
             routing_tables=layer._expert_routing_tables(),
         )
+        self.moe_kernel.fused_experts.keep_constants(layer)
 
     def get_fused_moe_quant_config(
         self, layer: "MuseSparkRoutedExperts"
