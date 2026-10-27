@@ -267,6 +267,42 @@ class TestReloadEqualsColdStart:
         assert _ptrs(after, names) == _ptrs(before, names)
 
 
+def _with_weight(module: torch.nn.Module, shape=(2, 2)) -> torch.nn.Module:
+    module.register_parameter(
+        "weight", torch.nn.Parameter(torch.empty(shape), requires_grad=False)
+    )
+    return module
+
+
+class _Tree(torch.nn.Module):
+    """Modules given by dotted name; ``hook`` is a model-level hook."""
+
+    def __init__(self, modules: dict[str, torch.nn.Module], hook=None):
+        super().__init__()
+        for name, module in modules.items():
+            *path, local = name.split(".")
+            parent = self.get_submodule(".".join(path)) if path else self
+            parent.add_module(local, module)
+        self.hook = hook
+
+    def process_weights_after_loading(self):
+        if self.hook is not None:
+            self.hook(self)
+
+    def load_weights(self, weights):
+        for name, weight in weights:
+            default_weight_loader(self.get_parameter(name), weight)
+        return {name for name, _ in weights}
+
+
+def _tree_cold_start(build, weights) -> "_Tree":
+    with _DEVICE:
+        model = build()
+    model.load_weights(weights.items())
+    process_weights_after_loading(model, _MODEL_CONFIG, _DEVICE)
+    return model
+
+
 class TestUnsent:
     def test_tensor_without_post_processing_keeps_its_bytes(self):
         # a frozen table the trainer does not send (Engram, an n-gram
@@ -335,6 +371,13 @@ class TestCompleteness:
         _assert_same(_state(model), before, addresses=True)
 
 
+class TestMovedAddress:
+    def test_rebinding_pwal_raises(self):
+        model = _cold_start(_checkpoint(rebind=True), rebind=True)
+        with pytest.raises(RuntimeError, match=r"moved: \['rebind.weight'\]"):
+            _reload(model, _checkpoint(1.01, rebind=True))
+
+
 class _OneLayer(torch.nn.Module):
     """One layer ``s`` with a (4, 4) weight and the given post-load
     processing; ``hook`` is an optional model-level post-load hook."""
@@ -366,6 +409,32 @@ def _one_layer(fn, weight, hook=None) -> _OneLayer:
 
 
 class TestRefusals:
+    def test_same_address_new_layout_moves(self):
+        def fn(layer):  # same storage, flattened only on reloads
+            if layer.quant_method.runs > 1:
+                layer.weight.data = layer.weight.data.view(16)
+
+        model = _one_layer(fn, torch.rand(4, 4))
+        with pytest.raises(RuntimeError, match=r"moved: \['s.weight'\]"):
+            _reload(model, {"s.weight": torch.rand(4, 4)})
+
+    def test_weight_derived_host_scalar_change_raises(self):
+        # an fp8 KV-cache scale read to a Python float, as kv_cache.py does
+        def fn(layer):
+            layer._k_scale_float = layer.weight.abs().amax().item()
+
+        model = _one_layer(fn, torch.rand(4, 4))
+        _reload(model, {"s.weight": model.s.weight.clone()})  # same: fine
+        with pytest.raises(RuntimeError, match=r"s._k_scale_float \(host scalar"):
+            _reload(model, {"s.weight": torch.rand(4, 4) + 2})
+
+    def test_nan_host_scalar_is_unchanged(self):
+        def fn(layer):  # e.g. an unset optional scale
+            layer._o_scale = float("nan")
+
+        model = _one_layer(fn, torch.rand(4, 4))
+        _reload(model, {"s.weight": torch.rand(4, 4)})
+
     def test_refused_begin_leaves_the_model_untouched(self):
         # proj is viewed back first, in module order; mimo's storage is short
         model = _cold_start(_checkpoint())
@@ -394,6 +463,29 @@ def test_retry_after_aborted_update_matches_cold_start():
     model.load_weights(list(_checkpoint(1.01).items())[:3])  # update aborts
     _reload(model, _checkpoint(1.01))
     _assert_same(_state(model), _state(_cold_start(_checkpoint(1.01))))
+
+
+def test_draft_wired_to_target_modules_after_cold_start():
+    # the proposer replaces a draft's embedding with the target's after the
+    # draft's cold start; updates compare against the addresses it serves with
+    draft = _tree_cold_start(
+        lambda: _Tree(
+            {"emb": _with_weight(_Layer(None)), "s": _with_weight(_Layer(None))}
+        ),
+        {"emb.weight": torch.rand(2, 2), "s.weight": torch.rand(2, 2)},
+    )
+    target_emb = _tree_cold_start(
+        lambda: _Tree({"emb": _with_weight(_Layer(None))}),
+        {"emb.weight": torch.rand(2, 2)},
+    ).emb
+    del draft.emb
+    draft.emb = target_emb
+    ptr = draft.emb.weight.data_ptr()
+    new = torch.rand(2, 2)
+    for _ in range(2):
+        _reload(draft, {"s.weight": new})
+    assert draft.emb.weight.data_ptr() == ptr
+    assert torch.equal(draft.s.weight, new.to(_DEVICE))
 
 
 class TestAbortedUpdate:
