@@ -256,6 +256,8 @@ def _pool_bytes_per_block(
     `available_memory` into `num_blocks`. Used to compute the effective KV cache
     capacity once `num_gpu_blocks_override` is applied.
     """
+    if not any(group.layer_names for group in kv_cache_groups):
+        return 0
     return _get_kv_cache_bytes_per_block(
         [group for group in kv_cache_groups if not group.host_resident],
         vllm_config.cache_config.get_resolved_kv_cache_layout(),
@@ -276,7 +278,7 @@ def _pool_bytes_per_block_from_builder(
     pool against ``max_model_len`` before auto-fit shortens it.
     ``num_gpu_blocks_override`` is suppressed so it cannot inflate the probe.
     """
-    if not kv_cache_groups:
+    if not any(group.layer_names for group in kv_cache_groups):
         return 0
     if vllm_config.attention_config.hisparse_config is not None:
         return _pool_bytes_per_block(vllm_config, kv_cache_groups)
@@ -655,7 +657,7 @@ def get_kv_cache_config_from_groups(
         The generated KVCacheConfig
 
     """
-    if len(kv_cache_groups) == 0:
+    if not any(group.layer_names for group in kv_cache_groups):
         # Attention free models do not have KV cache.
         # Return num_blocks=1 as BlockPool always needs a null_block.
         return KVCacheConfig(
@@ -1355,7 +1357,9 @@ def _auto_fit_max_model_len(
     """
     original_max = vllm_config.model_config.max_model_len
 
-    if all(not groups for groups in projected_groups_per_worker):
+    if not any(
+        group.layer_names for groups in projected_groups_per_worker for group in groups
+    ):
         # All workers have empty specs (attention-free model)
         logger.info_once(
             "Auto-fit max_model_len: attention-free model, "
@@ -1368,7 +1372,7 @@ def _auto_fit_max_model_len(
     auto_fit_max = original_max
     limiting_worker_mem = available_memory[0]
     for groups, avail_mem in zip(projected_groups_per_worker, available_memory):
-        if not groups:
+        if not any(group.layer_names for group in groups):
             continue
         worker_max = _estimate_max_model_len_from_groups(
             builder, vllm_config, groups, avail_mem
@@ -1554,8 +1558,10 @@ def get_kv_cache_configs(
     override = vllm_config.cache_config.num_gpu_blocks_override
     if override is not None:
         adjusted_memory: list[int] = []
-        for groups, avail_mem in zip(projected_groups_per_worker, available_memory):
-            if not groups:
+        for groups, avail_mem, worker_spec in zip(
+            projected_groups_per_worker, available_memory, kv_cache_specs
+        ):
+            if not worker_spec:
                 adjusted_memory.append(avail_mem)
                 continue
             bytes_per_block = _pool_bytes_per_block_from_builder(
@@ -1575,10 +1581,12 @@ def get_kv_cache_configs(
     check_memory = [
         (
             avail_mem - _pool_bytes_per_block_from_builder(builder, vllm_config, groups)
-            if groups
+            if worker_spec
             else avail_mem
         )
-        for groups, avail_mem in zip(projected_groups_per_worker, available_memory)
+        for groups, avail_mem, worker_spec in zip(
+            projected_groups_per_worker, available_memory, kv_cache_specs
+        )
     ]
 
     if vllm_config.model_config.original_max_model_len == -1:
@@ -1587,8 +1595,10 @@ def get_kv_cache_configs(
         )
 
     # Check if the available memory is enough per worker.
-    for groups, avail_mem in zip(projected_groups_per_worker, check_memory):
-        if not groups:
+    for groups, avail_mem, worker_spec in zip(
+        projected_groups_per_worker, check_memory, kv_cache_specs
+    ):
+        if not worker_spec:
             continue
         _check_enough_kv_cache_memory(
             avail_mem,
@@ -1608,7 +1618,9 @@ def get_kv_cache_configs(
             builder, vllm_config, projected_groups
         )
         num_blocks = (
-            available_memory_one_worker // bytes_per_block if projected_groups else 1
+            available_memory_one_worker // bytes_per_block
+            if kv_cache_spec_one_worker
+            else 1
         )
         kv_cache_configs.append(
             builder.get_kv_cache_config_from_groups(
@@ -1620,7 +1632,12 @@ def get_kv_cache_configs(
     # We also need to shrink the tensor size proportionally to avoid
     # allocating unused memory.
     min_num_blocks = min(
-        kv_cache_config.num_blocks for kv_cache_config in kv_cache_configs
+        (
+            kv_cache_config.num_blocks
+            for kv_cache_config, worker_spec in zip(kv_cache_configs, kv_cache_specs)
+            if worker_spec
+        ),
+        default=1,
     )
     for i, kv_cache_config in enumerate(kv_cache_configs):
         if kv_cache_config.num_blocks == min_num_blocks:
@@ -1687,11 +1704,9 @@ class DefaultKVCacheConfigBuilder(KVCacheConfigBuilder):
         num_blocks: int,
     ) -> KVCacheConfig:
         """See ``KVCacheConfigBuilder.get_kv_cache_config_from_groups``."""
-        if len(kv_cache_groups) == 0:
-            # Attention free models do not have KV cache.
-            # Return num_blocks=1 as BlockPool always needs a null_block.
+        if not any(group.layer_names for group in kv_cache_groups):
             return KVCacheConfig(
-                num_blocks=1,
+                num_blocks=num_blocks,
                 kv_cache_tensors=[],
                 kv_cache_groups=kv_cache_groups,
                 prefix_cache_retention_interval=(
