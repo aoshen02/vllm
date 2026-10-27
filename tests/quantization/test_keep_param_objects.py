@@ -289,6 +289,14 @@ class TestExpertsKeepConstants:
                 _EXP + "flashinfer_cutedsl_moe.FlashInferCuteDSLExperts",
                 ["per_token_global_scale"],
             ),
+            (
+                _EXP + "cutlass_moe.CutlassExpertsFp8",
+                ["ab_strides1", "ab_strides2", "c_strides1", "c_strides2"],
+            ),
+            (
+                _EXP + "cutlass_moe.CutlassExpertsW4A8Fp8",
+                ["a_strides1", "a_strides2", "c_strides1", "c_strides2", "s_strides1"],
+            ),
         ],
         ids=[
             "trtllm-mxfp4",
@@ -296,6 +304,8 @@ class TestExpertsKeepConstants:
             "trtllm-nvfp4",
             "flashinfer-cutlass",
             "cutedsl",
+            "cutlass-fp8",
+            "cutlass-w4a8",
         ],
     )
     def test_rebuilt_experts_keep_addresses(self, cls_path, names):
