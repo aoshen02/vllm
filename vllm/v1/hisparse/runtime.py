@@ -687,8 +687,11 @@ class HiSparseIndexGroup:
             dtype=torch.int32,
             device=device,
         )
-        self.lru_init = torch.arange(region_stride, dtype=torch.int16, device=device)
-        self.lru_slots = self.lru_init.repeat(max_num_reqs, 1).contiguous()
+        self.lru_slots = (
+            torch.arange(region_stride, dtype=torch.int16, device=device)
+            .repeat(max_num_reqs, 1)
+            .contiguous()
+        )
         self.shared_topk = _create_shared_topk_state(device, max_swap_rows, top_k)
         # Request ids the resolver reads, built on the copy stream: a
         # compute-stream write would race with its logical_topk_ready wait.
@@ -883,7 +886,12 @@ class HiSparseRuntime:
         compute_stream = current_stream()
         compute_stream.wait_stream(group.copy_stream)
         group.device_global_indices.fill_(-1)
-        group.lru_slots.copy_(group.lru_init.expand_as(group.lru_slots))
+        # Rebuild constants too: sleep level 2 discards this memory.
+        lru_init = torch.arange(
+            group.lru_slots.shape[1], dtype=group.lru_slots.dtype, device=self.device
+        )
+        group.lru_slots.copy_(lru_init.expand_as(group.lru_slots))
+        torch.arange(group.row_indices.numel(), out=group.row_indices)
         group.swap_stats.zero_()
         group.copy_stream.wait_stream(compute_stream)
 

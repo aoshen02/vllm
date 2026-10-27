@@ -562,6 +562,13 @@ class HiSparseConnectorWorker:
         for runtime in self.leader_runtimes:
             runtime.reset_hot_state()
 
+    def reset_after_sleep(self) -> None:
+        # Sleep dropped the hot cache and the tables allocated with it.
+        self.reset_hot_state()
+        self.request_state_indices.fill_(-1)
+        if self.residency is not None:
+            self.residency.zero_()
+
     def get_kv_connector_stats(self) -> HiSparseKVConnectorStats | None:
         stats = None
         if self._metrics_pending and self._metrics_event.query():

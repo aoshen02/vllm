@@ -294,6 +294,10 @@ class HiSparseConnector(KVConnectorBase_V1, SupportsHMA):
         assert self.connector_worker is not None
         self.connector_worker.reset_hot_state()
 
+    def restore_kv_caches(self) -> None:
+        assert self.connector_worker is not None
+        self.connector_worker.reset_after_sleep()
+
     def get_kv_connector_stats(self) -> KVConnectorStats | None:
         if self.connector_worker is not None:
             return self.connector_worker.get_kv_connector_stats()
