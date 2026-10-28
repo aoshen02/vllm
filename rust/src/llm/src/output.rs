@@ -44,6 +44,15 @@ pub struct TokenUsage {
     pub cached_token_count: usize,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct RequestTimingStats {
+    pub queued_ts: f64,
+    pub scheduled_ts: f64,
+    pub first_token_ts: f64,
+    pub last_token_ts: f64,
+    pub num_generation_tokens: u32,
+}
+
 /// Final raw token output plus terminal stream metadata.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CollectedGenerateOutput {
@@ -67,6 +76,9 @@ pub struct CollectedGenerateOutput {
     pub weight_versions: Option<Vec<WeightVersionSpan>>,
     /// Routed-expert rows for the whole request.
     pub routed_experts: Option<WireNdArray>,
+    pub remote_kv_wait_time: Option<f64>,
+    pub kv_transfer_metrics: Option<serde_json::Value>,
+    pub request_timings: Option<RequestTimingStats>,
 }
 
 /// Prompt-scoped metadata emitted only once on the first [`GenerateOutput`] for
@@ -196,6 +208,9 @@ pub struct GenerateOutput {
     /// request locally after matching a stop string, before the engine emits a
     /// terminal output.
     pub timestamps: RequestTimestamps,
+    pub remote_kv_wait_time: Option<f64>,
+    pub kv_transfer_metrics: Option<serde_json::Value>,
+    pub request_timings: Option<RequestTimingStats>,
 }
 
 impl GenerateOutput {
@@ -240,7 +255,7 @@ impl GenerateOutput {
         }
         if let Some(next_mask) = next.sampling_mask {
             match &mut self.sampling_mask {
-                Some(mask) => mask.rows.extend(next_mask.rows),
+                Some(mask) => mask.append(next_mask),
                 None => self.sampling_mask = Some(next_mask),
             }
         }
@@ -252,6 +267,9 @@ impl GenerateOutput {
         self.weight_versions = next.weight_versions;
         self.routed_experts = next.routed_experts;
         self.timestamps = next.timestamps;
+        self.remote_kv_wait_time = next.remote_kv_wait_time;
+        self.kv_transfer_metrics = next.kv_transfer_metrics;
+        self.request_timings = next.request_timings;
     }
 }
 
@@ -283,6 +301,9 @@ impl GenerateOutput {
             weight_versions: None,
             routed_experts: None,
             timestamps: RequestTimestamps::default(),
+            remote_kv_wait_time: None,
+            kv_transfer_metrics: None,
+            request_timings: None,
         }
     }
 }
@@ -302,6 +323,7 @@ pub struct GenerateOutputStream {
     num_output_tokens: usize,
     /// Routed-expert rows received so far, concatenated on the terminal output.
     routed_experts_chunks: Vec<WireNdArray>,
+    request_trace: Option<crate::request_trace::RequestTrace>,
     /// Removes this request's external→internal tracking edge on drop. Held for
     /// its `Drop` side effect only; never read directly.
     _request_guard: RequestGuard,
@@ -315,6 +337,7 @@ impl GenerateOutputStream {
         raw_stream: EngineCoreOutputStream,
         request_metrics: RequestMetricsTracker,
         request_guard: RequestGuard,
+        request_trace: Option<crate::request_trace::RequestTrace>,
     ) -> Self {
         Self {
             pending_prompt_info: Some(Box::new(GeneratePromptInfo {
@@ -327,6 +350,7 @@ impl GenerateOutputStream {
             weight_version_starts: Vec::new(),
             num_output_tokens: 0,
             routed_experts_chunks: Vec::new(),
+            request_trace,
             _request_guard: request_guard,
         }
     }
@@ -410,7 +434,11 @@ impl GenerateOutputStream {
         if let Some(finish_reason) = finish_reason.as_ref()
             && !rejected
         {
-            self.request_metrics.record_finished(received_at, finish_reason.clone());
+            self.request_metrics.record_finished(
+                received_at,
+                finish_reason.clone(),
+                self.request_trace.as_mut(),
+            );
         }
         let weight_versions = if finish_reason.is_some() {
             self.weight_version_spans()
@@ -422,6 +450,7 @@ impl GenerateOutputStream {
         } else {
             None
         };
+        let request_timings = finish_reason.as_ref().map(|_| self.request_metrics.snapshot());
 
         let output = GenerateOutput {
             request_id: raw.request_id,
@@ -437,6 +466,9 @@ impl GenerateOutputStream {
             weight_versions,
             routed_experts,
             timestamps: self.request_metrics.timestamps(),
+            remote_kv_wait_time: raw.remote_kv_wait_time,
+            kv_transfer_metrics: raw.kv_transfer_metrics,
+            request_timings,
         };
 
         Ok(output)
@@ -526,9 +558,11 @@ impl Drop for GenerateOutputStream {
             AbortCause::DroppedStream => FinishReason::Abort,
             AbortCause::StopStringMatched => FinishReason::Stop(None),
         };
-
-        self.request_metrics
-            .record_finished(current_unix_timestamp_secs(), finish_reason);
+        self.request_metrics.record_finished(
+            current_unix_timestamp_secs(),
+            finish_reason,
+            self.request_trace.as_mut(),
+        );
     }
 }
 
@@ -571,8 +605,8 @@ impl<T: Stream<Item = Result<GenerateOutput>> + Send> T {
                             existing.logprobs = Some(step_logprobs);
                         }
                     }
-                    if let Some(mut mask) = sampling_mask {
-                        existing.sampling_mask.get_or_insert_default().rows.append(&mut mask.rows);
+                    if let Some(mask) = sampling_mask {
+                        existing.sampling_mask.get_or_insert_default().append(mask);
                     }
                 } else {
                     collected = Some(CollectedGenerateOutput {
@@ -594,6 +628,9 @@ impl<T: Stream<Item = Result<GenerateOutput>> + Send> T {
                         spec_decode_metrics: None,
                         weight_versions: None,
                         routed_experts: None,
+                        remote_kv_wait_time: None,
+                        kv_transfer_metrics: None,
+                        request_timings: None,
                     });
                 }
 
@@ -610,6 +647,9 @@ impl<T: Stream<Item = Result<GenerateOutput>> + Send> T {
                     collected.spec_decode_metrics = output.spec_decode_metrics.map(|value| *value);
                     collected.weight_versions = output.weight_versions;
                     collected.routed_experts = output.routed_experts.map(|value| *value);
+                    collected.remote_kv_wait_time = output.remote_kv_wait_time;
+                    collected.kv_transfer_metrics = output.kv_transfer_metrics;
+                    collected.request_timings = output.request_timings;
                     if let Some(mask) = collected.sampling_mask.as_ref()
                         && mask.rows.len() != collected.token_ids.len()
                     {

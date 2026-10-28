@@ -20,6 +20,7 @@ from vllm.entrypoints.generate.base.protocol import (
 )
 from vllm.entrypoints.generate.base.serving import (
     GenerateBaseServing,
+    build_per_request_timing_metrics,
     build_spec_decoding_metrics,
     chat_top_logprobs_limit,
     clamp_prompt_logprobs,
@@ -42,7 +43,7 @@ from vllm.entrypoints.serve.utils.request_logger import RequestLogger
 from vllm.exceptions import GenerationError, VLLMValidationError
 from vllm.inputs import EngineInput, TokensPrompt, mm_input
 from vllm.logger import init_logger
-from vllm.logprobs import Logprob
+from vllm.logprobs import Logprob, _ColumnarLogprobs
 from vllm.multimodal.inputs import (
     MultiModalKwargsItem,
     MultiModalKwargsItems,
@@ -57,6 +58,7 @@ from vllm.tokenizers import TokenizerLike
 from vllm.utils.collection_utils import as_list
 from vllm.utils.serial_utils import numpy2base64
 
+from .logprobs_render import render_json_with_fragments, render_tokens_logprobs
 from .mm_features import (
     mm_kwargs_from_features,
     placeholder_ranges_from_engine_input,
@@ -77,6 +79,7 @@ from .protocol import (
     GenerateTokensResponse,
     GenerateTokensStreamChoice,
     GenerateTokensStreamResponse,
+    RenderedGenerateResponse,
 )
 
 logger = init_logger(__name__)
@@ -131,6 +134,7 @@ class ServingTokens(GenerateBaseServing):
         force_no_detokenize: bool = False,
         return_tokens_as_token_ids: bool = False,
         enable_prompt_tokens_details: bool = False,
+        enable_per_request_metrics: bool = False,
         enable_log_outputs: bool = False,
     ):
         super().__init__(
@@ -141,7 +145,9 @@ class ServingTokens(GenerateBaseServing):
         )
         self.online_renderer = online_renderer
         self.online_derenderer = online_derenderer
+        self.render_lock = asyncio.Lock()
         self.enable_prompt_tokens_details = enable_prompt_tokens_details
+        self.enable_per_request_metrics = enable_per_request_metrics
         self.enable_log_outputs = enable_log_outputs
         self.force_no_detokenize = force_no_detokenize
         self.has_tokenizer = (
@@ -186,7 +192,12 @@ class ServingTokens(GenerateBaseServing):
         self,
         request: GenerateRequest,
         raw_request: Request | None = None,
-    ) -> GenerateResponse | ErrorResponse | AsyncGenerator[str, None]:
+    ) -> (
+        GenerateResponse
+        | RenderedGenerateResponse
+        | ErrorResponse
+        | AsyncGenerator[str, None]
+    ):
         error_check_ret = await self._check_model(request)
         if error_check_ret is not None:
             logger.error("Error with model %s", error_check_ret)
@@ -363,6 +374,18 @@ class ServingTokens(GenerateBaseServing):
         sampling_params.output_kind = (
             RequestOutputKind.DELTA if request.stream else RequestOutputKind.FINAL_ONLY
         )
+        if (
+            not request.stream
+            and request.output_mode == "tokens"
+            and sampling_params.logprobs is not None
+            and sampling_params.logprobs > 1
+            and sampling_params.prompt_logprobs is None
+        ):
+            # Keep the top-k rows as numpy columns without decoded tokens: the
+            # response is rendered from them without a Python object per
+            # entry. Prompt logprobs stay lists, as the response returns them.
+            sampling_params._columnar_logprobs = True
+            sampling_params._detokenize_logprobs = False
 
         self._log_inputs(
             request_id,
@@ -426,7 +449,7 @@ class ServingTokens(GenerateBaseServing):
         model_name: str,
         request_metadata: RequestResponseMetadata,
         derender_request: ChatCompletionRequest | None = None,
-    ) -> ErrorResponse | GenerateResponse:
+    ) -> ErrorResponse | GenerateResponse | RenderedGenerateResponse:
         created_time = int(time.time())
         final_res: RequestOutput | None = None
         sampling_params: SamplingParams = request.sampling_params
@@ -452,6 +475,8 @@ class ServingTokens(GenerateBaseServing):
 
         assert final_res is not None
 
+        # choice position -> pre-rendered JSON of its logprobs
+        fragments: dict[int, list[bytes]] = {}
         tokens_choices: list[GenerateTokensChoice] = []
         text_choices: list[GenerateTextChoice] = []
         derender_choice_fields: list[dict[str, Any]] = []
@@ -463,10 +488,22 @@ class ServingTokens(GenerateBaseServing):
             out_logprobs = output.logprobs
 
             # This is top_logprobs in completions API
+            logprobs: GenerateLogProbs | ChatCompletionLogProbs | None = None
             if num_logprobs is not None:
                 assert out_logprobs is not None, "Did not output logprobs"
-                logprobs: GenerateLogProbs | ChatCompletionLogProbs | None
-                if text_mode:
+                rendered = None
+                top_logprobs: GenericSequence[dict[int, Logprob] | None] = out_logprobs
+                if isinstance(out_logprobs, _ColumnarLogprobs) and not text_mode:
+                    rendered = await render_tokens_logprobs(
+                        token_ids, out_logprobs, self.render_lock
+                    )
+                    if rendered is None:
+                        # Irregular rows: the per-entry path. Iterating once
+                        # is cheaper than indexing each position.
+                        top_logprobs = list(out_logprobs)
+                if rendered is not None:
+                    fragments[len(tokens_choices)] = rendered
+                elif text_mode:
                     logprobs = self._create_text_logprobs(
                         token_ids=token_ids,
                         top_logprobs=out_logprobs,
@@ -476,10 +513,8 @@ class ServingTokens(GenerateBaseServing):
                 else:
                     logprobs = self._create_tokens_logprobs(
                         token_ids=token_ids,
-                        top_logprobs=out_logprobs,
+                        top_logprobs=top_logprobs,
                     )
-            else:
-                logprobs = None
 
             routed_experts_b64 = (
                 numpy2base64(output.routed_experts)
@@ -488,8 +523,10 @@ class ServingTokens(GenerateBaseServing):
             )
 
             sampling_mask = None
+            sampling_mask_logprobs = None
             if output.sampling_mask is not None:
                 sampling_mask = output.sampling_mask.token_ids
+                sampling_mask_logprobs = output.sampling_mask.logprobs
 
             choice_fields: dict[str, Any] = dict(
                 index=output.index,
@@ -500,6 +537,7 @@ class ServingTokens(GenerateBaseServing):
                 routed_experts=routed_experts_b64,
                 sampling_mask=sampling_mask,
                 weight_versions=output.weight_versions,
+                sampling_mask_logprobs=sampling_mask_logprobs,
             )
             if derender_mode:
                 derender_choice_fields.append(choice_fields)
@@ -540,6 +578,7 @@ class ServingTokens(GenerateBaseServing):
                     fields["logprobs"] = None
                     fields["token_ids"] = None
                     fields["sampling_mask"] = None
+                    fields["sampling_mask_logprobs"] = None
                 derender_choices.append(
                     GenerateDerenderChoice(message=message, **fields)
                 )
@@ -565,6 +604,19 @@ class ServingTokens(GenerateBaseServing):
         else:
             response = GenerateTokensResponse(choices=tokens_choices, **response_fields)
 
+        metrics = response.metrics
+        if (
+            self.enable_per_request_metrics
+            and metrics is not None
+            and response.kv_transfer_params is not None
+        ):
+            response.kv_transfer_params["prefill_metrics"] = {
+                "queue_time_ms": metrics.queue_time_ms,
+                "time_to_first_token_ms": metrics.time_to_first_token_ms,
+                "kv_allocation_wait_time_ms": metrics.kv_allocation_wait_time_ms,
+                "kv_initial_queue_wait_time_ms": metrics.kv_initial_queue_wait_time_ms,
+            }
+
         # Log complete response if output logging is enabled
         if self.enable_log_outputs and self.request_logger:
             for choice in response.choices:
@@ -584,6 +636,11 @@ class ServingTokens(GenerateBaseServing):
                         delta=False,
                     )
 
+        if fragments:
+            parts = render_json_with_fragments(
+                response.model_dump(), "logprobs", fragments
+            )
+            return RenderedGenerateResponse(b"".join(parts))
         return response
 
     def _build_response_fields(
@@ -618,11 +675,20 @@ class ServingTokens(GenerateBaseServing):
 
         request_metadata.final_usage_info = usage
 
-        per_request_metrics = None
+        per_request_metrics = (
+            build_per_request_timing_metrics(
+                final_res.metrics,
+                num_generated_tokens,
+                request.kv_transfer_params,
+            )
+            if self.enable_per_request_metrics and request.sampling_params.n == 1
+            else None
+        )
         if request.sampling_params.n == 1:
             spec_stats = build_spec_decoding_metrics(final_res)
             if spec_stats is not None:
-                per_request_metrics = PerRequestMetrics(speculative_decoding=spec_stats)
+                per_request_metrics = per_request_metrics or PerRequestMetrics()
+                per_request_metrics.speculative_decoding = spec_stats
         return dict(
             request_id=request_id,
             created=created_time,
@@ -734,6 +800,11 @@ class ServingTokens(GenerateBaseServing):
                         routed_experts=routed_experts_b64,
                         sampling_mask=sampling_mask,
                         weight_versions=output.weight_versions,
+                        sampling_mask_logprobs=(
+                            output.sampling_mask.logprobs
+                            if output.sampling_mask is not None
+                            else None
+                        ),
                     )
                     chunk: GenerateTokensStreamResponse | GenerateTextStreamResponse
                     if text_mode:
@@ -783,13 +854,20 @@ class ServingTokens(GenerateBaseServing):
                 )
 
             if include_usage:
-                per_request_metrics = None
+                per_request_metrics = (
+                    build_per_request_timing_metrics(
+                        last_res.metrics if last_res is not None else None,
+                        total_completion_tokens,
+                        request.kv_transfer_params,
+                    )
+                    if self.enable_per_request_metrics and sampling_params.n == 1
+                    else None
+                )
                 if sampling_params.n == 1:
                     spec_stats = build_spec_decoding_metrics(last_res)
                     if spec_stats is not None:
-                        per_request_metrics = PerRequestMetrics(
-                            speculative_decoding=spec_stats
-                        )
+                        per_request_metrics = per_request_metrics or PerRequestMetrics()
+                        per_request_metrics.speculative_decoding = spec_stats
                 final_chunk: GenerateTokensStreamResponse | GenerateTextStreamResponse
                 if text_mode:
                     final_chunk = GenerateTextStreamResponse(

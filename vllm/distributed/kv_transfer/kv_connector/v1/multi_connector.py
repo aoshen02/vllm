@@ -55,6 +55,17 @@ class MultiKVConnectorMetadata(KVConnectorMetadata):
 class MultiKVConnectorWorkerMetadata(KVConnectorWorkerMetadata):
     metadata: tuple[KVConnectorWorkerMetadata | None, ...]
 
+    def get_request_metrics(self) -> dict[str, dict[str, float]]:
+        requests: dict[str, dict[str, float]] = {}
+        for metadata in self.metadata:
+            if metadata is None:
+                continue
+            for request_id, metrics in metadata.get_request_metrics().items():
+                target = requests.setdefault(request_id, {})
+                for name, value in metrics.items():
+                    target[name] = target.get(name, 0) + value
+        return requests
+
     def aggregate(self, other: KVConnectorWorkerMetadata) -> KVConnectorWorkerMetadata:
         assert isinstance(other, MultiKVConnectorWorkerMetadata)
 
@@ -750,6 +761,18 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
             per_engine_labelvalues,
             prom_metrics,
         )
+
+    def get_idle_timeout(self) -> float | None:
+        intervals = [
+            interval
+            for connector in self._connectors
+            if (interval := connector.get_idle_timeout()) is not None
+        ]
+        return min(intervals, default=None)
+
+    def on_idle(self) -> None:
+        for connector in self._connectors:
+            connector.on_idle()
 
     def reset_cache(self) -> bool:
         results = [c.reset_cache() is not False for c in self._connectors]

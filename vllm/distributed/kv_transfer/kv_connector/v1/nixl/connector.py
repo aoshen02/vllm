@@ -37,6 +37,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     NixlConnectorMetadata,
+    NixlRequestMetrics,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.pull_scheduler import (
     NixlPullConnectorScheduler,
@@ -269,6 +270,12 @@ class NixlBaseConnector(KVConnectorBase_V1, SupportsHMA):
         assert self.connector_worker is not None
         return self.connector_worker.get_block_ids_with_load_errors()
 
+    def build_connector_worker_meta(self) -> NixlRequestMetrics | None:
+        assert self.connector_worker is not None
+        metadata = self.connector_worker.request_metrics
+        self.connector_worker.request_metrics = NixlRequestMetrics()
+        return metadata if metadata.requests else None
+
     def get_kv_connector_stats(self) -> KVConnectorStats | None:
         if self.connector_worker is None:
             return None
@@ -380,6 +387,18 @@ class NixlPullConnector(NixlBaseConnector):
     def restore_kv_caches(self) -> None:
         assert self.connector_worker is not None
         self.connector_worker.restore_kv_caches()
+
+    def get_idle_timeout(self) -> float | None:
+        interval = float(
+            self.kv_transfer_config.get_from_extra_config(
+                "engine_heartbeat_interval", 5.0
+            )
+        )
+        return interval if interval > 0 else None
+
+    def on_idle(self) -> None:
+        assert self.connector_worker is not None
+        self.connector_worker._release_unreachable_remote_engines()
 
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
         assert self.connector_worker is not None

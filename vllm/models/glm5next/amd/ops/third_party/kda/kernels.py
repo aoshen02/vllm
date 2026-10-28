@@ -172,6 +172,11 @@ def fused_recurrent_kda(
     if scale is None:
         scale = k.shape[-1] ** -0.5
 
+    if compute_gate and lower_bound is None:
+        assert a_log is not None
+        g = fused_kda_gate(g.flatten(-2), a_log, k.shape[-1], g_bias)
+        compute_gate = False
+
     # q/k/v/beta are consumed in place with an explicit token stride, so
     # column slices of the fused projection buffer need no copy; layouts the
     # kernel cannot address fail loudly in `token_stride`.

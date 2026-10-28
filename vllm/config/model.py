@@ -283,6 +283,8 @@ class ModelConfig:
     equivalent to setting `-cc.mode=none -cc.cudagraph_mode=none`."""
     return_sampling_mask: bool = False
     """Whether to return the post-processing token support for each sample."""
+    return_sampling_mask_logprobs: bool = False
+    """Whether to return normalized logprobs aligned with sampling-mask IDs."""
     max_logprobs: int = Field(default=20, ge=-1)
     """Maximum number of log probabilities to return when `logprobs` is
     specified in `SamplingParams`. The default value comes the default for the
@@ -367,6 +369,9 @@ class ModelConfig:
     used with `--generation-config auto`, the override parameters will be
     merged with the default config from the model. If used with
     `--generation-config vllm`, only the override parameters are used."""
+    custom_pull_weights_pre_read_hook: str | None = None
+    """Import path of a hook(source_dir, target_version) called before reading published weights."""
+
     enable_sleep_mode: bool = False
     """Enable sleep mode for the engine (only cuda and
     hip platforms are supported)."""
@@ -439,6 +444,7 @@ class ModelConfig:
     mm_hasher_algorithm: InitVar[MMHasherAlgorithm | None] = None
     mm_shm_cache_max_object_size_mb: InitVar[int | None] = None
     mm_encoder_only: InitVar[bool | None] = None
+    mm_decoder_only: InitVar[bool | None] = None
     mm_encoder_tp_mode: InitVar[MMEncoderTPMode | None] = None
     mm_encoder_attn_backend: InitVar[AttentionBackendEnum | str | None] = None
     mm_encoder_attn_dtype: InitVar[str | None] = None
@@ -477,6 +483,7 @@ class ModelConfig:
             "spec_target_max_model_len",
             "enforce_eager",
             "return_sampling_mask",
+            "return_sampling_mask_logprobs",
             "logprobs_mode",
             "use_fp64_gumbel",
             "enable_trace_replay",
@@ -582,6 +589,7 @@ class ModelConfig:
         mm_hasher_algorithm: MMHasherAlgorithm | None,
         mm_shm_cache_max_object_size_mb: int | None,
         mm_encoder_only: bool | None,
+        mm_decoder_only: bool | None,
         mm_encoder_tp_mode: MMEncoderTPMode | None,
         mm_encoder_attn_backend: AttentionBackendEnum | str | None,
         mm_encoder_attn_dtype: str | None,
@@ -857,6 +865,7 @@ class ModelConfig:
                 mm_hasher_algorithm=mm_hasher_algorithm,
                 mm_shm_cache_max_object_size_mb=mm_shm_cache_max_object_size_mb,
                 mm_encoder_only=mm_encoder_only,
+                mm_decoder_only=mm_decoder_only,
                 mm_encoder_tp_mode=mm_encoder_tp_mode,
                 mm_encoder_attn_backend=mm_encoder_attn_backend,
                 mm_encoder_attn_dtype=mm_encoder_attn_dtype,
@@ -1061,6 +1070,10 @@ class ModelConfig:
     @model_validator(mode="after")
     def validate_model_config_after(self: "ModelConfig") -> "ModelConfig":
         """Called after __post_init__."""
+        if self.return_sampling_mask_logprobs and not self.return_sampling_mask:
+            raise ValueError(
+                "return_sampling_mask_logprobs requires return_sampling_mask"
+            )
         if not isinstance(self.tokenizer, str):
             raise ValueError(
                 f"tokenizer must be a string, got "

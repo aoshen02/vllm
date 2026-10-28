@@ -218,6 +218,7 @@ impl ChatRequestProcessor {
             add_special_tokens: request.add_special_tokens,
             data_parallel_rank: request.data_parallel_rank,
             session_id: request.session_id,
+            trace_headers: request.trace_headers,
             kv_hints: None,
             reasoning_parser_kwargs: ReasoningParserKwargs {
                 chat_template_kwargs,

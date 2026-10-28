@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from dataclasses import dataclass
 from typing import Annotated, Any, Literal, TypeAlias
 
 from pydantic import (
@@ -506,6 +507,7 @@ class GenerateChoiceBase(BaseModel):
     sampling_mask: list[list[int]] | None = None
     # Contiguous weight version spans over output-token indexes.
     weight_versions: list[WeightVersionSpan] | None = None
+    sampling_mask_logprobs: list[list[float]] | None = None
 
     @field_validator("token_ids")
     @classmethod
@@ -543,6 +545,7 @@ class GenerateStreamChoiceBase(BaseModel):
     sampling_mask: list[list[int]] | None = None
     # Set on the final chunk only; covers the whole output.
     weight_versions: list[WeightVersionSpan] | None = None
+    sampling_mask_logprobs: list[list[float]] | None = None
 
 
 class GenerateTokensStreamChoice(GenerateStreamChoiceBase):
@@ -633,6 +636,14 @@ class GenerateTextResponse(GenerateResponseBase):
 class GenerateDerenderResponse(GenerateResponseBase):
     output_mode: Literal["derender"] = "derender"
     choices: list[GenerateDerenderChoice]
+
+
+@dataclass
+class RenderedGenerateResponse:
+    """A non-streaming generate response already rendered to its JSON body:
+    the bytes ``JSONResponse`` gives for the equivalent ``GenerateResponse``."""
+
+    body: bytes
 
 
 def output_mode_or_tokens(value: Any) -> Any:

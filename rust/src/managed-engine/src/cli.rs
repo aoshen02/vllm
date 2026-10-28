@@ -86,8 +86,11 @@ impl ManagedEngineArgs {
         model: String,
         max_logprobs: Option<i32>,
         profiler_config: Option<String>,
+        otlp_traces_endpoint: Option<String>,
+        collect_detailed_traces: Option<String>,
         reasoning_parser: Option<&str>,
         language_model_only: bool,
+        enable_mm_embeds: bool,
         disable_log_stats: bool,
         shutdown_timeout: u64,
         handshake_port: u16,
@@ -108,12 +111,23 @@ impl ManagedEngineArgs {
             python_args.push("--profiler-config".to_string());
             python_args.push(profiler_config);
         }
+        if let Some(otlp_traces_endpoint) = otlp_traces_endpoint {
+            python_args.push("--otlp-traces-endpoint".to_string());
+            python_args.push(otlp_traces_endpoint);
+        }
+        if let Some(collect_detailed_traces) = collect_detailed_traces {
+            python_args.push("--collect-detailed-traces".to_string());
+            python_args.push(collect_detailed_traces);
+        }
         if let Some(reasoning_parser) = reasoning_parser {
             python_args.push("--reasoning-parser".to_string());
             python_args.push(reasoning_parser.to_string());
         }
         if language_model_only {
             python_args.push("--language-model-only".to_string());
+        }
+        if enable_mm_embeds {
+            python_args.push("--enable-mm-embeds".to_string());
         }
         if disable_log_stats {
             python_args.push("--disable-log-stats".to_string());

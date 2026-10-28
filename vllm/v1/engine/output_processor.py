@@ -28,6 +28,8 @@ from vllm.tracing import (
     SpanKind,
     extract_trace_context,
     instrument_manual,
+    is_tracing_available,
+    start_request_span,
 )
 from vllm.utils import length_from_prompt_token_ids_or_embeds
 from vllm.v1.engine import EngineCoreOutput, EngineCoreRequest, FinishReason
@@ -250,6 +252,9 @@ class RequestState:
         self.input_chunk_queue: deque[StreamingUpdate] | None = (
             deque() if stream_input else None
         )
+
+        # Tracing span
+        self.trace_span: Any | None = None
 
     def apply_streaming_update(self, update: StreamingUpdate) -> None:
         # Apply the update to the request state.
@@ -498,13 +503,19 @@ class RequestState:
             logprobs = logprobs[-num_new_tokens:] if num_new_tokens else logprobs[:0]
 
         sampling_mask = None
-        if (delta or finished) and self.sampling_mask_chunks:
+        if self.sampling_mask_chunks and (delta or finished):
+            chunks = self.sampling_mask_chunks
             sampling_mask = SamplingMask(
-                [
-                    position
-                    for chunk in self.sampling_mask_chunks
-                    for position in chunk.to_nested_list()
-                ]
+                [mask for chunk in chunks for mask in chunk.to_nested_list()],
+                (
+                    [
+                        scores
+                        for chunk in chunks
+                        for scores in chunk.to_nested_logprobs()
+                    ]
+                    if chunks[0].logprobs is not None
+                    else None
+                ),
             )
             if delta:
                 self.sampling_mask_chunks.clear()
@@ -632,6 +643,8 @@ class OutputProcessor:
         for request_id in internal_req_ids:
             req_state = self.request_states.pop(request_id, None)
             if req_state is not None:
+                if req_state.trace_span is not None:
+                    req_state.trace_span.end()
                 self.lora_states.request_finished(request_id, req_state.lora_name)
                 request_ids_to_abort.append(request_id)
                 # Produce final abort output.
@@ -681,9 +694,23 @@ class OutputProcessor:
             parent_req=parent_req,
             request_index=request_index,
             queue=queue,
-            log_stats=self.log_stats,
+            log_stats=self.log_stats or self.tracing_enabled,
             stream_interval=self.stream_interval,
         )
+
+        if self.tracing_enabled and is_tracing_available():
+            arrival_time_ns = int(request.arrival_time * 1e9)
+            trace_context = extract_trace_context(request.trace_headers)
+            span, updated_headers = start_request_span(
+                span_name="llm_request",
+                start_time=arrival_time_ns,
+                context=trace_context,
+                kind=SpanKind.SERVER,
+            )
+            req_state.trace_span = span
+            if updated_headers:
+                request.trace_headers = updated_headers
+
         self.request_states[request_id] = req_state
         if parent_req:
             self.parent_requests[parent_req.request_id] = parent_req
@@ -782,6 +809,17 @@ class OutputProcessor:
             stop_reason = engine_core_output.stop_reason
             kv_transfer_params = engine_core_output.kv_transfer_params
             ec_transfer_params = engine_core_output.ec_transfer_params
+            if req_state.stats is not None and engine_core_output.kv_transfer_metrics:
+                req_state.stats.kv_transfer_metrics = (
+                    engine_core_output.kv_transfer_metrics
+                )
+            if (
+                engine_core_output.remote_kv_wait_time is not None
+                and req_state.stats is not None
+            ):
+                req_state.stats.remote_kv_wait_time = (
+                    engine_core_output.remote_kv_wait_time
+                )
             if engine_core_output.routed_experts is not None:
                 req_state.routed_experts_chunks.append(
                     engine_core_output.routed_experts
@@ -944,39 +982,53 @@ class OutputProcessor:
         req_state: RequestState,
         iteration_stats: IterationStats | None,
     ) -> None:
-        assert req_state.stats is not None
-        assert iteration_stats is not None
-
-        metrics = req_state.stats
-        arrival_time_ns = int(metrics.arrival_time * 1e9)
         trace_context = extract_trace_context(engine_core_output.trace_headers)
         prompt_length = length_from_prompt_token_ids_or_embeds(
             req_state.prompt_token_ids, req_state.prompt_embeds
         )
 
-        # Calculate timing metrics
-        e2e_time = iteration_stats.iteration_timestamp - metrics.arrival_time
-        queued_time = metrics.scheduled_ts - metrics.queued_ts
-        prefill_time = metrics.first_token_ts - metrics.scheduled_ts
-        decode_time = metrics.last_token_ts - metrics.first_token_ts
-        inference_time = metrics.last_token_ts - metrics.scheduled_ts
+        arrival_time_ns = (
+            int(req_state.stats.arrival_time * 1e9)
+            if req_state.stats is not None
+            else 0
+        )
+        completion_tokens = (
+            req_state.stats.num_generation_tokens if req_state.stats is not None else 0
+        )
 
         # Build attributes dict
         attributes: dict[str, Any] = {
-            SpanAttributes.GEN_AI_LATENCY_TIME_TO_FIRST_TOKEN: (
-                metrics.first_token_latency
-            ),
-            SpanAttributes.GEN_AI_LATENCY_E2E: e2e_time,
-            SpanAttributes.GEN_AI_LATENCY_TIME_IN_QUEUE: queued_time,
             SpanAttributes.GEN_AI_USAGE_PROMPT_TOKENS: prompt_length,
-            SpanAttributes.GEN_AI_USAGE_COMPLETION_TOKENS: (
-                metrics.num_generation_tokens
-            ),
-            SpanAttributes.GEN_AI_LATENCY_TIME_IN_MODEL_PREFILL: prefill_time,
-            SpanAttributes.GEN_AI_LATENCY_TIME_IN_MODEL_DECODE: decode_time,
-            SpanAttributes.GEN_AI_LATENCY_TIME_IN_MODEL_INFERENCE: inference_time,
+            SpanAttributes.GEN_AI_USAGE_COMPLETION_TOKENS: completion_tokens,
             SpanAttributes.GEN_AI_REQUEST_ID: req_state.external_req_id,
         }
+
+        # Calculate timing metrics if stats available
+        if req_state.stats is not None and iteration_stats is not None:
+            metrics = req_state.stats
+            e2e_time = iteration_stats.iteration_timestamp - metrics.arrival_time
+            queued_time = metrics.scheduled_ts - metrics.queued_ts
+            prefill_time = metrics.first_token_ts - metrics.scheduled_ts
+            decode_time = metrics.last_token_ts - metrics.first_token_ts
+            inference_time = metrics.last_token_ts - metrics.scheduled_ts
+
+            attributes.update(
+                {
+                    SpanAttributes.GEN_AI_LATENCY_TIME_TO_FIRST_TOKEN: (
+                        metrics.first_token_latency
+                    ),
+                    SpanAttributes.GEN_AI_LATENCY_E2E: e2e_time,
+                    SpanAttributes.GEN_AI_LATENCY_TIME_IN_QUEUE: queued_time,
+                    SpanAttributes.GEN_AI_USAGE_COMPLETION_TOKENS: (
+                        metrics.num_generation_tokens
+                    ),
+                    SpanAttributes.GEN_AI_LATENCY_TIME_IN_MODEL_PREFILL: (prefill_time),
+                    SpanAttributes.GEN_AI_LATENCY_TIME_IN_MODEL_DECODE: (decode_time),
+                    SpanAttributes.GEN_AI_LATENCY_TIME_IN_MODEL_INFERENCE: (
+                        inference_time
+                    ),
+                }
+            )
 
         # Add optional request parameters
         if req_state.top_p:
@@ -992,13 +1044,17 @@ class OutputProcessor:
         if req_state.n:
             attributes[SpanAttributes.GEN_AI_REQUEST_N] = req_state.n
 
-        instrument_manual(
-            span_name="llm_request",
-            start_time=arrival_time_ns,
-            attributes=attributes,
-            context=trace_context,
-            kind=SpanKind.SERVER,
-        )
+        if req_state.trace_span is not None:
+            req_state.trace_span.set_attributes(attributes)
+            req_state.trace_span.end()
+        else:
+            instrument_manual(
+                span_name="llm_request",
+                start_time=arrival_time_ns,
+                attributes=attributes,
+                context=trace_context,
+                kind=SpanKind.SERVER,
+            )
 
     def _update_stats_from_output(
         self,

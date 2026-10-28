@@ -51,6 +51,7 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let port = unique_local_port()?;
     let config = Config {
+        vllm_config: None,
         transport_mode: TransportMode::HandshakeOwner {
             handshake_address: args.handshake_address,
             advertised_host: args.host,
@@ -77,6 +78,7 @@ async fn main() -> Result<()> {
         tool_strict_level: None,
         renderer: RendererSelection::Auto,
         language_model_only: false,
+        enable_mm_embeds: false,
         chat_template: None,
         default_chat_template_kwargs: None,
         trust_request_chat_template: false,
@@ -98,6 +100,7 @@ async fn main() -> Result<()> {
         manages_engine: false,
         keep_alive_timeout: Duration::from_secs(5),
         profiler: None,
+        observability: Default::default(),
     };
 
     let bind_address = format!("127.0.0.1:{port}");

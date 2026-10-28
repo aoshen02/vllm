@@ -1376,6 +1376,18 @@ class Scheduler(SchedulerInterface):
                 # Replayed tokens are already counted in the adopted hit; a
                 # chunk that ends inside the replayed range needs no new slots.
                 num_tokens_past_hit = max(num_new_tokens - num_replay_tokens, 0)
+                for phase, started_at in request.kv_queue_started_at.items():
+                    key = f"kv_{phase}_queue_wait_time_ms"
+                    request.kv_transfer_metrics[key] = (
+                        request.kv_transfer_metrics.get(key, 0)
+                        + (time.monotonic() - started_at) * 1000
+                    )
+                request.kv_queue_started_at.clear()
+                if (
+                    self.connector is not None
+                    and request.kv_allocation_started_at is None
+                ):
+                    request.kv_allocation_started_at = time.monotonic()
                 new_blocks = self.kv_cache_manager.allocate_slots(
                     request,
                     num_tokens_past_hit,
@@ -1403,6 +1415,13 @@ class Scheduler(SchedulerInterface):
                     if request.has_encoder_inputs:
                         self.encoder_cache_manager.free(request)
                     break
+
+                if request.kv_allocation_started_at is not None:
+                    request.kv_transfer_metrics["kv_allocation_wait_time_ms"] = (
+                        request.kv_transfer_metrics.get("kv_allocation_wait_time_ms", 0)
+                        + (time.monotonic() - request.kv_allocation_started_at) * 1000
+                    )
+                    request.kv_allocation_started_at = None
 
                 # KVTransfer: the connector uses this info to determine
                 # if a load is needed. Note that
@@ -1449,7 +1468,9 @@ class Scheduler(SchedulerInterface):
                     # here would start the cadence from a step that did none.
                     # If loading async, allocate memory and put request
                     # into the WAITING_FOR_REMOTE_KV state.
+                    request.start_remote_kv_wait()
                     request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
+                    request.async_kv_load_start_time_ns = time.time_ns()
                     # Set num_computed_tokens even though KVs are not yet loaded.
                     # request.num_computed_tokens will not be used anywhere until
                     # the request finished the KV transfer.
@@ -1480,9 +1501,18 @@ class Scheduler(SchedulerInterface):
                         EngineCoreEventType.SCHEDULED, scheduled_timestamp
                     )
                 if request.status == RequestStatus.WAITING:
+                    request.trace_end_queuing()
+                    if (
+                        request.num_computed_tokens > 0
+                        and num_computed_tokens >= request.num_tokens - 1
+                    ):
+                        request.decode_start_time_ns = time.time_ns()
+                    else:
+                        request.prefill_start_time_ns = time.time_ns()
                     scheduled_new_reqs.append(request)
                 elif request.status == RequestStatus.PREEMPTED:
                     scheduled_resumed_reqs.append(request)
+                    request.prefill_start_time_ns = time.time_ns()
                 else:
                     raise RuntimeError(f"Invalid request status: {request.status}")
 
@@ -1736,6 +1766,8 @@ class Scheduler(SchedulerInterface):
         )
         if self.aux_output_connector is not None:
             self.aux_output_connector.request_finished(request)
+        # Close active prefill or decode spans
+        request.trace_preempt()
         self._free_request_blocks(request)
         self.encoder_cache_manager.free(request)
         self._inflight_prefills.discard(request)
@@ -2263,6 +2295,11 @@ class Scheduler(SchedulerInterface):
                 sampled_token_ids[req_index] if sampled_token_ids else []
             )
 
+            if generated_token_ids:
+                request.trace_end_prefill()
+                if request.decode_start_time_ns is None:
+                    request.decode_start_time_ns = time.time_ns()
+
             scheduled_spec_token_ids = (
                 scheduler_output.scheduled_spec_decode_tokens.get(req_id)
             )
@@ -2315,6 +2352,7 @@ class Scheduler(SchedulerInterface):
             pooler_output = pooler_outputs[req_index] if pooler_outputs else None
             kv_transfer_params = None
             ec_transfer_params = None
+            remote_kv_wait_time = None
             prefill_stats = None
             status_before_stop = request.status
 
@@ -2395,6 +2433,8 @@ class Scheduler(SchedulerInterface):
                         kv_transfer_params["remote_prefill_cached_tokens"] = (
                             prefill_stats.num_cached_tokens
                         )
+                    if request.remote_kv_wait_time:
+                        remote_kv_wait_time = request.remote_kv_wait_time
                 else:
                     continuing_reqs.append(request)
 
@@ -2438,6 +2478,8 @@ class Scheduler(SchedulerInterface):
                         ),
                         kv_transfer_params=kv_transfer_params,
                         ec_transfer_params=ec_transfer_params,
+                        remote_kv_wait_time=remote_kv_wait_time,
+                        kv_transfer_metrics=request.kv_transfer_metrics or None,
                         trace_headers=request.trace_headers,
                         routed_experts=routed_experts,
                         num_nans_in_logits=request.num_nans_in_logits,
@@ -2769,6 +2811,49 @@ class Scheduler(SchedulerInterface):
         """Returns (num_running_reqs, num_waiting_reqs)."""
         return len(self.running), len(self.waiting) + len(self.kv_holding_waiting)
 
+    def get_inflight_queue_diagnostics(self, limit: int) -> dict[str, Any]:
+        """Return a bounded snapshot of in-flight request queues."""
+        now = time.time()
+        remaining = max(0, min(limit, 1000))
+        queues = []
+
+        for name, requests in (
+            ("running", self.running),
+            ("waiting", self.waiting),
+            ("kv_holding_waiting", self.kv_holding_waiting),
+            (
+                "finished_pending_cleanup",
+                [
+                    request
+                    for request in self.requests.values()
+                    if request.is_finished()
+                ],
+            ),
+        ):
+            entries = []
+            for request in requests:
+                if remaining == 0:
+                    break
+                entries.append(
+                    {
+                        "request_id": request.request_id,
+                        "status": request.status.name,
+                        "age_seconds": round(max(0.0, now - request.arrival_time), 3),
+                        "prompt_tokens": request.num_prompt_tokens,
+                        "output_tokens": request.num_output_tokens,
+                    }
+                )
+                remaining -= 1
+            queues.append(
+                {"name": name, "num_requests": len(requests), "requests": entries}
+            )
+
+        return {
+            "data_parallel_rank": self.parallel_config.data_parallel_index,
+            "has_pending_work": self.has_requests(),
+            "queues": queues,
+        }
+
     def get_kv_cache_usage(self) -> float:
         """Returns the fraction of the KV cache currently in use (0.0-1.0)."""
         return self.kv_cache_manager.usage
@@ -2800,6 +2885,7 @@ class Scheduler(SchedulerInterface):
                     self.num_spec_tokens
                 )
             if self.connector is not None:
+                request.kv_queue_started_at["initial"] = time.monotonic()
                 self.connector.on_new_request(request)
                 kv_transfer_params = request.kv_transfer_params
                 if kv_transfer_params and kv_transfer_params.get("do_remote_prefill"):
@@ -2879,8 +2965,11 @@ class Scheduler(SchedulerInterface):
     ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
         assert request.is_finished()
 
+        request.stop_remote_kv_wait()
+
         if self.aux_output_connector is not None:
             self.aux_output_connector.request_finished(request)
+        request.trace_cleanup()
         self._inflight_prefills.discard(request)
         self._set_kv_fetch_stage(request, None)
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
@@ -3346,6 +3435,9 @@ class Scheduler(SchedulerInterface):
                 return False
             # Promote request to waiting or preempted.
             self._update_waiting_for_remote_kv(request)
+            request.stop_remote_kv_wait()
+            request.kv_queue_started_at["post_receive"] = time.monotonic()
+            request.trace_end_kv_transfer()
             if request.num_preemptions:
                 request.status = RequestStatus.PREEMPTED
             else:
@@ -3383,6 +3475,16 @@ class Scheduler(SchedulerInterface):
         """
         if self.connector is not None:
             self.connector.update_connector_output(kv_connector_output)
+
+        metadata = kv_connector_output.kv_connector_worker_meta
+        if metadata is not None:
+            for request_id, metrics in metadata.get_request_metrics().items():
+                request = self.requests.get(request_id)
+                if request is not None:
+                    for name, value in metrics.items():
+                        request.kv_transfer_metrics[name] = (
+                            request.kv_transfer_metrics.get(name, 0) + value
+                        )
 
         # KV Connector:: update recv and send status from last step.
         for req_id in kv_connector_output.finished_recving or ():

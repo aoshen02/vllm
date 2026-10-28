@@ -207,6 +207,7 @@ fn serve_args_forward_python_flags_with_separator() {
                         tool_strict_level: None,
                         renderer: Auto,
                         language_model_only: false,
+                        enable_mm_embeds: false,
                         max_logprobs: None,
                         stream_interval: 1,
                         shutdown_timeout: 0,
@@ -254,6 +255,8 @@ fn serve_args_forward_python_flags_with_separator() {
                             ssl_ciphers: None,
                         },
                         profiler_config: None,
+                        otlp_traces_endpoint: None,
+                        collect_detailed_traces: None,
                     },
                     managed_engine: ManagedEngineArgs {
                         python: "../vllm/.venv/bin/python",
@@ -1224,6 +1227,7 @@ fn frontend_args_accept_json() {
                         tool_strict_level: None,
                         renderer: Auto,
                         language_model_only: false,
+                        enable_mm_embeds: false,
                         max_logprobs: None,
                         stream_interval: 1,
                         shutdown_timeout: 0,
@@ -1271,6 +1275,8 @@ fn frontend_args_accept_json() {
                             ssl_ciphers: None,
                         },
                         profiler_config: None,
+                        otlp_traces_endpoint: None,
+                        collect_detailed_traces: None,
                     },
                 },
             ),
@@ -1308,7 +1314,43 @@ fn frontend_args_json_applies_defaults() {
     assert_eq!(args.runtime.renderer, RendererSelection::Auto);
     assert_eq!(args.runtime.max_logprobs, None);
     assert_eq!(args.runtime.shutdown_timeout, 0);
+    assert_eq!(args.runtime.vllm_config, None);
     assert_eq!(args.into_config().transport_mode.data_parallel_size(), 4);
+}
+
+#[test]
+fn frontend_args_json_preserves_resolved_engine_config() {
+    let resolved = serde_json::json!({
+        "ec_transfer_config": {
+            "ec_connector": "ECCPUConnector",
+            "ec_role": "ec_producer",
+        },
+        "kv_transfer_config": null,
+    });
+    let payload = serde_json::json!({
+        "model_tag": "test-model",
+        "vllm_config": resolved,
+    });
+    let cli = Cli::try_parse_from([
+        "vllm-rs",
+        "frontend",
+        "--listen-fd",
+        "3",
+        "--input-listener-fd",
+        "999999",
+        "--output-listener-fd",
+        "999998",
+        "--args-json",
+        &payload.to_string(),
+    ])
+    .unwrap();
+    let Command::Frontend(args) = cli.command else {
+        panic!("expected frontend args");
+    };
+    let config = args.into_config();
+    assert_eq!(config.vllm_config, Some(resolved));
+    assert!(serde_json::to_value(&config).unwrap().get("vllm_config").is_none());
+    assert!(!format!("{config:?}").contains("ec_producer"));
 }
 
 #[test]
@@ -1509,7 +1551,7 @@ fn frontend_args_json_accepts_supported_non_default_fields() {
         "--output-listener-fd",
         "999998",
         "--args-json",
-        r#"{"model_tag":"Qwen/Qwen3-0.6B","generation_config":"vllm","revision":"release","engine_ready_timeout_secs":42,"tool_call_parser":"hermes","reasoning_parser":"qwen3_thinking","tokenizer_mode":"deepseek_v32","language_model_only":true,"max_logprobs":-1,"shutdown_timeout":3}"#,
+        r#"{"model_tag":"Qwen/Qwen3-0.6B","generation_config":"vllm","revision":"release","engine_ready_timeout_secs":42,"tool_call_parser":"hermes","reasoning_parser":"qwen3_thinking","tokenizer_mode":"deepseek_v32","language_model_only":true,"enable_mm_embeds":true,"max_logprobs":-1,"shutdown_timeout":3}"#,
     ])
     .unwrap();
 
@@ -1529,8 +1571,10 @@ fn frontend_args_json_accepts_supported_non_default_fields() {
     );
     assert_eq!(args.runtime.renderer, RendererSelection::DeepSeekV32);
     assert!(args.runtime.language_model_only);
+    assert!(args.runtime.enable_mm_embeds);
     assert_eq!(args.runtime.max_logprobs, Some(-1));
     assert_eq!(args.runtime.shutdown_timeout, 3);
+    assert!(args.into_config().enable_mm_embeds);
 }
 
 #[test]
@@ -1541,6 +1585,7 @@ fn serve_args_forward_auto_max_model_len_to_managed_engine() {
         "Qwen/Qwen3-0.6B",
         "--max-model-len",
         "auto",
+        "--enable-mm-embeds",
     ])
     .unwrap();
 
@@ -1556,6 +1601,7 @@ fn serve_args_forward_auto_max_model_len_to_managed_engine() {
             "auto",
             "--reasoning-parser",
             "qwen3",
+            "--enable-mm-embeds",
         ]
     "#]]
     .assert_debug_eq(&config.python_args);
@@ -2139,6 +2185,7 @@ fn serve_args_accept_handshake_aliases() {
                         tool_strict_level: None,
                         renderer: Auto,
                         language_model_only: false,
+                        enable_mm_embeds: false,
                         max_logprobs: None,
                         stream_interval: 1,
                         shutdown_timeout: 0,
@@ -2186,6 +2233,8 @@ fn serve_args_accept_handshake_aliases() {
                             ssl_ciphers: None,
                         },
                         profiler_config: None,
+                        otlp_traces_endpoint: None,
+                        collect_detailed_traces: None,
                     },
                     managed_engine: ManagedEngineArgs {
                         python: "python3",
@@ -2308,6 +2357,7 @@ fn serve_frontend_config_uses_dp_address_as_advertised_host() {
             tool_strict_level: None,
             renderer: Auto,
             language_model_only: false,
+            enable_mm_embeds: false,
             chat_template: None,
             default_chat_template_kwargs: None,
             trust_request_chat_template: false,
@@ -2350,6 +2400,10 @@ fn serve_frontend_config_uses_dp_address_as_advertised_host() {
             manages_engine: true,
             keep_alive_timeout: 5s,
             profiler: None,
+            observability: ObservabilityConfig {
+                otlp_traces_endpoint: None,
+                collect_detailed_traces: None,
+            },
         }
     "#]]
     .assert_debug_eq(&Config {
@@ -2415,6 +2469,7 @@ fn serve_frontend_config_keeps_tcp_transport_for_non_local_only_topology() {
             tool_strict_level: None,
             renderer: Auto,
             language_model_only: false,
+            enable_mm_embeds: false,
             chat_template: None,
             default_chat_template_kwargs: None,
             trust_request_chat_template: false,
@@ -2457,6 +2512,10 @@ fn serve_frontend_config_keeps_tcp_transport_for_non_local_only_topology() {
             manages_engine: true,
             keep_alive_timeout: 5s,
             profiler: None,
+            observability: ObservabilityConfig {
+                otlp_traces_endpoint: None,
+                collect_detailed_traces: None,
+            },
         }
     "#]]
     .assert_debug_eq(&config);
@@ -2610,6 +2669,7 @@ fn frontend_config_uses_external_coordinator_when_coordinator_address_is_present
             tool_strict_level: None,
             renderer: Auto,
             language_model_only: false,
+            enable_mm_embeds: false,
             chat_template: None,
             default_chat_template_kwargs: None,
             trust_request_chat_template: false,
@@ -2652,6 +2712,10 @@ fn frontend_config_uses_external_coordinator_when_coordinator_address_is_present
             manages_engine: false,
             keep_alive_timeout: 5s,
             profiler: None,
+            observability: ObservabilityConfig {
+                otlp_traces_endpoint: None,
+                collect_detailed_traces: None,
+            },
         }
     "#]]
     .assert_debug_eq(&config);
@@ -2831,4 +2895,107 @@ fn serve_revision_reaches_frontend_and_managed_engine() {
     );
     let engine = args.to_managed_engine_config(1234);
     assert!(engine.python_args.windows(2).any(|args| args == ["--revision", "release"]));
+}
+
+#[test]
+fn serve_args_accept_otlp_flags_into_config() {
+    let cli = Cli::try_parse_from([
+        "vllm-rs",
+        "serve",
+        "Qwen/Qwen3-0.6B",
+        "--otlp-traces-endpoint",
+        "localhost:4317",
+        "--collect-detailed-traces",
+        "all",
+    ])
+    .unwrap();
+
+    let Command::Serve(args) = cli.command else {
+        panic!("expected serve args");
+    };
+    let config = args.to_frontend_config("tcp://127.0.0.1:62100".to_string());
+    assert_eq!(
+        config.observability.otlp_traces_endpoint.as_deref(),
+        Some("localhost:4317")
+    );
+    assert_eq!(
+        config.observability.collect_detailed_traces.as_deref(),
+        Some("all")
+    );
+}
+
+#[test]
+fn frontend_args_json_accepts_graduated_otlp_endpoint() {
+    // Previously rejected as an unsupported field; now a real config knob.
+    let cli = Cli::try_parse_from([
+        "vllm-rs",
+        "frontend",
+        "--listen-fd",
+        "3",
+        "--input-listener-fd",
+        "999999",
+        "--output-listener-fd",
+        "999998",
+        "--args-json",
+        r#"{"model_tag":"Qwen/Qwen3-0.6B","otlp_traces_endpoint":"localhost:4317"}"#,
+    ])
+    .unwrap();
+
+    let Command::Frontend(args) = cli.command else {
+        panic!("expected frontend args");
+    };
+    let config = args.into_config();
+    assert_eq!(
+        config.observability.otlp_traces_endpoint.as_deref(),
+        Some("localhost:4317")
+    );
+}
+
+#[test]
+fn serve_args_reject_detailed_traces_without_endpoint() {
+    let cli = Cli::try_parse_from([
+        "vllm-rs",
+        "serve",
+        "Qwen/Qwen3-0.6B",
+        "--collect-detailed-traces",
+        "all",
+    ])
+    .unwrap();
+
+    let Command::Serve(args) = cli.command else {
+        panic!("expected serve args");
+    };
+    let config = args.to_frontend_config("tcp://127.0.0.1:62100".to_string());
+    let err = config.validate().unwrap_err().to_string();
+    assert!(err.contains("--collect-detailed-traces requires"), "{err}");
+}
+
+#[test]
+fn serve_args_forward_otlp_flags_to_managed_engine() {
+    let cli = Cli::try_parse_from([
+        "vllm-rs",
+        "serve",
+        "Qwen/Qwen3-0.6B",
+        "--otlp-traces-endpoint",
+        "localhost:4317",
+        "--collect-detailed-traces",
+        "all",
+    ])
+    .unwrap();
+
+    let Command::Serve(args) = cli.command else {
+        panic!("expected serve args");
+    };
+    let config = args.to_managed_engine_config(5555);
+    expect![[r#"
+        [
+            "--otlp-traces-endpoint",
+            "localhost:4317",
+            "--collect-detailed-traces",
+            "all",
+            "--reasoning-parser",
+            "qwen3",
+        ]
+    "#]]
+    .assert_debug_eq(&config.python_args);
 }

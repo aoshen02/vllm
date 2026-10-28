@@ -354,7 +354,8 @@ class SupportsMultiModal(SupportsMultiModalEmbeddings, Protocol):
         """Mark each child module that was assigned to this model during this context
         as a tower model component.
 
-        Tower model components are automatically skipped when `--limit-mm-per-prompt`
+        Tower model components are automatically skipped in decoder-only mode,
+        when `--limit-mm-per-prompt`
         is set to zero for all of their modalities, and on pipeline stages after the
         first under Model Runner V2, which runs encoders on the first stage only.
 
@@ -387,7 +388,8 @@ class SupportsMultiModal(SupportsMultiModalEmbeddings, Protocol):
                     lambda mod: StageMissingLayer(stage_name, mod),
                     targets=targets,
                 )
-                if all(mm_config.get_limit_per_prompt(m) == 0 for m in modalities)
+                if mm_config.mm_decoder_only
+                or all(mm_config.get_limit_per_prompt(m) == 0 for m in modalities)
                 or (
                     vllm_config.use_v2_model_runner and not get_pp_group().is_first_rank
                 )

@@ -70,7 +70,7 @@ pub fn lower_text_request(
         reasoning_ended: request.reasoning_ended,
         lora_request: request.lora_request.clone(),
         arrival_time: request.arrival_time,
-        trace_headers: None,
+        trace_headers: request.trace_headers.clone(),
     };
 
     Ok(PreparedTextRequest {

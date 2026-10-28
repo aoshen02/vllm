@@ -37,6 +37,7 @@ from vllm.v1.core.sched.output import SchedulerOutput
 if TYPE_CHECKING:
     import numpy as np
 
+    from vllm.config import VllmConfig
     from vllm.v1.engine.coordinator import DPCoordinator
     from vllm.v1.engine.utils import CoreEngineActorManager, CoreEngineProcManager
 
@@ -297,6 +298,7 @@ class RustFrontendProcessManager:
         data_parallel_size: int,
         stats_update_address: str | None = None,
         grpc_sock: Any | None = None,
+        vllm_config: "VllmConfig | None" = None,
     ):
         import os
         import subprocess
@@ -361,14 +363,22 @@ class RustFrontendProcessManager:
         # frontends.
         args_dict["engine_ready_timeout_secs"] = envs.VLLM_ENGINE_READY_TIMEOUT_S
         args_dict["http_timeout_keep_alive"] = envs.VLLM_HTTP_TIMEOUT_KEEP_ALIVE
-        args_json = json.dumps(args_dict, sort_keys=True)
-        cmd.extend(["--args-json", args_json])
 
         # The subprocess needs the real values, but the log must not carry
         # credentials such as api_key or hf_token.
         from vllm.entrypoints.common.startup import redact_sensitive_args
 
         redacted_json = json.dumps(redact_sensitive_args(args_dict), sort_keys=True)
+        if vllm_config is not None:
+            from pydantic import TypeAdapter
+
+            from vllm.config import VllmConfig
+
+            args_dict["vllm_config"] = TypeAdapter(VllmConfig).dump_python(
+                vllm_config, mode="json", fallback=str
+            )
+        args_json = json.dumps(args_dict, sort_keys=True)
+        cmd.extend(["--args-json", args_json])
         logger.info("Launching Rust frontend: %s", " ".join(cmd[:-1] + [redacted_json]))
         self._listeners = [input_listener, output_listener]
         try:

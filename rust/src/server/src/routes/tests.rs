@@ -948,7 +948,7 @@ async fn scale_out_generate_route_can_be_enabled() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
-async fn unimplemented_scale_out_routes_follow_scale_out_gate() {
+async fn scale_out_routes_follow_scale_out_gate() {
     const ROUTES: [&str; 7] = [
         "/inference/v1/abort_requests",
         "/v1/chat/completions/render",
@@ -968,7 +968,23 @@ async fn unimplemented_scale_out_routes_follow_scale_out_gate() {
 
     let enabled = build_router_with_scale_out_endpoints(state.clone(), true);
     for uri in ROUTES {
-        assert_route_not_supported(&enabled, "POST", uri, uri).await;
+        if matches!(uri, "/v1/chat/completions/render" | "/v1/completions/render") {
+            let response = enabled
+                .clone()
+                .call(
+                    Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .header("content-type", "application/json")
+                        .body(Body::from("{}"))
+                        .expect("build request"),
+                )
+                .await
+                .expect("call app");
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}");
+        } else {
+            assert_route_not_supported(&enabled, "POST", uri, uri).await;
+        }
     }
 
     let disabled = build_router_with_scale_out_endpoints(state, false);
@@ -1829,6 +1845,58 @@ async fn render_chat_response_can_be_submitted_to_generate_unchanged() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
+async fn combined_render_multimodal_response_can_be_submitted_to_generate_unchanged() {
+    let (chat, engine_task) = test_models_with_engine_outputs_and_backend(
+        b"engine-combined-render-multimodal",
+        default_stream_output_specs(),
+        Arc::new(FakeChatBackend::with_multimodal_model_info(
+            qwen_multimodal_model_info(),
+        )),
+    )
+    .await;
+    let mut app = build_router_with_scale_out_endpoints(
+        Arc::new(AppState::new(vec!["render-model".into()], chat)),
+        true,
+    );
+    let response = app.call(Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions/render")
+        .header("content-type", "application/json")
+        .body(Body::from(json!({
+            "model": "render-model",
+            "messages": [{"role": "user", "content": [{
+                "type": "image_url",
+                "image_url": {"url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="}
+            }]}],
+            "max_completion_tokens": 8
+        }).to_string())).unwrap()).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let mut payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        payload["features"]["mm_hashes"]["image"].as_array().unwrap().len(),
+        1
+    );
+    assert!(payload["features"]["kwargs_data"]["image"][0].is_string());
+    payload["content_parts"] = json!([]);
+    let response = app
+        .call(
+            Request::builder()
+                .method("POST")
+                .uri("/inference/v1/generate")
+                .header("content-type", "application/json")
+                .body(Body::from(payload.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    engine_task.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
 async fn list_models_returns_configured_model() {
     let mut app = test_app().await;
     let response = app
@@ -2023,6 +2091,48 @@ async fn api_key_auth_accepts_matching_bearer_token_on_guarded_route() {
         .expect("call app");
 
     assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn api_key_auth_rejects_missing_token_on_tokenize() {
+    // Regression test: `/tokenize` renders arbitrary text through the chat
+    // template and was reachable without a token because the old allowlist
+    // only guarded "/v1", "/v2" and "/inference" prefixes.
+    let (mut app, _engine_task) = test_app_with_api_keys(vec!["secret".to_string()]).await;
+    let response = app
+        .call(
+            Request::builder()
+                .method("POST")
+                .uri("/tokenize")
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .expect("build request"),
+        )
+        .await
+        .expect("call app");
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn api_key_auth_rejects_missing_token_on_metrics() {
+    // Regression test: "/metrics" was unreachable by GUARDED_PREFIXES and
+    // leaked server-internal metrics without a token.
+    let (mut app, _engine_task) = test_app_with_api_keys(vec!["secret".to_string()]).await;
+    let response = app
+        .call(
+            Request::builder()
+                .method("GET")
+                .uri("/metrics")
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("call app");
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4005,6 +4115,104 @@ async fn health_endpoint_returns_ok_with_empty_body_when_client_is_healthy() {
     assert_eq!(status, StatusCode::OK);
     assert!(body.is_empty(), "expected empty body, got {:?}", body);
 
+    engine_task.await.expect("mock engine task");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn generation_health_requires_scheduler_reply_and_probes_only_idle_engines() {
+    for (queued, pending_work) in [(0, false), (2, false), (0, true)] {
+        let (mut app, engine_task) = test_admin_app_with_engine_script(move |dealer, push| {
+            boxed_test_future(async move {
+                let utility = recv_engine_message(dealer).await;
+                assert_eq!(utility[0].as_ref(), &[0x03]);
+                let payload = decode_value(&utility[1]).expect("decode utility");
+                let fields = payload.as_array().expect("utility fields");
+                assert_eq!(fields[2], Value::from("get_inflight_queue_diagnostics"));
+                assert_eq!(fields[3], Value::Array(vec![Value::from(0)]));
+                send_outputs(
+                    push,
+                    utility_outputs(
+                        fields[1].as_u64().unwrap(),
+                        utility_result_value(
+                            json!({"queues": [{"num_requests": queued}], "data_parallel_rank": 0,
+                                   "has_pending_work": pending_work}),
+                        ),
+                    ),
+                )
+                .await;
+                if queued == 0 && !pending_work {
+                    let add = recv_engine_message(dealer).await;
+                    assert_eq!(add[0].as_ref(), &[0x00]);
+                    let request: EngineCoreRequest =
+                        rmp_serde::from_slice(&add[1]).expect("decode probe");
+                    assert!(request.request_id.starts_with("healthcheck-"));
+                    assert_eq!(request.prompt_token_ids, Some(vec![0]));
+                    let sampling = request.sampling_params.expect("probe sampling");
+                    assert_eq!(sampling.max_tokens, 1);
+                    assert_eq!(sampling.temperature, 1.0);
+                    assert_eq!(sampling.top_k, 1);
+                    send_outputs(
+                        push,
+                        engine_outputs_for_request(
+                            &request.request_id,
+                            vec![(vec![42], Some(EngineCoreFinishReason::Length))],
+                        ),
+                    )
+                    .await;
+                } else {
+                    assert!(
+                        tokio::time::timeout(
+                            Duration::from_millis(50),
+                            recv_engine_message(dealer)
+                        )
+                        .await
+                        .is_err()
+                    );
+                }
+            })
+        })
+        .await;
+        let response = app
+            .call(Request::builder().uri("/health_generate").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(to_bytes(response.into_body(), usize::MAX).await.unwrap().is_empty());
+        engine_task.await.expect("mock engine task");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn load_diagnostics_forwards_limit_and_preserves_scheduler_rank() {
+    let (mut app, engine_task) = test_admin_app_with_engine_script(|dealer, push| {
+        boxed_test_future(async move {
+            let utility = recv_engine_message(dealer).await;
+            let payload = decode_value(&utility[1]).expect("decode utility");
+            let fields = payload.as_array().expect("utility fields");
+            assert_eq!(fields[2], Value::from("get_inflight_queue_diagnostics"));
+            assert_eq!(fields[3], Value::Array(vec![Value::from(1)]));
+            send_outputs(push, utility_outputs(fields[1].as_u64().unwrap(), utility_result_value(
+                json!({"queues": [{"name": "running", "num_requests": 2, "requests": ["a"]}], "data_parallel_rank": 7})
+            ))).await;
+        })
+    }).await;
+    let response = app
+        .call(
+            Request::builder()
+                .uri("/load?include_inflight=true&inflight_limit=1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(value["server_load"], 0);
+    assert_eq!(value["inflight"][0]["data_parallel_rank"], 7);
+    assert_eq!(value["inflight"][0]["queues"][0]["num_requests"], 2);
     engine_task.await.expect("mock engine task");
 }
 
@@ -6588,6 +6796,120 @@ async fn collective_rpc_route_sends_expected_utility_call_and_returns_results() 
             }]
         })
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn dumper_control_routes_forward_without_dev_mode_and_return_worker_lists() {
+    let (state, engine_task) =
+        test_admin_state_with_ready_and_engine_script(default_ready_response(), |dealer, push| {
+            boxed_test_future(async move {
+                for (action, expected_body) in [
+                    ("configure", json!({"enable": true})),
+                    ("reset", json!({})),
+                    ("get_state", json!({})),
+                ] {
+                    let utility = recv_engine_message(dealer).await;
+                    let payload = decode_value(&utility[1]).unwrap();
+                    let request = payload.as_array().unwrap();
+                    assert_eq!(request[2], Value::from("collective_rpc"));
+                    let arguments = request[3].as_array().unwrap();
+                    assert_eq!(arguments[0], Value::from("dumper_control"));
+                    assert_eq!(arguments[1], Value::Nil);
+                    let positional = arguments[2].as_array().unwrap();
+                    assert_eq!(positional[0], Value::from(action));
+                    assert_eq!(
+                        serde_json::from_str::<serde_json::Value>(positional[1].as_str().unwrap())
+                            .unwrap(),
+                        expected_body
+                    );
+                    assert_eq!(arguments[3], Value::Map(vec![]));
+                    send_outputs(
+                        push,
+                        utility_outputs(
+                            request[1].as_u64().unwrap(),
+                            UtilityResultEnvelope::without_type_info(Value::Array(vec![
+                                Value::Map(vec![(Value::from("action"), Value::from(action))]),
+                            ])),
+                        ),
+                    )
+                    .await;
+                }
+            })
+        })
+        .await;
+    let mut disabled = super::build_router_with_options(state.clone(), false, false, false, false);
+    let response = disabled
+        .call(
+            Request::builder()
+                .method("POST")
+                .uri("/dumper/get_state")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let mut enabled = super::build_router_with_options(state, false, false, false, true);
+    for (action, body) in [
+        ("configure", Some(r#"{"enable":true}"#)),
+        ("reset", None),
+        ("get_state", Some("null")),
+    ] {
+        let request = Request::builder().method("POST").uri(format!("/dumper/{action}"));
+        let request = if let Some(body) = body {
+            request
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap()
+        } else {
+            request.body(Body::empty()).unwrap()
+        };
+        let response = enabled.call(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
+            json!([{"action": action}])
+        );
+    }
+    engine_task.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn dumper_control_routes_require_configured_api_keys() {
+    let (chat, _engine_task) = test_models_with_engine_outputs_and_backend(
+        b"engine-dumper-auth",
+        default_stream_output_specs(),
+        Arc::new(FakeChatBackend::new()),
+    )
+    .await;
+    let state =
+        Arc::new(AppState::new(vec!["model".into()], chat).with_api_keys(vec!["secret".into()]));
+    let mut app = super::build_router_with_options(state, false, false, false, true);
+    for token in [None, Some("Bearer wrong")] {
+        let request = Request::builder().method("POST").uri("/dumper/reset");
+        let request = if let Some(token) = token {
+            request.header("authorization", token)
+        } else {
+            request
+        };
+        let response = app.call(request.body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+    let response = app
+        .call(
+            Request::builder()
+                .method("GET")
+                .uri("/dumper/get_state")
+                .header("authorization", "Bearer secret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

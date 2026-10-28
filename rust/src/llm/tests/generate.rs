@@ -364,6 +364,10 @@ async fn generate_merges_outputs_by_stream_interval() {
                         Some(token_logprobs(token_ids)),
                         None,
                     );
+                    if output.finish_reason.is_some() {
+                        output.remote_kv_wait_time = Some(0.25);
+                        output.kv_transfer_metrics = Some(serde_json::json!({"recv_time_ms": 2.0}));
+                    }
                     // One [layer, top_k] = [1, 2] routing row per token.
                     let rows: Vec<u8> = token_ids.iter().flat_map(|&id| [id as u8, 0]).collect();
                     output.routed_experts = Some(Box::new(WireNdArray::from_raw(
@@ -428,6 +432,13 @@ async fn generate_merges_outputs_by_stream_interval() {
     for output in &outputs {
         assert_eq!(output.logprobs, Some(token_logprobs(&output.token_ids)));
     }
+    let terminal = outputs.last().unwrap();
+    assert_eq!(terminal.remote_kv_wait_time, Some(0.25));
+    assert_eq!(
+        terminal.kv_transfer_metrics,
+        Some(serde_json::json!({"recv_time_ms": 2.0}))
+    );
+    assert!(terminal.request_timings.is_some());
     let span = |version: &str, start, end| WeightVersionSpan {
         version: version.into(),
         start,
@@ -493,6 +504,7 @@ async fn collect_output_aggregates_raw_tokens_logprobs_and_terminal_metadata() {
                                 new_sampling_mask: Some(MaybeWireSamplingMask::Direct(
                                     SamplingMask {
                                         rows: vec![vec![1, 33, 99]],
+                                        logprobs: Some(vec![vec![-0.1, -0.2, -0.3]]),
                                     },
                                 )),
                                 ..request_output_with_logprobs(
@@ -507,6 +519,7 @@ async fn collect_output_aggregates_raw_tokens_logprobs_and_terminal_metadata() {
                                 new_sampling_mask: Some(MaybeWireSamplingMask::Direct(
                                     SamplingMask {
                                         rows: vec![vec![2, 44, 88]],
+                                        logprobs: Some(vec![vec![-0.4, -0.5, -0.6]]),
                                     },
                                 )),
                                 ..request_output_with_logprobs_and_kv(
@@ -555,6 +568,7 @@ async fn collect_output_aggregates_raw_tokens_logprobs_and_terminal_metadata() {
         collected.sampling_mask,
         Some(SamplingMask {
             rows: vec![vec![1, 33, 99], vec![2, 44, 88]],
+            logprobs: Some(vec![vec![-0.1, -0.2, -0.3], vec![-0.4, -0.5, -0.6]]),
         })
     );
 }
@@ -576,11 +590,15 @@ async fn collect_output_rejects_partial_sampling_mask() {
         ec_transfer_params: None,
         sampling_mask: Some(SamplingMask {
             rows: vec![vec![1, 33, 99]],
+            ..Default::default()
         }),
         spec_decode_metrics: None,
         weight_versions: None,
         routed_experts: None,
         timestamps: Default::default(),
+        remote_kv_wait_time: None,
+        kv_transfer_metrics: None,
+        request_timings: None,
     };
 
     let error = futures::stream::iter([Ok(output)]).collect_output().await.unwrap_err();
@@ -592,6 +610,112 @@ async fn collect_output_rejects_partial_sampling_mask() {
             ..
         }
     ));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stream_interval_sampling_mask_with_paired_scores() {
+    assert_stream_interval_sampling_mask(true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stream_interval_sampling_mask_without_paired_scores() {
+    assert_stream_interval_sampling_mask(false).await;
+}
+
+async fn assert_stream_interval_sampling_mask(paired_scores: bool) {
+    let ipc = IpcNamespace::new().unwrap();
+    let handshake_address = ipc.handshake_endpoint();
+    let engine_id = b"engine-stream-interval-mask".to_vec();
+    let (shutdown_tx, engine_task) =
+        spawn_mock_engine_task(handshake_address.clone(), engine_id, move |dealer, push| {
+            Box::pin(async move {
+                let add = recv_engine_message(dealer).await;
+                let request: EngineCoreRequest = rmp_serde::from_slice(&add[1]).unwrap();
+                for token_id in 1..=5 {
+                    let mut output = request_output(&request.request_id, vec![token_id], None);
+                    output.new_sampling_mask = Some(MaybeWireSamplingMask::Direct(SamplingMask {
+                        rows: vec![vec![token_id, token_id + 10]],
+                        logprobs: paired_scores
+                            .then_some(vec![vec![-(token_id as f32), -(token_id as f32) - 0.5]]),
+                    }));
+                    send_outputs(
+                        push,
+                        RequestBatchOutputs {
+                            outputs: vec![output],
+                            ..Default::default()
+                        }
+                        .into(),
+                    )
+                    .await;
+                }
+                send_outputs(
+                    push,
+                    RequestBatchOutputs {
+                        outputs: vec![request_output(
+                            &request.request_id,
+                            vec![],
+                            Some(EngineCoreFinishReason::Length),
+                        )],
+                        ..Default::default()
+                    }
+                    .into(),
+                )
+                .await;
+            })
+        });
+
+    let llm = connect_async_llm_with_ipc(handshake_address, 5, "test-model", &ipc).await;
+    let mut request = sample_generate_request("req-stream-interval-mask", 5);
+    request.sampling_params.stream_interval = NonZeroU32::new(3);
+    let outputs: Vec<_> = llm
+        .generate(request)
+        .await
+        .unwrap()
+        .map(|output| output.unwrap())
+        .collect()
+        .await;
+
+    let _ = shutdown_tx.send(());
+    engine_task.await.unwrap();
+    llm.shutdown().await.unwrap();
+
+    let actual: Vec<_> = outputs
+        .into_iter()
+        .map(|output| (output.token_ids, output.sampling_mask, output.finish_reason))
+        .collect();
+    assert_eq!(
+        actual,
+        [
+            (
+                vec![1],
+                Some(SamplingMask {
+                    rows: vec![vec![1, 11]],
+                    logprobs: paired_scores.then_some(vec![vec![-1.0, -1.5]]),
+                }),
+                None,
+            ),
+            (
+                vec![2, 3, 4],
+                Some(SamplingMask {
+                    rows: vec![vec![2, 12], vec![3, 13], vec![4, 14]],
+                    logprobs: paired_scores.then_some(vec![
+                        vec![-2.0, -2.5],
+                        vec![-3.0, -3.5],
+                        vec![-4.0, -4.5]
+                    ]),
+                }),
+                None,
+            ),
+            (
+                vec![5],
+                Some(SamplingMask {
+                    rows: vec![vec![5, 15]],
+                    logprobs: paired_scores.then_some(vec![vec![-5.0, -5.5]]),
+                }),
+                Some(FinishReason::Length),
+            ),
+        ]
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

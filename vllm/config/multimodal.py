@@ -382,6 +382,9 @@ class MultiModalConfig:
 
     This is usually only valid in disaggregated Encoder process.
     """
+    mm_decoder_only: bool = False
+    """Skip local encoder towers while retaining multimodal input processing
+    and cache capacity for external encoder outputs."""
     mm_encoder_tp_mode: MMEncoderTPMode = "weights"
     """Indicates how to optimize multi-modal encoder inference using tensor
     parallelism (TP).
@@ -513,6 +516,10 @@ class MultiModalConfig:
 
     @model_validator(mode="after")
     def _validate_multimodal_config(self):
+        if self.mm_encoder_only and self.mm_decoder_only:
+            raise ValueError(
+                "mm_encoder_only and mm_decoder_only are mutually exclusive"
+            )
         if self.mm_processor_cache_type != "shm" and (
             self.mm_shm_cache_max_object_size_mb
             != MultiModalConfig.mm_shm_cache_max_object_size_mb

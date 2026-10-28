@@ -166,6 +166,11 @@ class EngineClient(ABC):
         ...
 
     @abstractmethod
+    async def check_health_generate(self, timeout: float = 20.0) -> None:
+        """Require a scheduler or inference response, not just a live frontend."""
+        ...
+
+    @abstractmethod
     async def start_profile(
         self,
         profile_prefix: str | None = None,
@@ -332,4 +337,8 @@ class EngineClient(ABC):
 
     async def get_weight_version(self) -> str:
         """Return the latest committed weight version."""
+        raise NotImplementedError
+
+    async def get_inflight_queue_diagnostics(self, limit: int) -> list[dict[str, Any]]:
+        """Return bounded snapshots of in-flight request queues."""
         raise NotImplementedError

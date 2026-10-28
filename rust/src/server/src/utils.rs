@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::BoxError;
@@ -21,6 +21,7 @@ pub struct ResolvedRequestContext {
     pub data_parallel_rank: Option<u32>,
     pub priority: Option<i32>,
     pub session_id: Option<String>,
+    pub trace_headers: Option<BTreeMap<String, String>>,
 }
 
 /// Return the current Unix timestamp in seconds for OpenAI response objects.
@@ -43,7 +44,7 @@ where
     S: Stream<Item = Result<Event, E>> + Send + 'static,
     E: Into<BoxError>,
 {
-    let sse = Sse::new(stream);
+    let sse = Sse::new(Box::pin(stream));
     match keep_alive_interval {
         Some(interval) => sse
             .keep_alive(KeepAlive::new().interval(interval).text("keep-alive"))
@@ -167,6 +168,19 @@ pub fn resolve_request_context(
         data_parallel_rank,
         priority,
         session_id,
+        trace_headers: {
+            let headers: BTreeMap<_, _> = ["traceparent", "tracestate"]
+                .into_iter()
+                .filter_map(|name| {
+                    headers
+                        .get(name)?
+                        .to_str()
+                        .ok()
+                        .map(|value| (name.to_owned(), value.to_owned()))
+                })
+                .collect();
+            (!headers.is_empty()).then_some(headers)
+        },
     }
 }
 

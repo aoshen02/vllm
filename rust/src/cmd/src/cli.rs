@@ -35,7 +35,8 @@ use vllm_managed_engine::cli::{ManagedEngineArgs, repartition_managed_engine_arg
 use vllm_server::{
     ApiServerOptions, ChatTemplateContentFormatOption, Config, CoordinatorMode, CorsConfig,
     CustomHistogramBuckets, DEFAULT_KEEP_ALIVE_TIMEOUT, DEFAULT_LOG_STATS_INTERVAL,
-    HttpListenerMode, LoraModulePath, ParserSelection, RenderConfig, RendererSelection,
+    HttpListenerMode, LoraModulePath, ObservabilityConfig, ParserSelection, RenderConfig,
+    RendererSelection,
 };
 use vllm_text::backend::hf::{HfOverrides, ModelFileSources};
 
@@ -225,6 +226,10 @@ pub struct JsonStringList(pub Vec<String>);
 #[derive(Educe, Clone, Args, PartialEq, Eq, Deserialize)]
 #[educe(Debug)]
 pub struct SharedRuntimeArgs {
+    #[arg(skip)]
+    #[serde(default)]
+    #[educe(Debug(ignore))]
+    pub vllm_config: Option<Value>,
     /// The model and the sources of its tokenizer and config files.
     #[command(flatten)]
     #[serde(flatten)]
@@ -279,6 +284,9 @@ pub struct SharedRuntimeArgs {
     #[arg(long)]
     #[serde(default)]
     pub language_model_only: bool,
+    #[arg(long)]
+    #[serde(default)]
+    pub enable_mm_embeds: bool,
     /// Maximum number of log probabilities to return when `logprobs` is
     /// specified in sampling parameters. `-1` means no cap.
     #[arg(long, value_parser = clap::value_parser!(i32).range(-1..), allow_negative_numbers = true)]
@@ -518,6 +526,18 @@ pub struct SharedRuntimeArgs {
     #[serde(default)]
     pub profiler_config: Option<ProfilerConfig>,
 
+    /// Target URL to which OpenTelemetry traces will be sent. Enables the Rust
+    /// frontend trace exporter; also forwarded to the managed Python engine.
+    #[arg(long)]
+    #[serde(default)]
+    pub otlp_traces_endpoint: Option<String>,
+
+    /// Modules to collect detailed traces for, forwarded verbatim to the engine.
+    /// Requires `--otlp-traces-endpoint`.
+    #[arg(long)]
+    #[serde(default)]
+    pub collect_detailed_traces: Option<String>,
+
     /// Unsupported Python vLLM frontend arguments recognized but not yet
     /// implemented in Rust.
     #[educe(Debug(ignore))]
@@ -634,6 +654,7 @@ impl SharedRuntimeArgs {
             tokenizer,
             hf_config,
         } = self.model.file_sources();
+        let observability = self.observability_config();
 
         Config {
             transport_mode: TransportMode::Bootstrapped {
@@ -648,6 +669,7 @@ impl SharedRuntimeArgs {
                 Some(address) => CoordinatorMode::External { address },
                 None => CoordinatorMode::None,
             },
+            vllm_config: self.vllm_config,
             model: model.id,
             revision: model.revision,
             tokenizer,
@@ -662,6 +684,7 @@ impl SharedRuntimeArgs {
             tool_strict_level: self.tool_strict_level,
             renderer: self.renderer,
             language_model_only: self.language_model_only,
+            enable_mm_embeds: self.enable_mm_embeds,
             chat_template: self.chat_template,
             default_chat_template_kwargs: self.default_chat_template_kwargs,
             trust_request_chat_template: self.trust_request_chat_template,
@@ -684,6 +707,7 @@ impl SharedRuntimeArgs {
             manages_engine: false,
             keep_alive_timeout,
             profiler,
+            observability,
         }
     }
 
@@ -713,6 +737,7 @@ impl SharedRuntimeArgs {
             tokenizer,
             hf_config,
         } = self.model.file_sources();
+        let observability = self.observability_config();
 
         Config {
             transport_mode: TransportMode::HandshakeOwner {
@@ -724,6 +749,7 @@ impl SharedRuntimeArgs {
                 local_output_address,
             },
             coordinator_mode: CoordinatorMode::MaybeInProc,
+            vllm_config: self.vllm_config,
             model: model.id,
             revision: model.revision,
             tokenizer,
@@ -738,6 +764,7 @@ impl SharedRuntimeArgs {
             tool_strict_level: self.tool_strict_level,
             renderer: self.renderer,
             language_model_only: self.language_model_only,
+            enable_mm_embeds: self.enable_mm_embeds,
             chat_template: self.chat_template,
             default_chat_template_kwargs: self.default_chat_template_kwargs,
             trust_request_chat_template: self.trust_request_chat_template,
@@ -759,6 +786,7 @@ impl SharedRuntimeArgs {
             manages_engine,
             keep_alive_timeout,
             profiler,
+            observability,
         }
     }
 
@@ -781,6 +809,14 @@ impl SharedRuntimeArgs {
             allow_methods: self.allowed_methods.0.clone(),
             allow_headers: self.allowed_headers.0.clone(),
             allow_credentials: self.allow_credentials,
+        }
+    }
+    /// Build the observability config. Public so the managed `serve` path can
+    /// validate it before spawning the Python engine.
+    pub fn observability_config(&self) -> ObservabilityConfig {
+        ObservabilityConfig {
+            otlp_traces_endpoint: self.otlp_traces_endpoint.clone(),
+            collect_detailed_traces: self.collect_detailed_traces.clone(),
         }
     }
 }
@@ -1018,8 +1054,11 @@ impl ServeArgs {
             self.runtime.model.id.clone(),
             self.runtime.max_logprobs,
             profiler_config,
+            self.runtime.otlp_traces_endpoint.clone(),
+            self.runtime.collect_detailed_traces.clone(),
             reasoning_parser.as_deref(),
             self.runtime.language_model_only,
+            self.runtime.enable_mm_embeds,
             self.runtime.disable_log_stats,
             self.runtime.shutdown_timeout,
             handshake_port,

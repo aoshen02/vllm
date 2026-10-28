@@ -10,12 +10,14 @@ mod kv_event_sources;
 mod load;
 mod lora;
 mod metrics;
+mod multimodal_features;
 pub(crate) mod openai;
 mod pause;
 mod profile;
 pub(super) mod render;
 mod server_info;
 mod sleep;
+mod tensor_dump;
 mod tokenize;
 mod version;
 mod weight_checker;
@@ -45,8 +47,6 @@ const SCALE_OUT_DISABLED_MESSAGE: &str =
 /// `/inference/v1/generate` but the Rust frontend does not implement yet.
 const UNIMPLEMENTED_SCALE_OUT_ROUTES: &[&str] = &[
     "/inference/v1/abort_requests",
-    "/v1/chat/completions/render",
-    "/v1/completions/render",
     "/v1/messages/render",
     "/v1/responses/render",
     "/v1/chat/completions/derender",
@@ -109,6 +109,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         server_dev_mode_enabled(),
         runtime_lora_updating_enabled(),
         scale_out_endpoints_enabled,
+        std::env::var("DUMPER_SERVER_PORT").ok().as_deref() == Some("reuse"),
     )
 }
 
@@ -123,7 +124,13 @@ fn build_router_with_dev_mode_and_lora(
     dev_mode_enabled: bool,
     runtime_lora_updating_enabled: bool,
 ) -> Router {
-    build_router_with_options(state, dev_mode_enabled, runtime_lora_updating_enabled, true)
+    build_router_with_options(
+        state,
+        dev_mode_enabled,
+        runtime_lora_updating_enabled,
+        true,
+        false,
+    )
 }
 
 #[cfg(test)]
@@ -131,7 +138,7 @@ fn build_router_with_scale_out_endpoints(
     state: Arc<AppState>,
     scale_out_endpoints_enabled: bool,
 ) -> Router {
-    build_router_with_options(state, false, false, scale_out_endpoints_enabled)
+    build_router_with_options(state, false, false, scale_out_endpoints_enabled, false)
 }
 
 fn build_router_with_options(
@@ -139,10 +146,12 @@ fn build_router_with_options(
     dev_mode_enabled: bool,
     runtime_lora_updating_enabled: bool,
     scale_out_endpoints_enabled: bool,
+    dumper_enabled: bool,
 ) -> Router {
     let mut router = Router::new()
         // Health & monitoring
         .route("/health", get(health::health))
+        .route("/health_generate", get(health::health_generate))
         .route("/metrics", get(metrics::scrape))
         .route("/load", get(load::load))
         .route("/version", get(version::version))
@@ -166,15 +175,30 @@ fn build_router_with_options(
         .route("/tokenize", post(tokenize::tokenize))
         .route("/detokenize", post(tokenize::detokenize));
 
+    if dumper_enabled {
+        router = router.route("/dumper/{action}", post(tensor_dump::control));
+    }
+
     if scale_out_endpoints_enabled {
-        router = router.route("/inference/v1/generate", post(inference::generate));
-        // TODO: implement the remaining scale-out routes.
+        router = router
+            .route("/inference/v1/generate", post(inference::generate))
+            .route(
+                "/v1/chat/completions/render",
+                post(render::serve_render_chat),
+            )
+            .route(
+                "/v1/completions/render",
+                post(render::serve_render_completion),
+            );
         for path in UNIMPLEMENTED_SCALE_OUT_ROUTES {
             router = router.route(path, post(not_supported));
         }
     } else {
         info!("{SCALE_OUT_DISABLED_MESSAGE}");
-        router = router.route("/inference/v1/generate", post(disabled_scale_out));
+        router = router
+            .route("/inference/v1/generate", post(disabled_scale_out))
+            .route("/v1/chat/completions/render", post(disabled_scale_out))
+            .route("/v1/completions/render", post(disabled_scale_out));
         for path in UNIMPLEMENTED_SCALE_OUT_ROUTES {
             router = router.route(path, post(disabled_scale_out));
         }

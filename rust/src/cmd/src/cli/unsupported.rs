@@ -355,14 +355,6 @@ pub struct EngineUnsupportedArgs {
     #[arg(long)]
     pub default_mm_loras: Option<Unsupported>,
 
-    /// Target URL to which OpenTelemetry traces will be sent.
-    #[arg(long)]
-    pub otlp_traces_endpoint: Option<Unsupported>,
-
-    /// It makes sense to set this only if `--otlp-traces-endpoint` is set.
-    #[arg(long)]
-    pub collect_detailed_traces: Option<Unsupported>,
-
     /// Maximum number of requests that can be in-flight (waiting or running)
     /// at the same time. When the limit is reached, new requests are rejected
     /// with HTTP 503 so the client can retry on another instance.

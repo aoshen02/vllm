@@ -42,6 +42,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     NixlAgentMetadata,
     NixlConnectorMetadata,
     NixlHandshakePayload,
+    NixlRequestMetrics,
     ReqId,
     ReqMeta,
     TransferHandle,
@@ -123,6 +124,10 @@ def _share_storage_and_block_stride(caches: list[torch.Tensor]) -> bool:
     block_strides = {cache.stride(0) * cache.element_size() for cache in caches}
     storage_ptrs = {cache.untyped_storage().data_ptr() for cache in caches}
     return len(block_strides) == len(storage_ptrs) == 1
+
+
+def _is_remote_disconnect(error: Exception) -> bool:
+    return type(error).__name__ == "nixlRemoteDisconnectError"
 
 
 class NixlBaseConnectorWorker:
@@ -743,6 +748,8 @@ class NixlBaseConnectorWorker:
         sleep_mode = vllm_config.model_config.enable_sleep_mode and config is not None
         if sleep_mode:
             config = nixl_agent_config(backends=[], capture_telemetry=True)
+        if "UCX" in self.nixl_backends:
+            os.environ.setdefault("UCX_CUDA_IPC_CACHE", "n")
         self.nixl_wrapper = nixl_wrapper_cls(str(uuid.uuid4()), config)
         if sleep_mode:
             # Keep slept pages unpinned, for this agent only; UCX_* env vars win.
@@ -956,6 +963,14 @@ class NixlBaseConnectorWorker:
         )
         # Map of pull peer (host, port) -> engine_id currently serving it.
         self._engine_by_address: dict[tuple[str, int], EngineId] = {}
+        # Peers whose NIXL endpoints failed UCX keepalive.
+        self._unreachable_remote_engines: set[EngineId] = set()
+        self._engine_heartbeat_interval: float = float(
+            vllm_config.kv_transfer_config.get_from_extra_config(
+                "engine_heartbeat_interval", 5.0
+            )
+        )
+        self._next_engine_heartbeat: float = 0.0
 
         self.model_config = vllm_config.model_config
 
@@ -985,6 +1000,8 @@ class NixlBaseConnectorWorker:
         self.consumer_notification_counts_by_req = defaultdict[ReqId, int](int)
         self.expected_consumer_notifications_by_req: dict[ReqId, int] = {}
         self.xfer_stats = NixlKVConnectorStats()
+        self.request_metrics = NixlRequestMetrics()
+        self.pending_request_metrics: dict[str, dict[str, float]] = {}
 
         self._physical_blocks_per_logical_kv_block = 1
         self._sync_block_size_with_kernel()
@@ -1449,6 +1466,7 @@ class NixlBaseConnectorWorker:
     ):
         # Do NIXL handshake in background and add to _ready_requests when done.
         assert meta.remote is not None
+        handshake_start = time.perf_counter()
         fut = self._ensure_handshake(
             remote_engine_id,
             meta.remote.host,
@@ -1466,6 +1484,7 @@ class NixlBaseConnectorWorker:
         def request_ready(f: Future[Any], entry=(req_id, meta)):
             try:
                 f.result()
+                meta.handshake_wait_time = time.perf_counter() - handshake_start
                 self._ready_requests.put(entry)
             except Exception as e:
                 self._log_failure(
@@ -3242,6 +3261,7 @@ class NixlBaseConnectorWorker:
         for req_id in done_recving:
             # clean up metadata for completed requests
             meta = self._recving_metadata.pop(req_id, None)
+            self.pending_request_metrics.pop(req_id, None)
             assert meta is not None, f"{req_id} not found in recving_metadata list"
 
             # Skip KV sync and post-processing for failed requests
@@ -3323,6 +3343,7 @@ class NixlBaseConnectorWorker:
         self._reap_expired_send_leases(done_sending)
 
         self._cleanup_remote_engines()
+        self._release_unreachable_remote_engines()
         return KVConnectorTransferResults(
             finished_sending=done_sending,
             finished_recving=done_recving,
@@ -3422,6 +3443,13 @@ class NixlBaseConnectorWorker:
                     if xfer_state == "DONE":
                         res = self.nixl_wrapper.get_xfer_telemetry(handle)
                         self.xfer_stats.record_transfer(res)
+                        metrics = self.pending_request_metrics.setdefault(req_id, {})
+                        for name, value in (
+                            ("kv_transfer_worker_time_ms", res.xferDuration / 1e3),
+                            ("kv_transfer_post_worker_time_ms", res.postDuration / 1e3),
+                            ("kv_transfer_bytes", res.totalBytes),
+                        ):
+                            metrics[name] = metrics.get(name, 0) + value
                         self.nixl_wrapper.release_xfer_handle(handle)
                     elif xfer_state == "PROC":
                         in_progress.append(handle)
@@ -3445,6 +3473,10 @@ class NixlBaseConnectorWorker:
                         in_progress.append(handle)
 
             if not in_progress:
+                completed_metrics = self.pending_request_metrics.pop(req_id, None)
+                if completed_metrics is not None:
+                    self.request_metrics.requests[req_id] = completed_metrics
+                # Only report request as completed when all transfers are done.
                 done_req_ids.add(req_id)
                 del transfers[req_id]
             else:
@@ -3541,7 +3573,10 @@ class NixlBaseConnectorWorker:
             for agent_name in self._remote_agents[engine_id].values():
                 try:
                     self.nixl_wrapper.send_notif(agent_name, notif_msg=hb_msg)
-                except Exception:
+                except Exception as e:
+                    if _is_remote_disconnect(e):
+                        self._mark_remote_engine_unreachable(engine_id, agent_name)
+                        break
                     logger.debug(
                         "Failed to send heartbeat to engine %s",
                         engine_id,
@@ -4015,6 +4050,58 @@ class NixlBaseConnectorWorker:
             f" and a {backoff:.0f}s backoff" if backoff else "",
         )
 
+    def _release_unreachable_remote_engines(self) -> None:
+        """Release peers that failed heartbeat, once no reads are in flight."""
+        if self._TRANSFER_MODE != "pull":
+            return
+        self._heartbeat_remote_engines()
+        with self._handshake_lock:
+            if self._handshake_futures:
+                return
+            unreachable = self._unreachable_remote_engines & self._remote_agents.keys()
+        self._unreachable_remote_engines = set(unreachable)
+        for engine_id in unreachable - self._engines_with_inflight_transfers():
+            self._cleanup_remote_engine(engine_id, log_eviction=False)
+            self._unreachable_remote_engines.discard(engine_id)
+            logger.info(
+                "Released NIXL state for unreachable remote engine %s.", engine_id
+            )
+
+    def _heartbeat_remote_engines(self) -> None:
+        """Send an empty heartbeat to every peer; it fails once UCX keepalive
+        has failed the peer's endpoints."""
+        if self._engine_heartbeat_interval <= 0:
+            return
+        now = time.perf_counter()
+        if now < self._next_engine_heartbeat:
+            return
+        self._next_engine_heartbeat = now + self._engine_heartbeat_interval
+        with self._handshake_lock:
+            engines = {
+                engine_id: list(agents.values())
+                for engine_id, agents in self._remote_agents.items()
+            }
+        for engine_id, agent_names in engines.items():
+            for agent_name in agent_names:
+                try:
+                    self.nixl_wrapper.send_notif(agent_name, notif_msg=b"HB:")
+                except Exception as e:
+                    if _is_remote_disconnect(e):
+                        self._mark_remote_engine_unreachable(engine_id, agent_name)
+                        break
+
+    def _mark_remote_engine_unreachable(
+        self, engine_id: EngineId, agent_name: str
+    ) -> None:
+        if engine_id in self._unreachable_remote_engines:
+            return
+        logger.warning(
+            "Remote engine %s (agent %s) failed heartbeat; releasing its NIXL state.",
+            engine_id,
+            agent_name,
+        )
+        self._unreachable_remote_engines.add(engine_id)
+
     def _cleanup_remote_engine(
         self, engine_id: EngineId, *, log_eviction: bool = True
     ) -> None:
@@ -4120,4 +4207,6 @@ class NixlBaseConnectorWorker:
             for handle in handles:
                 self.nixl_wrapper.release_xfer_handle(handle)
         self._recving_transfers.clear()
+        self.pending_request_metrics.clear()
+        self.request_metrics.requests.clear()
         self._finish_shutdown()

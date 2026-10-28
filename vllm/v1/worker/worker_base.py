@@ -122,6 +122,9 @@ class WorkerBase:
         """
         raise NotImplementedError
 
+    def on_kv_connector_idle(self) -> None:
+        return
+
     def check_health(self) -> None:
         """Basic health check (override for device-specific checks)."""
         return

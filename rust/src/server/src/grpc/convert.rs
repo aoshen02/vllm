@@ -139,6 +139,7 @@ pub fn to_text_request(
         add_special_tokens: true,
         data_parallel_rank: None,
         session_id,
+        trace_headers: None,
         kv_hints,
         reasoning_parser_kwargs: ReasoningParserKwargs {
             chat_template_kwargs: reasoning_gate
@@ -356,6 +357,17 @@ pub fn to_sequence_output(
         .and_then(|finished| finished.sampling_mask.as_ref())
         .map(|mask| mask.rows.iter().map(|row| pb::TokenIds { ids: row.clone() }).collect())
         .unwrap_or_default();
+    let sampling_mask_logprobs = finished
+        .and_then(|finished| finished.sampling_mask.as_ref())
+        .and_then(|mask| mask.logprobs.as_ref())
+        .map(|rows| {
+            rows.iter()
+                .map(|row| pb::SamplingMaskLogprobs {
+                    values: row.clone(),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
 
     Ok(pb::SequenceOutput {
         index: 0, // TODO: multi-sequence (n > 1) not supported
@@ -375,6 +387,7 @@ pub fn to_sequence_output(
         candidate_tokens: candidates,
         finish_info,
         sampling_mask,
+        sampling_mask_logprobs,
     })
 }
 
@@ -1099,6 +1112,7 @@ mod tests {
         let mut fin = finished(FinishReason::Length);
         fin.sampling_mask = Some(SamplingMask {
             rows: vec![vec![1, 10], vec![2, 20]],
+            logprobs: Some(vec![vec![-0.1, -2.0], vec![-0.2, -1.8]]),
         });
 
         let terminal =
@@ -1114,7 +1128,19 @@ mod tests {
                 pb::TokenIds { ids: vec![2, 20] }
             ]
         );
+        assert_eq!(
+            terminal.sampling_mask_logprobs,
+            vec![
+                pb::SamplingMaskLogprobs {
+                    values: vec![-0.1, -2.0],
+                },
+                pb::SamplingMaskLogprobs {
+                    values: vec![-0.2, -1.8],
+                },
+            ]
+        );
         assert!(intermediate.sampling_mask.is_empty());
+        assert!(intermediate.sampling_mask_logprobs.is_empty());
     }
 
     #[test]

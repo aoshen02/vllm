@@ -170,6 +170,9 @@ class KVConnectorWorkerMetadata(ABC):
     being passed to the Scheduler KVConnector.
     """
 
+    def get_request_metrics(self) -> dict[str, dict[str, float]]:
+        return {}
+
     @abstractmethod
     def aggregate(
         self, other: "KVConnectorWorkerMetadata"
@@ -789,6 +792,12 @@ class KVConnectorBase_V1(ABC):
         expose connector transfer stats via Prometheus.
         """
         return None
+
+    def get_idle_timeout(self) -> float | None:
+        return None
+
+    def on_idle(self) -> None:
+        return
 
     def reset_cache(self) -> bool | None:
         """Reset the connector's internal cache.

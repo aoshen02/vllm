@@ -14,11 +14,12 @@ mod log_stats;
 mod output;
 mod request;
 mod request_metrics;
+mod request_trace;
 
 pub use error::{Error, Result};
 pub use output::{
     CollectedGenerateOutput, FinishReason, GenerateOutput, GenerateOutputStream,
-    GenerateOutputStreamExt, GeneratePromptInfo, TokenUsage, WeightVersionSpan,
+    GenerateOutputStreamExt, GeneratePromptInfo, RequestTimingStats, TokenUsage, WeightVersionSpan,
 };
 pub use request::GenerateRequest;
 pub use request_metrics::{RequestTimestamps, current_unix_timestamp_secs};
@@ -41,6 +42,7 @@ pub struct Llm {
     stream_interval: NonZeroU32,
     stats_logger: Option<StatsLogger>,
     inflight: InflightRequests,
+    tracing_enabled: bool,
 }
 
 impl Llm {
@@ -54,6 +56,7 @@ impl Llm {
             stream_interval: NonZeroU32::MIN,
             stats_logger: None,
             inflight: InflightRequests::new(),
+            tracing_enabled: false,
         }
     }
 
@@ -85,6 +88,11 @@ impl Llm {
         self
     }
 
+    pub fn with_tracing(mut self, enabled: bool) -> Self {
+        self.tracing_enabled = enabled;
+        self
+    }
+
     /// Expose the underlying engine-core client for low-level utility/admin
     /// calls.
     pub fn engine_core_client(&self) -> &EngineCoreClient {
@@ -103,7 +111,11 @@ impl Llm {
         req.sampling_params.stream_interval =
             (stream_interval > NonZeroU32::MIN).then_some(stream_interval);
 
-        let prepared = req.prepare(self.randomize_request_id)?;
+        let mut prepared = req.prepare(self.randomize_request_id)?;
+        let request_trace = self
+            .tracing_enabled
+            .then(|| request_trace::RequestTrace::start(&mut prepared.engine_request))
+            .flatten();
         let prompt_token_ids = prepared.prompt_token_ids().into();
         let external_request_id = prepared
             .engine_request
@@ -138,6 +150,7 @@ impl Llm {
             stream,
             request_metrics,
             guard,
+            request_trace,
         ))
     }
 

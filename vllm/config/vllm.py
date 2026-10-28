@@ -2069,6 +2069,13 @@ class VllmConfig:
         self._resolve_mm_video_decode_device()
         self._validate_mm_processor_device()
 
+        from vllm.utils.debug_utils.dumper import dumper
+
+        if dumper.may_enable and (
+            not self.use_v2_model_runner or not self.model_config.enforce_eager
+        ):
+            raise ValueError("Tensor dumping requires eager Model Runner V2")
+
         if self.use_v2_model_runner:
             self._disable_cudagraphs_for_v2_stock_torch_compile()
             self._validate_v2_model_runner()
@@ -2873,6 +2880,8 @@ class VllmConfig:
             raise ValueError(
                 "An EC producer-only instance requires a multimodal model."
             )
+        if mm_config.mm_decoder_only:
+            raise ValueError("An EC producer-only instance cannot use mm_decoder_only.")
         mm_config.mm_encoder_only = True
 
     def _resolve_mm_processor_device(self) -> None:

@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::num::NonZeroU32;
 
 use enum_as_inner::EnumAsInner;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use vllm_engine_core_client::protocol::kv_hints::KvHintsEnvelope;
 use vllm_engine_core_client::protocol::lora::LoraRequest;
@@ -33,6 +33,25 @@ pub fn normalize_top_k(value: i64) -> std::result::Result<Option<u32>, String> {
         value => Err(format!(
             "top_k must be -1, 0, or a positive integer, got {value}"
         )),
+    }
+}
+
+/// Deserialize a request `top_k` while preserving explicit disable.
+///
+/// Null remains `None` so model generation defaults apply. Explicit `-1` and
+/// `0` become `Some(0)` so the request overrides those defaults and disables
+/// top-k sampling. Positive limits are preserved.
+pub fn deserialize_request_top_k<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<u32>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    match Option::<i64>::deserialize(deserializer)? {
+        None => Ok(None),
+        Some(value) => normalize_top_k(value)
+            .map(|value| Some(value.unwrap_or(0)))
+            .map_err(serde::de::Error::custom),
     }
 }
 
@@ -78,6 +97,7 @@ pub struct SamplingParams {
     /// Cumulative probability threshold for nucleus sampling.
     pub top_p: Option<f32>,
     /// Maximum number of top tokens to consider. `Some(0)` means all tokens.
+    #[serde(deserialize_with = "deserialize_request_top_k")]
     pub top_k: Option<u32>,
     /// Random seed used by the sampler when present.
     pub seed: Option<i64>,
@@ -239,6 +259,8 @@ pub struct TextRequest {
     /// Stable session identity shared by related requests.
     #[serde(default)]
     pub session_id: Option<String>,
+    #[serde(default)]
+    pub trace_headers: Option<BTreeMap<String, String>>,
     /// Optional orchestrator-originated KV hints.
     #[serde(default)]
     pub kv_hints: Option<KvHintsEnvelope>,
@@ -282,6 +304,7 @@ impl TextRequest {
             add_special_tokens: false,
             data_parallel_rank: None,
             session_id: None,
+            trace_headers: None,
             kv_hints: None,
             reasoning_parser_kwargs: Default::default(),
             reasoning_ended: None,
@@ -353,6 +376,27 @@ mod tests {
             if let Err(err) = result {
                 assert!(err.is_request_validation_error());
             }
+        }
+    }
+
+    #[test]
+    fn sampling_params_preserve_explicit_top_k_disable() {
+        for (value, expected) in [
+            (serde_json::Value::Null, None),
+            (serde_json::json!(-1), Some(0)),
+            (serde_json::json!(0), Some(0)),
+            (serde_json::json!(32), Some(32)),
+        ] {
+            let params: SamplingParams =
+                serde_json::from_value(serde_json::json!({"top_k": value}))
+                    .expect("parse sampling params");
+            assert_eq!(params.top_k, expected);
+        }
+        for value in [-2i64, u32::MAX as i64 + 1] {
+            assert!(
+                serde_json::from_value::<SamplingParams>(serde_json::json!({"top_k": value}))
+                    .is_err()
+            );
         }
     }
 

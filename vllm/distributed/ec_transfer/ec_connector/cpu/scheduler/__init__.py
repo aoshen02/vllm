@@ -147,8 +147,10 @@ class ECCPUScheduler:
                 "ec_enable_nixl requires NIXL; install the `nixl` package or "
                 "remove ec_enable_nixl from ec_connector_extra_config."
             )
-        engine_id = self._ec_config.engine_id
-        assert engine_id is not None
+        engine_id = (
+            f"{vllm_config.instance_id}_dp"
+            f"{vllm_config.parallel_config.data_parallel_index}"
+        )
         # How long a consumer waits for an XferAck. The producer answers from
         # its scheduler step, so its reply latency scales with the encoder's
         # batch size: a deployment whose steps run longer must raise this.
@@ -165,7 +167,10 @@ class ECCPUScheduler:
         )
         if self._is_producer:
             self._peer_host = envs.VLLM_EC_SIDE_CHANNEL_HOST
-            self._peer_port = envs.VLLM_EC_SIDE_CHANNEL_PORT
+            self._peer_port = (
+                envs.VLLM_EC_SIDE_CHANNEL_PORT
+                + vllm_config.parallel_config.data_parallel_index
+            )
 
         self._data = NixlDataTransport(
             agent_name=engine_id,

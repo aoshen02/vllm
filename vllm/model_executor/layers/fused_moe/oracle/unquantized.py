@@ -40,6 +40,7 @@ class UnquantizedMoeBackend(Enum):
     AITER = "ROCm AITER"
     TRITON = "TRITON"
     BATCHED_TRITON = "BATCHED_TRITON"
+    DEEP_GEMM = "DeepGEMM BF16"
     MOONEP = "MOONEP"
     CPU = "CPU"
     XPU = "XPU"
@@ -145,6 +146,14 @@ def backend_to_kernel_cls(
 
         return [BatchedTritonExperts]
 
+    elif backend == UnquantizedMoeBackend.DEEP_GEMM:
+        from vllm.model_executor.layers.fused_moe.experts.deep_gemm_moe import (
+            DeepGemmBf16BatchedExperts,
+            DeepGemmBf16Experts,
+        )
+
+        return [DeepGemmBf16Experts, DeepGemmBf16BatchedExperts]
+
     elif backend == UnquantizedMoeBackend.MOONEP:
         from vllm.model_executor.layers.fused_moe.experts.moonep_experts import (
             MoonEPExperts,
@@ -185,6 +194,7 @@ def map_unquantized_backend(runner_backend: MoEBackend) -> UnquantizedMoeBackend
         "flashinfer_trtllm": UnquantizedMoeBackend.FLASHINFER_TRTLLM,
         "flashinfer_cutlass": UnquantizedMoeBackend.FLASHINFER_CUTLASS,
         "aiter": UnquantizedMoeBackend.AITER,
+        "deep_gemm": UnquantizedMoeBackend.DEEP_GEMM,
     }
     if backend := mapping.get(runner_backend):
         return backend
@@ -285,6 +295,11 @@ def select_unquantized_moe_backend(
         config: FusedMoEConfig,
         activation_format: mk.FusedMoEActivationFormat,
     ) -> tuple[UnquantizedMoeBackend, type[mk.FusedMoEExperts] | None]:
+        if (
+            backend == UnquantizedMoeBackend.DEEP_GEMM
+            and config.in_dtype != torch.bfloat16
+        ):
+            raise ValueError("DeepGEMM BF16 requires bfloat16 activations and weights")
         reason = None
         for k_cls in backend_to_kernel_cls(backend):
             supported, reason = k_cls.is_supported_config(

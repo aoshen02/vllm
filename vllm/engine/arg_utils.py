@@ -488,6 +488,7 @@ class EngineArgs:
     # AuxOutputConfig.
     enable_return_routed_experts: bool = False
     return_sampling_mask: bool = ModelConfig.return_sampling_mask
+    return_sampling_mask_logprobs: bool = ModelConfig.return_sampling_mask_logprobs
     model_weights: str = ModelConfig.model_weights
     served_model_name: str | list[str] | None = ModelConfig.served_model_name
     tokenizer: str | None = ModelConfig.tokenizer
@@ -663,6 +664,7 @@ class EngineArgs:
         MultiModalConfig.mm_shm_cache_max_object_size_mb
     )
     mm_encoder_only: bool = MultiModalConfig.mm_encoder_only
+    mm_decoder_only: bool = MultiModalConfig.mm_decoder_only
     mm_encoder_tp_mode: MMEncoderTPMode = MultiModalConfig.mm_encoder_tp_mode
     mm_encoder_attn_backend: AttentionBackendEnum | str | None = (
         MultiModalConfig.mm_encoder_attn_backend
@@ -790,6 +792,9 @@ class EngineArgs:
     reasoning_config: ReasoningConfig = get_field(VllmConfig, "reasoning_config")
 
     generation_config: str = ModelConfig.generation_config
+    custom_pull_weights_pre_read_hook: str | None = (
+        ModelConfig.custom_pull_weights_pre_read_hook
+    )
     enable_sleep_mode: bool = ModelConfig.enable_sleep_mode
     sleep_mode_backend: str = ModelConfig.sleep_mode_backend
     sleep_mode_offload_cudagraph: bool = ModelConfig.sleep_mode_offload_cudagraph
@@ -1000,6 +1005,10 @@ class EngineArgs:
             "--return-sampling-mask",
             **model_kwargs["return_sampling_mask"],
         )
+        model_group.add_argument(
+            "--return-sampling-mask-logprobs",
+            **model_kwargs["return_sampling_mask_logprobs"],
+        )
         model_group.add_argument("--max-logprobs", **model_kwargs["max_logprobs"])
         model_group.add_argument("--logprobs-mode", **model_kwargs["logprobs_mode"])
         model_group.add_argument("--use-fp64-gumbel", **model_kwargs["use_fp64_gumbel"])
@@ -1036,6 +1045,10 @@ class EngineArgs:
         )
         model_group.add_argument(
             "--override-generation-config", **model_kwargs["override_generation_config"]
+        )
+        model_group.add_argument(
+            "--custom-pull-weights-pre-read-hook",
+            **model_kwargs["custom_pull_weights_pre_read_hook"],
         )
         model_group.add_argument(
             "--enable-sleep-mode", **model_kwargs["enable_sleep_mode"]
@@ -1504,6 +1517,9 @@ class EngineArgs:
         )
         multimodal_group.add_argument(
             "--mm-processor-cache-gb", **multimodal_kwargs["mm_processor_cache_gb"]
+        )
+        multimodal_group.add_argument(
+            "--mm-decoder-only", **multimodal_kwargs["mm_decoder_only"]
         )
         multimodal_group.add_argument(
             "--mm-processor-cache-type", **multimodal_kwargs["mm_processor_cache_type"]
@@ -2010,6 +2026,7 @@ class EngineArgs:
             allow_deprecated_quantization=self.allow_deprecated_quantization,
             enforce_eager=self.enforce_eager,
             return_sampling_mask=self.return_sampling_mask,
+            return_sampling_mask_logprobs=self.return_sampling_mask_logprobs,
             max_logprobs=self.max_logprobs,
             logprobs_mode=self.logprobs_mode,
             use_fp64_gumbel=self.use_fp64_gumbel,
@@ -2031,6 +2048,7 @@ class EngineArgs:
             mm_shm_cache_max_object_size_mb=self.mm_shm_cache_max_object_size_mb,
             mm_hasher_algorithm=self.mm_hasher_algorithm,
             mm_encoder_only=self.mm_encoder_only,
+            mm_decoder_only=self.mm_decoder_only,
             mm_encoder_tp_mode=self.mm_encoder_tp_mode,
             mm_encoder_attn_backend=self.mm_encoder_attn_backend,
             mm_encoder_attn_dtype=self.mm_encoder_attn_dtype,
@@ -2040,6 +2058,7 @@ class EngineArgs:
             pooler_config=self.pooler_config,
             generation_config=self.generation_config,
             override_generation_config=self.override_generation_config,
+            custom_pull_weights_pre_read_hook=self.custom_pull_weights_pre_read_hook,
             enable_sleep_mode=self.enable_sleep_mode,
             sleep_mode_backend=self.sleep_mode_backend,
             sleep_mode_offload_cudagraph=self.sleep_mode_offload_cudagraph,

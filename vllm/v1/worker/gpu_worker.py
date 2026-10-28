@@ -637,6 +637,24 @@ class Worker(WorkerBase):
         with set_current_vllm_config(self.vllm_config):
             self.model_runner.reload_weights(*args, **kwargs)
 
+    def pull_weights(
+        self,
+        local_checkpoint_dir: str,
+        source_dir: str,
+        target_version: int,
+    ) -> dict[str, Any]:
+        from vllm.utils.local_checkpoint import pull_checkpoint
+
+        pull_checkpoint(
+            local_checkpoint_dir=local_checkpoint_dir,
+            base_dir=self.model_config.model,
+            source_dir=source_dir,
+            target_version=target_version,
+            pre_read_hook=self.model_config.custom_pull_weights_pre_read_hook,
+        )
+
+        return {"success": True, "weight_version": str(target_version)}
+
     @torch.inference_mode()
     def determine_available_memory(self) -> int:
         """Profiles the peak memory usage of the model to determine how much
@@ -812,6 +830,10 @@ class Worker(WorkerBase):
             self.model_config.multimodal_config,
             getattr(self.parallel_config, "_api_process_count", 1),
         )
+
+    def on_kv_connector_idle(self) -> None:
+        if has_kv_transfer_group():
+            get_kv_transfer_group().on_idle()
 
     def get_kv_connector_handshake_metadata(
         self,
@@ -1473,6 +1495,11 @@ class Worker(WorkerBase):
 
     def pin_lora(self, lora_id: int) -> bool:
         return self.model_runner.pin_lora(lora_id)
+
+    def dumper_control(self, action: str, body: str = "{}") -> dict:
+        if not self.use_v2_model_runner or self.model_runner.tensor_dumper is None:
+            raise RuntimeError("Dumper was not enabled at startup.")
+        return self.model_runner.tensor_dumper.control(action, body)
 
     def check_health(self) -> None:
         # worker will always be healthy as long as it's running.
