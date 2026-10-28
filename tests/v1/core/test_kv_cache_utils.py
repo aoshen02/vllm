@@ -3358,3 +3358,148 @@ def test_mamba_ratio_attention_only_pp_stage_profiles_legacy_but_plans_globally(
         assert set(views) == set(worker)
         for tensor in plan.kv_cache_tensors:
             assert views[tensor.layers[0]].shape[0] == plan.num_blocks_of(tensor)
+
+
+@pytest.mark.parametrize("ratio", [0.5, 0.9])
+@pytest.mark.parametrize("max_num_seqs", [2, 4])
+@pytest.mark.parametrize("prefix_caching", [True, False])
+def test_mamba_ratio_reserves_fixed_request_rings(
+    independent_mamba_groups, ratio, max_num_seqs, prefix_caching
+):
+    from vllm.v1.worker.utils import allocate_kv_cache
+
+    attention, state = independent_mamba_groups
+    ring = CircularBufferSpec(
+        block_size=4,
+        num_kv_heads=1,
+        head_size=128,
+        head_size_v=0,
+        dtype=torch.bfloat16,
+    )
+    specs = {
+        "attention": attention.kv_cache_spec,
+        "state": replace(state.kv_cache_spec, block_size=32, mamba_cache_mode="align"),
+        "ring": ring,
+    }
+    budget = 12 * 1024**2
+    config = mamba_ratio_config(
+        ratio,
+        budget,
+        max_num_seqs=max_num_seqs,
+        enable_prefix_caching=prefix_caching,
+    )
+    config.cache_config.kv_cache_layout = "BLHNC"
+    (plan,) = kv_cache_planning.get_kv_cache_configs(config, [specs], [budget])
+    assert plan.group_num_blocks is not None
+    counts = {
+        name: count
+        for group, count in zip(
+            plan.kv_cache_groups, plan.group_num_blocks, strict=True
+        )
+        for name in group.layer_names
+    }
+    ring_bytes = (max_num_seqs + 1) * ring.page_size_bytes
+    small_config = mamba_ratio_config(
+        ratio,
+        ring_bytes - 1,
+        max_num_seqs=max_num_seqs,
+        enable_prefix_caching=prefix_caching,
+    )
+    small_config.cache_config.kv_cache_layout = "BLHNC"
+    with pytest.raises(ValueError, match="fixed per-request rings"):
+        kv_cache_planning.get_kv_cache_configs(small_config, [specs], [ring_bytes - 1])
+    numerator, denominator = ratio.as_integer_ratio()
+    state_count = (
+        (budget - ring_bytes) * numerator // (numerator + denominator) // 32768
+    )
+    if not prefix_caching:
+        state_count = (
+            1 + max_num_seqs * specs["state"].max_memory_usage_bytes(config) // 32768
+        )
+    assert counts == {
+        "ring": max_num_seqs + 1,
+        "state": state_count,
+        "attention": (budget - ring_bytes - state_count * 32768) // 65536,
+    }
+    assert all(tensor.size <= budget for tensor in plan.kv_cache_tensors)
+    views = allocate_kv_cache(plan, torch.device("cpu"), KVCacheLayout.BLHNC)
+    assert views["ring"].shape[0] == max_num_seqs + 1
+    manager = KVCacheManager(
+        generate_scheduler_kv_cache_config([plan]),
+        max_model_len=32,
+        scheduler_block_size=32,
+        hash_block_size=16,
+        enable_caching=prefix_caching,
+    )
+    requests = [
+        make_request(f"ring-{index}", list(range(32)), block_size=16, hash_fn=sha256)
+        for index in range(max_num_seqs + 1)
+    ]
+    for request in requests[:-1]:
+        assert manager.allocate_slots(request, 32) is not None
+    ring_group_id = next(
+        group_id
+        for group_id, group in enumerate(plan.kv_cache_groups)
+        if "ring" in group.layer_names
+    )
+    assert manager.coordinator.block_pools[ring_group_id].get_num_free_blocks() == 0
+    assert manager.allocate_slots(requests[-1], 32) is None
+    manager.free(requests[0])
+    assert manager.allocate_slots(requests[-1], 32) is not None
+    for request in requests[1:]:
+        manager.free(request)
+    assert manager.usage == 0
+
+
+def test_mamba_ratio_request_ring_projection_uses_only_local_memory(
+    independent_mamba_groups,
+):
+    from vllm.v1.worker.utils import allocate_kv_cache
+
+    attention, state = independent_mamba_groups
+    workers = [
+        {
+            "attention": attention.kv_cache_spec,
+            "ring": CircularBufferSpec(
+                block_size=4,
+                num_kv_heads=1,
+                head_size=128,
+                head_size_v=0,
+                dtype=torch.bfloat16,
+            ),
+        },
+        {
+            "state": replace(
+                state.kv_cache_spec, block_size=32, mamba_cache_mode="align"
+            )
+        },
+    ]
+    budgets = [12 * 1024**2, 6 * 1024**2]
+    config = mamba_ratio_config(
+        0.5, budgets[0], max_num_seqs=2, pipeline_parallel_size=2
+    )
+    config.cache_config.kv_cache_layout = "BLHNC"
+    plans = kv_cache_planning.get_kv_cache_configs(config, workers, budgets)
+    assert plans[0].group_num_blocks == plans[1].group_num_blocks
+    assert {
+        name: count
+        for plan in plans
+        for group, count in zip(
+            plan.kv_cache_groups, plan.group_num_blocks, strict=True
+        )
+        for name in group.layer_names
+    } == {
+        "attention": (budgets[0] - 3 * workers[0]["ring"].page_size_bytes) // 65536,
+        "ring": 3,
+        "state": budgets[1] // 3 // 32768,
+    }
+    for worker, plan, budget in zip(workers, plans, budgets, strict=True):
+        views = allocate_kv_cache(plan, torch.device("cpu"), KVCacheLayout.BLHNC)
+        assert set(views) == set(worker)
+        assert all(tensor.size <= budget for tensor in plan.kv_cache_tensors)
+        for group, count in zip(
+            plan.kv_cache_groups, plan.group_num_blocks, strict=True
+        ):
+            if "ring" in group.layer_names:
+                assert count == 3
+                assert views["ring"].shape[0] == 3

@@ -1476,11 +1476,16 @@ def _get_ratio_kv_cache_configs(
     if vllm_config.attention_config.hisparse_config is not None:
         raise ValueError("Mamba ratio planning does not support HiSparse host storage")
     mamba_groups: list[bool] = []
+    ring_counts: list[int] = []
     for group in global_groups:
         specs = list(iter_layer_specs(group.kv_cache_spec))
         is_mamba = bool(specs) and all(isinstance(spec, MambaSpec) for spec in specs)
+        is_ring = bool(specs) and all(
+            isinstance(spec, CircularBufferSpec) for spec in specs
+        )
         if group.host_resident or not (
             is_mamba
+            or is_ring
             or (
                 specs
                 and all(
@@ -1490,11 +1495,14 @@ def _get_ratio_kv_cache_configs(
             )
         ):
             raise ValueError(
-                "Mamba ratio planning supports Mamba, full-attention and "
-                "sliding-window groups; "
+                "Mamba ratio planning supports Mamba, circular-state, "
+                "full-attention and sliding-window groups; "
                 "other cache types need an explicit budget policy"
             )
         mamba_groups.append(is_mamba)
+        ring_counts.append(
+            vllm_config.scheduler_config.max_num_seqs + 1 if is_ring else 0
+        )
     assert any(mamba_groups)
     layout = cache_config.get_resolved_kv_cache_layout()
     fixed_counts = (
@@ -1538,7 +1546,9 @@ def _get_ratio_kv_cache_configs(
                 group.replayssm_tracker_bytes_per_block
                 * vllm_config.scheduler_config.max_num_seqs
             )
-            if is_mamba:
+            if ring_counts[group_id]:
+                initialization_reserve += stride * ring_counts[group_id]
+            elif is_mamba:
                 mamba_stride += stride
                 if fixed_counts is not None:
                     fixed_mamba_bytes += stride * fixed_counts[group_id]
@@ -1546,7 +1556,8 @@ def _get_ratio_kv_cache_configs(
                 attention_stride += stride
         if budget < initialization_reserve:
             raise ValueError(
-                "Cache budget cannot hold alignment and cursor-rebinding reservations"
+                "Cache budget cannot hold alignment and cursor-rebinding "
+                "reservations and fixed per-request rings"
             )
         worker_costs.append(
             (
@@ -1589,9 +1600,13 @@ def _get_ratio_kv_cache_configs(
         default=0,
     )
     counts = tuple(
-        (fixed_counts[group_id] if fixed_counts is not None else mamba_count)
-        if is_mamba
-        else attention_count
+        ring_counts[group_id]
+        if ring_counts[group_id]
+        else (
+            (fixed_counts[group_id] if fixed_counts is not None else mamba_count)
+            if is_mamba
+            else attention_count
+        )
         for group_id, is_mamba in enumerate(mamba_groups)
     )
     if min(counts) < 2:

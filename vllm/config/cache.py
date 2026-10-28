@@ -286,8 +286,10 @@ class CacheConfig:
         default=None, gt=0, allow_inf_nan=False
     )
     """Optional native Mamba-to-attention cache memory ratio. Reserves r/(1+r)
-    of the available cache budget for Mamba pages, including verification state,
-    embedded replay records and null blocks. Remaining bytes fund attention.
+    of the remaining cache budget for Mamba pages, including verification state,
+    embedded replay records and null blocks. Circular-state groups first reserve
+    max_num_seqs + 1 blocks independently of the ratio. Remaining bytes fund
+    attention.
     Without prefix caching and with an explicit request bound, reserve each
     group's per-request native state demand instead of applying the ratio.
     Counts are rounded down and synchronized across workers. None preserves

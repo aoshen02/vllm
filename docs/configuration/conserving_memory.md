@@ -62,10 +62,14 @@ specified Mamba fraction; the unused remainder is not reassigned to state.
 The Mamba reservation includes native verification pages, state-embedded
 ReplaySSM/RecoverSSM records and each group's null block. It does not add a
 second copy of speculative scratch already represented by native pages.
-Per-worker group-start alignment headroom is reserved before splitting the
-budget. Counts are rounded down and made common across workers, including
-pipeline stages with different local layers; the realized ratio can therefore
-differ from the requested target. All group regions share one allocation.
+Per-request circular-state groups reserve `max_num_seqs + 1` blocks, including
+the null block, independently of token length or prefix caching. Their actual
+local bytes and group-start alignment headroom are reserved before splitting
+the remaining budget. Counts are rounded down and made common across workers,
+including pipeline stages with different local layers; the realized ratio can
+therefore differ from the requested target. All group regions share one allocation.
+With a KV connector, requests awaiting remote KV or delayed release also hold
+ring blocks; this fixed pool can limit admission until those blocks are freed.
 
 When prefix caching is disabled and `max_num_seqs` is explicitly supplied,
 the enabled policy instead reserves each
@@ -77,9 +81,10 @@ default request limit.
 
 This is a physical cache-budget policy, not a persistent-state slot cap or
 a request-concurrency setting. It cannot be combined with a shared block-count
-override, HiSparse host storage, or cache types other than Mamba, full attention
-and sliding-window attention. The attention groups share the remaining budget;
-this control does not set a separate sliding-window-to-full-attention ratio.
+override, HiSparse host storage, or cache types other than Mamba, circular state,
+full attention and sliding-window attention. The attention groups share the
+remaining budget; this control does not set a separate sliding-window-to-full
+attention ratio.
 FlashInfer Mamba2 ReplaySSM cursor tensors live outside
 the backing:
 the policy charges 12 bytes per block once per actual local cache namespace,
