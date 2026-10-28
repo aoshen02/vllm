@@ -1080,15 +1080,37 @@ def test_get_mooncake_bootstrap_addr_rejects_invalid_external_address(address):
         get_mooncake_bootstrap_addr(config)
 
 
-def test_scheduler_request_finished():
+@pytest.mark.parametrize("engine_id", ["producer-dp0", "producer-dp1", "replacement"])
+@pytest.mark.parametrize(
+    "bootstrap_host", ["10.1.2.3", "127.0.0.1", "::1", "2001:db8::1"]
+)
+@pytest.mark.parametrize("explicit_bootstrap", [False, True])
+def test_scheduler_request_finished(
+    monkeypatch, engine_id, bootstrap_host, explicit_bootstrap
+):
     """Tests the scheduler-side logic when a request finishes.
 
     Differentiates between 'Finished' (requires transfer)
     and 'Aborted' (immediate free).
     """
-    vllm_config = create_vllm_config(
-        kv_connector="MooncakeConnector", kv_role="kv_producer"
+    bootstrap_address = (
+        f"[{bootstrap_host}]:8998"
+        if ":" in bootstrap_host
+        else f"{bootstrap_host}:8998"
     )
+    vllm_config = create_vllm_config(
+        kv_connector="MooncakeConnector",
+        kv_role="kv_producer",
+        kv_connector_extra_config=(
+            {"bootstrap_server_address": bootstrap_address}
+            if explicit_bootstrap
+            else {}
+        ),
+    )
+    vllm_config.parallel_config.data_parallel_master_ip = bootstrap_host
+    vllm_config.kv_transfer_config.engine_id = engine_id
+    module = "vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector"
+    monkeypatch.setattr(f"{module}.get_ip", lambda: "10.1.2.4")
     scheduler = create_scheduler(vllm_config)
     scheduler_connector = scheduler.get_kv_connector().connector_scheduler
 
@@ -1097,16 +1119,36 @@ def test_scheduler_request_finished():
 
     # Case: Capped length (Successful prefill, need to send to decoder)
     request.status = RequestStatus.FINISHED_LENGTH_CAPPED
-    delay_free, _ = scheduler_connector.request_finished(request, block_ids=([10, 11],))
+    delay_free, params = scheduler_connector.request_finished(
+        request, block_ids=([10, 11],)
+    )
     assert delay_free is True
+    advertised_host = (
+        "10.1.2.4"
+        if not explicit_bootstrap and bootstrap_host in ("127.0.0.1", "::1")
+        else bootstrap_host
+    )
+    if ":" in advertised_host:
+        advertised_host = f"[{advertised_host}]"
+    assert params == {
+        "do_remote_decode": False,
+        "do_remote_prefill": True,
+        "transfer_id": request.request_id,
+        "remote_engine_id": engine_id,
+        "remote_bootstrap_addr": f"http://{advertised_host}:8998",
+    }
+    assert request.kv_transfer_params["do_remote_decode"] is True
     assert "id-1" in scheduler_connector._reqs_need_send
     assert scheduler_connector._reqs_need_send["id-1"][1] == [[10, 11]]
 
     # Case: Aborted (No need to transfer, free blocks immediately)
     scheduler_connector._reqs_need_send.clear()
     request.status = RequestStatus.FINISHED_ABORTED
-    delay_free, _ = scheduler_connector.request_finished(request, block_ids=([12],))
+    delay_free, params = scheduler_connector.request_finished(
+        request, block_ids=([12],)
+    )
     assert delay_free is False
+    assert params is None
     assert len(scheduler_connector._reqs_need_send) == 0
     assert "id-1" in scheduler_connector._reqs_not_processed
 
