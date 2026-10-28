@@ -38,6 +38,12 @@ python examples/disaggregated/mooncake_connector/mooncake_connector_proxy.py --p
 
 Now you can send requests to the proxy server through port 8000.
 
+Successful prefill responses include `kv_transfer_params` identifying the actual
+producer engine, bootstrap address, and transfer ID. A proxy should forward these
+parameters to the decoder unchanged. With internal data-parallel load balancing,
+the producer is selected per request; assuming producer rank zero can direct the
+decoder to an engine that does not own that request's KV cache.
+
 For multimodal Encode-Prefill-Decode (encoder embeddings rather than KV
 cache), see [ECMooncakeConnector Usage Guide](mooncake_ec_connector_usage.md).
 
