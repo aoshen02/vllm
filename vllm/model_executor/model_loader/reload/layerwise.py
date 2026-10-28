@@ -99,9 +99,6 @@ def initialize_layerwise_reload(model: torch.nn.Module):
     """
     from .direct import begin_direct_reload, direct_reload_enabled
 
-    # Parts parked by an update that never finished must not pair with this one
-    discard_weight_parts(model)
-
     if direct_reload_enabled():
         begin_direct_reload(model)
         return
