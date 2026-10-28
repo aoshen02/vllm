@@ -39,6 +39,20 @@ if TYPE_CHECKING:
     from vllm.v1.worker.gpu.input_batch import InputBatch
 
 
+AuxOutputCapture = RoutedExpertsCapturer
+
+
+def prepare_aux_output_capture(
+    model: torch.nn.Module, vllm_config: VllmConfig
+) -> AuxOutputCapture:
+    capturer = RoutedExpertsCapturer(
+        max_num_batched_tokens=vllm_config.scheduler_config.max_num_batched_tokens,
+        vllm_config=vllm_config,
+    )
+    bind_routed_experts_capturer(model, capturer)
+    return capturer
+
+
 @dataclass
 class _WorkerRequestState:
     aux_output_keys: list[str] = field(default_factory=list)
@@ -89,13 +103,12 @@ class AuxOutputWorkerConnector:
         vllm_config: VllmConfig,
         model: torch.nn.Module,
         kv_cache_config: KVCacheConfig,
+        capture: AuxOutputCapture | None = None,
     ) -> None:
         max_num_batched_tokens = vllm_config.scheduler_config.max_num_batched_tokens
-        capturer = RoutedExpertsCapturer(
-            max_num_batched_tokens=max_num_batched_tokens, vllm_config=vllm_config
-        )
-        bind_routed_experts_capturer(model, capturer)
-        self._capturer = capturer
+        if capture is None:
+            capture = prepare_aux_output_capture(model, vllm_config)
+        self._capturer = capture
         self._store: BackgroundBlockObjectStore | None = None
         self._buffer: RoutedExpertsBuffer | None = None
         self._requests: dict[str, _WorkerRequestState] = {}
@@ -406,10 +419,14 @@ class AuxOutputWorkerConnector:
 
 
 def get_aux_output_connector(
-    model: torch.nn.Module, vllm_config: VllmConfig, kv_cache_config: KVCacheConfig
+    model: torch.nn.Module,
+    vllm_config: VllmConfig,
+    kv_cache_config: KVCacheConfig,
+    capture: AuxOutputCapture | None = None,
 ) -> AuxOutputWorkerConnector:
     return AuxOutputWorkerConnector(
         model=model,
         kv_cache_config=kv_cache_config,
         vllm_config=vllm_config,
+        capture=capture,
     )

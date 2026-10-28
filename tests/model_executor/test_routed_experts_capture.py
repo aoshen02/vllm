@@ -661,18 +661,25 @@ def test_get_aux_output_connector_passes_config(monkeypatch):
     )
     model = Mock()
     kv_cache_config = Mock()
+    capture = Mock()
 
-    result = aux_output_worker.get_aux_output_connector(model, config, kv_cache_config)
+    result = aux_output_worker.get_aux_output_connector(
+        model, config, kv_cache_config, capture
+    )
 
     constructor.assert_called_once_with(
         model=model,
         kv_cache_config=kv_cache_config,
         vllm_config=config,
+        capture=capture,
     )
     assert result is connector
 
 
-def test_aux_output_worker_connector_binds_capture_on_non_output_rank(monkeypatch):
+@pytest.mark.parametrize("reuse_capture", [False, True], ids=["create", "reuse"])
+def test_aux_output_worker_connector_binds_capture_on_non_output_rank(
+    monkeypatch, reuse_capture
+):
     import vllm.distributed.aux_output_connector.worker as aux_output_worker
 
     capturer = Mock()
@@ -697,13 +704,19 @@ def test_aux_output_worker_connector_binds_capture_on_non_output_rank(monkeypatc
         vllm_config=config,
         model=model,
         kv_cache_config=SimpleNamespace(kv_cache_groups=[_full_attention_kv_group()]),
+        **({"capture": capturer} if reuse_capture else {}),
     )
 
-    constructor.assert_called_once_with(
-        max_num_batched_tokens=32,
-        vllm_config=config,
-    )
-    bind.assert_called_once_with(model, capturer)
+    if reuse_capture:
+        constructor.assert_not_called()
+        bind.assert_not_called()
+    else:
+        constructor.assert_called_once_with(
+            max_num_batched_tokens=32,
+            vllm_config=config,
+        )
+        bind.assert_called_once_with(model, capturer)
+    assert connector._capturer is capturer
     connector.begin_step(Mock())
     assert connector.prepare_output(Mock()) is None
     capturer.snapshot_routing_data.assert_not_called()
