@@ -51,8 +51,11 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from vllm.model_executor.model_loader.weight_utils import stash_weight_part
 from vllm.model_executor.models.module_mapping import MultiModelKeys
+from vllm.model_executor.models.molmo import (
+    _load_split_embedding,
+    _split_embedding_loader,
+)
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.image import normalize_image
 from vllm.multimodal.inputs import (
@@ -1173,6 +1176,9 @@ class Molmo2TextModel(nn.Module, SupportsQuant):
             self.embedding_size,
             text_config.hidden_size,
             quant_config=quant_config,
+        )
+        self.embed_tokens.weight.weight_loader = _split_embedding_loader(
+            self.embed_tokens
         )
 
         decoder_layer = (
@@ -2653,8 +2659,9 @@ class Molmo2ForConditionalGeneration(
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         loader = AutoWeightsLoader(self)
-        weights = _get_weights_with_merged_embedding(self, weights)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        loaded: set[str] = set()
+        weights = _load_split_embedding(self.model.embed_tokens, weights, loaded)
+        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper) | loaded
 
     def get_mm_mapping(self) -> MultiModelKeys:
         """Get the module prefix in multimodal models."""
@@ -2663,26 +2670,3 @@ class Molmo2ForConditionalGeneration(
             connector="vision_backbone.image_projector",
             tower_model="vision_backbone",
         )
-
-
-def _get_weights_with_merged_embedding(
-    module: nn.Module,
-    weights: Iterable[tuple[str, torch.Tensor]],
-) -> Iterable[tuple[str, torch.Tensor]]:
-    for name, weight in weights:
-        if "wte.embedding" in name:
-            part = "embedding"
-        elif "wte.new_embedding" in name:
-            part = "new_embedding"
-        else:
-            yield (name, weight)
-            continue
-        parts = stash_weight_part(
-            module, "wte", part, weight, ("embedding", "new_embedding")
-        )
-        # Quantization leaves embed_tokens unquantized, so the concat is safe.
-        if parts is not None:
-            yield (
-                "model.embed_tokens.weight",
-                torch.cat([parts["embedding"], parts["new_embedding"]], dim=0),
-            )
