@@ -324,15 +324,15 @@ class TestExpertsKeepConstants:
 
     def test_fallback_wrapper_keeps_the_inner_constants(self):
         # a runtime-dispatching wrapper holds the experts that own the tensors
-        from vllm.model_executor.layers.fused_moe.experts.fallback import (
-            FallbackExperts,
+        from vllm.model_executor.layers.fused_moe.experts.triton_cutlass_moe import (
+            TritonOrCutlassExperts,
         )
 
         layer = torch.nn.Module()
         names = ["ab_strides1", "ab_strides2", "c_strides1", "c_strides2"]
 
-        def wrapper(fill: float) -> FallbackExperts:
-            w = object.__new__(FallbackExperts)  # type: ignore[type-abstract]
+        def wrapper(fill: float) -> TritonOrCutlassExperts:
+            w = object.__new__(TritonOrCutlassExperts)
             w.experts = _experts(
                 _EXP + "cutlass_moe.CutlassExpertsFp8",
                 {n: torch.full((4,), fill) for n in names},
