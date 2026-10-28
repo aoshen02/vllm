@@ -9,9 +9,9 @@ import secrets
 import threading
 import time
 from collections import OrderedDict, defaultdict
-from collections.abc import Collection
+from collections.abc import Collection, Iterable
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import TYPE_CHECKING, Any, Final
 
@@ -35,6 +35,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorMetadata,
     KVConnectorRole,
     KVConnectorTransferResults,
+    KVConnectorWorkerMetadata,
     SupportsHMA,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
@@ -75,8 +76,10 @@ from vllm.v1.kv_cache_interface import (
     MLAAttentionSpec,
     SlidingWindowMLASpec,
     SlidingWindowSpec,
+    create_kv_cache_views,
 )
 from vllm.v1.metrics.cache_hit_source import CacheHitSource
+from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import RequestStatus
 from vllm.v1.worker.utils import select_common_block_size
 
@@ -689,6 +692,44 @@ class SendBlockMeta:
     need_send: int = 0
     sent: int = 0
     sending: int = 0
+    consumer_tp_ranks: set[int] = field(default_factory=set)
+
+
+@dataclass
+class MooncakeWorkerMetadata(KVConnectorWorkerMetadata):
+    consumer_pulls: dict[TransferId, set[int]] = field(default_factory=dict)
+
+    def aggregate(self, other: KVConnectorWorkerMetadata) -> "MooncakeWorkerMetadata":
+        assert isinstance(other, MooncakeWorkerMetadata)
+        combined = {
+            transfer_id: ranks.copy()
+            for transfer_id, ranks in self.consumer_pulls.items()
+        }
+        for transfer_id, ranks in other.consumer_pulls.items():
+            combined.setdefault(transfer_id, set()).update(ranks)
+        return MooncakeWorkerMetadata(combined)
+
+
+@dataclass
+class OptimisticPrefill:
+    request: "Request"
+    attempts: int = 0
+    terminal_published: bool = False
+
+
+def get_optimistic_prefill_attempts(vllm_config: VllmConfig) -> int:
+    assert vllm_config.kv_transfer_config is not None
+    attempts = vllm_config.kv_transfer_config.kv_connector_extra_config.get(
+        "optimistic_prefill_attempts", 0
+    )
+    if type(attempts) is not int or attempts < 0:
+        raise ValueError("optimistic_prefill_attempts must be a nonnegative integer")
+    if attempts and vllm_config.parallel_config.pipeline_parallel_size > 1:
+        logger.warning("Optimistic prefill does not support pp_size > 1")
+        return 0
+    if attempts and not vllm_config.use_v2_model_runner:
+        raise ValueError("Optimistic prefill candidate requires MRV2")
+    return attempts
 
 
 class MooncakeConnectorMetadata(KVConnectorMetadata):
@@ -776,7 +817,7 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
 
     def get_num_new_matched_tokens(
         self, request: "Request", num_computed_tokens: int
-    ) -> tuple[int, bool]:
+    ) -> tuple[int | None, bool]:
         assert self.connector_scheduler is not None
         return self.connector_scheduler.get_num_new_matched_tokens(
             request, num_computed_tokens
@@ -800,6 +841,22 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
     def on_new_request(self, request: "Request") -> None:
         assert self.connector_scheduler is not None
         self.connector_scheduler.on_new_request(request)
+
+    def update_connector_output(self, connector_output: KVConnectorOutput) -> None:
+        assert self.connector_scheduler is not None
+        self.connector_scheduler.update_connector_output(connector_output)
+
+    def should_yield_optimistic_prefill(
+        self, request: "Request", waiting: Iterable["Request"]
+    ) -> bool:
+        assert self.connector_scheduler is not None
+        return self.connector_scheduler.should_yield_optimistic_prefill(
+            request, waiting
+        )
+
+    def build_connector_worker_meta(self) -> MooncakeWorkerMetadata | None:
+        assert self.connector_worker is not None
+        return self.connector_worker.build_connector_worker_meta()
 
     def request_finished(
         self,
@@ -934,6 +991,13 @@ class MooncakeConnectorScheduler:
         self.block_size = vllm_config.cache_config.block_size
         self.kv_cache_config = kv_cache_config
 
+        self.optimistic_prefill_attempts = get_optimistic_prefill_attempts(vllm_config)
+        self._optimistic_prefills: dict[TransferId, OptimisticPrefill] = {}
+        self._consumer_pulls: dict[TransferId, set[int]] = {}
+        self._producer_tp_ranks = set(
+            range(vllm_config.parallel_config.tensor_parallel_size)
+        )
+
         assert vllm_config.kv_transfer_config
         self.is_kv_producer: bool = (
             vllm_config.kv_transfer_config.kv_role == "kv_producer"
@@ -1038,6 +1102,21 @@ class MooncakeConnectorScheduler:
 
     def on_new_request(self, request: "Request") -> None:
         params = request.kv_transfer_params
+        if params and params.get("do_remote_decode") and not self.is_kv_consumer:
+            request.kv_transfer_metrics["pd_prefill_retry_count"] = 0
+        if (
+            self.optimistic_prefill_attempts
+            and params
+            and params.get("do_remote_decode")
+        ):
+            transfer_id = params.get("transfer_id")
+            if not isinstance(transfer_id, str) or not transfer_id:
+                raise ValueError("Optimistic prefill requires a nonempty transfer_id")
+            if transfer_id in self._optimistic_prefills:
+                raise ValueError(
+                    "Optimistic prefill requires unique active transfer_ids"
+                )
+            self._optimistic_prefills[transfer_id] = OptimisticPrefill(request)
         if (
             params is not None
             and params.get("do_remote_decode")
@@ -1045,9 +1124,45 @@ class MooncakeConnectorScheduler:
         ):
             self._truncate_mamba_request_for_prefill(request)
 
+    def update_connector_output(self, connector_output: KVConnectorOutput) -> None:
+        metadata = connector_output.kv_connector_worker_meta
+        if isinstance(metadata, MooncakeWorkerMetadata):
+            for transfer_id, ranks in metadata.consumer_pulls.items():
+                self._consumer_pulls.setdefault(transfer_id, set()).update(ranks)
+        for request_id in connector_output.finished_sending or ():
+            for transfer_id, state in list(self._optimistic_prefills.items()):
+                if state.request.request_id == request_id:
+                    del self._optimistic_prefills[transfer_id]
+                    self._consumer_pulls.pop(transfer_id, None)
+
+    def _consumer_ready(self, request: "Request") -> bool:
+        params = request.kv_transfer_params or {}
+        return self._producer_tp_ranks <= self._consumer_pulls.get(
+            params.get("transfer_id", ""), set()
+        )
+
+    def should_yield_optimistic_prefill(
+        self, request: "Request", waiting: Iterable["Request"]
+    ) -> bool:
+        params = request.kv_transfer_params or {}
+        state = self._optimistic_prefills.get(params.get("transfer_id", ""))
+        if (
+            state is None
+            or state.request is not request
+            or state.terminal_published
+            or request.status != RequestStatus.RUNNING
+            or request.num_computed_tokens >= request.num_prompt_tokens
+            or self._consumer_ready(request)
+        ):
+            return False
+        pending = self._reqs_need_send.get(request.request_id)
+        if pending is not None and pending[1]:
+            return False
+        return any(self._consumer_ready(other) for other in waiting)
+
     def get_num_new_matched_tokens(
         self, request: "Request", num_computed_tokens: int
-    ) -> tuple[int, bool]:
+    ) -> tuple[int | None, bool]:
         """For remote prefill, pull all prompt blocks from remote
         asynchronously relative to engine execution.
 
@@ -1072,6 +1187,15 @@ class MooncakeConnectorScheduler:
 
         if not params:
             return 0, False
+
+        state = self._optimistic_prefills.get(params.get("transfer_id", ""))
+        if (
+            state is not None
+            and state.request is request
+            and not self._consumer_ready(request)
+            and state.attempts >= self.optimistic_prefill_attempts
+        ):
+            return None, False
 
         if params.get("do_remote_prefill"):
             # Remote prefill: get all prompt blocks from remote.
@@ -1129,6 +1253,9 @@ class MooncakeConnectorScheduler:
 
         elif params.get("do_remote_decode"):
             assert not self.is_kv_consumer
+            state = self._optimistic_prefills.get(params.get("transfer_id", ""))
+            if state is not None and not self._consumer_ready(request):
+                state.attempts += 1
             if not params.get("transfer_id"):
                 logger.warning("Missing transfer_id in kv_transfer_params from router!")
             else:
@@ -1202,11 +1329,16 @@ class MooncakeConnectorScheduler:
             return False, None
 
         assert not self.is_kv_consumer
+        state = self._optimistic_prefills.get(params["transfer_id"])
+        if state is not None:
+            state.terminal_published = True
 
         if request.status != RequestStatus.FINISHED_LENGTH_CAPPED:
             # Also include the case of a P/D Prefill request with immediate
             # block free (eg abort). Stop tracking this request.
             self._reqs_not_processed.add(params["transfer_id"])
+            self._optimistic_prefills.pop(params["transfer_id"], None)
+            self._consumer_pulls.pop(params["transfer_id"], None)
             return False, None
 
         # TODO: check whether block_ids actually ever be 0. If not we could
@@ -1248,6 +1380,8 @@ class MooncakeConnectorWorker:
         assert (kv_transfer_config := vllm_config.kv_transfer_config)
         self.is_kv_producer: bool = kv_transfer_config.kv_role == "kv_producer"
         self.is_kv_consumer: bool = kv_transfer_config.kv_role == "kv_consumer"
+        self.optimistic_prefill_attempts = get_optimistic_prefill_attempts(vllm_config)
+        self._consumer_pull_events: queue.SimpleQueue[TransferId] = queue.SimpleQueue()
         self.num_sender_workers = kv_transfer_config.kv_connector_extra_config.get(
             "num_workers", 10
         )
@@ -1564,6 +1698,8 @@ class MooncakeConnectorWorker:
     async def send_kv_to_decode(
         self, identity: bytes, sock: zmq.asyncio.Socket, meta: MooncakeXferMetadata
     ):
+        if self.optimistic_prefill_attempts and meta.remote_pp_size != 1:
+            raise ValueError("Optimistic prefill requires decode PP=1")
         pending_reqs: dict[ReqId, SendBlockMeta] = {}
         remote_tp_ranks = self.transfer_topo.handshake_target_ranks(meta.remote_tp_size)
         if meta.remote_tp_rank not in remote_tp_ranks:
@@ -1654,6 +1790,13 @@ class MooncakeConnectorWorker:
                 )
             send_meta = self.reqs_need_send[transfer_id]
             pending_reqs[d_req_id] = send_meta
+            if self.optimistic_prefill_attempts and meta.remote_pp_size == 1:
+                previously_ready = set(remote_tp_ranks) <= send_meta.consumer_tp_ranks
+                send_meta.consumer_tp_ranks.add(meta.remote_tp_rank)
+                if not previously_ready and (
+                    set(remote_tp_ranks) <= send_meta.consumer_tp_ranks
+                ):
+                    self._consumer_pull_events.put(transfer_id)
 
         async def wait_and_ret(
             d_req_id: ReqId, send_meta: SendBlockMeta
@@ -2086,6 +2229,16 @@ class MooncakeConnectorWorker:
         num_blocks = (
             self.kv_cache_config.num_blocks * self._physical_blocks_per_logical_kv_block
         )
+        placements = {
+            name: descriptor
+            for descriptor in self.kv_cache_config.kv_cache_tensors
+            for name in descriptor.layers
+        }
+        original_groups = {
+            name: group_id
+            for group_id, group in enumerate(self.kv_cache_config.kv_cache_groups)
+            for name in group.layer_names
+        }
 
         for layer_name, cache in kv_caches.items():
             layer_index = extract_layer_index(layer_name)
@@ -2106,6 +2259,86 @@ class MooncakeConnectorWorker:
                 seen_storage_ptrs.add(storage_addr)
                 kv_data_ptrs.append(storage_addr)
                 kv_data_lens.append(storage.nbytes())
+
+            if self.kv_cache_config.group_num_blocks is not None:
+                descriptor = placements[layer_name]
+                original_group = original_groups[layer_name]
+                count = self.kv_cache_config.num_blocks_for_group(original_group)
+                layout = self.cache_config.get_resolved_kv_cache_layout()
+                group_descriptors = [
+                    placement
+                    for placement in self.kv_cache_config.kv_cache_tensors
+                    if original_groups[placement.layers[0]] == original_group
+                ]
+                group_start = min(placement.offset for placement in group_descriptors)
+                group_end = (
+                    group_start + count * descriptor.block_stride
+                    if layout.is_block_outermost
+                    else max(
+                        placement.offset
+                        + len(placement.layers) * placement.layer_stride
+                        for placement in group_descriptors
+                    )
+                )
+                physical_ratio = (
+                    self._physical_blocks_per_logical_kv_block
+                    if isinstance(layer_spec, AttentionSpec)
+                    else 1
+                )
+                if cache.ndim == 1:
+                    raw = torch.empty(0, dtype=torch.int8, device=cache.device).set_(
+                        storage
+                    )
+                    cache = create_kv_cache_views(
+                        raw,
+                        layer_spec,
+                        count,
+                        layout,
+                        descriptor,
+                        kernel_block_size=(
+                            layer_spec.block_size // physical_ratio
+                            if physical_ratio > 1
+                            else None
+                        ),
+                    )[descriptor.layers.index(layer_name)]
+                expected_blocks = count * physical_ratio
+                if cache.shape[0] != expected_blocks:
+                    raise ValueError(
+                        f"Unexpected physical block count for {layer_name}"
+                    )
+                regions = (
+                    [cache]
+                    if is_non_overlapping_and_dense(cache[0])
+                    else [cache[:, head] for head in range(cache.shape[1])]
+                )
+                for region in regions:
+                    if not is_non_overlapping_and_dense(region[0]):
+                        raise ValueError(
+                            f"Non-contiguous Mooncake region: {layer_name}"
+                        )
+                    base = region.data_ptr()
+                    stride = region.stride(0) * region.element_size()
+                    payload = region[0].nbytes
+                    end = base - storage_addr + (expected_blocks - 1) * stride + payload
+                    if (
+                        base - storage_addr < group_start
+                        or end > group_end
+                        or end > storage.nbytes()
+                    ):
+                        raise ValueError(f"Mooncake region exceeds group: {layer_name}")
+                    region_base_addresses.append(base)
+                    self.block_len_per_layer.append(stride)
+                    self.kv_block_len_per_layer.append(payload)
+                    self.registered_layer_names.append(layer_name)
+                    self.registered_layer_indices.append(layer_index)
+                    self.registered_group_indices.append(group_index)
+                    self.region_shared_groups.append((group_index,))
+                    self.region_row_offsets.append(
+                        base - storage_addr - group_start
+                        if layout.is_block_outermost
+                        else -1
+                    )
+                continue
 
             is_mla_region = isinstance(
                 layer_spec, (MLAAttentionSpec, SlidingWindowMLASpec)
@@ -2404,6 +2637,18 @@ class MooncakeConnectorWorker:
             finished_recving=set(finished_recving_reqs or ()),
             failed_recving=failed_recving_reqs,
         )
+
+    def build_connector_worker_meta(self) -> MooncakeWorkerMetadata | None:
+        if not self.optimistic_prefill_attempts:
+            return None
+        consumer_pulls: dict[TransferId, set[int]] = {}
+        while True:
+            try:
+                transfer_id = self._consumer_pull_events.get_nowait()
+            except queue.Empty:
+                break
+            consumer_pulls[transfer_id] = {self.tp_rank}
+        return MooncakeWorkerMetadata(consumer_pulls)
 
     def get_kv_connector_stats(self) -> KVConnectorStats | None:
         """Return transfer stats collected since the last call, or None

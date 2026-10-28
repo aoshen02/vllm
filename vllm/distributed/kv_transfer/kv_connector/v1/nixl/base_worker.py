@@ -176,8 +176,11 @@ class NixlBaseConnectorWorker:
             else self.num_regions or len(self.block_len_per_layer)
         )
         if region_num_blocks is None:
-            region_num_blocks = [num_blocks] * num_desc_regions
-        elif block_size_ratio is not None:
+            region_num_blocks = [dst_num_blocks] * num_desc_regions
+        logical_region_counts = [
+            count // physical_blocks_per_logical for count in region_num_blocks
+        ]
+        if block_size_ratio is not None:
             region_num_blocks = [
                 int(count * block_size_ratio) for count in region_num_blocks
             ]
@@ -233,6 +236,49 @@ class NixlBaseConnectorWorker:
             if not desc_ids:
                 return np.array([], dtype=np.int64)
             return np.concatenate(desc_ids)
+
+        if (
+            region_group_ids is not None
+            and _SHARED_REGION_GROUP_ID not in region_group_ids
+        ):
+            assert self._conv_decomp is not None
+            ssm_regions = self._ssm_region_indices or range(self.num_regions)
+            state_regions = [
+                region
+                for region in ssm_regions
+                for _ in range(len(self._conv_decomp.local_conv_offsets) + 1)
+            ]
+            if self._ple_region_index is not None:
+                state_regions.append(self._ple_region_index)
+            state_counts = [logical_region_counts[region] for region in state_regions]
+            state_offsets = np.cumsum([num_fa_descs, *state_counts[:-1]])
+            grouped_descs: list[np.ndarray] = []
+            for group_id, group in enumerate(block_ids):
+                group_arr = np.asarray(group, dtype=np.int64)
+                if _is_attention_spec(self._group_spec_types[group_id]):
+                    offsets = [
+                        region_offsets[region]
+                        for region, owner in enumerate(region_group_ids)
+                        if owner == group_id
+                    ]
+                else:
+                    offsets = [
+                        state_offsets[index]
+                        for index, region in enumerate(state_regions)
+                        if region_group_ids[region] == group_id
+                    ]
+                if group:
+                    assert offsets, (
+                        "Transfer group has no registered descriptor regions"
+                    )
+                    grouped_descs.append(
+                        (np.asarray(offsets)[:, None] + group_arr[None, :]).ravel()
+                    )
+            return (
+                np.concatenate(grouped_descs)
+                if grouped_descs
+                else np.array([], dtype=np.int64)
+            )
 
         # Compute desc ids per group using the right stride: FA descs have
         # num_blocks entries per region (kernel granularity, expanded by
@@ -315,7 +361,7 @@ class NixlBaseConnectorWorker:
             else 0
         )
         sharded_desc_end = num_descs - (
-            self._logical_num_blocks if self._ple_region_index is not None else 0
+            int(src_blocks_data[-1, 4]) if self._ple_region_index is not None else 0
         )
         assert num_fa_descs <= sharded_desc_end
 
@@ -1597,6 +1643,11 @@ class NixlBaseConnectorWorker:
                 key=_region_sort_key,
             )
         )
+        allocation_block_strides = {
+            name: tensor.block_stride
+            for tensor in self.kv_cache_config.kv_cache_tensors
+            for name in tensor.layers
+        }
         for layer_name in layer_names:
             cache = xfer_buffers[layer_name]
             # NOTE (NickLucche) Hybrid SSM mamba/FA physical page_size may differ when
@@ -1625,13 +1676,11 @@ class NixlBaseConnectorWorker:
                 logical_num_blocks = self.kv_cache_config.hisparse_host_num_blocks
                 assert logical_num_blocks is not None
             else:
-                logical_num_blocks = self.kv_cache_config.num_blocks
+                logical_num_blocks = self.kv_cache_config.num_blocks_for_group(
+                    self.kv_cache_config.transfer_group_ids[group_index]
+                )
             group_id = group_index
-            num_blocks = (
-                logical_num_blocks
-                if isinstance(layer_spec, MambaSpec)
-                else logical_num_blocks * self._physical_blocks_per_logical_kv_block
-            )
+            num_blocks = logical_num_blocks * self._physical_blocks_per_logical_kv_block
             is_mla_region = isinstance(
                 layer_spec, (MLAAttentionSpec, SlidingWindowMLASpec)
             )
@@ -1665,11 +1714,11 @@ class NixlBaseConnectorWorker:
             if isinstance(layer_spec, MambaSpec):
                 physical_ratio = self._physical_blocks_per_logical_kv_block
                 block_len = physical_page_size // physical_ratio
-                block_stride = physical_page_size
-                if self._is_csa_linear and cache.ndim != 1:
-                    # CSA-linear packs multiple cache owners in each block, so
-                    # state views advance by the packed block stride.
-                    block_stride = cache.stride(0) * cache.element_size()
+                block_stride = (
+                    allocation_block_strides[layer_name]
+                    if cache.ndim != 1 and not self.use_host_buffer
+                    else physical_page_size
+                )
                 assert block_stride % physical_ratio == 0
                 region_specs = [
                     (cache.data_ptr(), block_len, block_stride // physical_ratio)
@@ -1844,7 +1893,7 @@ class NixlBaseConnectorWorker:
         self.region_mem_types = region_mem_types
         self._uses_region_group_mapping = len(set(self.region_group_ids)) > 1
         self._mixed_mem_types = len(set(region_mem_types)) > 1
-        if self._has_mamba:
+        if self._has_mamba and self.kv_cache_config.group_num_blocks is None:
             self.region_num_blocks = [self.num_blocks] * self.num_regions
 
         self._set_region_layers(region_layers)
@@ -2033,13 +2082,13 @@ class NixlBaseConnectorWorker:
         assert self._conv_decomp is not None
         conv_offsets = self._conv_decomp.local_conv_offsets
         conv_size, ssm_size = self._mamba_ssm_size
-        num_blocks = self._logical_num_blocks
         physical_per_logical = self._physical_blocks_per_logical_kv_block
         device_id = self.device_id
         strided_descs: list[tuple[int, int, int, int, int]] = []
 
         region_indices = self._ssm_region_indices or range(len(base_addresses))
         for i in region_indices:
+            num_blocks = self.region_num_blocks[i] // physical_per_logical
             base_addr = base_addresses[i]
             block_stride = self.block_stride_per_layer[i] * physical_per_logical
             for off, sz in conv_offsets:
@@ -2052,6 +2101,7 @@ class NixlBaseConnectorWorker:
             )
 
         if (region_index := self._ple_region_index) is not None:
+            num_blocks = self.region_num_blocks[region_index] // physical_per_logical
             block_len = self._ple_page_len() * physical_per_logical
             block_stride = (
                 self.block_stride_per_layer[region_index] * physical_per_logical
@@ -2089,7 +2139,9 @@ class NixlBaseConnectorWorker:
             ssm_read_size = nixl_agent_meta.ssm_sizes[1]
 
         remote_physical_per_logical = transfer_info.remote_physical_blocks_per_logical
-        num_blocks = nixl_agent_meta.num_blocks // remote_physical_per_logical
+        region_counts = nixl_agent_meta.region_num_blocks or [
+            nixl_agent_meta.num_blocks
+        ] * len(nixl_agent_meta.kv_caches_base_addr)
         device_id = nixl_agent_meta.device_id
 
         strided_descs: list[tuple[int, int, int, int, int]] = []
@@ -2099,6 +2151,7 @@ class NixlBaseConnectorWorker:
             len(nixl_agent_meta.kv_caches_base_addr)
         )
         for i in region_indices:
+            num_blocks = region_counts[i] // remote_physical_per_logical
             base_addr = nixl_agent_meta.kv_caches_base_addr[i]
             block_stride = (
                 nixl_agent_meta.block_strides[i] * remote_physical_per_logical
@@ -2114,6 +2167,7 @@ class NixlBaseConnectorWorker:
             )
 
         if (region_index := self._ple_region_index) is not None:
+            num_blocks = region_counts[region_index] // remote_physical_per_logical
             local_block_len = (
                 self._ple_page_len() * self._physical_blocks_per_logical_kv_block
             )

@@ -621,7 +621,7 @@ def validate_kv_cache_layout(
         for group in kv_cache_groups
         for layer_name in group.layer_names
     }
-    if len(page_sizes) == 1:
+    if len(page_sizes) <= 1:
         # A rectangular layer dim exists; every layout can express it.
         return
 
@@ -643,6 +643,7 @@ def get_kv_cache_config_from_groups(
     vllm_config: VllmConfig,
     kv_cache_groups: list[KVCacheGroupSpec],
     available_memory: int,
+    group_num_blocks: tuple[int, ...] | None = None,
 ) -> KVCacheConfig:
     """Generate the KV cache configuration from the KV cache groups and spec
     of each layer.
@@ -651,6 +652,8 @@ def get_kv_cache_config_from_groups(
         vllm_config: The global VllmConfig
         kv_cache_groups: The KV cache groups
         available_memory: Memory available for KV cache in bytes
+        group_num_blocks: Optional independent group capacities, including null blocks.
+
     Returns:
         The generated KVCacheConfig
 
@@ -668,21 +671,57 @@ def get_kv_cache_config_from_groups(
         )
 
     if vllm_config.attention_config.hisparse_config is not None:
+        if group_num_blocks is not None:
+            raise ValueError("Independent group capacities cannot override HiSparse.")
         host_budget = get_hisparse_host_pool_bytes(vllm_config)
         return get_hisparse_kv_cache_config(
             vllm_config, kv_cache_groups, available_memory, host_budget
         )
 
     layout = vllm_config.cache_config.get_resolved_kv_cache_layout()
-    validate_kv_cache_layout(layout, kv_cache_groups)
-    bytes_per_block = _get_kv_cache_bytes_per_block(kv_cache_groups, layout)
-    interleaved_block_stride = bytes_per_block if layout.is_block_outermost else None
+    if group_num_blocks is None:
+        validate_kv_cache_layout(layout, kv_cache_groups)
+        bytes_per_block = _get_kv_cache_bytes_per_block(kv_cache_groups, layout)
+        num_blocks = may_override_num_blocks(
+            vllm_config, available_memory // bytes_per_block
+        )
+        size = bytes_per_block * num_blocks
+        group_counts = (num_blocks,) * len(kv_cache_groups)
+        group_strides = [bytes_per_block] * len(kv_cache_groups)
+        group_offsets = [0] * len(kv_cache_groups)
+    else:
+        if len(group_num_blocks) != len(kv_cache_groups) or any(
+            type(count) is not int or count < 1 for count in group_num_blocks
+        ):
+            raise ValueError("Each cache group needs a positive integer block count.")
+        if vllm_config.cache_config.num_gpu_blocks_override is not None:
+            raise ValueError("A shared block override conflicts with group capacities.")
+        group_counts = group_num_blocks
+        group_strides = []
+        group_offsets = []
+        size = 0
+        for group, count in zip(kv_cache_groups, group_counts):
+            validate_kv_cache_layout(layout, [group])
+            stride = (
+                _get_kv_cache_bytes_per_block([group], layout)
+                if group.layer_names
+                else 0
+            )
+            alignment = math.lcm(
+                *(
+                    _get_per_layer_spec(group, name).get_block_stride_alignment()
+                    for name in group.layer_names
+                )
+            )
+            size = round_up(size, alignment)
+            group_strides.append(stride)
+            group_offsets.append(size)
+            size += stride * count
+        if size > available_memory:
+            raise ValueError("Independent group capacities exceed the cache budget.")
+        num_blocks = max(group_counts)
 
-    num_blocks = available_memory // bytes_per_block
-    num_blocks = may_override_num_blocks(vllm_config, num_blocks)
-    size = bytes_per_block * num_blocks
-
-    # Groups alias from byte 0. Spec regions are laid out differently:
+    # Within each group's region, specs are laid out differently:
     #
     # block-outer (the same packing repeats for every block):
     # group 0: | blk 0 [ A | B  | pad ] | blk 1 [ A | B  | pad ] | ...
@@ -694,7 +733,7 @@ def get_kv_cache_config_from_groups(
     # group 1: | C [ blk 0 | blk 1 | ... ] | D [ blk 0 | blk 1 | ... ] |
 
     kv_cache_tensors = []
-    for group in kv_cache_groups:
+    for group_id, group in enumerate(kv_cache_groups):
         group_spec = group.kv_cache_spec
         layers_by_spec: defaultdict[KVCacheSpec, list[str]] = defaultdict(list)
         if isinstance(group_spec, UniformTypeKVCacheSpecs):
@@ -703,16 +742,18 @@ def get_kv_cache_config_from_groups(
         elif group.layer_names:
             layers_by_spec[group_spec].extend(group.layer_names)
 
-        byte_offset = 0
+        byte_offset = group_offsets[group_id]
         for spec, layer_names in layers_by_spec.items():
-            block_stride = interleaved_block_stride
+            block_stride = (
+                group_strides[group_id] if layout.is_block_outermost else None
+            )
             padded_page = _get_layer_block_stride(spec)
             if block_stride is None and padded_page != spec.page_size_bytes:
                 assert layout.is_block_compact, f"{layout.name} cannot pad pages"
                 block_stride = padded_page
             layer_stride, block_stride, _, _, _ = compute_layout_strides(
                 spec,
-                num_blocks,
+                group_counts[group_id],
                 len(layer_names),
                 layout,
                 fixed_strides=(None, block_stride, None, None, None),
@@ -735,6 +776,7 @@ def get_kv_cache_config_from_groups(
         num_blocks=num_blocks,
         kv_cache_tensors=kv_cache_tensors,
         kv_cache_groups=kv_cache_groups,
+        group_num_blocks=group_num_blocks,
         prefix_cache_retention_interval=(
             vllm_config.cache_config.prefix_cache_retention_interval
         ),
@@ -1135,6 +1177,13 @@ def get_kv_cache_groups(
     if hisparse_groups := get_hisparse_kv_cache_groups(vllm_config, kv_cache_spec):
         return hisparse_groups
 
+    if vllm_config.cache_config.mamba_full_memory_ratio is not None and any(
+        isinstance(layer_spec, MambaSpec)
+        for spec in kv_cache_spec.values()
+        for layer_spec in iter_layer_specs(spec)
+    ):
+        return _get_kv_cache_groups_uniform_page_size(kv_cache_spec)
+
     if is_kv_cache_spec_uniform(kv_cache_spec):
         # KV cache of all layers are the same, which is true for
         # most models. Allocate the same amount of memory for
@@ -1410,6 +1459,213 @@ def _auto_fit_max_model_len(
         )
 
 
+def _get_ratio_kv_cache_configs(
+    builder: KVCacheConfigBuilder,
+    vllm_config: VllmConfig,
+    global_groups: list[KVCacheGroupSpec],
+    projected_groups: list[list[KVCacheGroupSpec]],
+    available_memory: list[int],
+) -> list[KVCacheConfig]:
+    """Resolve common native capacities from every worker's physical budget."""
+    cache_config = vllm_config.cache_config
+    ratio = cache_config.mamba_full_memory_ratio
+    assert ratio is not None
+    ratio_numerator, ratio_denominator = ratio.as_integer_ratio()
+    if cache_config.num_gpu_blocks_override is not None:
+        raise ValueError("A shared block override conflicts with the Mamba ratio")
+    if vllm_config.attention_config.hisparse_config is not None:
+        raise ValueError("Mamba ratio planning does not support HiSparse host storage")
+    mamba_groups: list[bool] = []
+    for group in global_groups:
+        specs = list(iter_layer_specs(group.kv_cache_spec))
+        is_mamba = bool(specs) and all(isinstance(spec, MambaSpec) for spec in specs)
+        if group.host_resident or not (
+            is_mamba
+            or (
+                specs
+                and all(
+                    isinstance(spec, (FullAttentionSpec, SlidingWindowSpec))
+                    for spec in specs
+                )
+            )
+        ):
+            raise ValueError(
+                "Mamba ratio planning supports Mamba, full-attention and "
+                "sliding-window groups; "
+                "other cache types need an explicit budget policy"
+            )
+        mamba_groups.append(is_mamba)
+    assert any(mamba_groups)
+    layout = cache_config.get_resolved_kv_cache_layout()
+    fixed_counts = (
+        tuple(
+            1
+            + cache_config.mamba_fixed_num_seqs
+            * cdiv(
+                group.kv_cache_spec.max_memory_usage_bytes(vllm_config),
+                group.kv_cache_spec.page_size_bytes,
+            )
+            if is_mamba
+            else 1
+            for group, is_mamba in zip(global_groups, mamba_groups, strict=True)
+        )
+        if not cache_config.enable_prefix_caching
+        and cache_config.mamba_fixed_num_seqs is not None
+        else None
+    )
+    worker_costs: list[tuple[int, int, int, int]] = []
+    for groups, budget in zip(projected_groups, available_memory, strict=True):
+        mamba_stride = attention_stride = initialization_reserve = 0
+        fixed_mamba_bytes = 0
+        for group_id, (group, is_mamba) in enumerate(
+            zip(groups, mamba_groups, strict=True)
+        ):
+            if not group.layer_names:
+                continue
+            validate_kv_cache_layout(layout, [group])
+            stride = (
+                _get_kv_cache_bytes_per_block([group], layout)
+                + group.replayssm_tracker_bytes_per_block
+            )
+            alignment = math.lcm(
+                *(
+                    _get_per_layer_spec(group, name).get_block_stride_alignment()
+                    for name in group.layer_names
+                )
+            )
+            initialization_reserve += alignment - 1
+            initialization_reserve += (
+                group.replayssm_tracker_bytes_per_block
+                * vllm_config.scheduler_config.max_num_seqs
+            )
+            if is_mamba:
+                mamba_stride += stride
+                if fixed_counts is not None:
+                    fixed_mamba_bytes += stride * fixed_counts[group_id]
+            else:
+                attention_stride += stride
+        if budget < initialization_reserve:
+            raise ValueError(
+                "Cache budget cannot hold alignment and cursor-rebinding reservations"
+            )
+        worker_costs.append(
+            (
+                mamba_stride,
+                attention_stride,
+                budget - initialization_reserve,
+                fixed_mamba_bytes,
+            )
+        )
+
+    mamba_count = (
+        0
+        if fixed_counts is not None
+        else min(
+            (budget * ratio_numerator // (ratio_numerator + ratio_denominator))
+            // mamba_stride
+            for mamba_stride, _, budget, _ in worker_costs
+            if mamba_stride
+        )
+    )
+    if any(budget < fixed_bytes for _, _, budget, fixed_bytes in worker_costs):
+        raise ValueError(
+            "Cache budget cannot hold fixed Mamba state for max_num_seqs, "
+            "including verification pages and null blocks"
+        )
+    attention_count = min(
+        (
+            (
+                budget
+                - (
+                    fixed_bytes
+                    if fixed_counts is not None
+                    else mamba_count * mamba_stride
+                )
+            )
+            // attention_stride
+            for mamba_stride, attention_stride, budget, fixed_bytes in worker_costs
+            if attention_stride
+        ),
+        default=0,
+    )
+    counts = tuple(
+        (fixed_counts[group_id] if fixed_counts is not None else mamba_count)
+        if is_mamba
+        else attention_count
+        for group_id, is_mamba in enumerate(mamba_groups)
+    )
+    if min(counts) < 2:
+        raise ValueError(
+            "Mamba ratio cache budget must hold a null block and usable "
+            "capacity in every group; increase cache memory or adjust the ratio"
+        )
+
+    def fits(model_len: int) -> bool:
+        vllm_config.model_config.max_model_len = model_len
+        return all(
+            count - 1
+            >= cdiv(
+                group.kv_cache_spec.max_memory_usage_bytes(vllm_config),
+                group.kv_cache_spec.page_size_bytes,
+            )
+            for group, count in zip(global_groups, counts, strict=True)
+        )
+
+    original_max = vllm_config.model_config.max_model_len
+    try:
+        if vllm_config.model_config.original_max_model_len == -1:
+            lower, upper = 1, original_max
+            fitted = 0
+            while lower <= upper:
+                candidate = (lower + upper) // 2
+                if fits(candidate):
+                    fitted = candidate
+                    lower = candidate + 1
+                else:
+                    upper = candidate - 1
+            if not fitted:
+                raise ValueError("Mamba ratio capacities cannot serve even one token")
+        else:
+            fitted = original_max
+            if not fits(fitted):
+                raise ValueError(
+                    "Mamba ratio capacities cannot serve one request at max_model_len; "
+                    "increase cache memory, adjust the ratio, or reduce max_model_len"
+                )
+    finally:
+        vllm_config.model_config.max_model_len = original_max
+    vllm_config.model_config.max_model_len = fitted
+    logger.info(
+        "Native Mamba cache policy %s (ratio=%s): group blocks %s (including nulls), "
+        "max_model_len=%d; alignment and cursor-rebinding headroom are reserved",
+        "fixed requests" if fixed_counts is not None else "ratio",
+        ratio,
+        counts,
+        fitted,
+    )
+    configs = [
+        builder.get_kv_cache_config_from_group_counts(
+            vllm_config,
+            groups,
+            counts,
+            budget
+            - sum(
+                group.replayssm_tracker_bytes_per_block
+                * (count + vllm_config.scheduler_config.max_num_seqs)
+                for group, count in zip(groups, counts, strict=True)
+            ),
+        )
+        for groups, budget in zip(projected_groups, available_memory, strict=True)
+    ]
+    for config in configs:
+        config.kv_tp_replicas = kv_cache_groups_tp_replicas(
+            config.kv_cache_groups,
+            vllm_config.parallel_config.tensor_parallel_size,
+            vllm_config.parallel_config.decode_context_parallel_size,
+        )
+    return configs
+
+
 def _project_kv_cache_groups_to_worker(
     global_kv_cache_groups: list[KVCacheGroupSpec],
     worker_spec: dict[str, KVCacheSpec],
@@ -1495,7 +1751,6 @@ def get_kv_cache_configs(
     from vllm.v1.core.kv_cache_config_builder import get_kv_cache_config_builder
 
     builder = get_kv_cache_config_builder(vllm_config)
-
     # Merge the KV cache specs of all workers. Different PP stages may have
     # different layer names, and different TP ranks of the same PP stage should
     # have the same KV cache spec.
@@ -1509,6 +1764,17 @@ def get_kv_cache_configs(
                     "The KV cache specs for the same layer are different "
                     "across workers. This is not supported yet."
                 )
+
+    use_mamba_ratio = (
+        vllm_config.cache_config.mamba_full_memory_ratio is not None
+        and any(
+            isinstance(layer_spec, MambaSpec)
+            for spec in merged_kv_cache_specs.values()
+            for layer_spec in iter_layer_specs(spec)
+        )
+    )
+    if use_mamba_ratio and vllm_config.scheduler_config.disable_hybrid_kv_cache_manager:
+        raise ValueError("Mamba ratio planning requires the hybrid KV cache manager")
 
     # Check if the KV cache specs are registered correctly.
     # This is to prevent that some layers are initialized with unregistered specs.
@@ -1545,6 +1811,15 @@ def get_kv_cache_configs(
         _project_kv_cache_groups_to_worker(global_kv_cache_groups, worker_spec)
         for worker_spec in kv_cache_specs
     ]
+
+    if use_mamba_ratio:
+        return _get_ratio_kv_cache_configs(
+            builder,
+            vllm_config,
+            global_kv_cache_groups,
+            projected_groups_per_worker,
+            available_memory,
+        )
 
     # If `num_gpu_blocks_override` is set, the cache size that will actually
     # be allocated is decoupled from the profiled `available_memory`. Reflect
@@ -1687,7 +1962,10 @@ class DefaultKVCacheConfigBuilder(KVCacheConfigBuilder):
         num_blocks: int,
     ) -> KVCacheConfig:
         """See ``KVCacheConfigBuilder.get_kv_cache_config_from_groups``."""
-        if len(kv_cache_groups) == 0:
+        if len(kv_cache_groups) == 0 or (
+            vllm_config.cache_config.mamba_full_memory_ratio is not None
+            and not any(group.layer_names for group in kv_cache_groups)
+        ):
             # Attention free models do not have KV cache.
             # Return num_blocks=1 as BlockPool always needs a null_block.
             return KVCacheConfig(
@@ -1698,7 +1976,40 @@ class DefaultKVCacheConfigBuilder(KVCacheConfigBuilder):
                     vllm_config.cache_config.prefix_cache_retention_interval
                 ),
             )
+        if vllm_config.cache_config.mamba_full_memory_ratio is not None and any(
+            isinstance(spec, MambaSpec)
+            for group in kv_cache_groups
+            if group.layer_names
+            for spec in iter_layer_specs(group.kv_cache_spec)
+        ):
+            layout = vllm_config.cache_config.get_resolved_kv_cache_layout()
+            group_strides = sum(
+                _get_kv_cache_bytes_per_block([group], layout)
+                for group in kv_cache_groups
+                if group.layer_names
+            )
+            return self.get_kv_cache_config_from_group_counts(
+                vllm_config,
+                kv_cache_groups,
+                (num_blocks,) * len(kv_cache_groups),
+                (num_blocks + 1) * group_strides,
+            )
         bytes_per_block = _pool_bytes_per_block(vllm_config, kv_cache_groups)
         return get_kv_cache_config_from_groups(
             vllm_config, kv_cache_groups, num_blocks * bytes_per_block
+        )
+
+    def get_kv_cache_config_from_group_counts(
+        self,
+        vllm_config: VllmConfig,
+        kv_cache_groups: list[KVCacheGroupSpec],
+        group_num_blocks: tuple[int, ...],
+        available_memory: int,
+    ) -> KVCacheConfig:
+        """Place native groups in one allocation with independent capacities."""
+        return get_kv_cache_config_from_groups(
+            vllm_config,
+            kv_cache_groups,
+            available_memory,
+            group_num_blocks=group_num_blocks,
         )

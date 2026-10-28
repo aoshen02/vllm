@@ -205,7 +205,14 @@ class KVCacheManager:
         # Watermark: minimum number of KV cache blocks to keep free when
         # admitting waiting/preempted requests, to avoid frequent preemptions.
         assert watermark >= 0.0, "watermark must be non-negative"
-        self.watermark_blocks = int(watermark * kv_cache_config.num_blocks)
+        self.watermark_blocks = (
+            {
+                group_id: int(watermark * count)
+                for group_id, count in enumerate(kv_cache_config.group_num_blocks)
+            }
+            if kv_cache_config.group_num_blocks is not None
+            else int(watermark * kv_cache_config.num_blocks)
+        )
         self.kv_cache_event_metadata = tuple(
             (
                 get_kv_cache_spec_kind(group.kv_cache_spec).value,
@@ -225,13 +232,53 @@ class KVCacheManager:
 
     @property
     def usage(self) -> float:
-        """Get the KV cache usage.
+        """Get the occupied fraction of usable cache block slots.
 
         Returns:
             The KV cache usage (between 0.0 and 1.0).
 
         """
-        return self.block_pool.get_usage()
+        if not self.coordinator.independent_groups:
+            return self.block_pool.get_usage()
+        pools = self.coordinator.block_pools
+        total = sum(pool.num_gpu_blocks - 1 for pool in pools)
+        return (
+            1.0 - sum(pool.get_num_free_blocks() for pool in pools) / total
+            if total
+            else 0.0
+        )
+
+    def _can_allocate_blocks(
+        self,
+        demand: int | dict[int, int],
+        watermark: int | dict[int, int],
+        reserved: int | dict[int, int] = 0,
+    ) -> bool:
+        if not self.coordinator.independent_groups:
+            assert isinstance(demand, int)
+            assert isinstance(watermark, int)
+            assert isinstance(reserved, int)
+            return (
+                demand + watermark <= self.block_pool.get_num_free_blocks() - reserved
+            )
+        assert isinstance(demand, dict)
+        if isinstance(reserved, int):
+            if reserved:
+                raise ValueError("Independent group reservations must be group-keyed")
+            reserved = {}
+        if isinstance(watermark, int):
+            assert watermark == 0
+            watermark = {}
+        if any(
+            group_id not in demand or count < 0 for group_id, count in reserved.items()
+        ):
+            raise ValueError("Invalid independent group reservation")
+        for group_id, count in demand.items():
+            pool = self.coordinator.single_type_managers[group_id].block_pool
+            available = pool.get_num_free_blocks() - reserved.get(group_id, 0)
+            if count + watermark.get(group_id, 0) > available:
+                return False
+        return True
 
     def make_prefix_cache_stats(self) -> PrefixCacheStats | None:
         """Get (and reset) the prefix cache stats.
@@ -379,7 +426,7 @@ class KVCacheManager:
         delay_cache_blocks: bool = False,
         num_encoder_tokens: int = 0,
         full_sequence_must_fit: bool = False,
-        reserved_blocks: int = 0,
+        reserved_blocks: int | dict[int, int] = 0,
         has_scheduled_reqs: bool = True,
         skip_zeroing_group_ids: tuple[int, ...] = (),
     ) -> KVCacheBlocks | None:
@@ -412,6 +459,7 @@ class KVCacheManager:
                 made if it fits within (free blocks - reserved_blocks). Used to gate
                 async KV-connector loads so their initial allocation cannot consume
                 blocks an already in-flight (prefilling) sequence is relying on.
+                Independent capacities require a group-keyed mapping, or zero.
             has_scheduled_reqs: Whether any requests are already scheduled to run
                 this step, controls whether watermark is applied.
             skip_zeroing_group_ids: Groups whose external-token blocks will be
@@ -506,7 +554,7 @@ class KVCacheManager:
             self.max_model_len,
         )
 
-        watermark_blocks = 0
+        watermark_blocks: int | dict[int, int] = 0
         # The watermark is applied to waiting/preempted requests only, and only
         # when there's at least one request already scheduled.
         if has_scheduled_reqs and request.status in (
@@ -534,8 +582,7 @@ class KVCacheManager:
                 apply_admission_cap=True,
                 prefill_end=prefill_end,
             )
-            required_blocks = num_blocks_to_allocate + watermark_blocks
-            if required_blocks > self.block_pool.get_num_free_blocks():
+            if not self._can_allocate_blocks(num_blocks_to_allocate, watermark_blocks):
                 return None
 
         num_tokens_main_model = total_computed_tokens + num_new_tokens
@@ -572,9 +619,9 @@ class KVCacheManager:
 
         # Keep `reserved_blocks` free for other in-flight sequences, and an
         # additional watermark of headroom for waiting/preempted admissions.
-        available_blocks = self.block_pool.get_num_free_blocks() - reserved_blocks
-        required_blocks = num_blocks_to_allocate + watermark_blocks
-        if required_blocks > available_blocks:
+        if not self._can_allocate_blocks(
+            num_blocks_to_allocate, watermark_blocks, reserved_blocks
+        ):
             # Cannot allocate new blocks
             return None
 
@@ -662,14 +709,32 @@ class KVCacheManager:
         """
         return self.coordinator.pop_blocks_for_free(request.request_id)
 
-    def evict_blocks(self, block_ids: set[int]) -> None:
+    def evict_blocks(self, block_ids: set[int] | dict[int, set[int]]) -> None:
         """Evict blocks from the prefix cache by their block IDs.
 
         Args:
-            block_ids: Set of block IDs to evict from cache.
+            block_ids: Block IDs, group-keyed for multiple independent pools.
 
         """
-        self.block_pool.evict_blocks(block_ids)
+        if self.coordinator.independent_groups:
+            if isinstance(block_ids, set) and self.num_kv_cache_groups == 1:
+                block_ids = {0: block_ids}
+            if not isinstance(block_ids, dict):
+                raise ValueError("Independent group eviction must be group-keyed")
+            for group_id, ids in block_ids.items():
+                if group_id < 0 or group_id >= self.num_kv_cache_groups:
+                    raise ValueError("Unknown cache group for eviction")
+                pool = self.coordinator.single_type_managers[group_id].block_pool
+                if any(
+                    block_id < 0 or block_id >= pool.num_gpu_blocks for block_id in ids
+                ):
+                    raise ValueError("Block ID is outside its capacity domain")
+            for group_id, ids in block_ids.items():
+                pool = self.coordinator.single_type_managers[group_id].block_pool
+                pool.evict_blocks(ids)
+        else:
+            assert isinstance(block_ids, set)
+            self.block_pool.evict_blocks(block_ids)
 
     def reset_prefix_cache(self) -> bool:
         """Reset prefix cache. This function may be used in RLHF
@@ -701,6 +766,9 @@ class KVCacheManager:
 
         """
         events = self.block_pool.take_events()
+        if self.coordinator.independent_groups:
+            for pool in self.coordinator.block_pools[1:]:
+                pool.kv_event_queue = self.block_pool.kv_event_queue
         for event in events:
             if not isinstance(event, BlockStored):
                 continue
@@ -830,8 +898,13 @@ class KVCacheManager:
             truncated.append(list(group_blocks[:num_blocks]))
         return self.create_kv_cache_blocks(tuple(truncated))
 
-    def take_new_block_ids(self) -> list[int]:
+    def take_new_block_ids(self) -> list[int] | dict[int, list[int]]:
         """Drain and return new attention block IDs for zeroing."""
+        if self.coordinator.independent_groups:
+            return {
+                manager.kv_cache_group_id: manager.take_new_block_ids()
+                for manager in self.coordinator.single_type_managers
+            }
         ids: list[int] = []
         for mgr in self.coordinator.single_type_managers:
             ids.extend(mgr.take_new_block_ids())
@@ -853,20 +926,28 @@ class KVCacheManager:
 
     def take_kv_cache_block_copies(
         self,
-    ) -> tuple[list[KVCacheBlockCopy], list[KVCacheBlock]]:
+    ) -> tuple[
+        list[KVCacheBlockCopy] | dict[int, list[KVCacheBlockCopy]], list[KVCacheBlock]
+    ]:
         """Drain pending copies and return their retained endpoints."""
-        pending_copies: list[tuple[KVCacheBlock, KVCacheBlock]] = []
+        copies: list[KVCacheBlockCopy] = []
+        group_copies: dict[int, list[KVCacheBlockCopy]] = {}
+        retained_blocks: list[KVCacheBlock] = []
         for mgr in self.coordinator.single_type_managers:
-            pending_copies.extend(mgr.take_pending_cow_copies())
-        copies = [
-            KVCacheBlockCopy(
-                src_block_id=source_block.block_id,
-                dst_block_id=cow_block.block_id,
-            )
-            for source_block, cow_block in pending_copies
-        ]
-        retained_blocks = [block for pair in pending_copies for block in pair]
-        return copies, retained_blocks
+            pending = mgr.take_pending_cow_copies()
+            manager_copies = [
+                KVCacheBlockCopy(source.block_id, destination.block_id)
+                for source, destination in pending
+            ]
+            if self.coordinator.independent_groups:
+                group_copies[mgr.kv_cache_group_id] = manager_copies
+            else:
+                copies.extend(manager_copies)
+            retained_blocks.extend(block for pair in pending for block in pair)
+        return (
+            group_copies if self.coordinator.independent_groups else copies,
+            retained_blocks,
+        )
 
     def take_boundary_state_offloads(
         self,

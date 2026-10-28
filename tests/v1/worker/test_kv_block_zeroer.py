@@ -8,18 +8,133 @@ import pytest
 import torch
 
 from tests.v1.attention.utils import dense_kv_cache_views
+from vllm.config import DeviceConfig, VllmConfig
+from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.v1.kv_cache_interface import (
     ChunkedLocalAttentionSpec,
     FullAttentionSpec,
+    KVCacheGroupSpec,
     KVCacheLayout,
+    MambaSpec,
     SlidingWindowSpec,
+    create_kv_cache_views,
 )
 from vllm.v1.worker import utils as worker_utils
 from vllm.v1.worker.utils import (
     AttentionGroup,
     KVBlockZeroer,
     _zero_kv_blocks_kernel,
+    allocate_kv_cache,
 )
+
+
+def _make_zeroer(*storages: torch.Tensor) -> KVBlockZeroer:
+    groups = []
+    context = {}
+    for index, storage in enumerate(storages):
+        name = f"layer.{index}"
+        layer = torch.nn.Module()
+        layer.register_buffer("kv_cache", storage)
+        context[name] = layer
+        spec = FullAttentionSpec(
+            block_size=1,
+            num_kv_heads=1,
+            head_size=storage.shape[1] // 2,
+            dtype=torch.int32,
+        )
+        groups.append(AttentionGroup(None, [name], spec, 0))
+    return KVBlockZeroer(
+        storages[0].device,
+        attn_groups_iter=groups,
+        kernel_block_sizes=[1],
+        static_forward_context=context,
+        num_blocks=storages[0].shape[0],
+    )
+
+
+class BoundMambaStates(torch.nn.Module, MambaBase):
+    def __init__(self, spec, pages):
+        super().__init__()
+        self.spec = spec
+        self.bind_kv_cache(pages)
+        for index, state in enumerate(self.kv_cache):
+            self.register_buffer(f"state_{index}", state)
+
+    def get_state_shape(self):
+        return self.spec.shapes
+
+    def get_state_dtype(self):
+        return self.spec.dtypes
+
+    @property
+    def mamba_type(self):
+        return self.spec.mamba_type
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("layout", list(KVCacheLayout))
+@pytest.mark.parametrize("bound_states", [False, True])
+def test_independent_mamba_zeroing_clears_only_selected_domain(layout, bound_states):
+    from vllm.v1.core.kv_cache_planning import get_kv_cache_config_from_groups
+
+    device = torch.device("cuda")
+    attention = FullAttentionSpec(
+        block_size=16, num_kv_heads=1, head_size=4, dtype=torch.float32
+    )
+    state = MambaSpec(
+        block_size=16,
+        shapes=((8, 3), (2, 4, 4)),
+        dtypes=(torch.bfloat16, torch.float32),
+        page_size_padded=192,
+        mamba_cache_mode="align",
+    )
+    groups = [
+        KVCacheGroupSpec(["attention"], attention),
+        KVCacheGroupSpec(["state_a", "state_b"], state),
+        KVCacheGroupSpec(["other_state"], state),
+    ]
+    config = VllmConfig(device_config=DeviceConfig("cuda"))
+    config.cache_config.kv_cache_layout = layout.name
+    counts = (7, 4, 5)
+    plan = get_kv_cache_config_from_groups(
+        config, groups, 2**20, group_num_blocks=counts
+    )
+    caches = allocate_kv_cache(plan, device, layout)
+    raw = torch.empty(0, dtype=torch.uint8, device=device).set_(
+        caches["attention"].untyped_storage()
+    )
+    raw.fill_(255)
+    expected = raw.clone()
+    context = {}
+    for group_id, group in enumerate(groups):
+        for name in group.layer_names:
+            if group_id and bound_states:
+                context[name] = BoundMambaStates(state, caches[name])
+            else:
+                layer = torch.nn.Module()
+                layer.register_buffer("kv_cache", caches[name])
+                context[name] = layer
+    for descriptor in plan.kv_cache_tensors:
+        if "state_a" in descriptor.layers:
+            expected_views = create_kv_cache_views(
+                expected, state, counts[1], layout, descriptor
+            )
+            for view in expected_views:
+                view[3].zero_()
+    zeroer = KVBlockZeroer(
+        device,
+        attn_groups_iter=[
+            AttentionGroup(None, group.layer_names, group.kv_cache_spec, group_id)
+            for group_id, group in enumerate(groups)
+        ],
+        kernel_block_sizes=[16, 16, 16],
+        static_forward_context=context,
+        num_blocks=counts,
+    )
+    zeroer.zero_block_ids({1: [3]})
+    torch.accelerator.synchronize()
+    assert torch.equal(raw, expected)
+    assert int((raw == 0).sum().item()) == 2 * state.real_page_size_bytes
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -122,18 +237,7 @@ def test_block_ids_are_not_overwritten_while_copy_is_in_flight():
     page_size_el = 4
     storage = torch.ones((num_blocks, page_size_el), dtype=torch.int32, device=device)
 
-    # Build the minimal zeroer state directly so the test can focus on the
-    # in-flight copy behavior without constructing model attention groups.
-    zeroer = KVBlockZeroer.__new__(KVBlockZeroer)
-    zeroer.device = device
-    zeroer._meta = (
-        torch.tensor([storage.data_ptr()], dtype=torch.uint64, device=device),
-        torch.tensor([page_size_el], dtype=torch.int64, device=device),
-        torch.tensor([page_size_el], dtype=torch.int64, device=device),
-        page_size_el // page_size_el,  # max_chunks = 1
-        page_size_el,  # blk_size
-        1,  # n_segs
-    )
+    zeroer = _make_zeroer(storage)
 
     stream = torch.cuda.Stream()
     with torch.cuda.stream(stream):
@@ -162,26 +266,7 @@ def test_non_uniform_page_sizes():
     storage_a = torch.ones((num_blocks, page_size_a), dtype=torch.int32, device=device)
     storage_b = torch.ones((num_blocks, page_size_b), dtype=torch.int32, device=device)
 
-    zeroer = KVBlockZeroer.__new__(KVBlockZeroer)
-    zeroer.device = device
-
-    seg_page_sizes = [page_size_a, page_size_b]
-    max_ps = max(seg_page_sizes)
-
-    blk_size = min(1 << (max_ps - 1).bit_length(), 1024)
-
-    zeroer._meta = (
-        torch.tensor(
-            [storage_a.data_ptr(), storage_b.data_ptr()],
-            dtype=torch.uint64,
-            device=device,
-        ),
-        torch.tensor(seg_page_sizes, dtype=torch.int64, device=device),
-        torch.tensor(seg_page_sizes, dtype=torch.int64, device=device),
-        (max_ps + blk_size - 1) // blk_size,
-        blk_size,
-        2,
-    )
+    zeroer = _make_zeroer(storage_a, storage_b)
 
     stream = torch.cuda.Stream()
     with torch.cuda.stream(stream):
@@ -207,20 +292,7 @@ def test_packed_segment_zeros_only_its_last_block_page():
         (num_blocks, block_stride_el), dtype=torch.int32, device=device
     )
 
-    zeroer = KVBlockZeroer.__new__(KVBlockZeroer)
-    zeroer.device = device
-    zeroer._meta = (
-        torch.tensor(
-            [backing.data_ptr() + page_offset_el * backing.element_size()],
-            dtype=torch.uint64,
-            device=device,
-        ),
-        torch.tensor([block_stride_el], dtype=torch.int64, device=device),
-        torch.tensor([page_size_el], dtype=torch.int64, device=device),
-        1,
-        page_size_el,
-        1,
-    )
+    zeroer = _make_zeroer(backing[:, page_offset_el : page_offset_el + page_size_el])
 
     zeroer.zero_block_ids([num_blocks - 1])
     torch.accelerator.synchronize()
@@ -299,16 +371,7 @@ def test_warmup_compiles_for_all_block_counts():
     page_size_el = 4
     storage = torch.ones((num_blocks, page_size_el), dtype=torch.int32, device=device)
 
-    zeroer = KVBlockZeroer.__new__(KVBlockZeroer)
-    zeroer.device = device
-    zeroer._meta = (
-        torch.tensor([storage.data_ptr()], dtype=torch.uint64, device=device),
-        torch.tensor([page_size_el], dtype=torch.int64, device=device),
-        torch.tensor([page_size_el], dtype=torch.int64, device=device),
-        1,  # max_chunks
-        page_size_el,  # blk_size
-        1,  # n_segs
-    )
+    zeroer = _make_zeroer(storage)
 
     def compiled_variants() -> set:
         return {
@@ -336,16 +399,7 @@ def test_warmup_respects_available_block_count():
     page_size_el = 4
     storage = torch.ones((1, page_size_el), dtype=torch.int32, device=device)
 
-    zeroer = KVBlockZeroer.__new__(KVBlockZeroer)
-    zeroer.device = device
-    zeroer._meta = (
-        torch.tensor([storage.data_ptr()], dtype=torch.uint64, device=device),
-        torch.tensor([page_size_el], dtype=torch.int64, device=device),
-        torch.tensor([page_size_el], dtype=torch.int64, device=device),
-        1,
-        page_size_el,
-        1,
-    )
+    zeroer = _make_zeroer(storage)
 
     zeroer.warmup(0)
     torch.accelerator.synchronize()

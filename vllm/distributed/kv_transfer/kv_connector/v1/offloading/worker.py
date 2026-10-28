@@ -23,6 +23,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     MambaSpec,
     UniformTypeKVCacheSpecs,
+    get_kv_cache_regions,
     group_kernel_blocks,
 )
 from vllm.v1.kv_offload.base import (
@@ -74,6 +75,33 @@ class OffloadingConnectorWorker:
         selected_groups = tuple(
             kv_cache_config.kv_cache_groups[group_id] for group_id in selected_group_ids
         )
+        if (
+            kv_cache_config.group_num_blocks is not None
+            and not self.spec.config.canonical_layout
+        ):
+            regions, region_groups = get_kv_cache_regions(
+                kv_cache_config,
+                kv_caches,
+                self.vllm_config.cache_config.get_resolved_kv_cache_layout(),
+            )
+            independent_tensors: list[CanonicalKVCacheTensor] = []
+            grouped_refs: list[list[CanonicalKVCacheRef]] = [
+                [] for _ in selected_group_ids
+            ]
+            group_indices = {
+                group_id: index for index, group_id in enumerate(selected_group_ids)
+            }
+            for name, tensor in regions.items():
+                group_id = region_groups[name]
+                if group_id not in group_indices:
+                    continue
+                size = tensor.shape[1]
+                grouped_refs[group_indices[group_id]].append(
+                    CanonicalKVCacheRef(len(independent_tensors), size)
+                )
+                independent_tensors.append(CanonicalKVCacheTensor(tensor, size))
+            self._init_worker(CanonicalKVCaches(independent_tensors, grouped_refs))
+            return
         mappings = derive_canonical_mappings(
             self.vllm_config, kv_cache_config, kv_caches
         )
@@ -84,9 +112,9 @@ class OffloadingConnectorWorker:
         unpadded_page_size_bytes: dict[str, int] = {}
         # layer_name -> size of page in bytes
         page_size_bytes: dict[str, int] = {}
-        for kv_cache_group in selected_groups:
+        for group_id, kv_cache_group in zip(selected_group_ids, selected_groups):
             assert not kv_cache_group.host_resident
-            num_blocks = kv_cache_config.num_blocks
+            num_blocks = kv_cache_config.num_blocks_for_group(group_id)
             group_layer_names = kv_cache_group.layer_names
             group_kv_cache_spec = kv_cache_group.kv_cache_spec
             if isinstance(group_kv_cache_spec, UniformTypeKVCacheSpecs):
@@ -107,6 +135,7 @@ class OffloadingConnectorWorker:
                 block_stride_bytes = (
                     ref.stride(0) * elem_size
                     if isinstance(layer_kv_cache_spec, AttentionSpec)
+                    or kv_cache_config.group_num_blocks is not None
                     else page
                 )
                 tensors_per_block[layer_name] = (
@@ -144,6 +173,7 @@ class OffloadingConnectorWorker:
         if (
             packed_layer_name is not None
             and kv_cache_config.hisparse_host_num_blocks is None
+            and kv_cache_config.group_num_blocks is None
         ):
             (tensor,) = tensors_per_block[packed_layer_name]
             num_blocks = tensor.shape[0]

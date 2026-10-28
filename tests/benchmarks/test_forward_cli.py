@@ -8,12 +8,23 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+import torch
 
 from vllm.benchmarks.forward.batch import build_batch
+from vllm.benchmarks.forward.kv_init import touched_kv_views, zero_kv_blocks
 from vllm.benchmarks.forward.main import run_case
 from vllm.benchmarks.forward.profile import summarize
 from vllm.benchmarks.forward.shapes import jitter_kv_lens, parse_case
+from vllm.config import CacheConfig, DeviceConfig, VllmConfig
 from vllm.platforms import current_platform
+from vllm.v1.core.kv_cache_planning import get_kv_cache_config_from_groups
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    KVCacheGroupSpec,
+    KVCacheLayout,
+    MambaSpec,
+)
+from vllm.v1.worker.utils import allocate_kv_cache
 
 MODEL_NAME = "meta-llama/Llama-3.2-1B-Instruct"
 
@@ -64,6 +75,126 @@ def test_build_batch_layout():
         parse_case("c=1@640"), groups, 1000, 1000, np.random.default_rng(0), 4
     )
     assert batch.group_block_ranges == [[(1, 11)], [(11, 51)]]
+
+
+def _hybrid_groups() -> list[KVCacheGroupSpec]:
+    return [
+        KVCacheGroupSpec(
+            ["attention"],
+            FullAttentionSpec(
+                block_size=16, num_kv_heads=1, head_size=1, dtype=torch.float32
+            ),
+        ),
+        KVCacheGroupSpec(
+            ["state"],
+            MambaSpec(block_size=16, shapes=((2, 3),), dtypes=(torch.float32,)),
+        ),
+    ]
+
+
+@pytest.mark.parametrize(
+    "capacity,ranges,used",
+    [
+        (6, [[(1, 3), (4, 5)], [(3, 4), (5, 6)]], 6),
+        ((4, 3), [[(1, 3), (3, 4)], [(1, 2), (2, 3)]], 7),
+    ],
+)
+def test_build_batch_shared_and_independent_domains(capacity, ranges, used):
+    batch = build_batch(
+        parse_case("mix=1@32,1@16"),
+        _hybrid_groups(),
+        capacity,
+        100,
+        np.random.default_rng(0),
+    )
+    assert batch.group_block_ranges == ranges
+    assert batch.num_blocks == used
+    actual_ids = [
+        request.block_ids for request in batch.scheduler_output.scheduled_new_reqs
+    ]
+    assert actual_ids == [
+        tuple(list(range(*ranges[group_id][request_id])) for group_id in range(2))
+        for request_id in range(2)
+    ]
+
+
+@pytest.mark.parametrize(
+    "capacity,message",
+    [
+        (5, "KV blocks"),
+        ((3, 3), "group 0"),
+        ((4, 2), "group 1"),
+        ((4,), "one entry per cache group"),
+        ((4, 0), "positive integers"),
+        ((4, -1), "positive integers"),
+        ((4, True), "positive integers"),
+    ],
+)
+def test_build_batch_rejects_domain_overflow_or_invalid_vector(capacity, message):
+    with pytest.raises(ValueError, match=message):
+        build_batch(
+            parse_case("mix=1@32,1@16"),
+            _hybrid_groups(),
+            capacity,
+            100,
+            np.random.default_rng(0),
+        )
+
+
+@pytest.mark.parametrize(
+    "case,counts,touched",
+    [
+        (
+            "mix=1@32,1@16",
+            (5, 4),
+            [(0, 1, 3), (0, 3, 4), (1, 1, 2), (1, 2, 3)],
+        ),
+        ("tail=1@128", (10, 3), [(0, 6, 9), (1, 1, 2)]),
+    ],
+)
+def test_independent_kv_initialization_and_touched_views(case, counts, touched):
+    groups = _hybrid_groups()
+    config = VllmConfig(
+        cache_config=CacheConfig(),
+        device_config=DeviceConfig("cpu"),
+    )
+    config.cache_config.kv_cache_layout = "BLHNC"
+    plan = get_kv_cache_config_from_groups(
+        config, groups, 8192, group_num_blocks=counts
+    )
+    assert plan.group_num_blocks == counts
+    caches = allocate_kv_cache(plan, torch.device("cpu"), KVCacheLayout.BLHNC)
+    context: dict[str, torch.nn.Module] = {}
+    for name, tensor in caches.items():
+        tensor.fill_(7)
+        layer = torch.nn.Module()
+        layer.register_buffer("kv_cache", tensor)
+        context[name] = layer
+    batch = build_batch(parse_case(case), groups, counts, 100, np.random.default_rng(0))
+    zero_kv_blocks(context, groups, batch, counts)
+    expected = {}
+    for group, ranges in zip(groups, batch.group_block_ranges, strict=True):
+        name = group.layer_names[0]
+        tensor = caches[name]
+        reference = torch.full_like(tensor, 7)
+        for begin, end in ranges:
+            reference[begin:end].zero_()
+        assert torch.equal(tensor, reference)
+        assert torch.all(tensor[0] == 7)
+        assert torch.all(tensor[-1] == 7)
+        expected[name] = reference
+    views = touched_kv_views(context, groups, batch, counts, dcp_size=1)
+    assert len(views) == len(touched)
+    for view, (group_id, begin, end) in zip(views, touched, strict=True):
+        name = groups[group_id].layer_names[0]
+        reference_view = caches[name][begin:end]
+        assert view.data_ptr() == reference_view.data_ptr()
+        assert view.shape == reference_view.shape
+        assert view.stride() == reference_view.stride()
+        view.fill_(9)
+        expected[name][begin:end].fill_(9)
+    for name, tensor in caches.items():
+        assert torch.equal(tensor, expected[name])
 
 
 def test_jitter_kv_lens():

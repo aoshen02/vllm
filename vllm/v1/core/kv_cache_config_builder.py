@@ -83,6 +83,18 @@ class KVCacheConfigBuilder(ABC):
         """
         return None
 
+    def get_kv_cache_config_from_group_counts(
+        self,
+        vllm_config: "VllmConfig",
+        kv_cache_groups: list["KVCacheGroupSpec"],
+        group_num_blocks: tuple[int, ...],
+        available_memory: int,
+    ) -> "KVCacheConfig":
+        """Materialize independent group counts within the worker's byte budget."""
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support independent group capacities"
+        )
+
 
 def get_kv_cache_config_builder(
     vllm_config: "VllmConfig",

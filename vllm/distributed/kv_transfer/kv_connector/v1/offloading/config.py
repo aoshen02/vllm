@@ -135,7 +135,15 @@ def build_offloading_config(
             )
 
     worker_kv_bytes_per_block = 0
-    if (
+    if kv_cache_config.group_num_blocks is not None:
+        from vllm.v1.core.kv_cache_planning import _get_kv_cache_bytes_per_block
+
+        layout = vllm_config.cache_config.get_resolved_kv_cache_layout()
+        worker_kv_bytes_per_block = sum(
+            _get_kv_cache_bytes_per_block([group], layout)
+            for _, group in selected_groups
+        )
+    elif (
         kv_cache_config.hisparse_host_num_blocks is None
         and kv_cache_config.num_blocks > 0
         and kv_cache_config.kv_cache_tensors

@@ -330,6 +330,63 @@ class KVCacheSpec:
         return True
 
 
+def get_kv_cache_regions(
+    config: KVCacheConfig,
+    caches: dict[str, torch.Tensor],
+    layout: KVCacheLayout,
+) -> tuple[dict[str, torch.Tensor], dict[str, int]]:
+    """Expose non-overlapping block byte views and their original group IDs."""
+    layer_groups = {
+        name: group_id
+        for group_id, group in enumerate(config.kv_cache_groups)
+        for name in group.layer_names
+    }
+    group_offsets: dict[int, int] = {}
+    for descriptor in config.kv_cache_tensors:
+        group_id = layer_groups[descriptor.layers[0]]
+        group_offsets[group_id] = min(
+            group_offsets.get(group_id, descriptor.offset), descriptor.offset
+        )
+    regions: dict[str, torch.Tensor] = {}
+    region_groups: dict[str, int] = {}
+    seen: set[tuple[torch.device, int]] = set()
+    for descriptor in config.kv_cache_tensors:
+        name = next((name for name in descriptor.layers if name in caches), None)
+        if name is None:
+            continue
+        group_id = layer_groups[name]
+        num_blocks = config.num_blocks_of(descriptor)
+        block_bytes = descriptor.block_stride
+        if layout.is_block_outermost:
+            start = group_offsets[group_id]
+            span = num_blocks * block_bytes
+            names = descriptor.layers[:1]
+        else:
+            start = descriptor.offset
+            span = len(descriptor.layers) * descriptor.layer_stride
+            names = descriptor.layers
+        cache = caches[name]
+        raw = torch.empty(0, dtype=torch.int8, device=cache.device).set_(
+            cache.untyped_storage()
+        )
+        if start + span > raw.numel():
+            raise ValueError(f"KV cache region {name!r} exceeds its backing storage")
+        views = raw[start : start + span].view(-1, num_blocks, block_bytes)
+        groups_per_layer, remainder = divmod(len(views), len(names))
+        if remainder:
+            raise ValueError(f"KV cache region {name!r} has inconsistent placement")
+        for index, view in enumerate(views):
+            identity = (view.device, view.data_ptr())
+            if identity in seen:
+                continue
+            seen.add(identity)
+            layer_name = names[index // groups_per_layer]
+            region_name = f"{layer_name}:{index % groups_per_layer}"
+            regions[region_name] = view
+            region_groups[region_name] = group_id
+    return regions, region_groups
+
+
 def group_kernel_blocks(cache: torch.Tensor, num_blocks: int) -> torch.Tensor:
     """View a kernel-block-granular layer cache with manager blocks as dim 0.
 
@@ -1091,6 +1148,9 @@ class MambaSpec(KVCacheSpec):
     # rank holds the full state (e.g. the replicated PLE conv state).
     tp_replicated: bool = False
 
+    replayssm_tracker_bytes_per_block: int = 0
+    """External ReplaySSM cursor bytes per block, shared within a cache group."""
+
     @property
     def state_content_size_bytes(self) -> int:
         return sum(
@@ -1501,6 +1561,20 @@ class KVCacheGroupSpec:
     enable_kv_transfer: bool = True
     role: KVCacheGroupRole = KVCacheGroupRole.DEFAULT
 
+    @property
+    def replayssm_tracker_bytes_per_block(self) -> int:
+        """Cursor storage for this group's actual local block-index namespace."""
+        if not self.layer_names:
+            return 0
+        return max(
+            (
+                spec.replayssm_tracker_bytes_per_block
+                for spec in iter_layer_specs(self.kv_cache_spec)
+                if isinstance(spec, MambaSpec)
+            ),
+            default=0,
+        )
+
 
 @dataclass
 class KVCacheConfig:
@@ -1537,6 +1611,9 @@ class KVCacheConfig:
 
     kv_tp_replicas: int = 1
     """Consecutive TP ranks holding identical KV for every layer (1: none)."""
+
+    group_num_blocks: tuple[int, ...] | None = None
+    """Independent group capacities, including null blocks; None uses shared IDs."""
 
     @cached_property
     def transfer_group_ids(self) -> tuple[int, ...]:
@@ -1601,10 +1678,39 @@ class KVCacheConfig:
 
     def num_blocks_of(self, tensor: KVCacheTensor) -> int:
         """Number of blocks addressable by the pool backing ``tensor``."""
+        if self.group_num_blocks is not None:
+            return self.group_num_blocks[
+                next(
+                    group_id
+                    for group_id, group in enumerate(self.kv_cache_groups)
+                    if tensor.layers[0] in group.layer_names
+                )
+            ]
         if not tensor.host_resident:
             return self.num_blocks
         assert self.hisparse_host_num_blocks is not None
         return self.hisparse_host_num_blocks
+
+    def num_blocks_for_group(self, group_id: int) -> int:
+        """Number of addressable blocks in an original cache group."""
+        if self.group_num_blocks is not None:
+            return self.group_num_blocks[group_id]
+        if self.kv_cache_groups[group_id].host_resident:
+            assert self.hisparse_host_num_blocks is not None
+            return self.hisparse_host_num_blocks
+        return self.num_blocks
+
+    @property
+    def mamba_num_blocks(self) -> int:
+        """Smallest physical capacity among Mamba groups, including null slots."""
+        return min(
+            self.num_blocks_for_group(group_id)
+            for group_id, group in enumerate(self.kv_cache_groups)
+            if any(
+                isinstance(spec, MambaSpec)
+                for spec in iter_layer_specs(group.kv_cache_spec)
+            )
+        )
 
     @property
     def has_mamba_layers(self) -> bool:

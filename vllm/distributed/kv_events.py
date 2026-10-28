@@ -135,7 +135,8 @@ class BlockRemoved(KVCacheEvent):
 
 
 class AllBlocksCleared(KVCacheEvent):
-    pass
+    def __hash__(self) -> int:
+        return hash(AllBlocksCleared)
 
 
 class KVEventBatch(EventBatch):

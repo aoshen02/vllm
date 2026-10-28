@@ -631,6 +631,12 @@ class KVConnectorBase_V1(ABC):
         """
         return
 
+    def should_yield_optimistic_prefill(
+        self, request: "Request", waiting: Iterable["Request"]
+    ) -> bool:
+        """Whether an unpublished optimistic prefill should yield to ready work."""
+        return False
+
     def request_finished(
         self,
         request: "Request",

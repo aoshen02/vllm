@@ -13,6 +13,7 @@ from vllm.model_executor.layers.mamba.mamba_mixer2 import MambaMixer2
 from vllm.model_executor.warmup import replayssm_warmup as warmup
 from vllm.platforms import current_platform
 from vllm.utils.flashinfer import has_flashinfer
+from vllm.v1.kv_cache_interface import KVCacheConfig
 
 pytestmark = pytest.mark.skipif(
     not current_platform.is_cuda() or not has_flashinfer(),
@@ -47,7 +48,9 @@ def _autotune_runner(
         decode_query_len=query_len,
         max_num_tokens=max_num_tokens,
         scheduler_config=SimpleNamespace(max_num_seqs=max_num_seqs),
-        kv_cache_config=SimpleNamespace(num_blocks=num_blocks),
+        kv_cache_config=KVCacheConfig(
+            num_blocks=num_blocks, kv_cache_tensors=[], kv_cache_groups=[]
+        ),
     )
 
 

@@ -881,6 +881,13 @@ class Worker(WorkerBase):
     @instrument(span_name="Allocate KV cache")
     def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
         """Allocate GPU KV cache with the specified kv_cache_config."""
+        if (
+            kv_cache_config.group_num_blocks is not None
+            and not self.use_v2_model_runner
+        ):
+            raise ValueError(
+                "Independent KV cache group capacities require Model Runner V2."
+            )
         # Update local config with adjusted num blocks after profiling,
         # so that it's available to the warmup stage.
         self.cache_config.num_gpu_blocks = kv_cache_config.num_blocks
@@ -944,6 +951,16 @@ class Worker(WorkerBase):
         if connector is None:
             return None
         return connector.get_aligned_num_cpu_blocks()
+
+    def get_simple_cpu_offload_group_num_blocks(self) -> tuple[int, ...] | None:
+        from vllm.distributed.kv_transfer.kv_connector.v1.simple_cpu_offload_connector import (  # noqa: E501
+            _find_simple_cpu_offload_connector,
+        )
+
+        if not has_kv_transfer_group():
+            return None
+        connector = _find_simple_cpu_offload_connector(get_kv_transfer_group())
+        return None if connector is None else connector.get_aligned_cpu_group_blocks()
 
     @instrument(span_name="Warmup (GPU)")
     def compile_or_warm_up_model(self) -> CompilationTimes:
@@ -1497,9 +1514,10 @@ class Worker(WorkerBase):
         return self.model_runner.pin_lora(lora_id)
 
     def dumper_control(self, action: str, body: str = "{}") -> dict:
-        if not self.use_v2_model_runner or self.model_runner.tensor_dumper is None:
+        model_runner = cast("GPUModelRunnerV2", self.model_runner)
+        if not self.use_v2_model_runner or model_runner.tensor_dumper is None:
             raise RuntimeError("Dumper was not enabled at startup.")
-        return self.model_runner.tensor_dumper.control(action, body)
+        return model_runner.tensor_dumper.control(action, body)
 
     def check_health(self) -> None:
         # worker will always be healthy as long as it's running.

@@ -72,6 +72,7 @@ def test_load_start_phase(
         idx_mapping=request_indices, req_ids=request_ids, num_tokens=5
     )
     attn_metadata = {"layer": object()}
+    connector.handle_preemptions(output)
     connector.pre_forward(output, input_batch, attn_metadata=attn_metadata)
     assert events == (
         ["handle", "bind", "start"] if has_sync_kv_loads else ["handle", "bind"]
@@ -90,7 +91,9 @@ def test_load_start_phase(
     assert kwargs["attn_metadata"] is attn_metadata
 
     # A subsequent step without a forward must not reuse the prior batch.
-    connector.no_forward(_scheduler_output(False))
+    output = _scheduler_output(False)
+    connector.handle_preemptions(output)
+    connector.no_forward(output)
     assert start_load_kv.call_count == 2
     assert start_load_kv.call_args.kwargs == {}
 
@@ -99,7 +102,9 @@ def test_no_forward_starts_deferred_load_once(monkeypatch: pytest.MonkeyPatch):
     events: list[str] = []
     connector = _make_connector(monkeypatch, events)
 
-    connector.no_forward(_scheduler_output(False))
+    output = _scheduler_output(False)
+    connector.handle_preemptions(output)
+    connector.no_forward(output)
 
     assert events == ["handle", "bind", "start", "wait", "results", "clear"]
 
@@ -112,7 +117,9 @@ def test_deferred_finalize_collects_results_before_saving(
     drafter writes its KV."""
     events: list[str] = []
     connector = _make_connector(monkeypatch, events)
-    connector.pre_forward(_scheduler_output(False))
+    output = _scheduler_output(False)
+    connector.handle_preemptions(output)
+    connector.pre_forward(output)
 
     connector.post_forward(set(), defer_finalize=True)
     assert events == ["handle", "bind", "start", "results"]

@@ -173,6 +173,18 @@ class Executor(ABC):
             )
         return aligned
 
+    def get_simple_cpu_offload_group_num_blocks(self) -> tuple[int, ...] | None:
+        values: list[tuple[int, ...] | None] = self.collective_rpc(
+            "get_simple_cpu_offload_group_num_blocks"
+        )
+        if not values or all(value is None for value in values):
+            return None
+        if any(value is None for value in values) or len(set(values)) != 1:
+            raise RuntimeError(
+                "SimpleCPUOffload workers reported inconsistent group capacities"
+            )
+        return values[0]
+
     def get_kv_cache_specs(self) -> list[dict[str, KVCacheSpec]]:
         return self.collective_rpc("get_kv_cache_spec")
 

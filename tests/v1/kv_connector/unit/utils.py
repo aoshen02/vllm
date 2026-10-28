@@ -232,6 +232,7 @@ def create_request(
     num_remote_blocks: int = 3,
     block_size: int = 16,
     hash_fn: Callable = sha256,
+    skip_reading_prefix_cache: bool | None = None,
 ) -> Request:
     """Make dummy request for testing."""
     assert num_tokens >= common_prefix_len >= 0
@@ -262,7 +263,9 @@ def create_request(
         )
 
     max_tokens = 1 if do_remote_decode else max_tokens
-    sampling_params = SamplingParams(max_tokens=max_tokens)
+    sampling_params = SamplingParams(
+        max_tokens=max_tokens, skip_reading_prefix_cache=skip_reading_prefix_cache
+    )
     sampling_params.update_from_generation_config({}, EOS_TOKEN_ID)
 
     common_prefix = [1] * common_prefix_len if common_prefix_len > 0 else []

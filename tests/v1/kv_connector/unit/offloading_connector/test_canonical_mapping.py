@@ -15,7 +15,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.canonical_mapping i
 from vllm.v1.attention.backends.triton_attn import TritonAttentionBackend
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
+    KVCacheConfig,
     KVCacheGroupSpec,
+    KVCacheLayout,
     KVCacheSpec,
     KVQuantMode,
     MLAAttentionSpec,
@@ -428,10 +430,152 @@ def _vllm_config(tp=1, dcp=1, pcp=1, pp=1, interleave=1, total_kv_heads=2):
 
 
 def _kv_cache_config(groups):
-    config = MagicMock()
-    config.kv_cache_groups = groups
-    config.num_blocks = NUM_BLOCKS
-    return config
+    return KVCacheConfig(
+        num_blocks=NUM_BLOCKS, kv_cache_tensors=[], kv_cache_groups=groups
+    )
+
+
+@pytest.mark.parametrize("layout", list(KVCacheLayout))
+@pytest.mark.parametrize("num_layers", [1, 2])
+@pytest.mark.parametrize("mamba_state", [False, True])
+def test_independent_mapping_reconstructs_last_group_page(
+    layout, num_layers, mamba_state
+):
+    from vllm.config import (
+        CacheConfig,
+        DeviceConfig,
+        KVTransferConfig,
+        ModelConfig,
+        VllmConfig,
+    )
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading.config import (
+        build_offloading_config,
+    )
+    from vllm.v1.core.kv_cache_planning import get_kv_cache_config_from_groups
+    from vllm.v1.kv_cache_interface import MambaSpec, get_kv_cache_regions
+    from vllm.v1.worker.utils import allocate_kv_cache
+
+    config = VllmConfig(
+        model_config=ModelConfig(
+            model="Qwen/Qwen3-0.6B",
+            dtype="float32",
+            hf_overrides={
+                "num_attention_heads": 2,
+                "num_key_value_heads": 2,
+                "hidden_size": 128,
+                "head_dim": 64,
+            },
+        ),
+        cache_config=CacheConfig(),
+        device_config=DeviceConfig("cpu"),
+        kv_transfer_config=KVTransferConfig(
+            kv_connector="OffloadingConnector",
+            kv_role="kv_both",
+            engine_id="mapping-test",
+        ),
+    )
+    config.cache_config.kv_cache_layout = layout.name
+    spec = FullAttentionSpec(
+        block_size=4, num_kv_heads=2, head_size=64, dtype=torch.float32
+    )
+    assert config.model_config.get_total_num_kv_heads() == spec.num_kv_heads
+    other_spec = (
+        MambaSpec(
+            block_size=4,
+            shapes=((8, 3), (1, 4, 4)),
+            dtypes=(torch.float16, torch.float32),
+            page_size_padded=spec.page_size_bytes,
+        )
+        if mamba_state
+        else spec
+    )
+    groups = [
+        KVCacheGroupSpec(
+            [f"{prefix}.{index}" for index in range(num_layers)], group_spec
+        )
+        for prefix, group_spec in (("attention", spec), ("other", other_spec))
+    ]
+    plan = get_kv_cache_config_from_groups(
+        config, groups, 65536, group_num_blocks=(5, 3)
+    )
+    single_plan = get_kv_cache_config_from_groups(
+        config,
+        [
+            KVCacheGroupSpec([name], group.kv_cache_spec)
+            for group in groups
+            for name in group.layer_names
+        ],
+        65536,
+        group_num_blocks=(1,) * (2 * num_layers),
+    )
+    caches = allocate_kv_cache(plan, torch.device("cpu"), layout)
+    single = allocate_kv_cache(single_plan, torch.device("cpu"), layout)
+    regions, _ = get_kv_cache_regions(plan, caches, layout)
+    assert build_offloading_config(config, plan).worker_kv_bytes_per_block == sum(
+        region.shape[1] for region in regions.values()
+    )
+    for index, (name, cache) in enumerate(caches.items()):
+        cache.copy_(torch.arange(cache.numel()).reshape(cache.shape) + index * 100000)
+        single[name].copy_(cache[-1:])
+    mappings = derive_canonical_mappings(config, plan, caches)
+    assert mappings.keys() == caches.keys()
+    for descriptor in single_plan.kv_cache_tensors:
+        name = descriptor.layers[0]
+        cache = caches[name]
+        mapping = mappings[name]
+        raw = torch.empty(0, dtype=torch.uint8).set_(cache.untyped_storage())
+        base = (
+            cache.storage_offset() + (cache.shape[0] - 1) * cache.stride(0)
+        ) * cache.element_size()
+        actual = torch.empty(mapping.canonical_page_size_bytes, dtype=torch.uint8)
+        for run in mapping.runs:
+            for fragment in range(run.num_fragments):
+                source = base + run.local_offset + fragment * run.local_stride
+                destination = run.canonical_offset + fragment * run.canonical_stride
+                actual[destination : destination + run.fragment_size] = raw[
+                    source : source + run.fragment_size
+                ]
+        expected = torch.empty(0, dtype=torch.uint8).set_(
+            single[name].untyped_storage()
+        )[descriptor.offset : descriptor.offset + mapping.canonical_page_size_bytes]
+        assert torch.equal(actual, expected), (
+            name,
+            cache.shape,
+            cache.stride(),
+            mapping,
+        )
+        original = raw.clone()
+        if name.startswith("other.") and mamba_state:
+            raw[base : base + mapping.local_page_size_bytes].fill_(0)
+        else:
+            cache[-1].fill_(-1)
+        for run in mapping.runs:
+            for fragment in range(run.num_fragments):
+                source = run.canonical_offset + fragment * run.canonical_stride
+                destination = base + run.local_offset + fragment * run.local_stride
+                raw[destination : destination + run.fragment_size].copy_(
+                    actual[source : source + run.fragment_size]
+                )
+        assert torch.equal(raw, original)
+
+    if not mamba_state:
+        legacy_plan = get_kv_cache_config_from_groups(config, groups[:1], 65536)
+        assert legacy_plan.group_num_blocks is None
+        legacy_caches = allocate_kv_cache(legacy_plan, torch.device("cpu"), layout)
+        legacy_mappings = derive_canonical_mappings(config, legacy_plan, legacy_caches)
+        sparse = layout is KVCacheLayout.LHBNC or (
+            layout is KVCacheLayout.BHLNC and num_layers > 1
+        )
+        page = spec.page_size_bytes
+        expected_mapping = CanonicalPageMapping(
+            canonical_page_size_bytes=page,
+            local_page_size_bytes=page,
+            runs=(CopyRun(0, 0, page, 1, page, page),),
+            num_writers=1,
+            writer_index=0,
+            parallelism_agnostic=not sparse,
+        )
+        assert legacy_mappings == dict.fromkeys(legacy_caches, expected_mapping)
 
 
 def test_derive_mixed_model_with_dcp():

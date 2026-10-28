@@ -282,6 +282,20 @@ class CacheConfig:
     mamba_page_size_padded: int | None = None
     """ Optional override for mamba page size; used by hybrid mamba/attention
     models to ensure exact alignment with attention page size."""
+    mamba_full_memory_ratio: float | None = Field(
+        default=None, gt=0, allow_inf_nan=False
+    )
+    """Optional native Mamba-to-attention cache memory ratio. Reserves r/(1+r)
+    of the available cache budget for Mamba pages, including verification state,
+    embedded replay records and null blocks. Remaining bytes fund attention.
+    Without prefix caching and with an explicit request bound, reserve each
+    group's per-request native state demand instead of applying the ratio.
+    Counts are rounded down and synchronized across workers. None preserves
+    shared-pool planning. This is not a persistent-state slot cap. FlashInfer
+    ReplaySSM cursor storage is charged once per local cache namespace, with
+    additional headroom for profiling cursors retained during rebinding."""
+    mamba_fixed_num_seqs: int | None = field(default=None, init=False)
+    """Explicit request bound for prefix-disabled Mamba sizing, before defaults."""
     skip_page_size_padded: int | None = None
     """Optional override for the page size of layers skipped from KV cache
     quantization (``--kv-cache-dtype-skip-layers``); set during block-size
@@ -334,6 +348,10 @@ class CacheConfig:
 
     simple_cpu_offload_num_blocks: int | None = field(default=None, init=False)
     """Worker-aligned offload block count for ``SimpleCPUOffloadConnector``."""
+    simple_cpu_offload_group_num_blocks: tuple[int, ...] | None = field(
+        default=None, init=False
+    )
+    """Worker-aligned independent CPU capacities, including per-group nulls."""
 
     # Set after KV cache initialization.
     effective_attention_block_size: int | None = field(default=None, init=False)
@@ -403,6 +421,8 @@ class CacheConfig:
             # Runtime/derived knobs that don't affect compiled graph shape
             "gpu_memory_utilization",
             "kv_cache_memory_bytes",
+            "mamba_full_memory_ratio",
+            "mamba_fixed_num_seqs",
             "is_attention_free",
             "num_gpu_blocks_override",
             "enable_prefix_caching",
@@ -419,6 +439,7 @@ class CacheConfig:
             "num_gpu_blocks",
             "num_cpu_blocks",
             "simple_cpu_offload_num_blocks",
+            "simple_cpu_offload_group_num_blocks",
             "effective_attention_block_size",
             "kv_cache_size_tokens",
             "kv_cache_max_concurrency",

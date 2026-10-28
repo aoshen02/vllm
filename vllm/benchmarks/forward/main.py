@@ -142,17 +142,22 @@ def run_case(runner, case: BenchCase, args: argparse.Namespace) -> dict[str, Any
 
     context = runner.vllm_config.compilation_config.static_forward_context
     kv_config = runner.kv_cache_config
+    capacity = (
+        kv_config.group_num_blocks
+        if kv_config.group_num_blocks is not None
+        else kv_config.num_blocks
+    )
     dcp_size = runner.parallel_config.decode_context_parallel_size
     rng = np.random.default_rng([args.seed, runner.dp_rank])
     batch = build_batch(
         case,
         kv_config.kv_cache_groups,
-        kv_config.num_blocks,
+        capacity,
         runner.model_config.get_vocab_size(),
         rng,
         dcp_size,
     )
-    zero_kv_blocks(context, kv_config.kv_cache_groups, batch, kv_config.num_blocks)
+    zero_kv_blocks(context, kv_config.kv_cache_groups, batch, capacity)
     profile_prefix = None
     if args.profile_dir:
         from vllm.distributed.parallel_state import get_world_group
@@ -165,9 +170,7 @@ def run_case(runner, case: BenchCase, args: argparse.Namespace) -> dict[str, Any
         batch,
         args.iters,
         args.samples,
-        touched_kv_views(
-            context, kv_config.kv_cache_groups, batch, kv_config.num_blocks, dcp_size
-        ),
+        touched_kv_views(context, kv_config.kv_cache_groups, batch, capacity, dcp_size),
         case.name,
         profile_prefix,
     )

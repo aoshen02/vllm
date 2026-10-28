@@ -22,7 +22,9 @@ from tests.v1.core.utils import (
 )
 from vllm.config import (
     CacheConfig,
+    DeviceConfig,
     ModelConfig,
+    ParallelConfig,
     SchedulerConfig,
     VllmConfig,
 )
@@ -2190,3 +2192,1169 @@ def test_null_head_len():
         assert null_head_len(table) == expected
     blocks = KVCacheBlocks(([null] * 4 + real, [null] + real[:1] + [null]))
     assert blocks.get_unhashed_block_ids_all_groups() == [[1, 2, 3], [1]]
+
+
+@pytest.fixture
+def independent_mamba_groups():
+    return [
+        KVCacheGroupSpec(
+            ["attention"],
+            FullAttentionSpec(
+                block_size=16,
+                num_kv_heads=8,
+                head_size=128,
+                dtype=torch.bfloat16,
+            ),
+        ),
+        KVCacheGroupSpec(
+            ["state"],
+            new_mamba_spec(
+                shapes=((128, 64), (128, 64)),
+                dtypes=(torch.bfloat16, torch.bfloat16),
+                num_speculative_blocks=0,
+            ),
+        ),
+    ]
+
+
+@pytest.mark.parametrize("layout", [layout.name for layout in KVCacheLayout])
+@pytest.mark.parametrize("counts", [(128, 128), (64, 128)])
+def test_independent_group_capacity_views_do_not_alias(
+    independent_mamba_groups, layout, counts
+):
+    from vllm.v1.worker.utils import allocate_kv_cache
+
+    config = VllmConfig(device_config=DeviceConfig("cpu"))
+    config.cache_config.kv_cache_layout = layout
+    budget = counts[0] * 65536 + counts[1] * 32768
+    plan = kv_cache_planning.get_kv_cache_config_from_groups(
+        config, independent_mamba_groups, budget, group_num_blocks=counts
+    )
+    assert plan.group_num_blocks == counts
+    assert [plan.num_blocks_of(tensor) for tensor in plan.kv_cache_tensors] == list(
+        counts
+    )
+    assert {tensor.size for tensor in plan.kv_cache_tensors} == {budget}
+    views = allocate_kv_cache(plan, torch.device("cpu"), KVCacheLayout[layout])
+    assert views["attention"].shape[0] == counts[0]
+    assert views["state"].shape[0] == counts[1]
+    assert (
+        views["attention"].untyped_storage().data_ptr()
+        == views["state"].untyped_storage().data_ptr()
+    )
+    assert views["attention"].untyped_storage().nbytes() == budget
+    views["state"].fill_(7)
+    assert torch.count_nonzero(views["attention"]) == 0
+    views["attention"].fill_(11)
+    assert torch.all(views["state"] == 7)
+
+
+@pytest.mark.parametrize(
+    "counts,budget,error",
+    [
+        ((128,), 12 * 1024**2, "positive integer"),
+        ((128, 0), 12 * 1024**2, "positive integer"),
+        ((128, True), 12 * 1024**2, "positive integer"),
+        ((128, 128), 12 * 1024**2 - 1, "exceed the cache budget"),
+    ],
+)
+def test_independent_group_capacity_rejects_invalid_placement(
+    independent_mamba_groups, counts, budget, error
+):
+    config = VllmConfig(device_config=DeviceConfig("cpu"))
+    config.cache_config.kv_cache_layout = "BLHNC"
+    with pytest.raises(ValueError, match=error):
+        kv_cache_planning.get_kv_cache_config_from_groups(
+            config, independent_mamba_groups, budget, group_num_blocks=counts
+        )
+
+
+def independent_capacity_manager(
+    groups, counts, *, enable_caching=False, watermark=0, scheduler_block_size=16
+):
+    config = VllmConfig(device_config=DeviceConfig("cpu"))
+    config.cache_config.kv_cache_layout = "BLHNC"
+    plan = kv_cache_planning.get_kv_cache_config_from_groups(
+        config, groups, 16 * 1024**2, group_num_blocks=counts
+    )
+    return KVCacheManager(
+        plan,
+        max_model_len=256,
+        scheduler_block_size=scheduler_block_size,
+        hash_block_size=16,
+        enable_caching=enable_caching,
+        enable_kv_cache_events=True,
+        watermark=watermark,
+    )
+
+
+@pytest.mark.parametrize("counts", [(8, 2), (2, 8)])
+@pytest.mark.parametrize("full_sequence_must_fit", [False, True])
+def test_independent_manager_denies_saturated_domain_atomically_and_reuses(
+    independent_mamba_groups, counts, full_sequence_must_fit
+):
+    manager = independent_capacity_manager(independent_mamba_groups, counts)
+    first = make_request("first", [1] * 16, block_size=16, hash_fn=sha256)
+    allocated = manager.allocate_slots(first, 16)
+    assert allocated is not None
+    assert allocated.get_block_ids() == ([1], [1])
+    pools = [single.block_pool for single in manager.coordinator.single_type_managers]
+    assert pools[0] is not pools[1]
+    assert all(
+        block.pool is pool
+        for pool, blocks in zip(pools, allocated.blocks)
+        for block in blocks
+    )
+    before = [pool.get_num_free_blocks() for pool in pools]
+    assert sum(before) > 2
+    second = make_request("second", [2] * 16, block_size=16, hash_fn=sha256)
+    assert (
+        manager.allocate_slots(
+            second, 16, full_sequence_must_fit=full_sequence_must_fit
+        )
+        is None
+    )
+    assert [pool.get_num_free_blocks() for pool in pools] == before
+    assert manager.get_block_ids(first.request_id) == ([1], [1])
+    assert manager.take_new_block_ids() == {0: [1], 1: [1]}
+    assert manager.take_new_block_ids() == {0: [], 1: []}
+    assert manager.take_kv_cache_block_copies() == ({0: [], 1: []}, [])
+    assert manager.usage == pytest.approx(2 / sum(count - 1 for count in counts))
+    retained = manager.pop_blocks_for_free(first)
+    assert [pool.get_num_free_blocks() for pool in pools] == before
+    manager.block_pool.free_blocks(reversed(retained))
+    assert [pool.get_num_free_blocks() for pool in pools] == [
+        count - 1 for count in counts
+    ]
+    assert manager.usage == 0
+    reused = manager.allocate_slots(second, 16)
+    assert reused is not None
+    assert reused.get_block_ids() == ([1], [1])
+    manager.free(second)
+    assert manager.usage == 0
+
+
+def test_independent_manager_applies_reservations_and_watermark_per_domain(
+    independent_mamba_groups,
+):
+    manager = independent_capacity_manager(independent_mamba_groups, (8, 3))
+    request = make_request("reserved", [1] * 16, block_size=16, hash_fn=sha256)
+    before = [pool.get_num_free_blocks() for pool in manager.coordinator.block_pools]
+    assert manager.allocate_slots(request, 16, reserved_blocks={1: 2}) is None
+    assert [
+        pool.get_num_free_blocks() for pool in manager.coordinator.block_pools
+    ] == before
+    with pytest.raises(ValueError, match="group-keyed"):
+        manager.allocate_slots(request, 16, reserved_blocks=1)
+    assert manager.allocate_slots(request, 16, reserved_blocks={0: 6, 1: 1}) is not None
+    manager.free(request)
+    manager = independent_capacity_manager(
+        independent_mamba_groups, (8, 3), watermark=0.5
+    )
+    assert manager.allocate_slots(request, 16, has_scheduled_reqs=True) is not None
+    other = make_request("watermark", [2] * 16, block_size=16, hash_fn=sha256)
+    assert manager.allocate_slots(other, 16, has_scheduled_reqs=True) is None
+    assert manager.allocate_slots(other, 16, has_scheduled_reqs=False) is not None
+
+
+@pytest.mark.parametrize("mamba", [False, True])
+def test_independent_manager_prefix_eviction_and_reset_are_domain_scoped(
+    independent_mamba_groups, mamba
+):
+    from vllm.distributed.kv_events import AllBlocksCleared, BlockRemoved, BlockStored
+
+    attention, state = independent_mamba_groups
+    if mamba:
+        state = replace(
+            state,
+            kv_cache_spec=replace(state.kv_cache_spec, mamba_cache_mode="align"),
+        )
+    else:
+        state = replace(
+            state,
+            kv_cache_spec=replace(attention.kv_cache_spec, num_kv_heads=4),
+        )
+    manager = independent_capacity_manager(
+        [attention, state], (5, 3), enable_caching=True
+    )
+    request = make_request("cached", list(range(17)), block_size=16, hash_fn=sha256)
+    allocated = manager.allocate_slots(request, 16)
+    assert allocated is not None
+    manager.new_step_starts()
+    hit, tokens, _ = manager.get_computed_blocks(request)
+    assert tokens == 16
+    assert hit.get_block_ids() == ([1], [1])
+    stored = [
+        event for event in manager.take_events() if isinstance(event, BlockStored)
+    ]
+    assert {event.group_idx for event in stored} == {0, 1}
+    with pytest.raises(ValueError, match="group-keyed"):
+        manager.evict_blocks({1})
+    with pytest.raises(ValueError, match="outside"):
+        manager.evict_blocks({0: {1}, 1: {3}})
+    assert manager.get_computed_blocks(request)[1] == 16
+    manager.evict_blocks({1: {1}})
+    assert manager.get_computed_blocks(request)[1] == 0
+    assert allocated.blocks[0][0].block_hash is not None
+    assert allocated.blocks[1][0].block_hash is None
+    removed = [
+        event for event in manager.take_events() if isinstance(event, BlockRemoved)
+    ]
+    assert removed
+    assert not manager.reset_prefix_cache()
+    assert allocated.blocks[0][0].block_hash is not None
+    manager.free(request)
+    assert manager.reset_prefix_cache()
+    assert manager.get_computed_blocks(request)[1] == 0
+    cleared = [
+        event for event in manager.take_events() if isinstance(event, AllBlocksCleared)
+    ]
+    assert len(cleared) == 1
+    assert manager.usage == 0
+
+
+def test_independent_manager_reclaims_only_its_domains_cached_prefix(
+    independent_mamba_groups,
+):
+    attention, state = independent_mamba_groups
+    state = replace(
+        state, kv_cache_spec=replace(attention.kv_cache_spec, num_kv_heads=4)
+    )
+    manager = independent_capacity_manager(
+        [attention, state], (6, 2), enable_caching=True
+    )
+    first = make_request("old", [1] * 17, block_size=16, hash_fn=sha256)
+    allocated = manager.allocate_slots(first, 16)
+    assert allocated is not None
+    manager.free(first)
+    assert manager.get_computed_blocks(first)[1] == 16
+    second = make_request("new", [2] * 17, block_size=16, hash_fn=sha256)
+    reused = manager.allocate_slots(second, 16)
+    assert reused is not None
+    assert reused.get_block_ids() == ([2], [1])
+    assert allocated.blocks[0][0].block_hash is not None
+    assert manager.get_computed_blocks(first)[1] == 0
+    manager.free(second)
+    assert manager.get_computed_blocks(second)[1] == 16
+
+
+def test_independent_manager_cow_copies_and_retention_keep_group_ownership(
+    independent_mamba_groups,
+):
+    attention, state = independent_mamba_groups
+    attention = replace(
+        attention, kv_cache_spec=replace(attention.kv_cache_spec, block_size=32)
+    )
+    state = replace(
+        state,
+        kv_cache_spec=replace(
+            state.kv_cache_spec, block_size=32, mamba_cache_mode="align"
+        ),
+    )
+    manager = independent_capacity_manager(
+        [attention, state], (8, 5), enable_caching=True, scheduler_block_size=32
+    )
+    first = make_request("source", list(range(49)), block_size=16, hash_fn=sha256)
+    assert manager.allocate_slots(first, 48) is not None
+    manager.free(first)
+    manager.new_step_starts()
+    manager.take_new_block_ids()
+    second = make_request("cow", list(range(64)), block_size=16, hash_fn=sha256)
+    hit, num_computed, _ = manager.get_computed_blocks(second)
+    assert num_computed == 48
+    assert manager.allocate_slots(second, 16, num_computed, hit) is not None
+    copies, retained = manager.take_kv_cache_block_copies()
+    assert isinstance(copies, dict)
+    assert set(copies) == {0, 1}
+    assert all(copies.values())
+    for group_id, pending in copies.items():
+        pool = manager.coordinator.single_type_managers[group_id].block_pool
+        for copy_record in pending:
+            assert copy_record.src_block_id != copy_record.dst_block_id
+            source = pool.blocks[copy_record.src_block_id]
+            destination = pool.blocks[copy_record.dst_block_id]
+            assert any(block is source for block in retained)
+            assert any(block is destination for block in retained)
+            assert source.pool is destination.pool is pool
+    manager.free(second)
+    assert all(block.ref_cnt > 0 for block in retained)
+    manager.block_pool.free_blocks(retained)
+    assert [pool.get_num_free_blocks() for pool in manager.coordinator.block_pools] == [
+        7,
+        4,
+    ]
+    assert manager.usage == 0
+    assert manager.take_kv_cache_block_copies() == ({0: [], 1: []}, [])
+
+
+def test_independent_manager_preserves_event_order_and_global_clear(
+    independent_mamba_groups,
+):
+    from vllm.distributed.kv_events import (
+        AllBlocksCleared,
+        BlockRemoved,
+        KVEventAggregator,
+    )
+
+    attention, state = independent_mamba_groups
+    state = replace(
+        state,
+        kv_cache_spec=replace(state.kv_cache_spec, mamba_cache_mode="align"),
+    )
+    manager = independent_capacity_manager(
+        [attention, state], (5, 3), enable_caching=True
+    )
+    request = make_request("events", list(range(17)), block_size=16, hash_fn=sha256)
+    assert manager.allocate_slots(request, 16) is not None
+    manager.take_events()
+    manager.evict_blocks({1: {1}, 0: {1}})
+    events = manager.take_events()
+    assert [event.group_idx for event in events if isinstance(event, BlockRemoved)] == [
+        1,
+        0,
+    ]
+    assert manager.take_events() == []
+    manager.free(request)
+    assert manager.reset_prefix_cache()
+    aggregator = KVEventAggregator(num_workers=1)
+    aggregator.add_events(manager.take_events())
+    cleared = aggregator.get_common_events()
+    assert len(cleared) == 1
+    assert isinstance(cleared[0], AllBlocksCleared)
+
+
+@pytest.mark.parametrize("counts", [(5, 8), (9, 3), (6, 4)])
+def test_independent_concurrency_matches_real_manager_request_capacity(
+    independent_mamba_groups, counts
+):
+    attention, state = independent_mamba_groups
+    state = replace(state, kv_cache_spec=replace(state.kv_cache_spec, block_size=32))
+    config = VllmConfig(
+        model_config=ModelConfig(max_model_len=32),
+        device_config=DeviceConfig("cpu"),
+    )
+    config.cache_config.kv_cache_layout = "BLHNC"
+    plan = kv_cache_planning.get_kv_cache_config_from_groups(
+        config, [attention, state], 16 * 1024**2, group_num_blocks=counts
+    )
+    scheduler_plan = generate_scheduler_kv_cache_config([plan, copy.deepcopy(plan)])
+    assert scheduler_plan.group_num_blocks == counts
+    expected = min((counts[0] - 1) / 2, counts[1] - 1)
+    assert get_max_concurrency_for_kv_cache_config(config, plan) == expected
+    assert get_max_concurrency_for_kv_cache_config(config, scheduler_plan) == expected
+    assert get_kv_cache_capacity(config, scheduler_plan) == (
+        int(expected * 32),
+        expected,
+    )
+    manager = KVCacheManager(
+        scheduler_plan,
+        max_model_len=32,
+        scheduler_block_size=32,
+        hash_block_size=16,
+        enable_caching=False,
+    )
+    requests = [
+        make_request(str(index), [index] * 32, block_size=16, hash_fn=sha256)
+        for index in range(int(expected) + 1)
+    ]
+    for request in requests[:-1]:
+        allocated = manager.allocate_slots(request, 32, full_sequence_must_fit=True)
+        assert allocated is not None
+        assert [len(blocks) for blocks in allocated.blocks] == [2, 1]
+    before = [pool.get_num_free_blocks() for pool in manager.coordinator.block_pools]
+    assert manager.allocate_slots(requests[-1], 32, full_sequence_must_fit=True) is None
+    assert [
+        pool.get_num_free_blocks() for pool in manager.coordinator.block_pools
+    ] == before
+    for request in requests[:-1]:
+        manager.free(request)
+    assert manager.usage == 0
+    with pytest.raises(AssertionError):
+        generate_scheduler_kv_cache_config(
+            [
+                plan,
+                replace(plan, group_num_blocks=(counts[0], counts[1] + 1)),
+            ]
+        )
+
+
+def mamba_ratio_config(
+    ratio,
+    budget,
+    *,
+    max_model_len=32,
+    pipeline_parallel_size=1,
+    enable_prefix_caching=True,
+    max_num_seqs=128,
+):
+    model_config = ModelConfig(max_model_len=max_model_len)
+    config = VllmConfig(
+        model_config=model_config,
+        cache_config=CacheConfig(
+            mamba_full_memory_ratio=ratio,
+            kv_cache_memory_bytes=budget,
+            enable_prefix_caching=enable_prefix_caching,
+        ),
+        scheduler_config=SchedulerConfig(
+            max_model_len=model_config.max_model_len,
+            is_encoder_decoder=model_config.is_encoder_decoder,
+            max_num_seqs=max_num_seqs,
+        ),
+        parallel_config=ParallelConfig(pipeline_parallel_size=pipeline_parallel_size),
+        device_config=DeviceConfig("cpu"),
+    )
+    config.cache_config.mamba_fixed_num_seqs = max_num_seqs
+    return config
+
+
+@pytest.mark.parametrize("ratio", [0.5, 0.9])
+def test_mamba_ratio_live_planner_uses_physical_native_pages(
+    independent_mamba_groups, ratio
+):
+    from vllm.v1.worker.utils import allocate_kv_cache
+
+    attention, state = independent_mamba_groups
+    state = replace(
+        state,
+        kv_cache_spec=replace(
+            state.kv_cache_spec, block_size=32, mamba_cache_mode="align"
+        ),
+    )
+    specs = {"attention": attention.kv_cache_spec, "state": state.kv_cache_spec}
+    budget = 12 * 1024**2
+    config = mamba_ratio_config(ratio, budget)
+    config.cache_config.kv_cache_layout = "BLHNC"
+    (plan,) = kv_cache_planning.get_kv_cache_configs(
+        config, [specs], [config.cache_config.kv_cache_memory_bytes]
+    )
+    state_count = int(budget * (ratio / (1 + ratio))) // 32768
+    attention_count = (budget - state_count * 32768) // 65536
+    assert plan.group_num_blocks == (attention_count, state_count)
+    assert state.kv_cache_spec.page_size_bytes == 32768
+    assert plan.kv_cache_groups[1].kv_cache_spec.page_size_bytes == 32768
+    assert {tensor.size for tensor in plan.kv_cache_tensors} == {
+        attention_count * 65536 + state_count * 32768
+    }
+    assert all(tensor.size <= budget for tensor in plan.kv_cache_tensors)
+    views = allocate_kv_cache(plan, torch.device("cpu"), KVCacheLayout.BLHNC)
+    assert views["attention"].shape[0] == attention_count
+    assert views["state"].shape[0] == state_count
+    views["state"].fill_(3)
+    assert torch.count_nonzero(views["attention"]) == 0
+    scheduler_plan = generate_scheduler_kv_cache_config([plan])
+    manager = KVCacheManager(
+        scheduler_plan,
+        max_model_len=32,
+        scheduler_block_size=32,
+        hash_block_size=16,
+        enable_caching=True,
+    )
+    assert [pool.get_num_free_blocks() for pool in manager.coordinator.block_pools] == [
+        attention_count - 1,
+        state_count - 1,
+    ]
+    assert get_max_concurrency_for_kv_cache_config(config, scheduler_plan) == min(
+        (attention_count - 1) / 2, (state_count - 1) / 2
+    )
+    request = make_request("ratio", list(range(32)), block_size=16, hash_fn=sha256)
+    allocated = manager.allocate_slots(request, 32, full_sequence_must_fit=True)
+    assert allocated is not None
+    assert [len(blocks) for blocks in allocated.blocks] == [2, 1]
+    manager.free(request)
+    assert manager.usage == 0
+
+
+@pytest.mark.parametrize("ratio", [0.5, 0.9])
+def test_mamba_ratio_live_pp_projection_has_common_counts_and_zero_byte_empty_groups(
+    independent_mamba_groups, ratio
+):
+    from vllm.v1.worker.utils import allocate_kv_cache
+
+    attention, state = independent_mamba_groups
+    state_spec = replace(state.kv_cache_spec, block_size=32, mamba_cache_mode="align")
+    workers = [
+        {
+            "a0": attention.kv_cache_spec,
+            "a1": attention.kv_cache_spec,
+            "m0": state_spec,
+        },
+        {"m1": state_spec, "m2": state_spec},
+    ]
+    budgets = [12 * 1024**2, 10 * 1024**2]
+    config = mamba_ratio_config(ratio, budgets[0], pipeline_parallel_size=2)
+    config.cache_config.kv_cache_layout = "BLHNC"
+    plans = kv_cache_planning.get_kv_cache_configs(config, workers, budgets)
+    assert plans[0].group_num_blocks == plans[1].group_num_blocks
+    assert any(not group.layer_names for group in plans[0].kv_cache_groups)
+    assert any(not group.layer_names for group in plans[1].kv_cache_groups)
+    for worker, plan, budget in zip(workers, plans, budgets):
+        assert all(tensor.size <= budget for tensor in plan.kv_cache_tensors)
+        assert {
+            name for group in plan.kv_cache_groups for name in group.layer_names
+        } == set(worker)
+        views = allocate_kv_cache(plan, torch.device("cpu"), KVCacheLayout.BLHNC)
+        assert set(views) == set(worker)
+        assert views[next(iter(worker))].untyped_storage().nbytes() == (
+            plan.kv_cache_tensors[0].size
+        )
+        expected_size = sum(
+            len(group.layer_names) * group.kv_cache_spec.page_size_bytes * count
+            for group, count in zip(plan.kv_cache_groups, plan.group_num_blocks)
+        )
+        assert plan.kv_cache_tensors[0].size == expected_size
+    scheduler_plan = generate_scheduler_kv_cache_config(plans)
+    assert scheduler_plan.group_num_blocks == plans[0].group_num_blocks
+    assert (
+        get_max_concurrency_for_kv_cache_config(config, plans[0])
+        == (get_max_concurrency_for_kv_cache_config(config, plans[1]))
+        == get_max_concurrency_for_kv_cache_config(config, scheduler_plan)
+    )
+
+
+def test_mamba_ratio_none_preserves_live_legacy_plan(independent_mamba_groups):
+    specs = {
+        group.layer_names[0]: group.kv_cache_spec for group in independent_mamba_groups
+    }
+    budget = 12 * 1024**2
+    config = mamba_ratio_config(None, budget, enable_prefix_caching=False)
+    config.cache_config.kv_cache_layout = "BLHNC"
+    expected = kv_cache_planning.get_kv_cache_config_from_groups(
+        config,
+        kv_cache_planning.get_kv_cache_groups(config, specs),
+        budget,
+    )
+    (actual,) = kv_cache_planning.get_kv_cache_configs(config, [specs], [budget])
+    assert actual == expected
+    assert actual.group_num_blocks is None
+    assert (
+        CacheConfig().compute_hash()
+        == CacheConfig(mamba_full_memory_ratio=None).compute_hash()
+    )
+
+
+@pytest.mark.parametrize(
+    "budget,error",
+    [
+        (65536, "null block"),
+        (512 * 1024, "one request at max_model_len"),
+    ],
+)
+def test_mamba_ratio_live_planner_rejects_insufficient_physical_capacity(
+    independent_mamba_groups, budget, error
+):
+    attention, state = independent_mamba_groups
+    specs = {
+        "attention": attention.kv_cache_spec,
+        "state": replace(state.kv_cache_spec, block_size=256, mamba_cache_mode="align"),
+    }
+    config = mamba_ratio_config(0.5, budget, max_model_len=256)
+    config.cache_config.kv_cache_layout = "BLHNC"
+    with pytest.raises(ValueError, match=error):
+        kv_cache_planning.get_kv_cache_configs(config, [specs], [budget])
+    assert config.model_config.max_model_len == 256
+
+
+def test_mamba_ratio_live_auto_fit_uses_usable_group_counts(independent_mamba_groups):
+    attention, state = independent_mamba_groups
+    specs = {
+        "attention": attention.kv_cache_spec,
+        "state": replace(state.kv_cache_spec, block_size=256, mamba_cache_mode="align"),
+    }
+    budget = 512 * 1024
+    config = mamba_ratio_config(0.5, budget, max_model_len=-1)
+    config.cache_config.kv_cache_layout = "BLHNC"
+    assert config.model_config.original_max_model_len == -1
+    (plan,) = kv_cache_planning.get_kv_cache_configs(config, [specs], [budget])
+    assert config.model_config.max_model_len == 64
+    assert plan.group_num_blocks == (5, 5)
+    assert get_max_concurrency_for_kv_cache_config(config, plan) == 1
+
+
+def test_mamba_ratio_live_minimum_includes_verification_pages(independent_mamba_groups):
+    attention, state = independent_mamba_groups
+    specs = {
+        "attention": attention.kv_cache_spec,
+        "state": replace(
+            state.kv_cache_spec,
+            block_size=256,
+            num_speculative_blocks=8,
+            mamba_cache_mode="align",
+        ),
+    }
+    budget = 512 * 1024
+    config = mamba_ratio_config(0.5, budget, max_model_len=-1)
+    config.cache_config.kv_cache_layout = "BLHNC"
+    with pytest.raises(ValueError, match="even one token"):
+        kv_cache_planning.get_kv_cache_configs(config, [specs], [budget])
+
+
+@pytest.mark.parametrize("ratio", [0, -0.5, float("inf"), float("nan")])
+def test_mamba_ratio_config_rejects_invalid_ratios(ratio):
+    with pytest.raises(ValueError, match="greater than 0|finite number"):
+        CacheConfig(mamba_full_memory_ratio=ratio)
+
+
+def test_mamba_ratio_engine_args_reach_native_cache_config():
+    from vllm.engine.arg_utils import EngineArgs
+
+    config = EngineArgs(
+        mamba_full_memory_ratio=0.5,
+        kv_cache_memory_bytes=12 * 1024**2,
+        max_model_len=32,
+        enforce_eager=True,
+    ).create_engine_config()
+    assert config.cache_config.mamba_full_memory_ratio == 0.5
+    assert config.cache_config.kv_cache_memory_bytes == 12 * 1024**2
+
+
+def test_mamba_ratio_live_alignment_charges_physical_stride(independent_mamba_groups):
+    attention, state = independent_mamba_groups
+    alignment = 128 * 1024
+    specs = {
+        "attention": replace(attention.kv_cache_spec, block_stride_alignment=alignment),
+        "state": replace(
+            state.kv_cache_spec,
+            block_size=32,
+            block_stride_alignment=alignment,
+            mamba_cache_mode="align",
+        ),
+    }
+    budget = 12 * 1024**2
+    config = mamba_ratio_config(0.5, budget)
+    config.cache_config.kv_cache_layout = "BLHNC"
+    (plan,) = kv_cache_planning.get_kv_cache_configs(config, [specs], [budget])
+    state_count = int((budget - 2 * (alignment - 1)) / 3) // alignment
+    attention_count = (
+        budget - 2 * (alignment - 1) - state_count * alignment
+    ) // alignment
+    assert plan.group_num_blocks == (attention_count, state_count)
+    assert {tensor.block_stride for tensor in plan.kv_cache_tensors} == {alignment}
+    assert all(tensor.offset % alignment == 0 for tensor in plan.kv_cache_tensors)
+    assert {tensor.size for tensor in plan.kv_cache_tensors} == {
+        (attention_count + state_count) * alignment
+    }
+    assert plan.kv_cache_tensors[0].size <= budget
+
+
+@pytest.mark.parametrize("ratio", [0.5, 0.9])
+def test_mamba_ratio_without_prefix_reserves_native_request_demand(
+    independent_mamba_groups, ratio
+):
+    attention, state = independent_mamba_groups
+    state_spec = replace(state.kv_cache_spec, block_size=256, num_speculative_blocks=2)
+    specs = {"attention": attention.kv_cache_spec, "state": state_spec}
+    budget = 2 * 1024**2
+    config = mamba_ratio_config(
+        ratio, budget, enable_prefix_caching=False, max_num_seqs=3
+    )
+    config.cache_config.kv_cache_layout = "BLHNC"
+    (plan,) = kv_cache_planning.get_kv_cache_configs(config, [specs], [budget])
+    assert plan.group_num_blocks == (27, 10)
+    assert plan.kv_cache_tensors[0].size == 27 * 65536 + 10 * 32768
+    assert get_max_concurrency_for_kv_cache_config(config, plan) == 3
+    manager = KVCacheManager(
+        plan,
+        max_model_len=32,
+        scheduler_block_size=256,
+        hash_block_size=16,
+        enable_caching=False,
+    )
+    requests = [
+        make_request(str(index), [index] * 32, block_size=16, hash_fn=sha256)
+        for index in range(4)
+    ]
+    for request in requests[:3]:
+        allocated = manager.allocate_slots(request, 32, full_sequence_must_fit=True)
+        assert allocated is not None
+        assert [len(blocks) for blocks in allocated.blocks] == [2, 3]
+    assert manager.allocate_slots(requests[3], 32) is None
+    assert manager.coordinator.block_pools[0].get_num_free_blocks() == 20
+    assert manager.coordinator.block_pools[1].get_num_free_blocks() == 0
+    for request in requests[:3]:
+        manager.free(request)
+    assert manager.usage == 0
+
+
+@pytest.mark.parametrize("ratio", [0.5, 0.9])
+def test_mamba_ratio_without_explicit_request_bound_remains_automatic(
+    independent_mamba_groups, ratio
+):
+    attention, state = independent_mamba_groups
+    specs = {
+        "attention": attention.kv_cache_spec,
+        "state": replace(state.kv_cache_spec, block_size=256, num_speculative_blocks=2),
+    }
+    budget = 2 * 1024**2
+    config = mamba_ratio_config(
+        ratio, budget, enable_prefix_caching=False, max_num_seqs=3
+    )
+    config.cache_config.kv_cache_layout = "BLHNC"
+    (fixed,) = kv_cache_planning.get_kv_cache_configs(config, [specs], [budget])
+    config.cache_config.mamba_fixed_num_seqs = None
+    (automatic,) = kv_cache_planning.get_kv_cache_configs(config, [specs], [budget])
+    assert fixed.group_num_blocks[1] == 10
+    assert automatic.group_num_blocks[1] > fixed.group_num_blocks[1]
+    assert automatic.kv_cache_tensors[0].size <= budget
+
+
+def test_mamba_ratio_without_prefix_rejects_unfunded_request_state(
+    independent_mamba_groups,
+):
+    attention, state = independent_mamba_groups
+    specs = {
+        "attention": attention.kv_cache_spec,
+        "state": replace(state.kv_cache_spec, block_size=256, num_speculative_blocks=2),
+    }
+    budget = 512 * 1024
+    config = mamba_ratio_config(
+        0.5, budget, enable_prefix_caching=False, max_num_seqs=48
+    )
+    config.cache_config.kv_cache_layout = "BLHNC"
+    with pytest.raises(ValueError, match="fixed Mamba state for max_num_seqs"):
+        kv_cache_planning.get_kv_cache_configs(config, [specs], [budget])
+
+
+def test_mamba_ratio_replay_cursors_are_charged_once_per_namespace(
+    independent_mamba_groups,
+):
+    attention, state = independent_mamba_groups
+    state_spec = replace(
+        state.kv_cache_spec,
+        block_size=32,
+        mamba_cache_mode="align",
+        replayssm_tracker_bytes_per_block=12,
+    )
+    specs = {
+        "a0": attention.kv_cache_spec,
+        "a1": attention.kv_cache_spec,
+        "m0": state_spec,
+        "m1": state_spec,
+    }
+    count = 64
+    rebinding_headroom = 12 * 4
+    budget = 3 * count * (2 * 32768 + 12) + rebinding_headroom
+    config = mamba_ratio_config(0.5, budget, max_num_seqs=4)
+    config.cache_config.kv_cache_layout = "BLHNC"
+    (plan,) = kv_cache_planning.get_kv_cache_configs(config, [specs], [budget])
+    assert plan.group_num_blocks == (64, 64)
+    assert [
+        group.replayssm_tracker_bytes_per_block for group in plan.kv_cache_groups
+    ] == [0, 12]
+    backing_size = count * (2 * 65536 + 2 * 32768)
+    assert {tensor.size for tensor in plan.kv_cache_tensors} == {backing_size}
+    assert backing_size + 12 * count + rebinding_headroom <= budget
+    assert (
+        plan.group_num_blocks[1] * (2 * 32768 + 12)
+        == (budget - rebinding_headroom) // 3
+    )
+
+
+def test_mamba_ratio_replay_auxiliary_storage_projects_pp_namespaces(
+    independent_mamba_groups,
+):
+    attention, state = independent_mamba_groups
+    state_spec = replace(
+        state.kv_cache_spec,
+        block_size=32,
+        mamba_cache_mode="align",
+        replayssm_tracker_bytes_per_block=12,
+    )
+    workers = [
+        {
+            "a0": attention.kv_cache_spec,
+            "a1": attention.kv_cache_spec,
+            "m0": state_spec,
+        },
+        {"m1": state_spec, "m2": state_spec},
+    ]
+    budgets = [12 * 1024**2, 10 * 1024**2]
+    config = mamba_ratio_config(
+        0.5, budgets[0], pipeline_parallel_size=2, max_num_seqs=4
+    )
+    config.cache_config.kv_cache_layout = "BLHNC"
+    plans = kv_cache_planning.get_kv_cache_configs(config, workers, budgets)
+    assert plans[0].group_num_blocks == plans[1].group_num_blocks
+    for plan, budget in zip(plans, budgets):
+        auxiliary = sum(
+            group.replayssm_tracker_bytes_per_block * (count + 4)
+            for group, count in zip(plan.kv_cache_groups, plan.group_num_blocks)
+        )
+        assert plan.kv_cache_tensors[0].size + auxiliary <= budget
+        for group in plan.kv_cache_groups:
+            if not group.layer_names:
+                assert group.replayssm_tracker_bytes_per_block == 0
+    assert (
+        sum(
+            group.replayssm_tracker_bytes_per_block
+            for group in plans[0].kv_cache_groups
+        )
+        == 12
+    )
+    assert (
+        sum(
+            group.replayssm_tracker_bytes_per_block
+            for group in plans[1].kv_cache_groups
+        )
+        == 24
+    )
+
+
+@pytest.mark.parametrize("layout", [layout.name for layout in KVCacheLayout])
+def test_mamba_ratio_minimal_profiling_builder_preserves_independent_counts(
+    independent_mamba_groups, layout
+):
+    from vllm.v1.core.kv_cache_config_builder import get_kv_cache_config_builder
+    from vllm.v1.worker.utils import allocate_kv_cache
+
+    config = mamba_ratio_config(0.5, 12 * 1024**2)
+    config.cache_config.kv_cache_layout = layout
+    builder = get_kv_cache_config_builder(config)
+    plan = builder.get_kv_cache_config_from_groups(
+        config, independent_mamba_groups, num_blocks=4
+    )
+    assert plan.group_num_blocks == (4, 4)
+    assert plan.num_blocks == 4
+    assert {tensor.size for tensor in plan.kv_cache_tensors} == {4 * (65536 + 32768)}
+    views = allocate_kv_cache(plan, torch.device("cpu"), KVCacheLayout[layout])
+    views["state"].fill_(9)
+    assert torch.count_nonzero(views["attention"]) == 0
+
+
+@pytest.mark.parametrize("cache_types", ["full", "sliding", "mixed"])
+@pytest.mark.parametrize("disable_hybrid", [False, True])
+def test_mamba_ratio_dense_preserves_legacy_plan_and_profiling(
+    independent_mamba_groups, cache_types, disable_hybrid
+):
+    from vllm.v1.core.kv_cache_config_builder import get_kv_cache_config_builder
+    from vllm.v1.worker.utils import allocate_kv_cache
+
+    attention = independent_mamba_groups[0].kv_cache_spec
+    sliding = SlidingWindowSpec(
+        block_size=attention.block_size,
+        num_kv_heads=attention.num_kv_heads,
+        head_size=attention.head_size,
+        dtype=attention.dtype,
+        sliding_window=16,
+    )
+    specs = {}
+    if cache_types != "sliding":
+        specs["attention"] = attention
+    if cache_types != "full":
+        specs["sliding"] = sliding
+    budget = 12 * 1024**2
+    plans = []
+    profiles = []
+    for ratio in (None, 0.9):
+        config = mamba_ratio_config(ratio, budget)
+        config.cache_config.kv_cache_layout = "BLHNC"
+        config.scheduler_config.disable_hybrid_kv_cache_manager = disable_hybrid
+        (plan,) = kv_cache_planning.get_kv_cache_configs(
+            config, [dict(specs)], [budget]
+        )
+        plans.append(plan)
+        groups = kv_cache_planning.get_kv_cache_groups(config, dict(specs))
+        profiles.append(
+            get_kv_cache_config_builder(config).get_kv_cache_config_from_groups(
+                config, groups, num_blocks=4
+            )
+        )
+        assert plan.group_num_blocks is None
+        views = allocate_kv_cache(plan, torch.device("cpu"), KVCacheLayout.BLHNC)
+        assert set(views) == set(specs)
+    assert plans[0] == plans[1]
+    assert profiles[0] == profiles[1]
+
+
+@pytest.mark.parametrize("ratio", [0.5, 0.9])
+@pytest.mark.parametrize("enable_prefix_caching", [False, True])
+@pytest.mark.parametrize("empty_pp_stage", [False, True])
+def test_mamba_ratio_pure_state_uses_native_budget_and_nulls(
+    independent_mamba_groups, ratio, enable_prefix_caching, empty_pp_stage
+):
+    from vllm.v1.core.kv_cache_config_builder import get_kv_cache_config_builder
+    from vllm.v1.worker.utils import allocate_kv_cache
+
+    state_spec = replace(
+        independent_mamba_groups[1].kv_cache_spec,
+        num_speculative_blocks=1,
+        mamba_cache_mode="align" if enable_prefix_caching else "none",
+        replayssm_tracker_bytes_per_block=12,
+    )
+    workers = [{"state": state_spec}]
+    if empty_pp_stage:
+        workers.insert(0, {})
+    budget = 12 * 1024**2
+    config = mamba_ratio_config(
+        ratio,
+        budget,
+        pipeline_parallel_size=len(workers),
+        enable_prefix_caching=enable_prefix_caching,
+        max_num_seqs=3,
+    )
+    config.cache_config.kv_cache_layout = "BLHNC"
+    config.cache_config.mamba_cache_mode = state_spec.mamba_cache_mode
+    plans = kv_cache_planning.get_kv_cache_configs(
+        config, workers, [budget] * len(workers)
+    )
+    if enable_prefix_caching:
+        numerator, denominator = ratio.as_integer_ratio()
+        state_budget = (budget - 12 * 3) * numerator // (numerator + denominator)
+        expected_count = state_budget // (state_spec.page_size_bytes + 12)
+    else:
+        expected_count = 1 + 3 * 2
+    for worker, plan in zip(workers, plans):
+        assert plan.group_num_blocks == (expected_count,)
+        views = allocate_kv_cache(plan, torch.device("cpu"), KVCacheLayout.BLHNC)
+        assert set(views) == set(worker)
+        if worker:
+            assert views["state"].shape[0] == expected_count
+            backing = expected_count * state_spec.page_size_bytes
+            assert {tensor.size for tensor in plan.kv_cache_tensors} == {backing}
+            assert backing + 12 * (expected_count + 3) <= budget
+        else:
+            assert plan.kv_cache_tensors == []
+            assert plan.kv_cache_groups[0].replayssm_tracker_bytes_per_block == 0
+    manager = KVCacheManager(
+        generate_scheduler_kv_cache_config(plans),
+        max_model_len=32,
+        scheduler_block_size=state_spec.block_size,
+        hash_block_size=state_spec.block_size,
+        enable_caching=enable_prefix_caching,
+    )
+    assert (
+        manager.coordinator.block_pools[0].get_num_free_blocks() == expected_count - 1
+    )
+    builder = get_kv_cache_config_builder(config)
+    profile = builder.get_kv_cache_config_from_groups(
+        config, plans[-1].kv_cache_groups, num_blocks=4
+    )
+    assert profile.group_num_blocks == (4,)
+    if empty_pp_stage:
+        profile = builder.get_kv_cache_config_from_groups(
+            config, plans[0].kv_cache_groups, num_blocks=4
+        )
+        assert profile.group_num_blocks is None
+        assert profile.kv_cache_tensors == []
+
+
+@pytest.mark.parametrize("ratio", [0.5, 0.9])
+@pytest.mark.parametrize("include_full_attention", [False, True])
+@pytest.mark.parametrize("enable_prefix_caching", [False, True])
+@pytest.mark.parametrize("projection", ["single", "uneven", "empty"])
+def test_mamba_ratio_with_sliding_window_uses_physical_attention_budget(
+    independent_mamba_groups,
+    ratio,
+    include_full_attention,
+    enable_prefix_caching,
+    projection,
+):
+    from vllm.v1.worker.utils import allocate_kv_cache
+
+    attention, state = independent_mamba_groups
+    state_spec = replace(state.kv_cache_spec, block_size=256)
+    specs = {
+        "sliding": SlidingWindowSpec(
+            block_size=16,
+            num_kv_heads=2,
+            head_size=128,
+            dtype=torch.bfloat16,
+            sliding_window=16,
+        ),
+        "state": state_spec,
+    }
+    if include_full_attention:
+        specs["attention"] = attention.kv_cache_spec
+    workers = [specs]
+    if projection == "uneven":
+        workers = [
+            {name: spec for name, spec in specs.items() if name != "state"},
+            {"state": state_spec, "state2": state_spec},
+        ]
+    elif projection == "empty":
+        workers.append({})
+    budgets = [2 * 1024**2 - index * 65536 for index in range(len(workers))]
+    config = mamba_ratio_config(
+        ratio,
+        budgets[0],
+        pipeline_parallel_size=len(workers),
+        enable_prefix_caching=enable_prefix_caching,
+        max_num_seqs=3,
+    )
+    config.cache_config.kv_cache_layout = "BLHNC"
+    plans = kv_cache_planning.get_kv_cache_configs(config, workers, budgets)
+    costs = [
+        (
+            sum(
+                spec.page_size_bytes
+                for spec in worker.values()
+                if isinstance(spec, MambaSpec)
+            ),
+            sum(
+                spec.page_size_bytes
+                for spec in worker.values()
+                if not isinstance(spec, MambaSpec)
+            ),
+        )
+        for worker in workers
+    ]
+    numerator, denominator = ratio.as_integer_ratio()
+    state_count = (
+        min(
+            (budget * numerator // (numerator + denominator)) // state_bytes
+            for (state_bytes, _), budget in zip(costs, budgets)
+            if state_bytes
+        )
+        if enable_prefix_caching
+        else 4
+    )
+    attention_count = min(
+        (budget - state_count * state_bytes) // attention_bytes
+        for (state_bytes, attention_bytes), budget in zip(costs, budgets)
+        if attention_bytes
+    )
+    assert {spec.page_size_bytes for spec in specs.values()} == (
+        {16384, 32768, 65536} if include_full_attention else {16384, 32768}
+    )
+    for worker, plan, budget in zip(workers, plans, budgets):
+        assert plan.group_num_blocks is not None
+        assert plan.group_num_blocks == plans[0].group_num_blocks
+        expected_size = 0
+        for group, count in zip(plan.kv_cache_groups, plan.group_num_blocks):
+            is_state = isinstance(group.kv_cache_spec, MambaSpec)
+            assert count == (state_count if is_state else attention_count)
+            expected_size += sum(
+                worker[name].page_size_bytes * count for name in group.layer_names
+            )
+        assert {tensor.size for tensor in plan.kv_cache_tensors} == (
+            {expected_size} if worker else set()
+        )
+        views = allocate_kv_cache(plan, torch.device("cpu"), KVCacheLayout.BLHNC)
+        assert set(views) == set(worker)
+        backing_sizes = {
+            view.untyped_storage().data_ptr(): view.untyped_storage().nbytes()
+            for view in views.values()
+        }
+        assert len(backing_sizes) == (1 if worker else 0)
+        assert sum(backing_sizes.values()) == expected_size
+        assert sum(backing_sizes.values()) <= budget
+        for name, view in views.items():
+            assert view.shape[0] == (
+                state_count if isinstance(worker[name], MambaSpec) else attention_count
+            )
+        if not worker:
+            assert plan.kv_cache_tensors == []
+    scheduler_plan = generate_scheduler_kv_cache_config(plans)
+    requirements = [
+        group.kv_cache_spec.max_memory_usage_bytes(config)
+        // group.kv_cache_spec.page_size_bytes
+        for group in scheduler_plan.kv_cache_groups
+    ]
+    assert all(
+        count - 1 >= required
+        for count, required in zip(scheduler_plan.group_num_blocks, requirements)
+    )
+    assert get_max_concurrency_for_kv_cache_config(config, scheduler_plan) == min(
+        (count - 1) / required
+        for count, required in zip(scheduler_plan.group_num_blocks, requirements)
+    )
+
+
+def test_mamba_ratio_sliding_window_rejects_unfunded_minimum_request(
+    independent_mamba_groups,
+):
+    specs = {
+        "sliding": SlidingWindowSpec(
+            block_size=16,
+            num_kv_heads=2,
+            head_size=128,
+            dtype=torch.bfloat16,
+            sliding_window=16,
+        ),
+        "state": replace(independent_mamba_groups[1].kv_cache_spec, block_size=256),
+    }
+    budget = 6 * 32768
+    config = mamba_ratio_config(0.5, budget, max_model_len=256)
+    config.cache_config.kv_cache_layout = "BLHNC"
+    assert specs["sliding"].max_memory_usage_bytes(config) == 17 * 16384
+    with pytest.raises(ValueError, match="cannot serve one request at max_model_len"):
+        kv_cache_planning.get_kv_cache_configs(config, [specs], [budget])
+
+
+def test_mamba_ratio_sliding_window_manager_rollover_and_atomic_saturation(
+    independent_mamba_groups,
+):
+    groups = [
+        KVCacheGroupSpec(
+            ["sliding"],
+            SlidingWindowSpec(
+                block_size=16,
+                num_kv_heads=2,
+                head_size=128,
+                dtype=torch.bfloat16,
+                sliding_window=16,
+            ),
+        ),
+        replace(
+            independent_mamba_groups[1],
+            kv_cache_spec=replace(
+                independent_mamba_groups[1].kv_cache_spec, block_size=256
+            ),
+        ),
+    ]
+    manager = independent_capacity_manager(groups, (3, 3), scheduler_block_size=256)
+    request = make_request("rollover", [1] * 64, block_size=16, hash_fn=sha256)
+    assert manager.allocate_slots(request, 16) is not None
+    first_ids = manager.get_block_ids(request.request_id)[0]
+    request.num_computed_tokens = 16
+    assert manager.allocate_slots(request, 16) is not None
+    request.num_computed_tokens = 32
+    assert manager.allocate_slots(request, 16) is not None
+    rolled_ids = manager.get_block_ids(request.request_id)[0]
+    assert rolled_ids[0] == 0
+    assert rolled_ids[-1] == first_ids[0]
+    pools = manager.coordinator.block_pools
+    before = [pool.get_num_free_blocks() for pool in pools]
+    assert before == [0, 1]
+    other = make_request("blocked", [2] * 16, block_size=16, hash_fn=sha256)
+    assert manager.allocate_slots(other, 16) is None
+    assert [pool.get_num_free_blocks() for pool in pools] == before
+    manager.free(request)
+    assert manager.allocate_slots(other, 16) is not None
+    manager.free(other)
+    assert manager.usage == 0
+
+
+def test_mamba_ratio_attention_only_pp_stage_profiles_legacy_but_plans_globally(
+    independent_mamba_groups,
+):
+    from vllm.v1.core.kv_cache_config_builder import get_kv_cache_config_builder
+    from vllm.v1.worker.utils import allocate_kv_cache
+
+    attention, state = independent_mamba_groups
+    workers = [
+        {"attention": attention.kv_cache_spec},
+        {"state": replace(state.kv_cache_spec, mamba_cache_mode="align")},
+    ]
+    budget = 12 * 1024**2
+    config = mamba_ratio_config(0.9, budget, pipeline_parallel_size=2)
+    config.cache_config.kv_cache_layout = "BLHNC"
+    plans = kv_cache_planning.get_kv_cache_configs(config, workers, [budget, budget])
+    assert plans[0].group_num_blocks == plans[1].group_num_blocks
+    assert plans[0].group_num_blocks is not None
+    assert len(plans[0].group_num_blocks) == 2
+    profiles = []
+    for ratio in (None, 0.9):
+        profile_config = mamba_ratio_config(ratio, budget, pipeline_parallel_size=2)
+        profile_config.cache_config.kv_cache_layout = "BLHNC"
+        profiles.append(
+            get_kv_cache_config_builder(profile_config).get_kv_cache_config_from_groups(
+                profile_config, plans[0].kv_cache_groups, num_blocks=4
+            )
+        )
+    assert profiles[0] == profiles[1]
+    assert profiles[1].group_num_blocks is None
+    for worker, plan in zip(workers, plans):
+        views = allocate_kv_cache(plan, torch.device("cpu"), KVCacheLayout.BLHNC)
+        assert set(views) == set(worker)
+        for tensor in plan.kv_cache_tensors:
+            assert views[tensor.layers[0]].shape[0] == plan.num_blocks_of(tensor)

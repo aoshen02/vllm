@@ -247,8 +247,15 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
     def get_aligned_num_cpu_blocks(self) -> int | None:
         if self.worker_handler is None:
             return None
+        if self.worker_handler.num_cpu_group_blocks is not None:
+            return None
         num_cpu_blocks = self.worker_handler.num_cpu_blocks
         return num_cpu_blocks if num_cpu_blocks > 0 else None
+
+    def get_aligned_cpu_group_blocks(self) -> tuple[int, ...] | None:
+        if self.worker_handler is None:
+            return None
+        return self.worker_handler.num_cpu_group_blocks
 
     def bind_connector_metadata(
         self,
@@ -306,7 +313,11 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
 
     def bind_gpu_block_pool(self, gpu_block_pool: "BlockPool") -> None:
         if self.scheduler_manager is not None:
-            self.scheduler_manager.bind_gpu_block_pool(gpu_block_pool)
+            pools = None
+            if self._kv_cache_manager is not None:
+                managers = self._kv_cache_manager.coordinator.single_type_managers
+                pools = tuple(manager.block_pool for manager in managers)
+            self.scheduler_manager.bind_gpu_block_pool(gpu_block_pool, pools)
 
     def get_num_new_matched_tokens(
         self,

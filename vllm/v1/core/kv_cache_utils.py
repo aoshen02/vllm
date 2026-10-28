@@ -1018,7 +1018,7 @@ def get_max_concurrency_for_kv_cache_config(
     """Get the maximum concurrency for the given KV cache configuration.
 
     A request at max_model_len consumes whole blocks from each group's block
-    table — cdiv(per-request bytes, page bytes) of the group's spec — and all
+    table — cdiv(per-request bytes, page bytes) of the group's spec. In shared mode, all
     device groups draw those block ids from one shared pool, so the per-request
     total is the sum over groups. The memory/page ratio is identical whether
     a group carries an aggregated UniformTypeKVCacheSpecs (worker config) or
@@ -1029,15 +1029,22 @@ def get_max_concurrency_for_kv_cache_config(
     """
     num_blocks_per_request = 0
     host_blocks_per_request = 0
-    for group in kv_cache_config.kv_cache_groups:
+    group_limits = []
+    for group_id, group in enumerate(kv_cache_config.kv_cache_groups):
         required = cdiv(
             group.kv_cache_spec.max_memory_usage_bytes(vllm_config),
             group.kv_cache_spec.page_size_bytes,
         )
+        if kv_cache_config.group_num_blocks is not None and required:
+            group_limits.append(
+                (kv_cache_config.group_num_blocks[group_id] - 1) / required
+            )
         if group.host_resident:
             host_blocks_per_request += required
         else:
             num_blocks_per_request += required
+    if kv_cache_config.group_num_blocks is not None:
+        return min(group_limits, default=0.0)
     limits = [kv_cache_config.num_blocks / num_blocks_per_request]
     if host_blocks_per_request:
         assert kv_cache_config.hisparse_host_num_blocks is not None
@@ -1053,6 +1060,10 @@ def generate_scheduler_kv_cache_config(
     """Generate the KV cache configuration for the scheduler."""
     assert all(
         [cfg.num_blocks == kv_cache_configs[0].num_blocks for cfg in kv_cache_configs]
+    )
+    assert all(
+        cfg.group_num_blocks == kv_cache_configs[0].group_num_blocks
+        for cfg in kv_cache_configs
     )
     assert all(
         cfg.hisparse_host_num_blocks == kv_cache_configs[0].hisparse_host_num_blocks

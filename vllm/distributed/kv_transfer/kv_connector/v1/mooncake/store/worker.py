@@ -79,11 +79,13 @@ from vllm.v1.core.kv_cache_utils import (
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
+    KVCacheGroupSpec,
     KVCacheSpec,
     MambaSpec,
     MLAAttentionSpec,
     SlidingWindowMLASpec,
     UniformTypeKVCacheSpecs,
+    create_kv_cache_views,
     group_kernel_blocks,
 )
 from vllm.v1.kv_cache_layout import KVCacheLayout
@@ -1726,6 +1728,78 @@ class MooncakeStoreWorker:
             for g_idx, db in enumerate(self.token_dbs)
         )
 
+    def _register_independent_group(
+        self,
+        group: KVCacheGroupSpec,
+        db: ChunkedTokenDatabase,
+        kv_caches: dict[str, torch.Tensor],
+        registered_buffers: dict[int, int],
+    ) -> int:
+        if not group.layer_names:
+            db.set_kv_caches_base_addr([])
+            db.set_block_len([])
+            return 0
+        original_groups = {
+            name: group_id
+            for group_id, original in enumerate(self._kv_cache_config.kv_cache_groups)
+            for name in original.layer_names
+        }
+        group_id = original_groups[group.layer_names[0]]
+        count = self._kv_cache_config.num_blocks_for_group(group_id)
+        descriptors = [
+            descriptor
+            for descriptor in self._kv_cache_config.kv_cache_tensors
+            if original_groups[descriptor.layers[0]] == group_id
+        ]
+        placements = {
+            name: descriptor for descriptor in descriptors for name in descriptor.layers
+        }
+        layout = self.cache_config.get_resolved_kv_cache_layout()
+        caches: list[torch.Tensor] = []
+        for name in group.layer_names:
+            if name not in kv_caches:
+                raise ValueError(f"Missing transferable KV cache: {name}")
+            cache = kv_caches[name]
+            storage = cache.untyped_storage()
+            address = storage.data_ptr()
+            if address not in registered_buffers:
+                if self.store.register_buffer(address, storage.nbytes()) != 0:
+                    raise RuntimeError("Mooncake register_buffer failed")
+                registered_buffers[address] = storage.nbytes()
+            if cache.ndim == 1:
+                descriptor = placements[name]
+                original_spec = self._kv_cache_config.kv_cache_groups[
+                    group_id
+                ].kv_cache_spec
+                spec = (
+                    original_spec.kv_cache_specs[name]
+                    if isinstance(original_spec, UniformTypeKVCacheSpecs)
+                    else original_spec
+                )
+                raw = torch.empty(0, dtype=torch.int8, device=cache.device).set_(
+                    storage
+                )
+                cache = create_kv_cache_views(raw, spec, count, layout, descriptor)[
+                    descriptor.layers.index(name)
+                ]
+            caches.append(group_kernel_blocks(cache, count))
+        if isinstance(db.store_layout, TPShardedStoreLayout):
+            db.store_layout.register_kv_caches(caches, count)
+            return len(caches)
+        if layout.is_block_outermost:
+            start = min(descriptor.offset for descriptor in descriptors)
+            stride = descriptors[0].block_stride
+            if any(descriptor.block_stride != stride for descriptor in descriptors):
+                raise ValueError("Inconsistent independent Mooncake group row strides")
+            storage = caches[0].untyped_storage()
+            if start + count * stride > storage.nbytes():
+                raise ValueError("Independent Mooncake group exceeds backing storage")
+            db.set_kv_caches_base_addr([storage.data_ptr() + start])
+            db.set_block_len([stride])
+            return 1
+        db.store_layout.register_kv_caches(caches, count)
+        return len(caches)
+
     def register_kv_caches(
         self,
         kv_caches: dict[str, torch.Tensor],
@@ -1748,8 +1822,9 @@ class MooncakeStoreWorker:
         assert self.cache_config.num_gpu_blocks is not None
         self.num_blocks = self.cache_config.num_gpu_blocks
         use_group_regions = self._kv_cache_config.hisparse_host_num_blocks is not None
+        independent_groups = self._kv_cache_config.group_num_blocks is not None
 
-        if not use_group_regions:
+        if not use_group_regions and not independent_groups:
             store_layer_names = {
                 layer_name
                 for group in self._kv_cache_groups
@@ -1784,6 +1859,11 @@ class MooncakeStoreWorker:
         num_device_segments = 0
 
         for group, db in zip(self._kv_cache_groups, self.token_dbs, strict=True):
+            if independent_groups:
+                num_device_segments += self._register_independent_group(
+                    group, db, kv_caches, registered_buffers
+                )
+                continue
             if not use_group_regions:
                 continue
             missing_layers = [

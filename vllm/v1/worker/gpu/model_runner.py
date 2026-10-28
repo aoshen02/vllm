@@ -309,6 +309,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.speculative_config
             )
 
+        # Set once the KV connector is created, see initialize_kv_cache.
+        self.output_waits_for_drafter = False
+
         # Draft tokens propagation - for spec-dec + struct outputs.
         self.draft_tokens_handler = DraftTokensHandler(self.device)
 
@@ -818,11 +821,28 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.kv_caches = [
             cache for cache in kv_caches_dict.values() if cache.device == self.device
         ]
+        self.kv_caches_by_group = (
+            {
+                group_id: [
+                    kv_caches_dict[name]
+                    for name in group.layer_names
+                    if kv_caches_dict[name].device == self.device
+                ]
+                for group_id, group in enumerate(kv_cache_config.kv_cache_groups)
+            }
+            if kv_cache_config.group_num_blocks is not None
+            else None
+        )
         self.model_state.initialize_kv_cache(self.kv_cache_config, self.block_tables)
         if is_profiling:
             self.kv_connector = NO_OP_KV_CONNECTOR
         else:
             self.kv_connector = get_kv_connector(self.vllm_config, kv_caches_dict)
+            # A KV producer may send a finished request's blocks (including
+            # drafter KV) once the step output is ready, with no GPU sync.
+            self.output_waits_for_drafter = (
+                self.speculator is not None and self.kv_connector.requires_kv_delivery
+            )
 
             # AuxOutput connector requires resolved kv_cache_config.
             if self.vllm_config.aux_output_config.enabled:
@@ -837,7 +857,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             attn_groups_iter=(g for groups in self.attn_groups for g in groups),
             kernel_block_sizes=self.kernel_block_sizes,
             static_forward_context=self.compilation_config.static_forward_context,
-            num_blocks=self.kv_cache_config.num_blocks,
+            num_blocks=(
+                self.kv_cache_config.group_num_blocks or self.kv_cache_config.num_blocks
+            ),
         )
 
     @torch.inference_mode()
@@ -1293,8 +1315,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # zeroing new blocks and before the forward pass reads them.
         if scheduler_output.kv_cache_block_copies:
             copy_kv_cache_blocks_inplace(
-                self.kv_caches,
-                self.kv_cache_config.num_blocks,
+                self.kv_caches_by_group
+                if self.kv_caches_by_group is not None
+                else self.kv_caches,
+                self.kv_cache_config.group_num_blocks
+                or self.kv_cache_config.num_blocks,
                 scheduler_output.kv_cache_block_copies,
             )
 
@@ -1759,6 +1784,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         randomize_inputs: bool = False,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
         if not dummy_run:
+            self.kv_connector.handle_preemptions(scheduler_output)
             # Update the request states.
             self.update_pp_decode_requests()
             self.finish_requests(scheduler_output)
@@ -1898,7 +1924,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         input_batch,
                         self.block_tables,
                         context_len,
-                        self.kv_cache_config.num_blocks,
+                        self.kv_cache_config.group_num_blocks
+                        or self.kv_cache_config.num_blocks,
                         self.max_model_len,
                         input_block_tables=block_tables,
                     )
@@ -2330,6 +2357,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if defer_kv_finalize:
             self.kv_connector.finalize_step()
         model_runner_output.ec_connector_output = ec_connector_output
+
+        if self.output_waits_for_drafter:
+            async_output.wait_for_stream(self.main_stream)
 
         return async_output
 

@@ -3,6 +3,7 @@
 import filecmp
 import shutil
 import tempfile
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
@@ -10,7 +11,13 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
-from tests.v1.kv_connector.unit.utils import create_vllm_config, maybe_update_block_size
+from tests.v1.kv_connector.unit.utils import (
+    create_model_runner_output,
+    create_request,
+    create_scheduler,
+    create_vllm_config,
+    maybe_update_block_size,
+)
 from vllm import LLM, SamplingParams
 from vllm.config import KVTransferConfig
 from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
@@ -24,6 +31,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
     KVConnectorLogging,
     KVConnectorStats,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector import (
+    MooncakeWorkerMetadata,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import (
     MultiConnector,
     MultiKVConnectorPromMetrics,
@@ -33,9 +43,15 @@ from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import (
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
     NixlKVConnectorStats,
 )
-from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.core.kv_cache_planning import get_kv_cache_config_from_groups
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    KVCacheConfig,
+    KVCacheGroupSpec,
+)
 from vllm.v1.metrics.cache_hit_source import CacheHitSource
 from vllm.v1.outputs import KVConnectorOutput, KVConnectorWorkerMetadata
+from vllm.v1.simple_kv_offload.metadata import SimpleCPUOffloadWorkerMetadata
 
 MODEL_NAME = "meta-llama/Llama-3.2-1B-Instruct"
 
@@ -46,6 +62,157 @@ PROMPTS = [
 ]
 
 SAMPLING_PARAMS = SamplingParams(temperature=0, max_tokens=20)
+
+
+@pytest.mark.parametrize("mooncake_first", [False, True])
+@pytest.mark.parametrize("skip_prefix_cache", [False, True])
+@pytest.mark.parametrize("attempts", [0, 1])
+def test_mooncake_simple_cpu_optimistic_yield_retains_pending_saves(
+    monkeypatch, mooncake_first, skip_prefix_cache, attempts
+):
+    """A cache child cannot bypass PD admission or release pending save sources."""
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    children = [
+        {
+            "kv_connector": "MooncakeConnector",
+            "kv_role": "kv_producer",
+            "kv_connector_extra_config": {"optimistic_prefill_attempts": attempts},
+        },
+        {
+            "kv_connector": "SimpleCPUOffloadConnector",
+            "kv_role": "kv_both",
+            "kv_connector_extra_config": {
+                "cpu_bytes_to_use": 4096,
+                "num_cpu_blocks": 32,
+            },
+        },
+    ]
+    if not mooncake_first:
+        children.reverse()
+    mooncake_index = 0 if mooncake_first else 1
+    cpu_index = 1 - mooncake_index
+    config = create_vllm_config(
+        kv_connector="MultiConnector",
+        kv_role="kv_both",
+        max_num_batched_tokens=16,
+        kv_connector_extra_config={"connectors": children},
+    )
+    config.scheduler_config.async_scheduling = True
+    cache = get_kv_cache_config_from_groups(
+        config,
+        [
+            KVCacheGroupSpec(
+                ["layer"],
+                FullAttentionSpec(
+                    block_size=16, num_kv_heads=1, head_size=1, dtype=torch.float32
+                ),
+            )
+        ],
+        available_memory=64 * 128,
+    )
+    scheduler = create_scheduler(config, num_blocks=64, kv_cache_config=cache)
+    connector = scheduler.get_kv_connector()
+    assert isinstance(connector, MultiConnector)
+    request = create_request(
+        request_id=201,
+        num_tokens=128,
+        do_remote_decode=True,
+        skip_reading_prefix_cache=skip_prefix_cache,
+    )
+    request.kv_transfer_params["transfer_id"] = "optimistic-multi"
+    scheduler.add_request(request)
+    assert connector.get_num_new_matched_tokens(request, 0) == (0, False)
+    assert connector.get_num_new_matched_tokens(request, 0) == (0, False)
+    first = scheduler.schedule()
+    assert first.kv_connector_metadata.metadata[mooncake_index].reqs_to_send[
+        request.request_id
+    ] == ("optimistic-multi", [])
+    scheduler.update_from_output(
+        first,
+        replace(create_model_runner_output([request]), sampled_token_ids=[[]]),
+    )
+    second = scheduler.schedule()
+    store_metas = [
+        output.kv_connector_metadata.metadata[cpu_index] for output in (first, second)
+    ]
+    saved_blocks = {
+        block_id for metadata in store_metas for block_id in metadata.store_gpu_blocks
+    }
+    assert saved_blocks
+    ready = create_request(request_id=202, num_tokens=8, do_remote_decode=True)
+    ready.kv_transfer_params["transfer_id"] = "ready-multi"
+    scheduler.add_request(ready)
+    empty = MultiKVConnectorWorkerMetadata(metadata=(None, None))
+    connector.update_connector_output(KVConnectorOutput(kv_connector_worker_meta=empty))
+    assert not connector.should_yield_optimistic_prefill(request, scheduler.waiting)
+    receipts: list[KVConnectorWorkerMetadata | None] = [None, None]
+    receipts[mooncake_index] = MooncakeWorkerMetadata({"ready-multi": {0}})
+    aggregated = empty.aggregate(
+        MultiKVConnectorWorkerMetadata(metadata=tuple(receipts))
+    )
+    connector.update_connector_output(
+        KVConnectorOutput(kv_connector_worker_meta=aggregated)
+    )
+    if not attempts:
+        assert not connector.should_yield_optimistic_prefill(request, scheduler.waiting)
+        assert connector.get_num_new_matched_tokens(request, 0) == (0, False)
+        assert request.kv_transfer_metrics["pd_prefill_retry_count"] == 0
+        scheduler.shutdown()
+        return
+    assert connector.should_yield_optimistic_prefill(request, scheduler.waiting)
+    yielded = scheduler.schedule()
+    assert request.request_id in yielded.preempted_req_ids
+    assert ready.request_id in yielded.num_scheduled_tokens
+    assert request.request_id not in yielded.num_scheduled_tokens
+    assert yielded.kv_connector_metadata.metadata[cpu_index].need_flush
+    assert request.kv_transfer_metrics["pd_prefill_retry_count"] == 1
+    assert request.drop_stale_output
+    assert connector.get_num_new_matched_tokens(request, 0) == (None, False)
+    scheduler.update_from_output(
+        second,
+        replace(create_model_runner_output([request]), sampled_token_ids=[[]]),
+    )
+    scheduler.update_from_output(yielded, create_model_runner_output([ready]))
+    assert not request.output_token_ids
+    pool = scheduler.kv_cache_manager.block_pool
+    assert all(pool.blocks[block_id].ref_cnt == 1 for block_id in saved_blocks)
+    blocked = scheduler.schedule()
+    assert request.request_id not in blocked.num_scheduled_tokens
+    assert connector.get_num_new_matched_tokens(request, 0) == (None, False)
+    scheduler.update_from_output(
+        blocked,
+        create_model_runner_output(
+            [scheduler.requests[req_id] for req_id in blocked.num_scheduled_tokens]
+        ),
+    )
+    completed: list[KVConnectorWorkerMetadata | None] = [None, None]
+    completed[cpu_index] = SimpleCPUOffloadWorkerMetadata(
+        completed_store_events={
+            metadata.store_event: 1
+            for metadata in store_metas
+            if metadata.store_event >= 0
+        }
+    )
+    connector.update_connector_output(
+        KVConnectorOutput(
+            kv_connector_worker_meta=MultiKVConnectorWorkerMetadata(
+                metadata=tuple(completed)
+            )
+        )
+    )
+    assert all(pool.blocks[block_id].ref_cnt == 0 for block_id in saved_blocks)
+    assert connector.get_num_new_matched_tokens(request, 0) == (None, False)
+    receipts[mooncake_index] = MooncakeWorkerMetadata({"optimistic-multi": {0}})
+    connector.update_connector_output(
+        KVConnectorOutput(
+            kv_connector_worker_meta=MultiKVConnectorWorkerMetadata(
+                metadata=tuple(receipts)
+            )
+        )
+    )
+    assert connector.get_num_new_matched_tokens(request, 0)[0] is not None
+    assert request.kv_transfer_metrics["pd_prefill_retry_count"] == 1
+    scheduler.shutdown()
 
 
 # Test connector with custom stats for testing MultiConnector

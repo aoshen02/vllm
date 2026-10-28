@@ -9,6 +9,8 @@ read partially written / stale blocks and silently corrupt the CPU cache.
 
 from __future__ import annotations
 
+import ctypes
+import threading
 import time
 from contextlib import nullcontext
 from unittest.mock import MagicMock
@@ -26,7 +28,7 @@ from tests.v1.attention.utils import dense_kv_cache_tensor, dense_kv_cache_views
 from tests.v1.kv_connector.unit.test_kv_connector_lifecycle import (
     _make_empty_scheduler_output,
 )
-from vllm.config import CacheConfig
+from vllm.config import CacheConfig, DeviceConfig, VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.simple_cpu_offload_connector import (
     SimpleCPUOffloadConnector,
 )
@@ -42,6 +44,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheLayout,
     KVCacheSpec,
     KVCacheTensor,
+    MambaSpec,
     MLAAttentionSpec,
     UniformTypeKVCacheSpecs,
 )
@@ -50,6 +53,7 @@ from vllm.v1.simple_kv_offload.cuda_mem_ops import (
     CU_MEMCPY_SRC_ACCESS_ORDER_ANY,
     CU_MEMCPY_SRC_ACCESS_ORDER_STREAM,
     build_params,
+    copy_blocks,
 )
 from vllm.v1.simple_kv_offload.disk_backend import DiskBackend
 from vllm.v1.simple_kv_offload.metadata import (
@@ -68,6 +72,384 @@ ITERS = 30
 # Keep the compute stream busy so the KV write lands late; this makes the
 # store-vs-compute race deterministic instead of timing-dependent.
 SLEEP_CYCLES = 50_000_000
+
+
+@pytest.fixture
+def host_dma_driver(monkeypatch):
+    """Emulate only the CUDA driver/streams using real host pointer descriptors."""
+    from vllm.v1.simple_kv_offload import cuda_mem_ops
+
+    class HostStream:
+        cuda_stream = 0
+
+        def __init__(self, **kwargs):
+            pass
+
+        @staticmethod
+        def priority_range():
+            return (0, 0)
+
+        def wait_event(self, event):
+            event.synchronize()
+
+    class HostEvent:
+        def __init__(self):
+            self.done = threading.Event()
+
+        def record(self, stream):
+            self.done.set()
+
+        def query(self):
+            return self.done.is_set()
+
+        def synchronize(self):
+            assert self.done.wait(timeout=5)
+
+    def memcpy(dst, src, sizes, count, *args):
+        destinations = (ctypes.c_uint64 * count).from_address(dst)
+        sources = (ctypes.c_uint64 * count).from_address(src)
+        lengths = (ctypes.c_uint64 * count).from_address(sizes)
+        for index in range(count):
+            ctypes.memmove(destinations[index], sources[index], lengths[index])
+        return 0
+
+    pins: list[torch.Tensor] = []
+    monkeypatch.setattr(cuda_mem_ops, "_batch_memcpy", (memcpy, 1))
+    monkeypatch.setattr(torch.cuda, "Stream", HostStream)
+    monkeypatch.setattr(torch, "Event", HostEvent)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: HostStream())
+    monkeypatch.setattr(current_platform, "set_device", lambda device: None)
+    monkeypatch.setattr("vllm.v1.simple_kv_offload.worker.pin_tensor", pins.append)
+    return HostStream(), pins
+
+
+def test_host_dma_group_filter_and_legacy_broadcast(host_dma_driver):
+    stream, _ = host_dma_driver
+    source = {
+        "attention": torch.arange(24, dtype=torch.int8).view(3, 8),
+        "state": torch.arange(40, dtype=torch.int8).view(5, 8),
+    }
+    destination = {
+        "attention": torch.full((5, 8), -1, dtype=torch.int8),
+        "state": torch.full((3, 8), -1, dtype=torch.int8),
+    }
+    params = build_params(
+        source, destination, stream, region_group_ids={"attention": 0, "state": 1}
+    )
+    copy_blocks([2, 4], [4, 2], params, group_ids=[0, 1])
+    assert torch.equal(destination["attention"][4], source["attention"][2])
+    assert torch.equal(destination["state"][2], source["state"][4])
+    assert torch.all(destination["attention"][:4] == -1)
+    assert torch.all(destination["state"][:2] == -1)
+    with pytest.raises(ValueError, match="every copy"):
+        copy_blocks([0], [0], params)
+    with pytest.raises(ValueError, match="pair count"):
+        copy_blocks([0, 1], [0, 1], params, group_ids=[0])
+    with pytest.raises(ValueError, match="no registered regions"):
+        copy_blocks([0], [0], params, group_ids=[2])
+    legacy = build_params(source, destination, stream)
+    copy_blocks([1], [1], legacy)
+    for name in source:
+        assert torch.equal(destination[name][1], source[name][1])
+
+
+@pytest.mark.parametrize("layout", list(KVCacheLayout))
+@pytest.mark.parametrize("mamba_state", [False, True])
+def test_independent_worker_host_regions_and_grouped_copy(
+    monkeypatch, host_dma_driver, layout, mamba_state
+):
+    from vllm.v1.simple_kv_offload.worker import PIN_MEMORY
+
+    config = VllmConfig(
+        cache_config=CacheConfig(),
+        device_config=DeviceConfig("cpu"),
+    )
+    config.cache_config.kv_cache_layout = layout.name
+    groups = [
+        KVCacheGroupSpec(
+            ["attention.0", "attention.1"],
+            FullAttentionSpec(
+                block_size=2, num_kv_heads=2, head_size=2, dtype=torch.float16
+            ),
+        ),
+        KVCacheGroupSpec(
+            ["state.0", "state.1"],
+            (
+                MambaSpec(block_size=2, shapes=((8,),), dtypes=(torch.float32,))
+                if mamba_state
+                else FullAttentionSpec(
+                    block_size=2, num_kv_heads=2, head_size=2, dtype=torch.float16
+                )
+            ),
+        ),
+    ]
+    gpu_config = get_kv_cache_config_from_groups(
+        config, groups, 4096, group_num_blocks=(5, 3)
+    )
+
+    class CPUWorldGroup:
+        world_size = 2
+        cpu_group = object()
+
+    reductions = []
+
+    def reduce_counts(counts, group, op):
+        assert op is dist.ReduceOp.MIN
+        reductions.append(tuple(counts.tolist()))
+        counts.copy_(torch.minimum(counts, torch.tensor([3, 5])))
+
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(dist, "all_reduce", reduce_counts)
+    monkeypatch.setattr(
+        "vllm.distributed.parallel_state.get_world_group", CPUWorldGroup
+    )
+    caches = allocate_kv_cache(gpu_config, torch.device("cpu"), layout)
+    worker = SimpleCPUOffloadWorker(config, gpu_config, 4096)
+    try:
+        worker.register_kv_caches(caches)
+        assert len(reductions) == 1
+        assert worker.num_cpu_group_blocks == (3, 5)
+        assert worker.cpu_kv_cache_config is not None
+        assert worker.gpu_kv_caches is not None
+        assert worker.cpu_kv_caches is not None
+        assert worker.region_group_ids is not None
+        assert worker.cpu_kv_cache_config.group_num_blocks == (3, 5)
+        stream, pins = host_dma_driver
+        assert len(pins) == int(PIN_MEMORY)
+        assert worker.gpu_kv_caches.keys() == worker.cpu_kv_caches.keys()
+        storage_pointers = {
+            tensor.untyped_storage().data_ptr()
+            for tensor in worker.cpu_kv_caches.values()
+        }
+        assert len(storage_pointers) == 1
+        backing = next(iter(worker.cpu_kv_caches.values())).untyped_storage()
+        backing_bytes = backing.nbytes()
+        assert backing_bytes == worker.cpu_kv_cache_config.kv_cache_tensors[0].size
+        assert backing_bytes <= 4096
+        for name, gpu_region in worker.gpu_kv_caches.items():
+            group_id = worker.region_group_ids[name]
+            assert gpu_region.shape[0] == (5, 3)[group_id]
+            assert worker.cpu_kv_caches[name].shape[0] == (3, 5)[group_id]
+            gpu_region.fill_(17 + group_id)
+        params = build_params(
+            worker.gpu_kv_caches,
+            worker.cpu_kv_caches,
+            stream,
+            region_group_ids=worker.region_group_ids,
+        )
+        copy_blocks([4, 2], [2, 4], params, group_ids=[0, 1])
+        for name, cpu_region in worker.cpu_kv_caches.items():
+            group_id = worker.region_group_ids[name]
+            target = (2, 4)[group_id]
+            assert torch.all(cpu_region[target] == 17 + group_id)
+            assert torch.all(cpu_region[:target] == 0)
+        worker.bind_connector_metadata(
+            SimpleCPUOffloadMetadata(
+                load_event=0, load_cpu_blocks=[0], load_gpu_blocks=[0]
+            )
+        )
+        with pytest.raises(ValueError, match="every copy"):
+            worker.start_load_kv()
+        empty_config = KVCacheConfig(
+            num_blocks=5,
+            kv_cache_tensors=[],
+            kv_cache_groups=[
+                KVCacheGroupSpec([], group.kv_cache_spec) for group in groups
+            ],
+            group_num_blocks=(5, 3),
+        )
+        empty_worker = SimpleCPUOffloadWorker(config, empty_config, 4096)
+        empty_worker.register_kv_caches({})
+        assert len(reductions) == 2
+        assert empty_worker.num_cpu_group_blocks == (3, 5)
+        assert empty_worker.cpu_kv_caches is None
+        empty_worker.bind_connector_metadata(
+            SimpleCPUOffloadMetadata(
+                load_event=7,
+                load_cpu_blocks=[2, 4],
+                load_gpu_blocks=[4, 2],
+                load_group_ids=[0, 1],
+                load_event_to_reqs={7: ["empty-pp-load"]},
+                store_event=9,
+                store_gpu_blocks=[4, 2],
+                store_cpu_blocks=[2, 4],
+                store_group_ids=[0, 1],
+            )
+        )
+        assert empty_worker.get_finished(set()) == (None, None)
+        assert empty_worker.build_connector_worker_meta() is None
+        empty_worker.start_load_kv()
+        empty_worker.wait_for_save()
+        assert empty_worker.get_finished(set()) == (None, {"empty-pp-load"})
+        completion = empty_worker.build_connector_worker_meta()
+        assert completion is not None
+        assert completion.completed_store_events == {9: 1}
+        assert empty_worker.get_finished(set()) == (None, None)
+        assert empty_worker.build_connector_worker_meta() is None
+        empty_worker.bind_connector_metadata(
+            SimpleCPUOffloadMetadata(
+                load_cpu_blocks=[0],
+                load_gpu_blocks=[0],
+                load_group_ids=[2],
+                store_cpu_blocks=[0],
+                store_gpu_blocks=[0],
+                store_group_ids=[2],
+            )
+        )
+        with pytest.raises(ValueError, match="global KV cache group range"):
+            empty_worker.start_load_kv()
+        with pytest.raises(ValueError, match="global KV cache group range"):
+            empty_worker.wait_for_save()
+        uninitialized = SimpleCPUOffloadWorker(config, gpu_config, 4096)
+        uninitialized.bind_connector_metadata(
+            SimpleCPUOffloadMetadata(
+                load_event=0,
+                load_cpu_blocks=[1],
+                load_gpu_blocks=[1],
+                load_group_ids=[0],
+                store_event=0,
+                store_cpu_blocks=[1],
+                store_gpu_blocks=[1],
+                store_group_ids=[0],
+            )
+        )
+        with pytest.raises(AssertionError):
+            uninitialized.start_load_kv()
+        with pytest.raises(AssertionError):
+            uninitialized.wait_for_save()
+        uninitialized.register_kv_caches({})
+        with pytest.raises(AssertionError):
+            uninitialized.start_load_kv()
+        with pytest.raises(AssertionError):
+            uninitialized.wait_for_save()
+    finally:
+        if worker._backend is not None:
+            worker._backend.shutdown()
+
+
+@pytest.mark.parametrize("owned_group", [0, 1])
+def test_partial_pp_worker_projects_global_copy_events(
+    monkeypatch, host_dma_driver, owned_group
+):
+    """Each PP stage copies its own group and completes remote-only events once."""
+    monkeypatch.setattr(dist, "is_initialized", lambda: False)
+    config = VllmConfig(
+        cache_config=CacheConfig(),
+        device_config=DeviceConfig("cpu"),
+    )
+    config.cache_config.kv_cache_layout = "BLHNC"
+    specs = [
+        FullAttentionSpec(
+            block_size=2, num_kv_heads=2, head_size=2, dtype=torch.float16
+        ),
+        MambaSpec(block_size=2, shapes=((8,),), dtypes=(torch.float32,)),
+    ]
+    groups = [
+        KVCacheGroupSpec([f"layer.{group_id}"] if group_id == owned_group else [], spec)
+        for group_id, spec in enumerate(specs)
+    ]
+    gpu_config = get_kv_cache_config_from_groups(
+        config, groups, 4096, group_num_blocks=(5, 3)
+    )
+    caches = allocate_kv_cache(gpu_config, torch.device("cpu"), KVCacheLayout.BLHNC)
+    worker = SimpleCPUOffloadWorker(config, gpu_config, 4096)
+    try:
+        worker.register_kv_caches(caches)
+        assert worker.gpu_kv_caches is not None
+        assert worker.cpu_kv_caches is not None
+        assert worker.region_group_ids is not None
+        assert set(worker.region_group_ids.values()) == {owned_group}
+        for region in worker.gpu_kv_caches.values():
+            region.fill_(17)
+        for region in worker.cpu_kv_caches.values():
+            region[1].fill_(33)
+        worker.bind_connector_metadata(
+            SimpleCPUOffloadMetadata(
+                load_cpu_blocks=[0],
+                load_gpu_blocks=[0],
+                load_group_ids=[2],
+                store_cpu_blocks=[0],
+                store_gpu_blocks=[0],
+                store_group_ids=[2],
+            )
+        )
+        with pytest.raises(ValueError, match="global KV cache group range"):
+            worker.start_load_kv()
+        with pytest.raises(ValueError, match="global KV cache group range"):
+            worker.wait_for_save()
+        worker.bind_connector_metadata(
+            SimpleCPUOffloadMetadata(
+                load_event=3,
+                load_cpu_blocks=[1, 1],
+                load_gpu_blocks=[1, 1],
+                load_group_ids=[0, 1],
+                load_event_to_reqs={3: ["mixed-load"]},
+                store_event=5,
+                store_gpu_blocks=[4, 2],
+                store_cpu_blocks=[2, 4],
+                store_group_ids=[0, 1],
+            )
+        )
+        worker.start_load_kv()
+        worker.wait_for_save()
+        worker.bind_connector_metadata(
+            SimpleCPUOffloadMetadata(
+                load_event=4,
+                load_cpu_blocks=[1],
+                load_gpu_blocks=[1],
+                load_group_ids=[1 - owned_group],
+                load_event_to_reqs={3: ["mixed-load"], 4: ["remote-only-load"]},
+                store_event=6,
+                store_gpu_blocks=[1],
+                store_cpu_blocks=[1],
+                store_group_ids=[1 - owned_group],
+            )
+        )
+        worker.start_load_kv()
+        worker.wait_for_save()
+        assert worker._backend is not None
+        worker._backend.shutdown()
+        assert worker.get_finished(set()) == (
+            None,
+            {"mixed-load", "remote-only-load"},
+        )
+        completion = worker.build_connector_worker_meta()
+        assert completion is not None
+        assert completion.completed_store_events == {5: 1, 6: 1}
+        for region in worker.gpu_kv_caches.values():
+            assert torch.all(region[1] == 33)
+        for region in worker.cpu_kv_caches.values():
+            assert torch.all(region[(2, 4)[owned_group]] == 17)
+        assert worker.get_finished(set()) == (None, None)
+        assert worker.build_connector_worker_meta() is None
+    finally:
+        if worker._backend is not None:
+            worker._backend.shutdown()
+
+
+@pytest.mark.parametrize(
+    "kwargs, message",
+    [
+        ({"num_cpu_blocks": 2}, "num_cpu_blocks"),
+        ({"kv_offload_backend": "disk"}, "Disk offload"),
+    ],
+)
+def test_independent_worker_rejects_unsupported_overrides(kwargs, message):
+    config = VllmConfig(device_config=DeviceConfig("cpu"))
+    gpu_config = KVCacheConfig(
+        num_blocks=2,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                [], MambaSpec(block_size=2, shapes=((8,),), dtypes=(torch.float32,))
+            )
+        ],
+        group_num_blocks=(2,),
+    )
+    worker = SimpleCPUOffloadWorker(config, gpu_config, 4096, **kwargs)
+    with pytest.raises(ValueError, match=message):
+        worker.register_kv_caches({})
+    assert worker.cpu_kv_caches is None
 
 
 def _make_worker(

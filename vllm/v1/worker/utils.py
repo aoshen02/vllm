@@ -5,7 +5,7 @@ from collections import defaultdict
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from itertools import product as iprod
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 import torch
@@ -116,8 +116,9 @@ class KVBlockZeroer:
         attn_groups_iter: Iterable["AttentionGroup"],
         kernel_block_sizes: list[int],
         static_forward_context: dict[str, Any],
-        num_blocks: int,
+        num_blocks: int | Sequence[int],
         runner_only_attn_layers: set[str] | None = None,
+        zero_mamba_blocks: bool = False,
     ) -> None:
         """Precompute the absolute-address table for the Triton zeroing kernel.
 
@@ -135,12 +136,31 @@ class KVBlockZeroer:
         Each virtual block is represented as an independent segment so its
         physical block stride and zeroed page span remain independent.
 
-        Only AttentionSpec layers are processed; Mamba layers are skipped.
+        Scalar domains process only attention unless zero_mamba_blocks is set.
+        Independent domains also process the bound Mamba state views.
         """
         self.device = device
         self._meta: (
             tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int, int] | None
         ) = None
+        self._group_zeroers: dict[int, KVBlockZeroer] | None = None
+        if not isinstance(num_blocks, int):
+            grouped: dict[int, list[AttentionGroup]] = defaultdict(list)
+            for group in attn_groups_iter:
+                grouped[group.kv_cache_group_id].append(group)
+            self._group_zeroers = {
+                group_id: KVBlockZeroer(
+                    device,
+                    grouped.get(group_id, []),
+                    kernel_block_sizes,
+                    static_forward_context,
+                    count,
+                    runner_only_attn_layers,
+                    zero_mamba_blocks=True,
+                )
+                for group_id, count in enumerate(num_blocks)
+            }
+            return
 
         if runner_only_attn_layers is None:
             runner_only_attn_layers = set()
@@ -154,19 +174,25 @@ class KVBlockZeroer:
 
         for group in attn_groups_iter:
             spec = group.kv_cache_spec
-            if not isinstance(spec, AttentionSpec):
+            if not isinstance(spec, AttentionSpec) and not (
+                zero_mamba_blocks and isinstance(spec, MambaSpec)
+            ):
                 continue
             if group.kv_cache_group_id >= len(kernel_block_sizes):
                 continue
             kernel_bs = kernel_block_sizes[group.kv_cache_group_id]
             assert spec.block_size % kernel_bs == 0
+            layer_caches: list[tuple[str, torch.Tensor]] = []
             for layer_name in group.layer_names:
                 if layer_name in runner_only_attn_layers:
                     continue
                 kv = static_forward_context[layer_name].kv_cache
-                if not isinstance(kv, torch.Tensor):
-                    continue
-                if group.kernel_block_stride:
+                if isinstance(kv, torch.Tensor):
+                    layer_caches.append((layer_name, kv))
+                elif isinstance(spec, MambaSpec):
+                    layer_caches.extend((layer_name, state) for state in kv)
+            for layer_name, kv in layer_caches:
+                if group.kernel_block_stride and isinstance(spec, AttentionSpec):
                     # Bound views address kernel blocks; zero by manager block.
                     kv = group.map_kv_cache_to_manager_blocks(kv, num_blocks)
                 if kv.device.type != self.device.type:
@@ -229,8 +255,14 @@ class KVBlockZeroer:
             len(seg_addrs),
         )
 
-    def zero_block_ids(self, block_ids: list[int]) -> None:
+    def zero_block_ids(self, block_ids: list[int] | dict[int, list[int]]) -> None:
         """Zero the KV cache memory for the given block IDs."""
+        if self._group_zeroers is not None:
+            assert isinstance(block_ids, dict)
+            for group_id, ids in block_ids.items():
+                self._group_zeroers[group_id].zero_block_ids(ids)
+            return
+        assert isinstance(block_ids, list)
         if not block_ids or self._meta is None:
             return
         (
@@ -254,6 +286,10 @@ class KVBlockZeroer:
 
     def warmup(self, num_kv_blocks: int) -> None:
         """JIT-compile the zeroing kernel before the first real request."""
+        if self._group_zeroers is not None:
+            for zeroer in self._group_zeroers.values():
+                zeroer.warmup(num_kv_blocks)
+            return
         if num_kv_blocks > 0:
             self.zero_block_ids([0])
 
@@ -907,18 +943,28 @@ def clear_layer_kv_caches(layers: Iterable[Any]) -> None:
 
 
 def copy_kv_cache_blocks_inplace(
-    kv_caches: Iterable[torch.Tensor],
-    num_blocks: int,
-    kv_cache_block_copies: Sequence[KVCacheBlockCopy],
+    kv_caches: Iterable[torch.Tensor] | Mapping[int, Iterable[torch.Tensor]],
+    num_blocks: int | Sequence[int],
+    kv_cache_block_copies: Sequence[KVCacheBlockCopy]
+    | Mapping[int, Sequence[KVCacheBlockCopy]],
 ) -> None:
     if not kv_cache_block_copies:
         return
+    if isinstance(kv_cache_block_copies, Mapping):
+        assert isinstance(kv_caches, Mapping) and not isinstance(num_blocks, int)
+        for group_id, copies in kv_cache_block_copies.items():
+            copy_kv_cache_blocks_inplace(
+                kv_caches[group_id], num_blocks[group_id], copies
+            )
+        return
+    assert isinstance(num_blocks, int)
+    assert not isinstance(kv_caches, Mapping)
 
     indices_np = np.array(kv_cache_block_copies, dtype=np.int64)
     indices: torch.Tensor | None = None
     seen: set[tuple[torch.device, int]] = set()
     copied_storages: set[tuple[torch.device, int]] = set()
-    for cache in kv_caches:
+    for cache in cast(Iterable[torch.Tensor], kv_caches):
         # Layers sharing KV (cross-layer sharing) alias the same view; copy it
         # once. data_ptr distinguishes per-layer views of a shared allocation.
         key = (cache.device, cache.data_ptr())

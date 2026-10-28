@@ -9,6 +9,7 @@ import torch
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.utils.torch_utils import PIN_MEMORY
+from vllm.v1.kv_cache_interface import get_kv_cache_regions
 from vllm.v1.simple_kv_offload.copy_backend import DmaCopyBackend
 from vllm.v1.simple_kv_offload.cuda_mem_ops import pin_tensor
 from vllm.v1.simple_kv_offload.disk_backend import DiskBackend
@@ -16,7 +17,11 @@ from vllm.v1.simple_kv_offload.metadata import (
     SimpleCPUOffloadMetadata,
     SimpleCPUOffloadWorkerMetadata,
 )
-from vllm.v1.simple_kv_offload.sizing import sync_num_offload_blocks_across_workers
+from vllm.v1.simple_kv_offload.sizing import (
+    derive_independent_cpu_config,
+    sync_cpu_group_counts,
+    sync_num_offload_blocks_across_workers,
+)
 
 if TYPE_CHECKING:
     from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -53,6 +58,11 @@ class SimpleCPUOffloadWorker:
         self.cpu_kv_caches: dict[str, torch.Tensor] | None = None
         self.device: torch.device | None = None
         self.num_cpu_blocks: int = 0
+        self.num_cpu_group_blocks: tuple[int, ...] | None = None
+        self.cpu_kv_cache_config: KVCacheConfig | None = None
+        self._cpu_backing: torch.Tensor | None = None
+        self.region_group_ids: dict[str, int] | None = None
+        self._empty_local_cache = False
 
         # CUDA streams for the async transfers
         self.load_stream: torch.cuda.Stream | None = None
@@ -95,11 +105,49 @@ class SimpleCPUOffloadWorker:
                 by resolving to their underlying raw storage.
 
         """
+        self._empty_local_cache = False
+        if self.kv_cache_config is not None and isinstance(
+            self.kv_cache_config.group_num_blocks, tuple
+        ):
+            if self._num_cpu_blocks_override is not None:
+                raise ValueError(
+                    "num_cpu_blocks does not support independent CPU pools"
+                )
+            if self.disk_mode:
+                raise ValueError("Disk offload does not support independent CPU pools")
+            self.cpu_kv_cache_config = derive_independent_cpu_config(
+                self.vllm_config,
+                self.kv_cache_config,
+                self.cpu_capacity_bytes,
+                self.vllm_config.cache_config.simple_cpu_offload_group_num_blocks,
+            )
+            counts = self.cpu_kv_cache_config.group_num_blocks
+            assert counts is not None
+            self.num_cpu_group_blocks = sync_cpu_group_counts(counts)
+            self.cpu_kv_cache_config = derive_independent_cpu_config(
+                self.vllm_config,
+                self.kv_cache_config,
+                self.cpu_capacity_bytes,
+                self.num_cpu_group_blocks,
+            )
+            self.num_cpu_blocks = max(self.num_cpu_group_blocks, default=0)
+
         if not kv_caches:
+            self._empty_local_cache = (
+                self.num_cpu_group_blocks is not None
+                and self.kv_cache_config is not None
+                and not any(
+                    group.layer_names for group in self.kv_cache_config.kv_cache_groups
+                )
+            )
             logger.warning("No KV caches to offload.")
             return
 
         self.device = next(iter(kv_caches.values())).device
+
+        if self.num_cpu_group_blocks is not None:
+            self._register_independent_caches(kv_caches)
+            return
 
         assert self.kv_cache_config is not None
         num_blocks = self.kv_cache_config.num_blocks
@@ -178,6 +226,41 @@ class SimpleCPUOffloadWorker:
             self._init_disk_mode(unique_gpu_caches, total_bytes_per_block, self.device)
         else:
             self._init_cpu_mode(unique_gpu_caches, total_bytes_per_block, self.device)
+
+    def _register_independent_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
+        assert self.kv_cache_config is not None
+        assert self.cpu_kv_cache_config is not None
+        assert self.device is not None
+        layout = self.vllm_config.cache_config.get_resolved_kv_cache_layout()
+        self.gpu_kv_caches, self.region_group_ids = get_kv_cache_regions(
+            self.kv_cache_config, kv_caches, layout
+        )
+        size = max(
+            (tensor.size for tensor in self.cpu_kv_cache_config.kv_cache_tensors),
+            default=0,
+        )
+        self._cpu_backing = torch.zeros(size, dtype=torch.int8, device="cpu")
+        if PIN_MEMORY and size:
+            pin_tensor(self._cpu_backing)
+        self.cpu_kv_caches, cpu_region_groups = get_kv_cache_regions(
+            self.cpu_kv_cache_config,
+            {name: self._cpu_backing for name in kv_caches},
+            layout,
+        )
+        if cpu_region_groups != self.region_group_ids:
+            raise ValueError("CPU and GPU KV cache regions do not match")
+        low_pri, _ = torch.cuda.Stream.priority_range()
+        self.load_stream = torch.cuda.Stream(priority=low_pri)
+        self.store_stream = torch.cuda.Stream(priority=low_pri)
+        self._backend = DmaCopyBackend()
+        self._backend.init(
+            self.gpu_kv_caches,
+            self.cpu_kv_caches,
+            self.device,
+            self.load_stream,
+            self.store_stream,
+            region_group_ids=self.region_group_ids,
+        )
 
     def _resolve_num_cpu_blocks(self, capacity_bytes: int, bytes_per_block: int) -> int:
         local_capacity = capacity_bytes // bytes_per_block
@@ -275,14 +358,23 @@ class SimpleCPUOffloadWorker:
         # issued in wait_for_save().
         metadata = self._connector_metadata
         if metadata is not None and metadata.load_cpu_blocks:
+            source, destination, group_ids = self._project_copy(
+                metadata.load_cpu_blocks,
+                metadata.load_gpu_blocks,
+                metadata.load_group_ids,
+            )
+            if self._empty_local_cache:
+                self._load_hwm = max(self._load_hwm, metadata.load_event)
+                return
             backend = self._backend
             assert backend is not None
             backend.launch_copy(
-                metadata.load_cpu_blocks,
-                metadata.load_gpu_blocks,
+                source,
+                destination,
                 is_store=False,
                 event_idx=metadata.load_event,
                 events_list=self._load_events,
+                **self._copy_group_kwargs(group_ids, source),
             )
 
     def wait_for_save(self) -> None:
@@ -295,19 +387,66 @@ class SimpleCPUOffloadWorker:
         """
         metadata = self._connector_metadata
         if metadata is not None and metadata.store_gpu_blocks:
+            source, destination, group_ids = self._project_copy(
+                metadata.store_gpu_blocks,
+                metadata.store_cpu_blocks,
+                metadata.store_group_ids,
+            )
+            if self._empty_local_cache:
+                self._store_hwm = max(self._store_hwm, metadata.store_event)
+                return
             backend = self._backend
             assert backend is not None
             if self._store_compute_done is None:
                 self._store_compute_done = torch.Event()
             self._store_compute_done.record(torch.cuda.current_stream())
             backend.launch_copy(
-                metadata.store_gpu_blocks,
-                metadata.store_cpu_blocks,
+                source,
+                destination,
                 is_store=True,
                 event_idx=metadata.store_event,
                 events_list=self._store_events,
                 wait_event=self._store_compute_done,
+                **self._copy_group_kwargs(group_ids, source),
             )
+
+    def _project_copy(
+        self, source: list[int], destination: list[int], group_ids: list[int]
+    ) -> tuple[list[int], list[int], list[int]]:
+        if self.num_cpu_group_blocks is None:
+            return source, destination, group_ids
+        assert self.kv_cache_config is not None
+        if len(source) != len(destination):
+            raise ValueError(
+                "Source and destination block lists must have equal lengths"
+            )
+        if len(group_ids) != len(source):
+            raise ValueError("Independent CPU pools require a group ID for every copy")
+        groups = self.kv_cache_config.kv_cache_groups
+        if any(
+            type(group_id) is not int or not 0 <= group_id < len(groups)
+            for group_id in group_ids
+        ):
+            raise ValueError("Copy group ID is outside the global KV cache group range")
+        positions = [
+            index
+            for index, group_id in enumerate(group_ids)
+            if groups[group_id].layer_names
+        ]
+        return (
+            [source[index] for index in positions],
+            [destination[index] for index in positions],
+            [group_ids[index] for index in positions],
+        )
+
+    def _copy_group_kwargs(
+        self, group_ids: list[int], block_ids: list[int]
+    ) -> dict[str, list[int]]:
+        if self.num_cpu_group_blocks is not None and len(group_ids) != len(block_ids):
+            raise ValueError("Independent CPU pools require a group ID for every copy")
+        if self.disk_mode and group_ids:
+            raise ValueError("Grouped copies are not supported by disk offload")
+        return {"group_ids": group_ids} if group_ids else {}
 
     def get_finished(
         self, finished_req_ids: set[str]

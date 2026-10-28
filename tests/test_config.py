@@ -11,7 +11,7 @@ from dataclasses import MISSING, Field, asdict, dataclass, field
 from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
-from typing import cast
+from typing import Any, cast
 from unittest.mock import patch
 
 import pydantic
@@ -1113,10 +1113,43 @@ def test_late_piecewise_restrictions_without_compilation(monkeypatch, engine_kwa
     assert config.compilation_config.max_cudagraph_capture_size == 0
 
 
+@pytest.mark.parametrize("prefix_caching", [False, True])
+@pytest.mark.parametrize("ratio", [None, 0.5])
+def test_engine_args_preserve_explicit_mamba_bound(prefix_caching, ratio):
+    from vllm.engine.arg_utils import EngineArgs
+
+    kwargs: dict[str, Any] = dict(
+        model="Qwen/Qwen3.5-0.8B",
+        max_model_len=2048,
+        max_num_batched_tokens=8192,
+        enable_prefix_caching=prefix_caching,
+        mamba_full_memory_ratio=ratio,
+        enforce_eager=True,
+    )
+    automatic = EngineArgs(**kwargs).create_engine_config()
+    resolved = automatic.scheduler_config.max_num_seqs
+    explicit = EngineArgs(**kwargs, max_num_seqs=resolved).create_engine_config()
+    assert automatic.cache_config.mamba_fixed_num_seqs is None
+    assert explicit.cache_config.mamba_fixed_num_seqs == resolved
+    assert explicit.scheduler_config.max_num_seqs == resolved
+    assert explicit.cache_config.compute_hash() == automatic.cache_config.compute_hash()
+
+
 def test_resolve_cudagraph_mode_skips_mamba_block_check_while_profiling():
     """Cudagraph memory profiling uses a minimal KV cache, so the Mamba
     block-count guard must only fire for the real cache sizing."""
-    kv_cache_config = SimpleNamespace(has_mamba_layers=True, num_blocks=4)
+    from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheGroupSpec, MambaSpec
+
+    kv_cache_config = KVCacheConfig(
+        num_blocks=4,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["mamba"],
+                MambaSpec(block_size=16, shapes=((1,),), dtypes=(torch.float32,)),
+            )
+        ],
+    )
 
     compilation_config = CompilationConfig(
         cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
@@ -1144,6 +1177,66 @@ def test_resolve_cudagraph_mode_skips_mamba_block_check_while_profiling():
         is_profiling=True,
     )
     assert cudagraph_mode == CUDAGraphMode.FULL_AND_PIECEWISE
+
+
+@pytest.mark.parametrize(
+    "counts,max_num_reqs,should_raise",
+    [
+        ((12, 4, 6), 3, False),
+        ((12, 4, 6), 4, True),
+        ((12, 6, 4), 3, False),
+        ((12, 6, 4), 4, True),
+        (None, 12, False),
+        (None, 13, True),
+    ],
+)
+def test_mrv2_cudagraph_checks_smallest_mamba_capacity(
+    counts, max_num_reqs, should_raise
+):
+    from contextlib import nullcontext
+
+    from vllm.v1.kv_cache_interface import (
+        FullAttentionSpec,
+        KVCacheConfig,
+        KVCacheGroupSpec,
+        MambaSpec,
+    )
+
+    cache = KVCacheConfig(
+        num_blocks=12,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["attention"],
+                FullAttentionSpec(
+                    block_size=16, num_kv_heads=1, head_size=16, dtype=torch.float32
+                ),
+            ),
+            *[
+                KVCacheGroupSpec(
+                    [f"state.{group_id}"],
+                    MambaSpec(block_size=16, shapes=((1,),), dtypes=(torch.float32,)),
+                )
+                for group_id in (1, 2)
+            ],
+        ],
+        group_num_blocks=counts,
+    )
+    compilation = CompilationConfig(cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE)
+    error = (
+        pytest.raises(ValueError, match="exceeds available Mamba cache blocks")
+        if should_raise
+        else nullcontext()
+    )
+    with error:
+        mode = compilation.resolve_cudagraph_mode_and_sizes(
+            AttentionCGSupport.ALWAYS,
+            "TRITON_ATTN",
+            use_v2_model_runner=True,
+            kv_cache_config=cache,
+            max_num_reqs=max_num_reqs,
+        )
+        assert mode == CUDAGraphMode.FULL_AND_PIECEWISE
 
 
 @pytest.mark.parametrize(

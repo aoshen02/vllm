@@ -7,6 +7,7 @@ import errno
 import socket
 import threading
 import time
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -29,6 +30,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector im
     MooncakeConnector,
     MooncakeConnectorMetadata,
     MooncakeConnectorWorker,
+    MooncakeWorkerMetadata,
     MooncakeXferMetadata,
     MooncakeXferResponse,
     MooncakeXferResponseStatus,
@@ -43,22 +45,31 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector im
     _pp_mismatch_hides_packed_layers,
     _validate_asymmetric_region_lengths,
     get_mooncake_bootstrap_addr,
+    get_optimistic_prefill_attempts,
     should_launch_bootstrap_server,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_utils import (
     MooncakeBootstrapServer,
     RegisterWorkerPayload,
 )
+from vllm.entrypoints.generate.base.serving import build_per_request_timing_metrics
+from vllm.v1.core.kv_cache_planning import get_kv_cache_config_from_groups
+from vllm.v1.core.sched.interface import PauseState
+from vllm.v1.engine import EngineCoreRequest
+from vllm.v1.engine.output_processor import OutputProcessor
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheLayout,
+    MambaSpec,
     MLAAttentionSpec,
 )
 from vllm.v1.request import RequestStatus
+from vllm.v1.worker.utils import allocate_kv_cache
 
 from .utils import (
+    create_model_runner_output,
     create_request,
     create_scheduler,
     create_vllm_config,
@@ -1111,6 +1122,310 @@ def test_scheduler_request_finished():
     assert "id-1" in scheduler_connector._reqs_not_processed
 
 
+def _export_pd_retry_metrics(request, engine_output):
+    processor = OutputProcessor(tokenizer=None, log_stats=True)
+    processor.add_request(
+        EngineCoreRequest(
+            request_id=request.request_id,
+            external_req_id=request.request_id,
+            prompt_token_ids=request.prompt_token_ids,
+            mm_features=None,
+            sampling_params=request.sampling_params,
+            pooling_params=None,
+            arrival_time=request.arrival_time,
+            lora_request=None,
+            cache_salt=None,
+            data_parallel_rank=None,
+        ),
+        prompt=None,
+    )
+    processed = processor.process_outputs([engine_output], engine_core_timestamp=1.0)
+    assert len(processed.request_outputs) == 1
+    output = processed.request_outputs[0]
+    assert output.finished
+    return build_per_request_timing_metrics(
+        output.metrics,
+        num_generation_tokens=len(output.outputs[0].token_ids),
+        kv_transfer_params=output.kv_transfer_params,
+    ).model_dump(exclude_none=True)
+
+
+@pytest.mark.parametrize("pp_size", [1, 2])
+@pytest.mark.parametrize("attempts", [0, 2])
+def test_optimistic_prefill_pp_resolution_matches_source(pp_size, attempts):
+    config = create_vllm_config(
+        kv_connector_extra_config={"optimistic_prefill_attempts": attempts}
+    )
+    config.parallel_config = replace(
+        config.parallel_config, pipeline_parallel_size=pp_size
+    )
+    assert get_optimistic_prefill_attempts(config) == (attempts if pp_size == 1 else 0)
+
+
+@pytest.mark.parametrize("async_scheduling", [False, True])
+@pytest.mark.parametrize("skip_prefix_cache", [False, True])
+def test_optimistic_prefill_yield_exhaustion_and_stale_output(
+    monkeypatch, async_scheduling, skip_prefix_cache
+):
+    """One admitted attempt yields once; old output cannot publish its blocks."""
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    config = create_vllm_config(
+        kv_connector="MooncakeConnector",
+        kv_role="kv_producer",
+        max_num_batched_tokens=16,
+        kv_connector_extra_config={"optimistic_prefill_attempts": 1},
+    )
+    config.scheduler_config.async_scheduling = async_scheduling
+    scheduler = create_scheduler(config)
+    request = create_request(
+        request_id=101,
+        num_tokens=128,
+        do_remote_decode=True,
+        skip_reading_prefix_cache=skip_prefix_cache,
+    )
+    request.kv_transfer_params["transfer_id"] = "optimistic"
+    scheduler.add_request(request)
+    connector = scheduler.get_kv_connector()
+    assert connector.get_num_new_matched_tokens(request, 0) == (0, False)
+    assert connector.get_num_new_matched_tokens(request, 0) == (0, False)
+    first = scheduler.schedule()
+    assert first.num_scheduled_tokens[request.request_id] == 16
+    assert first.kv_connector_metadata.reqs_to_send[request.request_id] == (
+        "optimistic",
+        [],
+    )
+
+    ready = create_request(request_id=102, num_tokens=8, do_remote_decode=True)
+    ready.kv_transfer_params["transfer_id"] = "ready"
+    scheduler.add_request(ready)
+    connector.update_connector_output(
+        mooncake_connector.KVConnectorOutput(
+            kv_connector_worker_meta=MooncakeWorkerMetadata({"ready": {0}})
+        )
+    )
+    yielded = scheduler.schedule()
+    assert request.request_id in yielded.preempted_req_ids
+    assert ready.request_id in yielded.num_scheduled_tokens
+    assert request.request_id not in yielded.num_scheduled_tokens
+    assert request.kv_transfer_metrics["pd_prefill_retry_count"] == 1
+    assert request.drop_stale_output
+    assert connector.get_num_new_matched_tokens(request, 0) == (None, False)
+
+    scheduler.update_from_output(first, create_model_runner_output([request]))
+    assert request.num_stale_output_tokens == 0
+    assert not request.output_token_ids
+    assert not request.is_finished()
+    assert request.request_id not in connector.connector_scheduler._reqs_need_send
+    scheduler.update_from_output(yielded, create_model_runner_output([ready]))
+    blocked = scheduler.schedule()
+    assert request.request_id not in blocked.num_scheduled_tokens
+    assert scheduler.has_requests()
+    scheduler.update_from_output(blocked, create_model_runner_output([]))
+    connector.update_connector_output(
+        mooncake_connector.KVConnectorOutput(
+            kv_connector_worker_meta=MooncakeWorkerMetadata({"optimistic": {0}})
+        )
+    )
+    resumed = scheduler.schedule()
+    assert request.request_id in resumed.num_scheduled_tokens
+    assert request.kv_transfer_metrics["pd_prefill_retry_count"] == 1
+    for step in range(16):
+        model_output = create_model_runner_output([request])
+        if request.is_prefill_chunk:
+            model_output.sampled_token_ids = [[]]
+        outputs = scheduler.update_from_output(resumed, model_output)
+        if request.is_finished():
+            engine_output = outputs[request.client_index].outputs[0]
+            assert engine_output.kv_transfer_metrics["pd_prefill_retry_count"] == 1
+            exported = _export_pd_retry_metrics(request, engine_output)
+            assert exported["pd_prefill_retry_count"] == 1
+            break
+        resumed = scheduler.schedule()
+    else:
+        pytest.fail("Optimistic retry did not finish within its prompt chunk budget")
+
+
+def test_optimistic_prefill_completed_request_parks_without_yield(monkeypatch):
+    """Completed producer KV stays pinned on the existing transfer-finish path."""
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    config = create_vllm_config(
+        kv_connector="MooncakeConnector",
+        kv_role="kv_producer",
+        kv_connector_extra_config={"optimistic_prefill_attempts": 1},
+    )
+    scheduler = create_scheduler(config)
+    request = create_request(request_id=103, num_tokens=8, do_remote_decode=True)
+    request.kv_transfer_params["transfer_id"] = "completed"
+    scheduler.add_request(request)
+    completed = scheduler.schedule()
+    ready = create_request(request_id=104, num_tokens=8, do_remote_decode=True)
+    ready.kv_transfer_params["transfer_id"] = "ready"
+    scheduler.add_request(ready)
+    connector = scheduler.get_kv_connector()
+    connector.update_connector_output(
+        mooncake_connector.KVConnectorOutput(
+            kv_connector_worker_meta=MooncakeWorkerMetadata({"ready": {0}})
+        )
+    )
+    assert not connector.should_yield_optimistic_prefill(request, scheduler.waiting)
+    scheduler.update_from_output(completed, create_model_runner_output([request]))
+    assert request.is_finished()
+    assert request.request_id in scheduler.requests
+    assert request.kv_transfer_metrics["pd_prefill_retry_count"] == 0
+    publication = scheduler.schedule()
+    published_blocks = publication.kv_connector_metadata.reqs_to_send[
+        request.request_id
+    ]
+    assert published_blocks[0] == "completed"
+    assert any(published_blocks[1])
+    assert not connector.should_yield_optimistic_prefill(request, scheduler.waiting)
+
+
+def test_optimistic_prefill_metadata_requires_each_tp_identity(monkeypatch):
+    """Duplicate/omitted workers never satisfy a two-rank admission gate."""
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    config = create_vllm_config(
+        kv_connector="MooncakeConnector",
+        kv_role="kv_producer",
+        kv_connector_extra_config={"optimistic_prefill_attempts": 1},
+    )
+    config.parallel_config.tensor_parallel_size = 2
+    scheduler = create_scheduler(config)
+    connector = scheduler.get_kv_connector()
+    request = create_request(request_id=105, num_tokens=128, do_remote_decode=True)
+    request.kv_transfer_params["transfer_id"] = "partial"
+    scheduler.add_request(request)
+    scheduler.schedule()
+    assert connector.get_num_new_matched_tokens(request, 0) == (None, False)
+    one_rank = MooncakeWorkerMetadata({"partial": {0}})
+    partial = one_rank.aggregate(one_rank).aggregate(MooncakeWorkerMetadata())
+    connector.update_connector_output(
+        mooncake_connector.KVConnectorOutput(kv_connector_worker_meta=partial)
+    )
+    assert connector.get_num_new_matched_tokens(request, 0) == (None, False)
+    connector.update_connector_output(
+        mooncake_connector.KVConnectorOutput(
+            kv_connector_worker_meta=MooncakeWorkerMetadata({"partial": {1}})
+        )
+    )
+    assert connector.get_num_new_matched_tokens(request, 0) == (0, False)
+
+
+def test_optimistic_prefill_default_keeps_native_admission(monkeypatch):
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    config = create_vllm_config(kv_connector="MooncakeConnector", kv_role="kv_producer")
+    scheduler = create_scheduler(config)
+    request = create_request(request_id=106, num_tokens=128, do_remote_decode=True)
+    request.kv_transfer_params["transfer_id"] = "default"
+    scheduler.add_request(request)
+    first = scheduler.schedule()
+    second = scheduler.schedule()
+    assert request.request_id in first.num_scheduled_tokens
+    assert request.request_id in second.num_scheduled_tokens
+    assert request.kv_transfer_metrics["pd_prefill_retry_count"] == 0
+
+
+@pytest.mark.parametrize("attempts", [0, 2])
+@pytest.mark.parametrize("remote_decode", [False, True])
+def test_optimistic_prefill_g5_exports_policy_zero_only_for_producer_requests(
+    monkeypatch, attempts, remote_decode
+):
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    config = create_vllm_config(
+        kv_connector="MooncakeConnector",
+        kv_role="kv_producer",
+        kv_connector_extra_config={"optimistic_prefill_attempts": attempts},
+    )
+    scheduler = create_scheduler(config)
+    request = create_request(
+        request_id=111, num_tokens=8, do_remote_decode=remote_decode, max_tokens=1
+    )
+    if remote_decode:
+        request.kv_transfer_params["transfer_id"] = "zero-export"
+    scheduler.add_request(request)
+    scheduled = scheduler.schedule()
+    outputs = scheduler.update_from_output(
+        scheduled, create_model_runner_output([request])
+    )
+    engine_output = outputs[request.client_index].outputs[0]
+    exported = _export_pd_retry_metrics(request, engine_output)
+    if remote_decode:
+        assert engine_output.kv_transfer_metrics["pd_prefill_retry_count"] == 0
+        assert exported["pd_prefill_retry_count"] == 0
+        if attempts:
+            state = scheduler.get_kv_connector().connector_scheduler
+            assert state._optimistic_prefills["zero-export"].attempts == 1
+    else:
+        assert "pd_prefill_retry_count" not in (engine_output.kv_transfer_metrics or {})
+        assert "pd_prefill_retry_count" not in exported
+
+
+def test_optimistic_prefill_failed_allocation_does_not_spend_attempt(monkeypatch):
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    config = create_vllm_config(
+        kv_connector="MooncakeConnector",
+        kv_role="kv_producer",
+        kv_connector_extra_config={"optimistic_prefill_attempts": 1},
+    )
+    scheduler = create_scheduler(config, num_blocks=1)
+    request = create_request(request_id=107, num_tokens=128, do_remote_decode=True)
+    request.kv_transfer_params["transfer_id"] = "no-space"
+    scheduler.add_request(request)
+    output = scheduler.schedule()
+    assert not output.num_scheduled_tokens
+    assert scheduler.get_kv_connector().get_num_new_matched_tokens(request, 0) == (
+        0,
+        False,
+    )
+    assert request.kv_transfer_metrics["pd_prefill_retry_count"] == 0
+
+
+def test_optimistic_prefill_generic_preemption_is_not_pd_retry(monkeypatch):
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    config = create_vllm_config(
+        kv_connector="MooncakeConnector",
+        kv_role="kv_producer",
+        kv_connector_extra_config={"optimistic_prefill_attempts": 1},
+    )
+    scheduler = create_scheduler(config)
+    request = create_request(request_id=108, num_tokens=128, do_remote_decode=True)
+    request.kv_transfer_params["transfer_id"] = "generic-preemption"
+    scheduler.add_request(request)
+    scheduler.schedule()
+    assert scheduler.reset_prefix_cache(reset_running_requests=True)
+    assert request.num_preemptions == 1
+    assert request.kv_transfer_metrics["pd_prefill_retry_count"] == 0
+
+
+@pytest.mark.parametrize("pause_state", [PauseState.PAUSED_NEW, PauseState.PAUSED_ALL])
+def test_optimistic_prefill_pause_does_not_yield_to_queued_work(
+    monkeypatch, pause_state
+):
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    config = create_vllm_config(
+        kv_connector="MooncakeConnector",
+        kv_role="kv_producer",
+        kv_connector_extra_config={"optimistic_prefill_attempts": 1},
+    )
+    scheduler = create_scheduler(config)
+    request = create_request(request_id=109, num_tokens=256, do_remote_decode=True)
+    request.kv_transfer_params["transfer_id"] = "paused"
+    ready = create_request(request_id=110, num_tokens=8, do_remote_decode=True)
+    ready.kv_transfer_params["transfer_id"] = "ready"
+    scheduler.add_request(request)
+    scheduler.schedule()
+    scheduler.add_request(ready)
+    scheduler.get_kv_connector().update_connector_output(
+        mooncake_connector.KVConnectorOutput(
+            kv_connector_worker_meta=MooncakeWorkerMetadata({"ready": {0}})
+        )
+    )
+    scheduler.set_pause_state(pause_state)
+    paused = scheduler.schedule()
+    assert request.request_id not in paused.preempted_req_ids
+    assert request.kv_transfer_metrics["pd_prefill_retry_count"] == 0
+
+
 @contextlib.contextmanager
 def patch_worker_dependencies():
     """Helper to mock all distributed and network dependencies for Worker tests."""
@@ -1165,6 +1480,106 @@ def patch_worker_dependencies():
             "mock_async_client": mock_async_client,
             "mock_http_client": mock_http_client_instance,
         }
+
+
+@pytest.mark.parametrize("layout", list(KVCacheLayout))
+@pytest.mark.parametrize("raw_state", [False, True])
+def test_independent_mooncake_registration_preserves_group_payloads(
+    monkeypatch, layout, raw_state
+):
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    config = _make_worker_vllm_config("kv_consumer")
+    config.cache_config.kv_cache_layout = layout.name
+    config.cache_config.mamba_cache_mode = "align"
+    attention = FullAttentionSpec(
+        block_size=16, num_kv_heads=1, head_size=1, dtype=torch.float32
+    )
+    state = MambaSpec(
+        block_size=16,
+        shapes=((32,),),
+        dtypes=(torch.float32,),
+        mamba_cache_mode="align",
+    )
+    groups = [
+        KVCacheGroupSpec(["model.layers.0.attn", "model.layers.1.attn"], attention),
+        KVCacheGroupSpec(["model.layers.2.state"], state),
+    ]
+    plan = get_kv_cache_config_from_groups(
+        config, groups, 8192, group_num_blocks=(5, 3)
+    )
+    caches = allocate_kv_cache(plan, torch.device("cpu"), layout)
+    if raw_state:
+        cache = caches["model.layers.2.state"]
+        caches["model.layers.2.state"] = torch.empty(0, dtype=torch.int8).set_(
+            cache.untyped_storage()
+        )
+    monkeypatch.setattr(torch.accelerator, "current_device_index", lambda: 0)
+    monkeypatch.setattr(
+        mooncake_connector.current_platform, "set_device", lambda _: None
+    )
+    module = "vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector"
+    with (
+        set_current_vllm_config(config),
+        patch_worker_dependencies(),
+        patch(f"{module}.threading.Thread"),
+    ):
+        connector = MooncakeConnector(config, KVConnectorRole.WORKER, plan)
+        registered_worker = connector.connector_worker
+        assert registered_worker is not None
+        try:
+            with patch.object(
+                registered_worker.engine, "batch_register_memory", return_value=0
+            ) as registration:
+                registered_worker.register_kv_caches(caches)
+            storage = next(iter(caches.values())).untyped_storage()
+            registration.assert_called_once_with(
+                [storage.data_ptr()], [storage.nbytes()]
+            )
+            assert set(registered_worker.registered_group_indices) == {0, 1}
+            assert all(
+                group_id != _SHARED_REGION_GROUP_ID
+                for group_id in registered_worker.registered_group_indices
+            )
+            for group_id, group in enumerate(groups):
+                descriptors = [
+                    descriptor
+                    for descriptor in plan.kv_cache_tensors
+                    if descriptor.layers[0] in group.layer_names
+                ]
+                start = min(descriptor.offset for descriptor in descriptors)
+                count = plan.num_blocks_for_group(group_id)
+                end = (
+                    start + count * descriptors[0].block_stride
+                    if layout.is_block_outermost
+                    else max(
+                        descriptor.offset
+                        + len(descriptor.layers) * descriptor.layer_stride
+                        for descriptor in descriptors
+                    )
+                )
+                payloads = []
+                for base, stride, payload, region_group in zip(
+                    registered_worker.kv_caches_base_addr,
+                    registered_worker.block_len_per_layer,
+                    registered_worker.kv_block_len_per_layer,
+                    registered_worker.registered_group_indices,
+                    strict=True,
+                ):
+                    if region_group != group_id:
+                        continue
+                    assert base >= storage.data_ptr() + start
+                    assert (
+                        base + (count - 1) * stride + payload
+                        <= storage.data_ptr() + end
+                    )
+                    payloads.append(payload)
+                assert sum(payloads) == (
+                    len(group.layer_names) * group.kv_cache_spec.page_size_bytes
+                )
+            assert registered_worker._kv_layout_id != 0
+        finally:
+            registered_worker.shutdown()
+            registered_worker.receiver_loop.close()
 
 
 def _region(

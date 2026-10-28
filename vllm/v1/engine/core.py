@@ -366,15 +366,26 @@ class EngineCore:
             and kv_transfer_config.has_connector("SimpleCPUOffloadConnector")
             and vllm_config.cache_config.enable_prefix_caching
         ):
-            aligned_num_cpu_blocks = (
-                self.model_executor.get_simple_cpu_offload_num_blocks()
-            )
-            assert aligned_num_cpu_blocks is not None, (
-                "SimpleCPUOffloadConnector workers must report their block count"
-            )
-            vllm_config.cache_config.simple_cpu_offload_num_blocks = (
-                aligned_num_cpu_blocks
-            )
+            if scheduler_kv_cache_config.group_num_blocks is not None:
+                aligned_groups = (
+                    self.model_executor.get_simple_cpu_offload_group_num_blocks()
+                )
+                assert aligned_groups is not None, (
+                    "SimpleCPUOffloadConnector workers must report group capacities"
+                )
+                vllm_config.cache_config.simple_cpu_offload_group_num_blocks = (
+                    aligned_groups
+                )
+            else:
+                aligned_num_cpu_blocks = (
+                    self.model_executor.get_simple_cpu_offload_num_blocks()
+                )
+                assert aligned_num_cpu_blocks is not None, (
+                    "SimpleCPUOffloadConnector workers must report their block count"
+                )
+                vllm_config.cache_config.simple_cpu_offload_num_blocks = (
+                    aligned_num_cpu_blocks
+                )
         if not envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH:
             self.model_executor.compile_or_warm_up_model()
 

@@ -761,6 +761,9 @@ class BlockPool:
         for block in blocks:
             if block.is_null:
                 continue
+            if block.pool is not None and block.pool is not self:
+                block.pool.touch((block,))
+                continue
             # ref_cnt=0 means this block is in the free list (i.e. eviction
             # candidate), so remove it.
             if block.ref_cnt == 0:

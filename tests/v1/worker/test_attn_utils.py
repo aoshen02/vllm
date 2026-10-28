@@ -883,3 +883,48 @@ def test_packed_token_cache_cannot_be_split():
     packed = torch.zeros(3, 1, 2048, 1152, dtype=torch.uint8)[:, :, :1024]
     with pytest.raises(ValueError, match="cannot be split"):
         map_kv_caches_to_kernel_blocks({"layer.0": packed}, [group])
+
+
+def test_copy_kv_cache_blocks_respects_independent_group_ownership():
+    backing = torch.arange(128, dtype=torch.uint8)
+    attention = backing[:64].view(4, 1, 4, 4)
+    state = backing[64:].view(8, 1, 2, 4)
+    caches = {0: [attention], 1: [state]}
+    before_attention = attention.clone()
+    before_state = state.clone()
+
+    copy_kv_cache_blocks_inplace(caches, (4, 8), {0: [KVCacheBlockCopy(1, 2)]})
+    assert torch.equal(attention[2], before_attention[1])
+    assert torch.equal(attention[1], before_attention[1])
+    assert torch.equal(state, before_state)
+
+    after_attention = attention.clone()
+    copy_kv_cache_blocks_inplace(caches, (4, 8), {1: [KVCacheBlockCopy(1, 6)]})
+    assert torch.equal(state[6], before_state[1])
+    assert torch.equal(state[1], before_state[1])
+    assert torch.equal(attention, after_attention)
+
+
+@pytest.mark.parametrize("capacities", [None, (4, 8)])
+def test_warmup_allocation_respects_capacity_domains(capacities):
+    from vllm.v1.worker.gpu.warmup import _warmup_block_allocator
+
+    spec = FullAttentionSpec(
+        block_size=16, num_kv_heads=1, head_size=64, dtype=torch.bfloat16
+    )
+    config = KVCacheConfig(
+        num_blocks=16,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(["first"], spec),
+            KVCacheGroupSpec(["second"], spec),
+        ],
+        group_num_blocks=capacities,
+    )
+    allocate = _warmup_block_allocator(config)
+    assert allocate(0, 2) == [1, 2]
+    assert allocate(1, 2) == ([1, 2] if capacities is not None else [3, 4])
+    if capacities is not None:
+        assert allocate(0, 1) == [3]
+        with pytest.raises(ValueError, match="exceeds the cache group's capacity"):
+            allocate(0, 1)

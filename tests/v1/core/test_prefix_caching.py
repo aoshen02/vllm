@@ -3485,6 +3485,73 @@ def test_prefill_not_enough_free_blocks_with_computed_blocks():
     assert {block.ref_cnt for block in block_part1[3:]} == {0}
 
 
+@pytest.mark.parametrize(
+    "independent,group_keyed", [(False, False), (True, False), (True, True)]
+)
+def test_single_group_manager_eviction_accepts_unambiguous_ids(
+    independent, group_keyed
+):
+    block_size = 4
+    config = make_kv_cache_config(block_size, 8)
+    if independent:
+        config = replace(config, group_num_blocks=(8,))
+    manager = make_kv_cache_manager(
+        config,
+        max_model_len=32,
+        hash_block_size=block_size,
+        enable_caching=True,
+    )
+    request = make_request("evict", list(range(9)), block_size, sha256)
+    allocated = manager.allocate_slots(request, 8)
+    assert allocated is not None
+    first, second = allocated.blocks[0]
+    manager.free(request)
+    pool = manager.coordinator.single_type_managers[0].block_pool
+    assert pool.get_cached_block(request.block_hashes[0], [0]) == [first]
+    assert pool.get_cached_block(request.block_hashes[1], [0]) == [second]
+    free_before = pool.get_num_free_blocks()
+    ids = {first.block_id}
+    manager.evict_blocks({0: ids} if group_keyed else ids)
+    assert pool.get_cached_block(request.block_hashes[0], [0]) is None
+    assert first.block_hash is None
+    assert pool.get_cached_block(request.block_hashes[1], [0]) == [second]
+    assert pool.get_num_free_blocks() == free_before
+
+
+def test_independent_group_eviction_rejects_flat_ids_and_isolates_equal_ids():
+    block_size = 4
+    config = replace(
+        _make_hybrid_kv_cache_config(block_size, 8, ["full", "full"]),
+        group_num_blocks=(8, 6),
+    )
+    manager = make_kv_cache_manager(
+        config,
+        max_model_len=32,
+        hash_block_size=block_size,
+        enable_caching=True,
+    )
+    request = make_request("evict-groups", list(range(9)), block_size, sha256)
+    allocated = manager.allocate_slots(request, 8)
+    assert allocated is not None
+    first = allocated.blocks[0][0]
+    other = allocated.blocks[1][0]
+    assert first.block_id == other.block_id
+    manager.free(request)
+    first_pool, other_pool = (
+        group_manager.block_pool
+        for group_manager in manager.coordinator.single_type_managers
+    )
+    with pytest.raises(ValueError, match="must be group-keyed"):
+        manager.evict_blocks({first.block_id})
+    assert first_pool.get_cached_block(request.block_hashes[0], [0]) == [first]
+    assert other_pool.get_cached_block(request.block_hashes[0], [1]) == [other]
+    manager.evict_blocks({0: {first.block_id}})
+    assert first_pool.get_cached_block(request.block_hashes[0], [0]) is None
+    assert first.block_hash is None
+    assert other_pool.get_cached_block(request.block_hashes[0], [1]) == [other]
+    assert other.block_hash is not None
+
+
 def test_reset_prefix_cache():
     block_size = 16
     manager = make_kv_cache_manager(

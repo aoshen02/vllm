@@ -184,6 +184,7 @@ class BatchMemcpyParams(NamedTuple):
     # cuMemcpyBatchAsync() with fail_idx for backward compatibility
     fail_idx: ctypes.c_size_t
     stream_handle: int  # raw cudaStream_t / CUstream
+    region_group_ids: np.ndarray | None = None
 
 
 def build_params(
@@ -191,6 +192,7 @@ def build_params(
     dst_caches: dict[str, torch.Tensor],
     stream: torch.cuda.Stream,
     src_access_order: int = CU_MEMCPY_SRC_ACCESS_ORDER_ANY,
+    region_group_ids: dict[str, int] | None = None,
 ) -> BatchMemcpyParams:
     global _batch_memcpy
     if _batch_memcpy is None:
@@ -221,6 +223,11 @@ def build_params(
         num_attrs=num_attrs,
         fail_idx=ctypes.c_size_t(0),
         stream_handle=stream.cuda_stream,
+        region_group_ids=(
+            np.array([region_group_ids[name] for name in src_caches], dtype=np.int64)
+            if region_group_ids is not None
+            else None
+        ),
     )
 
 
@@ -228,9 +235,18 @@ def copy_blocks(
     src_block_ids: list[int],
     dst_block_ids: list[int],
     params: BatchMemcpyParams,
+    group_ids: list[int] | None = None,
 ) -> None:
     """Copy blocks via cuMemcpyBatchAsync / hipMemcpyBatchAsync."""
     n = len(src_block_ids)
+    if len(dst_block_ids) != n:
+        raise ValueError("Source and destination block lists must have equal lengths")
+    if group_ids and len(group_ids) != n:
+        raise ValueError("Copy group IDs must match the block pair count")
+    if params.region_group_ids is not None and n and not group_ids:
+        raise ValueError("Independent CPU pools require a group ID for every copy")
+    if group_ids and params.region_group_ids is None:
+        raise ValueError("Grouped copies require region group IDs")
     if n == 0:
         return
 
@@ -248,6 +264,17 @@ def copy_blocks(
     ).ravel()
     sz_all = np.repeat(params.bpb, n)
     total = n * params.num_layers
+    if group_ids:
+        copy_groups = np.asarray(group_ids, dtype=np.int64)
+        assert params.region_group_ids is not None
+        mask = params.region_group_ids[:, None] == copy_groups[None, :]
+        if not mask.any(axis=0).all():
+            raise ValueError("Copy group has no registered regions")
+        selected = mask.ravel()
+        src_all = src_all[selected]
+        dst_all = dst_all[selected]
+        sz_all = sz_all[selected]
+        total = len(sz_all)
 
     # Chunk on ROCm: hipMemcpyBatchAsync faults above 8192 descriptors/call.
     # CUDA is uncapped (max_desc == 0) and issues a single call.

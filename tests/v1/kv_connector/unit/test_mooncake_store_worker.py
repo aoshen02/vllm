@@ -17,6 +17,7 @@ import pytest
 import torch
 
 from tests.v1.attention.utils import dense_kv_cache_views
+from tests.v1.kv_connector.unit.utils import create_vllm_config
 from vllm.distributed import mooncake_store
 from vllm.distributed.kv_events import KVEventAggregator
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake import (
@@ -49,6 +50,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.scheduler impor
     _partial_tail_non_mamba_puts,
 )
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
+from vllm.v1.core.kv_cache_planning import get_kv_cache_config_from_groups
 from vllm.v1.core.kv_cache_utils import BlockHash, maybe_convert_block_hash
 from vllm.v1.kv_cache_interface import (
     CircularBufferSpec,
@@ -59,6 +61,7 @@ from vllm.v1.kv_cache_interface import (
     RSWASpec,
 )
 from vllm.v1.kv_cache_layout import KVCacheLayout
+from vllm.v1.worker.utils import allocate_kv_cache
 
 _TP_SHARED_NAMESPACE = "@store_tp:4@store_pp:1@store_format:tp_shared_lbhnc"
 _TP_SHARED_LBNHC_NAMESPACE = "@store_tp:4@store_pp:1@store_format:tp_shared_lbnhc"
@@ -4640,6 +4643,90 @@ def test_register_kv_caches_shared_storage(layout: KVCacheLayout):
         assert db.kv_caches_base_addr == [raw.data_ptr()]
         assert db.block_len == [num_layers * spec.page_size_bytes]
     worker.store.register_buffer.assert_called_once_with(raw.data_ptr(), raw.nbytes)
+
+
+@pytest.mark.parametrize("layout", list(KVCacheLayout))
+def test_independent_store_registration_uses_each_group_domain(
+    monkeypatch, tmp_path, layout
+):
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    store = MagicMock()
+    store.setup.return_value = 0
+    store.register_buffer.return_value = 0
+    _install_fake_mooncake(monkeypatch, store)
+    _patch_worker_runtime(monkeypatch)
+    config_path = _write_mooncake_config(
+        tmp_path,
+        {
+            "metadata_server": "http://metadata/endpoint",
+            "master_server_address": "10.0.0.7:50051",
+            "protocol": "rdma",
+            "device_name": "mlx5_0",
+            "global_segment_size": 4096,
+            "local_buffer_size": 4096,
+        },
+    )
+    monkeypatch.setenv("MOONCAKE_CONFIG_PATH", str(config_path))
+    config = create_vllm_config(
+        kv_connector="MooncakeStoreConnector", kv_role="kv_consumer"
+    )
+    config.cache_config.kv_cache_layout = layout.name
+    config.cache_config.mamba_cache_mode = "align"
+    attention = FullAttentionSpec(
+        block_size=16, num_kv_heads=1, head_size=1, dtype=torch.float32
+    )
+    state = MambaSpec(
+        block_size=16,
+        shapes=((32,),),
+        dtypes=(torch.float32,),
+        mamba_cache_mode="align",
+    )
+    groups = [
+        KVCacheGroupSpec(["model.layers.0.attn", "model.layers.1.attn"], attention),
+        KVCacheGroupSpec(["model.layers.2.state"], state),
+    ]
+    plan = get_kv_cache_config_from_groups(
+        config, groups, 8192, group_num_blocks=(5, 3)
+    )
+    config.cache_config.num_gpu_blocks = plan.num_blocks
+    caches = allocate_kv_cache(plan, torch.device("cpu"), layout)
+    store_worker = worker.MooncakeStoreWorker(config, plan)
+    _register_with_mocked_threads(store_worker, caches)
+    storage = next(iter(caches.values())).untyped_storage()
+    store.register_buffer.assert_called_once_with(storage.data_ptr(), storage.nbytes())
+    assert len(store_worker.token_dbs) == 2
+    for group_id, (group, db) in enumerate(
+        zip(groups, store_worker.token_dbs, strict=True)
+    ):
+        descriptors = [
+            descriptor
+            for descriptor in plan.kv_cache_tensors
+            if descriptor.layers[0] in group.layer_names
+        ]
+        count = plan.num_blocks_for_group(group_id)
+        start = min(descriptor.offset for descriptor in descriptors)
+        end = (
+            start + count * descriptors[0].block_stride
+            if layout.is_block_outermost
+            else max(
+                descriptor.offset + len(descriptor.layers) * descriptor.layer_stride
+                for descriptor in descriptors
+            )
+        )
+        addresses, sizes = db.prepare_value_for_block(count - 1)
+        assert addresses
+        assert (
+            sum(sizes) == len(group.layer_names) * group.kv_cache_spec.page_size_bytes
+        )
+        for address, size in zip(addresses, sizes, strict=True):
+            assert address >= storage.data_ptr() + start
+            assert address + size <= storage.data_ptr() + end
+        if group_id == 1:
+            assert start > 0
+        if layout.is_block_outermost:
+            assert addresses == [
+                storage.data_ptr() + start + (count - 1) * descriptors[0].block_stride
+            ]
 
 
 def test_register_kv_caches_uses_transfer_group_memory_domain():

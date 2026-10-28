@@ -815,6 +815,9 @@ class EngineArgs:
     mamba_cache_dtype: MambaDType = CacheConfig.mamba_cache_dtype
     mamba_ssm_cache_dtype: MambaDType = CacheConfig.mamba_ssm_cache_dtype
     mamba_block_size: int | None = get_field(CacheConfig, "mamba_block_size")
+    mamba_full_memory_ratio: float | None = get_field(
+        CacheConfig, "mamba_full_memory_ratio"
+    )
     prefix_match_unit: int | None = get_field(CacheConfig, "prefix_match_unit")
     mamba_cache_mode: MambaCacheMode | None = None
     enable_mamba_shared_prefix_checkpoint: bool = (
@@ -1436,6 +1439,9 @@ class EngineArgs:
         )
         cache_group.add_argument(
             "--mamba-block-size", **cache_kwargs["mamba_block_size"]
+        )
+        cache_group.add_argument(
+            "--mamba-full-memory-ratio", **cache_kwargs["mamba_full_memory_ratio"]
         )
         cache_group.add_argument(
             "--prefix-match-unit", **cache_kwargs["prefix_match_unit"]
@@ -2334,6 +2340,7 @@ class EngineArgs:
             mamba_cache_dtype=self.mamba_cache_dtype,
             mamba_ssm_cache_dtype=self.mamba_ssm_cache_dtype,
             mamba_block_size=self.mamba_block_size,
+            mamba_full_memory_ratio=self.mamba_full_memory_ratio,
             prefix_match_unit=self.prefix_match_unit,
             enable_mamba_shared_prefix_checkpoint=(
                 self.enable_mamba_shared_prefix_checkpoint
@@ -2652,6 +2659,7 @@ class EngineArgs:
         diffusion_config = self.create_diffusion_config()
         watermark_config = self.create_watermark_config()
 
+        cache_config.mamba_fixed_num_seqs = self.max_num_seqs
         self._set_default_max_num_seqs_and_batched_tokens_args(
             usage_context,
             model_config,

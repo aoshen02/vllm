@@ -67,18 +67,30 @@ def _num_blocks(
     return skipped, total - skipped
 
 
+def _group_capacities(
+    num_blocks: int | tuple[int, ...], num_groups: int
+) -> tuple[int, ...]:
+    if isinstance(num_blocks, int):
+        return (num_blocks,) * num_groups
+    if len(num_blocks) != num_groups:
+        raise ValueError("KV capacity vector must have one entry per cache group")
+    if any(type(count) is not int or count < 1 for count in num_blocks):
+        raise ValueError("KV capacity vector entries must be positive integers")
+    return num_blocks
+
+
 def build_batch(
     case: BenchCase,
     kv_cache_groups,
-    num_kv_blocks: int,
+    num_kv_blocks: int | tuple[int, ...],
     vocab_size: int,
     rng: np.random.Generator,
     dcp_size: int = 1,
 ) -> BenchBatch:
     """Allocate disjoint blocks and build `NewRequestData` for every request.
 
-    Groups share one block pool, so block IDs are unique across groups. Block
-    0 is the null block.
+    Scalar capacity uses a shared pool with globally unique block IDs. A
+    capacity vector uses independent group pools. Block 0 is null in each pool.
 
     With prefix P = K - Q (KV length K, query length Q):
 
@@ -93,12 +105,15 @@ def build_batch(
     otherwise), like the scheduler: it schedules R + Q tokens from
     replay_start = num_computed_tokens = P - R.
     """
+    capacities = _group_capacities(num_kv_blocks, len(kv_cache_groups))
+    independent = not isinstance(num_kv_blocks, int)
     replay_window = max(
         (group.kv_cache_spec.prefix_replay_tokens for group in kv_cache_groups),
         default=0,
     )
     expected: dict[str, tuple[int, int, bool]] = {}
     cursor = 1
+    group_cursors = [1] * len(kv_cache_groups)
     new_reqs = []
     query_token_ids = {}
     group_block_ranges: list[list[tuple[int, int]]] = [[] for _ in kv_cache_groups]
@@ -108,13 +123,19 @@ def build_batch(
         replay = min(replay_window, req.prefix_len) if req.prefix_hit else 0
         computed = req.prefix_len - replay
         block_ids = []
-        for group, ranges in zip(kv_cache_groups, group_block_ranges):
+        for group_id, (group, ranges) in enumerate(
+            zip(kv_cache_groups, group_block_ranges)
+        ):
             skipped, live = _num_blocks(
                 group.kv_cache_spec, computed, req.kv_len, dcp_size
             )
-            block_ids.append([0] * skipped + list(range(cursor, cursor + live)))
-            ranges.append((cursor, cursor + live))
-            cursor += live
+            begin = group_cursors[group_id] if independent else cursor
+            block_ids.append([0] * skipped + list(range(begin, begin + live)))
+            ranges.append((begin, begin + live))
+            if independent:
+                group_cursors[group_id] += live
+            else:
+                cursor += live
         tokens = rng.integers(0, vocab_size, req.kv_len, dtype=np.int64)
         prompt = tokens[: req.prefix_len] if req.is_decode else tokens
         query_token_ids[req_id] = tokens[computed:]
@@ -138,11 +159,21 @@ def build_batch(
             output.scheduled_spec_decode_tokens[req_id] = tokens[
                 req.prefix_len + 1 :
             ].tolist()
-    if cursor > num_kv_blocks:
+    if isinstance(num_kv_blocks, int) and cursor > num_kv_blocks:
         raise ValueError(
             f"Case {case.name!r} needs {cursor} KV blocks, but only "
             f"{num_kv_blocks} exist. Increase the KV cache size."
         )
+    if independent:
+        for group_id, (used, capacity) in enumerate(zip(group_cursors, capacities)):
+            if used > capacity:
+                raise ValueError(
+                    f"Case {case.name!r} needs {used} KV blocks in group {group_id}, "
+                    f"but only {capacity} exist. Increase the KV cache size."
+                )
     output.scheduled_new_reqs = new_reqs
     output.total_num_scheduled_tokens = sum(output.num_scheduled_tokens.values())
-    return BenchBatch(output, query_token_ids, group_block_ranges, cursor, expected)
+    used_blocks = sum(group_cursors) if independent else cursor
+    return BenchBatch(
+        output, query_token_ids, group_block_ranges, used_blocks, expected
+    )

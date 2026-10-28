@@ -1514,20 +1514,25 @@ class CompilationConfig:
         # of silently capping cudagraph_capture_sizes avoids unintended
         # restrictions on PIECEWISE (prefill) cudagraphs.
         # See: https://github.com/vllm-project/vllm/issues/34094
+        mamba_num_blocks = 0
+        if kv_cache_config is not None and kv_cache_config.has_mamba_layers:
+            mamba_num_blocks = kv_cache_config.mamba_num_blocks
+            if kv_cache_config.group_num_blocks is not None:
+                mamba_num_blocks -= 1
         if (
             kv_cache_config is not None
             and max_num_reqs is not None
             and cudagraph_mode.has_full_cudagraphs()
             and not is_profiling
             and kv_cache_config.has_mamba_layers
-            and max_num_reqs > kv_cache_config.num_blocks
+            and max_num_reqs > mamba_num_blocks
         ):
             raise ValueError(
                 f"max_num_seqs ({max_num_reqs}) exceeds available Mamba cache "
-                f"blocks ({kv_cache_config.num_blocks}). Each decode sequence "
+                f"blocks ({mamba_num_blocks}). Each decode sequence "
                 "requires one Mamba cache block, so CUDA graph capture cannot "
                 "proceed. Please lower max_num_seqs to at most "
-                f"{kv_cache_config.num_blocks} or increase "
+                f"{mamba_num_blocks} or increase "
                 "gpu_memory_utilization."
             )
 

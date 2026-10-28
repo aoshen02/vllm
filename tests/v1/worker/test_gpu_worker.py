@@ -31,6 +31,48 @@ def test_v2_worker_requires_triton(monkeypatch):
         )
 
 
+@pytest.mark.parametrize("ratio", [None, 0.5])
+def test_independent_group_capacity_requires_v2_before_worker_mutation(
+    monkeypatch, ratio
+):
+    from vllm.config import CacheConfig, DeviceConfig, VllmConfig
+    from vllm.v1.core.kv_cache_planning import get_kv_cache_config_from_groups
+    from vllm.v1.kv_cache_interface import KVCacheGroupSpec, MambaSpec
+
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0")
+    config = VllmConfig(
+        cache_config=CacheConfig(mamba_full_memory_ratio=ratio),
+        device_config=DeviceConfig("cpu"),
+    )
+    config.cache_config.kv_cache_layout = "BLHNC"
+    config.cache_config.num_gpu_blocks = 17
+    plan = get_kv_cache_config_from_groups(
+        config,
+        [
+            KVCacheGroupSpec(
+                ["state"],
+                MambaSpec(
+                    block_size=16,
+                    shapes=((2,), (2,)),
+                    dtypes=(torch.float32, torch.float32),
+                ),
+            )
+        ],
+        available_memory=4096,
+        group_num_blocks=(4,),
+    )
+    worker = gpu_worker.Worker(
+        config, local_rank=0, rank=0, distributed_init_method="env://"
+    )
+    assert not worker.use_v2_model_runner
+    assert worker.model_runner is None
+    assert plan.group_num_blocks == (4,)
+    with pytest.raises(ValueError, match="group capacities require Model Runner V2"):
+        worker.initialize_from_config(plan)
+    assert config.cache_config.num_gpu_blocks == 17
+    assert worker.model_runner is None
+
+
 @pytest.mark.skipif(
     not current_platform.is_cpu(), reason="CPU worker test; needs the CPU platform"
 )

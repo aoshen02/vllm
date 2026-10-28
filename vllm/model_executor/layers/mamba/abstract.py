@@ -7,6 +7,7 @@ from math import lcm, prod
 import torch
 
 from vllm.config import VllmConfig, get_layers_from_vllm_config
+from vllm.config.mamba import MambaBackendEnum
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.attention.backend import AttentionBackend
@@ -80,6 +81,13 @@ class MambaBase(AttentionLayerBase):
             page_size_padded=page_size_padded,
             mamba_type=self.mamba_type,
             tp_replicated=self.is_kv_cache_tp_replicated,
+            replayssm_tracker_bytes_per_block=(
+                12
+                if self.mamba_type == MambaAttentionBackendEnum.MAMBA2
+                and vllm_config.cache_config.use_replayssm
+                and vllm_config.mamba_config.backend == MambaBackendEnum.FLASHINFER
+                else 0
+            ),
             mamba_cache_mode=vllm_config.cache_config.mamba_cache_mode,
             # ReplaySSM verifies the whole window off one checkpoint, so it
             # never writes the baseline's per-draft-token state slots.

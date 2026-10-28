@@ -45,6 +45,51 @@ from vllm import LLM
 llm = LLM(model="Qwen/Qwen2.5-VL-3B-Instruct", max_model_len=2048, max_num_seqs=2)
 ```
 
+## Hybrid Mamba Cache Budget
+
+This opt-in policy requires Model Runner V2.
+
+For models with Mamba cache groups, optionally alongside full-attention or
+sliding-window attention groups,
+`--mamba-full-memory-ratio r` reserves `r / (1 + r)` of the available cache
+budget for native Mamba pages. For example, `0.5` targets one third of the
+cache budget for Mamba and leaves the remainder for attention. The default
+is unset and preserves shared-pool planning. Models without Mamba groups ignore
+this control and retain their existing grouping and allocation, including
+full-attention and sliding-window models. Pure Mamba models still reserve the
+specified Mamba fraction; the unused remainder is not reassigned to state.
+
+The Mamba reservation includes native verification pages, state-embedded
+ReplaySSM/RecoverSSM records and each group's null block. It does not add a
+second copy of speculative scratch already represented by native pages.
+Per-worker group-start alignment headroom is reserved before splitting the
+budget. Counts are rounded down and made common across workers, including
+pipeline stages with different local layers; the realized ratio can therefore
+differ from the requested target. All group regions share one allocation.
+
+When prefix caching is disabled and `max_num_seqs` is explicitly supplied,
+the enabled policy instead reserves each
+Mamba group's native per-request block demand times `max_num_seqs`, plus one
+null block. This includes native verification pages; the numeric ratio is not
+used in that branch. The remaining budget funds attention. An omitted
+`max_num_seqs` retains ratio sizing, even after the scheduler resolves its
+default request limit.
+
+This is a physical cache-budget policy, not a persistent-state slot cap or
+a request-concurrency setting. It cannot be combined with a shared block-count
+override, HiSparse host storage, or cache types other than Mamba, full attention
+and sliding-window attention. The attention groups share the remaining budget;
+this control does not set a separate sliding-window-to-full-attention ratio.
+FlashInfer Mamba2 ReplaySSM cursor tensors live outside
+the backing:
+the policy charges 12 bytes per block once per actual local cache namespace,
+not per layer. It also reserves up to 12 times `max_num_seqs` bytes per such
+namespace for old profiling cursors that may overlap final cursor allocation
+during rebinding. This conservative headroom is reserved before the ratio
+split; profiling is not assumed to cover final-capacity cursors. Embedded
+replay records are included in native page sizes. Existing non-cache memory
+profiling remains unchanged.
+
 ## Reduce CUDA Graphs
 
 By default, we optimize model inference using CUDA graphs which take up extra memory in the GPU.

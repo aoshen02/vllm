@@ -116,13 +116,36 @@ class KVCacheCoordinator(ABC):
         self.scheduler_block_size = scheduler_block_size
         self.num_reprefillable_tokens = max(0, num_prefill_lookahead - 1)
 
-        self.block_pool = BlockPool(
-            num_gpu_blocks=kv_cache_config.num_blocks,
-            enable_caching=enable_caching,
-            hash_block_size=hash_block_size,
-            enable_kv_cache_events=enable_kv_cache_events,
-            metrics_collector=metrics_collector,
+        self.independent_groups = kv_cache_config.group_num_blocks is not None
+        if self.independent_groups and metrics_collector is not None:
+            raise ValueError(
+                "Independent group capacities require pool-aware cache metrics"
+            )
+        capacities = kv_cache_config.group_num_blocks
+        if capacities is not None and (
+            len(capacities) != len(kv_cache_config.kv_cache_groups)
+            or not capacities
+            or any(type(count) is not int or count <= 0 for count in capacities)
+        ):
+            raise ValueError(
+                "group_num_blocks must contain one positive integer per group"
+            )
+        self.block_pools = tuple(
+            BlockPool(
+                num_gpu_blocks=count,
+                enable_caching=enable_caching,
+                hash_block_size=hash_block_size,
+                enable_kv_cache_events=enable_kv_cache_events,
+                metrics_collector=metrics_collector,
+            )
+            for count in (
+                capacities if capacities is not None else (kv_cache_config.num_blocks,)
+            )
         )
+        self.block_pool = self.block_pools[0]
+        if self.independent_groups:
+            for pool in self.block_pools[1:]:
+                pool.kv_event_queue = self.block_pool.kv_event_queue
 
         # KV cache group indices that get the EAGLE last-block drop.
         self.eagle_group_ids: set[int] = {
@@ -159,7 +182,9 @@ class KVCacheCoordinator(ABC):
                 kv_cache_spec=kv_cache_group.kv_cache_spec,
                 max_in_flight_tokens=max_in_flight_tokens,
                 max_model_len=max_model_len,
-                block_pool=self.block_pool,
+                block_pool=(
+                    self.block_pools[i] if self.independent_groups else self.block_pool
+                ),
                 role=kv_cache_group.role,
                 enable_caching=enable_caching,
                 kv_cache_group_id=i,
@@ -167,6 +192,7 @@ class KVCacheCoordinator(ABC):
                 pcp_world_size=pcp_world_size,
                 scheduler_block_size=self.scheduler_block_size,
                 needs_kv_cache_zeroing=self.kv_cache_config.needs_kv_cache_zeroing,
+                **({"zero_mamba_blocks": True} if self.independent_groups else {}),
             )
             for i, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups)
         )
@@ -198,7 +224,7 @@ class KVCacheCoordinator(ABC):
         num_tokens_main_model: int,
         apply_admission_cap: bool = False,
         prefill_end: int = 0,
-    ) -> int:
+    ) -> int | dict[int, int]:
         """Get the number of device blocks needed to be allocated for the request.
 
         Args:
@@ -226,17 +252,18 @@ class KVCacheCoordinator(ABC):
                 state, so it is ignored (0).
 
         Returns:
-            The number of blocks to allocate.
+            The total demand, or per-group demands for independent capacities.
 
         """
         num_blocks_to_allocate = 0
+        group_demands: dict[int, int] = {}
         if self.retention_interval != 0:
             prefill_end = 0
         for i, manager in enumerate(self.single_type_managers):
             if isinstance(manager, CrossAttentionManager):
                 # For cross-attention, we issue a single static allocation
                 # of blocks based on the number of encoder input tokens.
-                num_blocks_to_allocate += manager.get_num_blocks_to_allocate(
+                demand = manager.get_num_blocks_to_allocate(
                     request_id,
                     num_encoder_tokens,
                     [],
@@ -246,7 +273,7 @@ class KVCacheCoordinator(ABC):
                     apply_admission_cap=apply_admission_cap,
                 )
             else:
-                num_blocks_to_allocate += manager.get_num_blocks_to_allocate(
+                demand = manager.get_num_blocks_to_allocate(
                     request_id,
                     num_tokens,
                     new_computed_blocks[i],
@@ -256,7 +283,9 @@ class KVCacheCoordinator(ABC):
                     apply_admission_cap=apply_admission_cap,
                     prefill_end=prefill_end,
                 )
-        return num_blocks_to_allocate
+            group_demands[i] = demand
+            num_blocks_to_allocate += demand
+        return group_demands if self.independent_groups else num_blocks_to_allocate
 
     def allocate_new_computed_blocks(
         self,
@@ -395,6 +424,17 @@ class KVCacheCoordinator(ABC):
         pools = dict.fromkeys(
             manager.block_pool for manager in self.single_type_managers
         )
+        if self.independent_groups:
+            if any(
+                pool.get_num_free_blocks() != pool.num_gpu_blocks - 1 for pool in pools
+            ):
+                return False
+            for pool in pools:
+                if not pool.reset_prefix_cache():
+                    return False
+                if pool is not self.block_pool and pool.enable_kv_cache_events:
+                    pool.kv_event_queue.pop()
+            return True
         return all([pool.reset_prefix_cache() for pool in pools])
 
     def free(self, request_id: str) -> None:

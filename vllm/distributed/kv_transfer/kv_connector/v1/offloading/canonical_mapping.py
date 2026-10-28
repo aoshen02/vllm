@@ -22,6 +22,8 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     MLAAttentionSpec,
     UniformTypeKVCacheSpecs,
+    get_kv_cache_regions,
+    group_kernel_blocks,
 )
 from vllm.v1.kv_offload.base import CanonicalPageMapping, CopyRun
 
@@ -181,11 +183,11 @@ def _packed_kv_regions(
             )
         ]
 
-    if head_stride == bs * head_elems and token_stride == head_elems:  # HND
+    if head_stride >= bs * head_elems and token_stride == head_elems:  # HND
         canonical_span = bs * cp_size  # canonical tokens per offloaded block
         return [
             ByteRegion(
-                local_offset=head * bs * head_bytes,
+                local_offset=head * head_stride * elem,
                 canonical_offset=(head_shard * heads + head)
                 * canonical_span
                 * head_bytes,
@@ -368,18 +370,63 @@ def _is_exact_partition(intervals: list[tuple[int, int]], size: int) -> bool:
     )
 
 
-def _verify_tiling(layer_name: str, per_rank: list[CanonicalPageMapping]) -> None:
+def _merge_intervals(intervals: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    merged: list[tuple[int, int]] = []
+    for start, end in sorted(intervals):
+        assert 0 <= start < end
+        if merged:
+            assert merged[-1][1] <= start, "Physical byte intervals overlap"
+            if merged[-1][1] == start:
+                merged[-1] = (merged[-1][0], end)
+                continue
+        merged.append((start, end))
+    return merged
+
+
+def _physical_page_intervals(cache: torch.Tensor) -> list[tuple[int, int]]:
+    intervals = [(0, cache.element_size())]
+    axes = sorted(zip(cache.shape[1:], cache.stride()[1:]), key=lambda axis: axis[1])
+    for size, stride in axes:
+        if size == 1:
+            continue
+        stride *= cache.element_size()
+        if len(intervals) == 1 and stride == intervals[0][1]:
+            intervals = [(0, size * stride)]
+        else:
+            intervals = _merge_intervals(
+                [
+                    (start + index * stride, end + index * stride)
+                    for index in range(size)
+                    for start, end in intervals
+                ]
+            )
+    return intervals
+
+
+def _verify_tiling(
+    layer_name: str,
+    per_rank: list[CanonicalPageMapping],
+    owned_intervals: list[tuple[int, int]] | None = None,
+) -> None:
     """Whichever ranks a block elects as writers must tile the canonical page
-    exactly once, and each rank's runs must cover exactly its local page."""
+    exactly once, and each rank's runs must cover exactly its owned bytes."""
     size = per_rank[0].canonical_page_size_bytes
     num_writers = per_rank[0].num_writers
     for mapping in per_rank:
         assert mapping.canonical_page_size_bytes == size
         assert mapping.num_writers == num_writers
         local = _run_intervals(mapping.runs, canonical=False)
-        assert _is_exact_partition(local, mapping.local_page_size_bytes), (
-            f"runs do not cover the local page of layer {layer_name}"
-        )
+        if owned_intervals is None:
+            assert _is_exact_partition(local, mapping.local_page_size_bytes), (
+                f"runs do not cover the local page of layer {layer_name}"
+            )
+        else:
+            assert _merge_intervals(local) == owned_intervals, (
+                f"runs do not cover the physical bytes of layer {layer_name}"
+            )
+            assert sum(end - start for start, end in owned_intervals) == (
+                mapping.local_page_size_bytes
+            )
     for block_id in range(num_writers):
         stored: list[tuple[int, int]] = []
         for mapping in per_rank:
@@ -428,10 +475,21 @@ def derive_canonical_mappings(
         )
 
     my_rank = parallel_config.rank
-    num_blocks = kv_cache_config.num_blocks
-
+    regions: dict[str, torch.Tensor] = {}
+    region_groups: dict[str, int] = {}
+    if kv_cache_config.group_num_blocks is not None:
+        regions, region_groups = get_kv_cache_regions(
+            kv_cache_config,
+            {
+                name: cache
+                for name, cache in kv_caches.items()
+                if isinstance(cache, torch.Tensor)
+            },
+            vllm_config.cache_config.get_resolved_kv_cache_layout(),
+        )
     mappings: dict[str, CanonicalPageMapping] = {}
-    for kv_cache_group in kv_cache_config.kv_cache_groups:
+    for group_id, kv_cache_group in enumerate(kv_cache_config.kv_cache_groups):
+        num_blocks = kv_cache_config.num_blocks_for_group(group_id)
         group_kv_cache_spec = kv_cache_group.kv_cache_spec
         if isinstance(group_kv_cache_spec, UniformTypeKVCacheSpecs):
             per_layer_specs = group_kv_cache_spec.kv_cache_specs
@@ -444,6 +502,15 @@ def derive_canonical_mappings(
                 mapping = _layer_mapping(
                     spec, kv_caches.get(layer_name), num_blocks, ctx(rank)
                 )
+                if (
+                    mapping is not None
+                    and kv_cache_config.group_num_blocks is None
+                    and not _is_exact_partition(
+                        _run_intervals(mapping.runs, canonical=False),
+                        mapping.local_page_size_bytes,
+                    )
+                ):
+                    mapping = None
                 if mapping is None:
                     break
                 per_rank.append(mapping)
@@ -455,6 +522,27 @@ def derive_canonical_mappings(
                     _opaque_fallback_mapping(page, group_size, rank)
                     for rank in range(group_size)
                 ]
-            _verify_tiling(layer_name, per_rank)
+            owned_intervals = None
+            cache = kv_caches.get(layer_name)
+            if kv_cache_config.group_num_blocks is not None and isinstance(
+                cache, torch.Tensor
+            ):
+                cache = group_kernel_blocks(cache, num_blocks)
+                owned_intervals = _physical_page_intervals(cache)
+                page = per_rank[my_rank].local_page_size_bytes
+                assert sum(end - start for start, end in owned_intervals) == page
+                base = cache.data_ptr()
+                last_block = (num_blocks - 1) * cache.stride(0) * cache.element_size()
+                storage = cache.untyped_storage()
+                storage_end = storage.data_ptr() + storage.nbytes()
+                for start, end in owned_intervals:
+                    assert base + last_block + end <= storage_end
+                    assert any(
+                        region_groups[name] == group_id
+                        and region.data_ptr() <= base + start
+                        and base + last_block + end <= region.data_ptr() + region.nbytes
+                        for name, region in regions.items()
+                    ), f"Layer {layer_name} exceeds its physical cache group"
+            _verify_tiling(layer_name, per_rank, owned_intervals)
             mappings[layer_name] = per_rank[my_rank]
     return mappings

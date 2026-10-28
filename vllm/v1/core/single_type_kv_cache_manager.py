@@ -77,6 +77,7 @@ class SingleTypeKVCacheManager(ABC):
         pcp_world_size: int = 1,
         needs_kv_cache_zeroing: bool = False,
         max_admission_blocks_per_request: int | None = None,
+        zero_mamba_blocks: bool = False,
     ) -> None:
         """Initializes the SingleTypeKVCacheManager.
 
@@ -97,6 +98,7 @@ class SingleTypeKVCacheManager(ABC):
                 chunked-local); `None` (the default) means no cap, which is
                 correct for full-attention-style specs that hold every
                 block until the request finishes.
+            zero_mamba_blocks: Record Mamba block IDs for group-scoped zeroing.
 
         """
         self.scheduler_block_size = scheduler_block_size
@@ -115,7 +117,10 @@ class SingleTypeKVCacheManager(ABC):
         # consume them and this manager holds a spec type that gets zeroed.
         self._record_new_block_ids = (
             needs_kv_cache_zeroing
-            and isinstance(kv_cache_spec, AttentionSpec)
+            and (
+                isinstance(kv_cache_spec, AttentionSpec)
+                or (zero_mamba_blocks and isinstance(kv_cache_spec, MambaSpec))
+            )
             and not isinstance(kv_cache_spec, CircularBufferSpec)
         )
         self.new_block_ids: list[int] = []
@@ -1872,6 +1877,8 @@ class MambaManager(SingleTypeKVCacheManager):
                     max_new_blocks += self.num_speculative_blocks
                 assert num_new_blocks <= max_new_blocks
                 new_blocks = self.block_pool.get_new_blocks(num_new_blocks)
+                if self._record_new_block_ids:
+                    self.new_block_ids.extend(block.block_id for block in new_blocks)
                 returned_blocks = req_blocks[prev_block_len:]
                 if partial_hit is not None:
                     block_idx, source_block = partial_hit

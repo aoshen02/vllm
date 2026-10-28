@@ -508,6 +508,14 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
         for c in self._connectors:
             c.on_new_request(request)
 
+    def should_yield_optimistic_prefill(
+        self, request: "Request", waiting: Iterable["Request"]
+    ) -> bool:
+        return any(
+            c.should_yield_optimistic_prefill(request, waiting)
+            for c in self._connectors
+        )
+
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
     ) -> MultiKVConnectorMetadata:

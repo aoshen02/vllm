@@ -767,6 +767,151 @@ def _make_remote_meta(
     )
 
 
+@pytest.mark.cpu_test
+@pytest.mark.parametrize(
+    "worker_cls", [NixlPullConnectorWorker, NixlPushConnectorWorker]
+)
+@pytest.mark.parametrize("logical_block_size", [64, 128])
+@pytest.mark.parametrize("counts", [(8, 5, 3), (3, 8, 5), (5, 5, 5)])
+def test_independent_mamba_region_descriptors_use_group_capacities(
+    worker_cls, logical_block_size, counts
+):
+    from vllm.config import set_current_vllm_config
+    from vllm.v1.attention.backends.mla.flashmla import FlashMLABackend
+    from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
+    from vllm.v1.core.kv_cache_planning import get_kv_cache_config_from_groups
+    from vllm.v1.kv_cache_interface import MambaSpec
+    from vllm.v1.worker.utils import allocate_kv_cache
+
+    attention = MLAAttentionSpec(
+        block_size=logical_block_size,
+        num_kv_heads=1,
+        head_size=6,
+        dtype=torch.float16,
+    )
+    state = MambaSpec(
+        block_size=logical_block_size,
+        shapes=((8, 3), (1, 4, 4)),
+        dtypes=(torch.float16, torch.float32),
+        page_size_padded=attention.page_size_bytes,
+        mamba_type=MambaAttentionBackendEnum.GDN_ATTN,
+    )
+    groups = [
+        KVCacheGroupSpec([], attention, enable_kv_transfer=False),
+        KVCacheGroupSpec(["mla.0"], attention),
+        KVCacheGroupSpec(["kda_a.0"], state),
+        KVCacheGroupSpec(["kda_b.0"], state),
+    ]
+    config = create_vllm_config(block_size=logical_block_size)
+    config.cache_config.enable_prefix_caching = False
+    config.cache_config.kv_cache_layout = "BLHNC"
+    config.kv_transfer_config.kv_buffer_device = "cuda"
+    cache_config = get_kv_cache_config_from_groups(
+        config, groups, 2**20, group_num_blocks=(11, *counts)
+    )
+    caches = allocate_kv_cache(
+        cache_config,
+        torch.device("cpu"),
+        KVCacheLayout.BLHNC,
+        kernel_block_sizes=[64, 64, logical_block_size, logical_block_size],
+    )
+    platform = MagicMock()
+    platform.device_type = "cuda"
+    platform.get_nixl_memory_type.return_value = "VRAM"
+    with (
+        patch.object(bw, "NixlWrapper", _RecordingNixl),
+        patch.object(bw, "get_tensor_model_parallel_rank", return_value=0),
+        patch.object(bw, "get_tensor_model_parallel_world_size", return_value=1),
+        patch.object(bw, "get_current_attn_backends", return_value=[FlashMLABackend]),
+        patch.object(bw, "current_platform", platform),
+        patch(
+            "vllm.model_executor.layers.mamba.mamba_utils.get_conv_state_layout",
+            return_value="DS",
+        ),
+        set_current_vllm_config(config),
+    ):
+        worker = worker_cls(config, "independent-engine", cache_config)
+        worker.register_kv_caches(caches)
+
+    metadata = msgspec.msgpack.decode(
+        worker.xfer_handshake_metadata.agent_metadata_bytes, type=NixlAgentMetadata
+    )
+    physical_ratio = logical_block_size // 64
+    assert dict(zip(metadata.region_group_ids, metadata.region_num_blocks)) == {
+        group_id: count * physical_ratio for group_id, count in enumerate(counts)
+    }
+    assert metadata.region_names == ["kda_a.0", "kda_b.0", "mla.0"]
+    local_state = worker._build_mamba_local(metadata.kv_caches_base_addr)
+    assert local_state[:, 4].tolist() == [counts[1]] * 4 + [counts[2]] * 4
+    remote_state = worker._build_mamba_remote(
+        metadata,
+        tp_ratio=1,
+        transfer_info=bw.EngineTransferInfo(
+            remote_tp_size=1,
+            remote_block_size=metadata.block_size,
+            remote_block_len=metadata.block_lens[0],
+            remote_physical_blocks_per_logical=physical_ratio,
+        ),
+    )
+    assert np.array_equal(local_state, remote_state)
+    remote_metadata = msgspec.msgpack.decode(
+        msgspec.msgpack.encode(metadata), type=NixlAgentMetadata
+    )
+    remote_metadata.region_num_blocks = [
+        (counts[group_id] + 2) * physical_ratio
+        for group_id in remote_metadata.region_group_ids
+    ]
+    remote_state = worker._build_mamba_remote(
+        remote_metadata,
+        tp_ratio=1,
+        transfer_info=bw.EngineTransferInfo(
+            remote_tp_size=1,
+            remote_block_size=metadata.block_size,
+            remote_block_len=metadata.block_lens[0],
+            remote_physical_blocks_per_logical=physical_ratio,
+        ),
+    )
+    assert remote_state[:, 4].tolist() == [counts[1] + 2] * 4 + [counts[2] + 2] * 4
+    descriptors = expand_strided_descs(worker.src_blocks_data)
+    block_ids = (
+        [counts[0] * physical_ratio - 1],
+        [counts[1] - 1],
+        [counts[2] - 1],
+    )
+    selected = worker._compute_desc_ids(
+        block_ids,
+        metadata.num_blocks,
+        None,
+        physical_ratio,
+        region_num_blocks=metadata.region_num_blocks,
+        region_group_ids=metadata.region_group_ids,
+        uses_region_group_mapping=True,
+    )
+    assert len(selected) == 9
+    for group_id, name in enumerate(("mla.0", "kda_a.0", "kda_b.0")):
+        page = attention.page_size_bytes
+        begin = caches[name].data_ptr() + (counts[group_id] - 1) * page
+        group_selected = (
+            selected[:1]
+            if group_id == 0
+            else selected[1 + 4 * (group_id - 1) : 1 + 4 * group_id]
+        )
+        for descriptor in descriptors[group_selected]:
+            address, length = map(int, descriptor[:2])
+            assert begin <= address < address + length <= begin + page
+    for descriptor in descriptors:
+        address, length = map(int, descriptor[:2])
+        assert any(
+            cache.data_ptr()
+            <= address
+            < address + length
+            <= cache.data_ptr() + count * attention.page_size_bytes
+            for cache, count in zip(
+                (caches["mla.0"], caches["kda_a.0"], caches["kda_b.0"]), counts
+            )
+        )
+
+
 def _register_remote_agents(worker, metadata, tp_size):
     """Mirror the async handshake callback that publishes prepared agents."""
     worker._remote_agents[metadata.engine_id] = {

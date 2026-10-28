@@ -41,6 +41,7 @@ class DmaCopyBackend:
         device: torch.device,
         load_stream: torch.cuda.Stream,
         store_stream: torch.cuda.Stream,
+        region_group_ids: dict[str, int] | None = None,
     ) -> None:
         self._load_stream = load_stream
         self._store_stream = store_stream
@@ -52,12 +53,14 @@ class DmaCopyBackend:
             cpu_caches,
             store_stream,
             src_access_order=CU_MEMCPY_SRC_ACCESS_ORDER_STREAM,
+            region_group_ids=region_group_ids,
         )
         self._load_params = build_params(
             cpu_caches,
             gpu_caches,
             load_stream,
             src_access_order=CU_MEMCPY_SRC_ACCESS_ORDER_ANY,
+            region_group_ids=region_group_ids,
         )
 
         self._queue = queue.SimpleQueue()
@@ -76,6 +79,7 @@ class DmaCopyBackend:
         event_idx: int,
         events_list: list[tuple[int, torch.Event]],
         wait_event: torch.Event | None = None,
+        group_ids: list[int] | None = None,
     ) -> None:
         params = self._store_params if is_store else self._load_params
         assert params is not None and self._queue is not None
@@ -88,6 +92,7 @@ class DmaCopyBackend:
                 event_idx,
                 events_list,
                 wait_event,
+                group_ids,
             )
         )
 
@@ -120,11 +125,12 @@ class DmaCopyBackend:
                 event_idx,
                 events_list,
                 wait_event,
+                group_ids,
             ) = item
             stream = store_stream if is_store else load_stream
             if wait_event is not None:
                 stream.wait_event(wait_event)
-            copy_blocks(src_blocks, dst_blocks, params)
+            copy_blocks(src_blocks, dst_blocks, params, group_ids=group_ids)
             event = torch.Event()
             event.record(stream)
             events_list.append((event_idx, event))

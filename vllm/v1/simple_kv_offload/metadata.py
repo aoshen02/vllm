@@ -35,6 +35,8 @@ class SimpleCPUOffloadMetadata(KVConnectorMetadata):
 
     # Whether any requests were preempted this step and need flush pending transfers.
     need_flush: bool = False
+    load_group_ids: list[int] = field(default_factory=list)
+    store_group_ids: list[int] = field(default_factory=list)
 
 
 @dataclass

@@ -1392,8 +1392,11 @@ class OffloadingConnectorScheduler:
                         if bid != 0:
                             self._current_batch_allocated_block_ids.add(bid)
 
-        for copy in scheduler_output.kv_cache_block_copies or ():
-            self._current_batch_allocated_block_ids.add(copy.dst_block_id)
+        copies = scheduler_output.kv_cache_block_copies
+        copy_groups = copies.values() if isinstance(copies, dict) else (copies or (),)
+        for group_copies in copy_groups:
+            for copy in group_copies:
+                self._current_batch_allocated_block_ids.add(copy.dst_block_id)
 
         # Zero out stale block_ids in sliding window groups' pending-store
         # positions. Only sliding window groups can have stale entries (blocks

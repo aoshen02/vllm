@@ -431,11 +431,14 @@ def test_secondary_hash_block_stored_metadata() -> None:
         num_stored_blocks=[0],
     )
 
-    gpu_block_ids, advanced_per_group, block_meta = sched._select_eager_blocks_to_store(
-        state,
-        ([gpu_block.block_id],),
+    gpu_block_ids, group_ids, advanced_per_group, block_meta = (
+        sched._select_eager_blocks_to_store(
+            state,
+            ([gpu_block.block_id],),
+        )
     )
     assert gpu_block_ids == [gpu_block.block_id]
+    assert group_ids == [0]
     assert advanced_per_group == [1]
     assert block_meta is not None
     assert set(block_meta[0]) == {primary_hash, secondary_hash}

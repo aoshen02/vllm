@@ -207,6 +207,55 @@ def _make_vllm_config(block_size: int = BLOCK_SIZE) -> VllmConfig:
     )
 
 
+def test_independent_cpu_pools_preserve_owner_and_reset_all_groups():
+    from vllm.distributed.kv_events import AllBlocksCleared
+    from vllm.v1.core.kv_cache_planning import get_kv_cache_config_from_groups
+    from vllm.v1.simple_kv_offload.metrics import MetricName
+
+    config = _make_vllm_config()
+    config.cache_config.kv_cache_layout = "BLHNC"
+    config.kv_events_config = KVEventsConfig(enable_kv_cache_events=True)
+    groups = _make_kv_cache_config(9, num_groups=2).kv_cache_groups
+    groups[1].kv_cache_spec = groups[0].kv_cache_spec
+    gpu_config = get_kv_cache_config_from_groups(
+        config, groups, _BYTES_PER_BLOCK * 14, group_num_blocks=(9, 5)
+    )
+    capacity = _BYTES_PER_BLOCK * 28
+    scheduler = SimpleCPUOffloadScheduler(
+        config, gpu_config, capacity, BLOCK_SIZE, BLOCK_SIZE
+    )
+    counts = scheduler.cpu_kv_cache_config.group_num_blocks
+    assert counts is not None and counts != gpu_config.group_num_blocks
+    assert scheduler.cpu_kv_cache_config.kv_cache_tensors[0].size <= capacity
+    primary, secondary = scheduler.cpu_block_pools
+    assert primary is not secondary
+    assert (primary.num_gpu_blocks, secondary.num_gpu_blocks) == counts
+    initial = tuple(pool.get_num_free_blocks() for pool in (primary, secondary))
+    block = secondary.get_new_blocks(1)[0]
+    secondary.free_blocks((block,))
+    primary.touch((block,))
+    assert tuple(pool.get_num_free_blocks() for pool in (primary, secondary)) == (
+        initial[0],
+        initial[1] - 1,
+    )
+    assert not scheduler.reset()
+    assert block.ref_cnt == 1
+    primary.free_blocks((block,))
+    assert scheduler.reset()
+    assert tuple(pool.get_num_free_blocks() for pool in (primary, secondary)) == initial
+    assert len(list(scheduler.take_events())) == 1
+    assert secondary.kv_event_queue is primary.kv_event_queue
+    assert scheduler.reset()
+    events = list(scheduler.take_events())
+    assert len(events) == 1
+    assert isinstance(events[0], AllBlocksCleared)
+    stats = scheduler.get_stats()
+    assert stats.reduce()[MetricName.USED_BLOCKS] == len(counts)
+    assert stats.data["data"][MetricName.INFO] == {
+        ("cpu", "false", "false", str(sum(counts))): 1
+    }
+
+
 @dataclass
 class SchedulerFixture:
     """Bundle returned by make_scheduler for convenient access."""
@@ -3064,7 +3113,10 @@ def test_boundary_handoff_keeps_block_meta_index_parallel() -> None:
         },
     )
 
-    gpu_ids, cpu_ids, req_ids, block_meta = sched.prepare_store_specs(output)
+    transfer, req_ids = sched.prepare_store_specs(output)
+    gpu_ids = transfer.gpu_block_ids
+    cpu_ids = transfer.cpu_block_ids
+    block_meta = transfer.block_meta
     assert mamba_blocks[1].block_id in gpu_ids
     assert set(gpu_ids) == {
         *(block.block_id for block in attn_blocks),

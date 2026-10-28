@@ -16,7 +16,7 @@ from tests.v1.kv_connector.unit.offloading_connector.utils import (
     generate_store_output,
     to_keys,
 )
-from tests.v1.kv_connector.unit.utils import EOS_TOKEN_ID
+from tests.v1.kv_connector.unit.utils import EOS_TOKEN_ID, create_request
 from vllm.config import KVEventsConfig
 from vllm.distributed.kv_events import MEDIUM_CPU, BlockRemoved, BlockStored
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
@@ -408,6 +408,49 @@ def test_aligned_boundary_store_flushes_before_block_reuse(cow_reuse):
     meta = scheduler.build_connector_meta(output)
     assert isinstance(meta, OffloadingConnectorMetadata)
 
+    assert meta.jobs_to_flush == {job_id}
+
+
+@pytest.mark.parametrize(
+    "copies,flushes",
+    [
+        pytest.param([KVCacheBlockCopy(98, 99)], True, id="legacy"),
+        pytest.param({0: [], 1: [KVCacheBlockCopy(98, 99)]}, True, id="grouped"),
+        pytest.param([KVCacheBlockCopy(99, 98)], False, id="legacy-source-only"),
+        pytest.param(
+            {0: [], 1: [KVCacheBlockCopy(99, 98)]}, False, id="grouped-source-only"
+        ),
+        pytest.param({0: [], 1: []}, False, id="grouped-empty"),
+    ],
+)
+def test_boundary_store_copy_formats_preserve_reuse_fence(copies, flushes):
+    scheduler = _make_partial_tail_scheduler()
+    scheduler.manager = CPUOffloadingManager(num_chunks=16)
+    request = create_request(request_id=1, num_tokens=30, block_size=4)
+    scheduler.on_new_request(request)
+
+    output = SchedulerOutput.make_empty()
+    output.kv_connector_block_state = KVConnectorBlockState(
+        req_ids=set(),
+        resolve_block_ids={}.__getitem__,
+        boundary_state_offloads={request.request_id: [(1, 99, 16)]},
+    )
+    meta = scheduler.build_connector_meta(output)
+    assert isinstance(meta, OffloadingConnectorMetadata)
+    [job_id] = meta.store_jobs
+
+    output = SchedulerOutput.make_empty()
+    output.kv_cache_block_copies = copies
+    meta = scheduler.build_connector_meta(output)
+    assert isinstance(meta, OffloadingConnectorMetadata)
+    assert meta.jobs_to_flush == ({job_id} if flushes else set())
+    assert meta.store_jobs == {}
+
+    output = SchedulerOutput.make_empty()
+    output.scheduled_cached_reqs.req_ids = [request.request_id]
+    output.scheduled_cached_reqs.new_block_ids = [([], [99])]
+    meta = scheduler.build_connector_meta(output)
+    assert isinstance(meta, OffloadingConnectorMetadata)
     assert meta.jobs_to_flush == {job_id}
 
 

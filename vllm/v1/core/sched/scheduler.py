@@ -360,10 +360,17 @@ class Scheduler(SchedulerInterface):
             if self.num_spec_tokens
             else 0
         )
-        self._spec_decode_step_blocks = sum(
-            cdiv(num_spec_decode_tokens, manager.block_size)
-            for manager in self.kv_cache_manager.coordinator.single_type_managers
+        spec_decode_blocks = {
+            group_id: cdiv(num_spec_decode_tokens, manager.block_size)
+            for group_id, manager in enumerate(
+                self.kv_cache_manager.coordinator.single_type_managers
+            )
             if not isinstance(manager.kv_cache_spec, MambaSpec)
+        }
+        self._spec_decode_step_blocks = (
+            spec_decode_blocks
+            if kv_cache_config.group_num_blocks is not None
+            else sum(spec_decode_blocks.values())
         )
         # Bind after construction so connectors can access the cache manager.
         if self.connector is not None:
@@ -689,6 +696,7 @@ class Scheduler(SchedulerInterface):
         scheduled_resumed_reqs: list[Request] = []
         scheduled_running_reqs: list[Request] = []
         preempted_reqs: list[Request] = []
+        optimistic_yielded_req_ids: set[str] = set()
 
         req_to_new_blocks: dict[str, KVCacheBlocks] = {}
         num_scheduled_tokens: dict[str, int] = {}
@@ -720,6 +728,25 @@ class Scheduler(SchedulerInterface):
         scheduled_timestamp = time.monotonic()
 
         self.kv_cache_manager.new_step_starts()
+
+        if (
+            self.connector is not None
+            and token_budget > 0
+            and self._pause_state == PauseState.UNPAUSED
+        ):
+            for request in self.running.copy():
+                if self.connector.should_yield_optimistic_prefill(
+                    request, self.waiting
+                ):
+                    self.running.remove(request)
+                    self._preempt_request(
+                        request, scheduled_timestamp, drop_stale_output=True
+                    )
+                    request.kv_transfer_metrics["pd_prefill_retry_count"] = (
+                        request.kv_transfer_metrics.get("pd_prefill_retry_count", 0) + 1
+                    )
+                    preempted_reqs.append(request)
+                    optimistic_yielded_req_ids.add(request.request_id)
 
         # DP prefill balancing: on a throttled (non-cadence-aligned) step, defer
         # all prefill compute unless saturated.
@@ -1013,7 +1040,10 @@ class Scheduler(SchedulerInterface):
             assert len(scheduled_loras) <= self.lora_config.max_loras
 
         # Next, schedule the WAITING requests.
-        if not preempted_reqs and self._pause_state != PauseState.PAUSED_ALL:
+        if (
+            len(preempted_reqs) == len(optimistic_yielded_req_ids)
+            and self._pause_state != PauseState.PAUSED_ALL
+        ):
             step_skipped_waiting: deque[Request] = deque()
             step_skipped_kv_holding: deque[Request] = deque()
 
@@ -1041,6 +1071,9 @@ class Scheduler(SchedulerInterface):
 
                 request = request_queue.peek_request()
                 request_id = request.request_id
+                if request_id in optimistic_yielded_req_ids:
+                    skip_request(request_queue)
+                    continue
 
                 ready_to_schedule = self._handle_blocked_waiting_request(request)
                 if not ready_to_schedule:
@@ -1096,7 +1129,7 @@ class Scheduler(SchedulerInterface):
                                 request, block_aligned_local
                             )
                         )
-                        if request.skip_reading_prefix_cache:
+                        if request.skip_reading_prefix_cache and ext_tokens is not None:
                             ext_tokens, load_kv_async = 0, False
 
                         if ext_tokens is None:
@@ -1361,17 +1394,26 @@ class Scheduler(SchedulerInterface):
                         for i in encoder_inputs_to_schedule
                     )
 
-                reserved_blocks = 0
+                reserved_blocks: int | dict[int, int] = 0
                 if load_kv_async:
                     # An async load holds its blocks for the whole transfer with
                     # no forward progress and isn't preemptible here. Admit it
                     # only if it fits in (free - other in-flight reservations)
                     # plus its own spec decode step blocks, to avoid deadlock and
                     # predictable preemptions.
-                    reserved_blocks = (
-                        self._inflight_prefill_reserved_blocks()
-                        + self._spec_decode_step_blocks
-                    )
+                    inflight_reserved = self._inflight_prefill_reserved_blocks()
+                    if isinstance(inflight_reserved, dict):
+                        assert isinstance(self._spec_decode_step_blocks, dict)
+                        reserved_blocks = dict(inflight_reserved)
+                        for group_id, count in self._spec_decode_step_blocks.items():
+                            reserved_blocks[group_id] = (
+                                reserved_blocks.get(group_id, 0) + count
+                            )
+                    else:
+                        assert isinstance(self._spec_decode_step_blocks, int)
+                        reserved_blocks = (
+                            inflight_reserved + self._spec_decode_step_blocks
+                        )
 
                 # Replayed tokens are already counted in the adopted hit; a
                 # chunk that ends inside the replayed range needs no new slots.
@@ -1740,7 +1782,7 @@ class Scheduler(SchedulerInterface):
     ) -> KVConnectorMetadata:
         return connector.build_connector_meta(scheduler_output)
 
-    def _get_new_block_ids_to_zero(self) -> list[int] | None:
+    def _get_new_block_ids_to_zero(self) -> list[int] | dict[int, list[int]] | None:
         # Drain new attention block ids every step so the manager-side list
         # does not grow unbounded; only kv-cache zeroing consumes them.
         new_block_ids_to_zero = self.kv_cache_manager.take_new_block_ids()
@@ -3309,7 +3351,7 @@ class Scheduler(SchedulerInterface):
             )
         return delay_free or partial_tail_delay, kv_xfer_params
 
-    def _request_remaining_blocks(self, request: Request) -> int:
+    def _request_remaining_blocks(self, request: Request) -> int | dict[int, int]:
         """Blocks `request` still needs to hold its full sequence and be promoted."""
         full_num_tokens = min(request.num_tokens, self.max_model_len)
         num_tokens = full_num_tokens
@@ -3337,11 +3379,22 @@ class Scheduler(SchedulerInterface):
                 kv_fetch_stages[request] = stage
                 self._kv_fetch_counts[stage] += 1
 
-    def _inflight_prefill_reserved_blocks(self) -> int:
+    def _inflight_prefill_reserved_blocks(self) -> int | dict[int, int]:
         """Num blocks in-flight prefills still need to finish (their reservation)."""
-        return sum(
-            self._request_remaining_blocks(req) for req in self._inflight_prefills
-        )
+        if self.kv_cache_config.group_num_blocks is not None:
+            reserved: dict[int, int] = defaultdict(int)
+            for request in self._inflight_prefills:
+                demand = self._request_remaining_blocks(request)
+                assert isinstance(demand, dict)
+                for group_id, count in demand.items():
+                    reserved[group_id] += count
+            return dict(reserved)
+        total = 0
+        for request in self._inflight_prefills:
+            blocks = self._request_remaining_blocks(request)
+            assert isinstance(blocks, int)
+            total += blocks
+        return total
 
     def _load_restores_replay_window(self, request: Request) -> bool:
         """Whether the KV connector's load for ``request`` restores every DSV41

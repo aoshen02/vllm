@@ -30,6 +30,13 @@ if TYPE_CHECKING:
 class KVConnector:
     """KVConnector interface used by GPUModelRunner."""
 
+    @property
+    def requires_kv_delivery(self) -> bool:
+        return False
+
+    def handle_preemptions(self, scheduler_output: "SchedulerOutput") -> None:
+        pass
+
     def pre_forward(
         self,
         scheduler_output: "SchedulerOutput",
@@ -72,6 +79,17 @@ class ActiveKVConnector(KVConnector):
         self._pending_load_kwargs: dict[str, Any] | None = None
         self._disabled = False
 
+    @property
+    def requires_kv_delivery(self) -> bool:
+        return self.kv_connector.requires_kv_delivery
+
+    def handle_preemptions(self, scheduler_output: "SchedulerOutput") -> None:
+        if self._disabled:
+            return
+        metadata = scheduler_output.kv_connector_metadata
+        assert metadata is not None
+        self.kv_connector.handle_preemptions(metadata)
+
     def pre_forward(
         self,
         scheduler_output: "SchedulerOutput",
@@ -83,7 +101,6 @@ class ActiveKVConnector(KVConnector):
 
         kv_connector_metadata = scheduler_output.kv_connector_metadata
         assert kv_connector_metadata is not None
-        self.kv_connector.handle_preemptions(kv_connector_metadata)
         self.kv_connector.bind_connector_metadata(kv_connector_metadata)
         self._pending_load_kwargs = self._build_load_kwargs(
             scheduler_output, input_batch, attn_metadata
