@@ -40,6 +40,7 @@ __all__ = [
     "get_layerwise_info",
     "record_metadata_for_reloading",
     "initialize_layerwise_reload",
+    "stage_layer_for_reload",
     "finalize_layerwise_processing",
     "finalize_layerwise_reload",
 ]
@@ -112,22 +113,29 @@ def initialize_layerwise_reload(model: torch.nn.Module):
     model._do_torchao_reload = False
 
     for layer in model.modules():
-        info = get_layerwise_info(layer)
+        stage_layer_for_reload(layer)
 
-        # Skip if the layer has already been initialized
-        if info.can_load():
-            continue
 
-        # Save current tensors for later copying
-        info.kernel_tensors = get_layer_params_buffers(layer)
-        # snapshot now: restore_layer_on_meta drops alias buffers from the live set
-        info.kernel_non_persistent_buffers = set(layer._non_persistent_buffers_set)
+def stage_layer_for_reload(layer: torch.nn.Module) -> None:
+    """Keep the layer's kernel tensors aside and restore it on the meta device,
+    so its loaders stage the checkpoint tensors until the layer is complete;
+    the processed values are then copied into the kernel tensors."""
+    info = get_layerwise_info(layer)
 
-        # Restore layer parameters/buffers onto meta device
-        restore_layer_on_meta(layer, info)
+    # Skip if the layer has already been initialized
+    if info.can_load():
+        return
 
-        # Wrap weight loaders to buffer loading
-        initialize_online_processing(layer)
+    # Save current tensors for later copying
+    info.kernel_tensors = get_layer_params_buffers(layer)
+    # snapshot now: restore_layer_on_meta drops alias buffers from the live set
+    info.kernel_non_persistent_buffers = set(layer._non_persistent_buffers_set)
+
+    # Restore layer parameters/buffers onto meta device
+    restore_layer_on_meta(layer, info)
+
+    # Wrap weight loaders to buffer loading
+    initialize_online_processing(layer)
 
 
 def initialize_online_processing(layer: torch.nn.Module):
