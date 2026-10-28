@@ -51,6 +51,7 @@ def test_replace_parameter_preserves_custom_attribute(wrap_in_parameter: bool) -
         "weight", torch.nn.Parameter(torch.zeros(4, 4), requires_grad=False)
     )
     original = layer.weight
+    original_ptr = original.data_ptr()
 
     new_data: torch.Tensor = torch.ones(4, 4).t()
     if wrap_in_parameter:
@@ -70,23 +71,25 @@ def test_replace_parameter_preserves_custom_attribute(wrap_in_parameter: bool) -
 
     assert layer.weight is original
     assert layer.weight.stride() == new_data.stride()
-    assert layer.weight.data_ptr() == new_data.data_ptr()
+    # same byte size: copied into the loaded storage, address kept
+    assert layer.weight.data_ptr() == original_ptr
 
 
 @pytest.mark.parametrize(
     "new_data,copies",
     [
         (torch.ones(4, 4, dtype=torch.float32, device="cpu"), True),
-        (torch.ones(4, 4, dtype=torch.float32, device="cpu").t(), False),
+        (torch.ones(4, 4, dtype=torch.float32, device="cpu").t(), True),
         (torch.ones(8, 4, dtype=torch.float32, device="cpu"), False),
-        # A smaller result goes into the loaded storage, which never shrinks.
+        # A result that fits (equal or smaller) goes into the loaded storage,
+        # which never shrinks.
         (torch.ones(4, 4, dtype=torch.bfloat16, device="cpu"), True),
         (torch.ones(4, 2, dtype=torch.float32, device="cpu"), True),
         (torch.tensor(1.0, device="cpu"), True),
     ],
     ids=[
         "same-layout-copies",
-        "new-strides",
+        "new-strides-copies",
         "larger-shape",
         "smaller-dtype-copies",
         "smaller-shape-copies",
@@ -153,7 +156,7 @@ def test_humming_replace_keeps_loaded_params(single_rank_tp: None) -> None:
 
     assert layer.weight is packed and layer.weight_scale is scale_inv
     assert torch.equal(layer.weight, torch.full((32, 8), 2.0))
-    assert packed.untyped_storage().nbytes() == 64 * 8 * 4
+    assert packed.untyped_storage().nbytes() == 64 * 8 * packed.element_size()
     assert set(kernel_parameters(layer)) == {"weight", "weight_scale"}
 
 
