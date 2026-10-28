@@ -14,7 +14,6 @@ from vllm.model_executor.layers.attention import is_deferred_attention_layer
 from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
 from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader,
-    discard_weight_parts,
     finalize_model_weights,
 )
 

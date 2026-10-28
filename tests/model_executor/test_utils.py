@@ -51,6 +51,7 @@ def test_replace_parameter_preserves_custom_attribute(wrap_in_parameter: bool) -
         "weight", torch.nn.Parameter(torch.zeros(4, 4), requires_grad=False)
     )
     original = layer.weight
+    original_ptr = original.data_ptr()
 
     new_data: torch.Tensor = torch.ones(4, 4).t()
     if wrap_in_parameter:
@@ -70,23 +71,25 @@ def test_replace_parameter_preserves_custom_attribute(wrap_in_parameter: bool) -
 
     assert layer.weight is original
     assert layer.weight.stride() == new_data.stride()
-    assert layer.weight.data_ptr() == new_data.data_ptr()
+    # same byte size: copied into the loaded storage, address kept
+    assert layer.weight.data_ptr() == original_ptr
 
 
 @pytest.mark.parametrize(
     "new_data,copies",
     [
         (torch.ones(4, 4, dtype=torch.float32, device="cpu"), True),
-        (torch.ones(4, 4, dtype=torch.float32, device="cpu").t(), False),
+        (torch.ones(4, 4, dtype=torch.float32, device="cpu").t(), True),
         (torch.ones(8, 4, dtype=torch.float32, device="cpu"), False),
-        # A smaller result goes into the loaded storage, which never shrinks.
+        # A result that fits (equal or smaller) goes into the loaded storage,
+        # which never shrinks.
         (torch.ones(4, 4, dtype=torch.bfloat16, device="cpu"), True),
         (torch.ones(4, 2, dtype=torch.float32, device="cpu"), True),
         (torch.tensor(1.0, device="cpu"), True),
     ],
     ids=[
         "same-layout-copies",
-        "new-strides",
+        "new-strides-copies",
         "larger-shape",
         "smaller-dtype-copies",
         "smaller-shape-copies",
@@ -153,7 +156,7 @@ def test_humming_replace_keeps_loaded_params(single_rank_tp: None) -> None:
 
     assert layer.weight is packed and layer.weight_scale is scale_inv
     assert torch.equal(layer.weight, torch.full((32, 8), 2.0))
-    assert packed.untyped_storage().nbytes() == 64 * 8 * 4
+    assert packed.untyped_storage().nbytes() == 64 * 8 * packed.element_size()
     assert set(kernel_parameters(layer)) == {"weight", "weight_scale"}
 
 
@@ -367,6 +370,34 @@ def test_replace_parameter_with_own_parameter_keeps_layout(single_rank_tp) -> No
     assert (layer.weight.input_dim, layer.weight.output_dim) == (1, 0)
     assert (layer.weight.packed_dim, layer.weight.packed_factor) == (0, 8)
     assert torch.equal(layer.weight, torch.ones(4, 4))
+
+
+def test_kept_param_ops_skip_python_torch_function(single_rank_tp: None) -> None:
+    """Kept vLLM params must dispatch eager ops like a plain Parameter: a Python
+    `__torch_function__` would put every op on them through the interpreter."""
+    layer = torch.nn.Module()
+    layer.register_parameter(
+        "weight",
+        ModelWeightParameter(
+            data=torch.zeros(4, 4),
+            input_dim=1,
+            output_dim=0,
+            weight_loader=lambda param, loaded_weight: None,
+        ),
+    )
+    replace_parameter(layer, "weight", torch.ones(4, 4))
+
+    assert type(layer.weight) is ModelWeightParameter
+    # A kept param must dispatch like a plain Parameter. Compare against a
+    # plain Parameter rather than asserting an absolute False: on ROCm,
+    # has_torch_function can return True for plain Parameters too.
+    plain = torch.nn.Parameter(torch.ones(4, 4))
+    assert torch.overrides.has_torch_function(
+        (layer.weight,)
+    ) == torch.overrides.has_torch_function((plain,))
+    out = layer.weight + 1
+    assert type(out) is torch.Tensor
+    assert torch.equal(out, torch.full((4, 4), 2.0))
 
 
 def test_transposed_kept_param_keeps_checkpoint_dims(single_rank_tp: None) -> None:
