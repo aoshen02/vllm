@@ -534,7 +534,7 @@ class FusedMoEExperts(ABC):
     # Tensors this object allocates that its kernels read.
     kept_constants: tuple[str, ...] = ()
 
-    def keep_constants(self, layer: torch.nn.Module) -> None:
+    def keep_constants(self, layer: torch.nn.Module, prefix: str = "_experts_") -> None:
         """Hand this object the ``kept_constants`` kept on ``layer``, refilled
         with its fresh values. Quant methods build a new experts object on every
         post-load rerun (each weight reload), while captured CUDA graphs keep
@@ -544,8 +544,9 @@ class FusedMoEExperts(ABC):
         for name in self.kept_constants:
             value = getattr(self, name, None)
             if isinstance(value, torch.Tensor):
-                key = "_experts_" + name.lstrip("_")
-                setattr(self, name, refill_derived(layer, key, value))
+                setattr(
+                    self, name, refill_derived(layer, prefix + name.lstrip("_"), value)
+                )
 
     def _uses_post_gemm2_hook(self, num_tokens: int) -> bool:
         return self.post_gemm2_hook is not None and num_tokens > 0

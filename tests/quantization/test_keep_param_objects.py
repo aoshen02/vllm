@@ -322,6 +322,35 @@ class TestExpertsKeepConstants:
             torch.testing.assert_close(kept, torch.full((4,), 2.0))
         assert [n for n, _ in layer.named_parameters()] == ["w"]
 
+    def test_fallback_wrapper_keeps_the_inner_constants(self):
+        # a runtime-dispatching wrapper holds the experts that own the tensors
+        from vllm.model_executor.layers.fused_moe.experts.fallback import (
+            FallbackExperts,
+        )
+
+        layer = torch.nn.Module()
+        names = ["ab_strides1", "ab_strides2", "c_strides1", "c_strides2"]
+
+        def wrapper(fill: float) -> FallbackExperts:
+            w = object.__new__(FallbackExperts)  # type: ignore[type-abstract]
+            w.experts = _experts(
+                _EXP + "cutlass_moe.CutlassExpertsFp8",
+                {n: torch.full((4,), fill) for n in names},
+            )
+            w.fallback_experts = _experts(_EXP + "triton_moe.TritonExperts", {})
+            return w
+
+        first = wrapper(1.0)
+        first.keep_constants(layer)
+        ptrs = {n: getattr(first.experts, n).data_ptr() for n in names}
+        second = wrapper(2.0)
+        second.keep_constants(layer)
+        for n in names:
+            assert getattr(second.experts, n).data_ptr() == ptrs[n]
+            torch.testing.assert_close(
+                getattr(second.experts, n), torch.full((4,), 2.0)
+            )
+
     def test_absent_constant_is_skipped(self):
         layer = torch.nn.Module()
         experts = _experts(
