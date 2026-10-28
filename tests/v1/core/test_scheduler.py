@@ -59,6 +59,7 @@ from vllm.v1.engine.core import EngineCore
 from vllm.v1.executor.uniproc_executor import UniProcExecutor
 from vllm.v1.hisparse.coordinator import get_hisparse_coordinator
 from vllm.v1.kv_cache_interface import (
+    CircularBufferSpec,
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
@@ -79,6 +80,34 @@ from vllm.v1.structured_output import StructuredOutputGrammar, StructuredOutputM
 from .utils import EOS_TOKEN_ID, create_requests, create_scheduler, mock_kv
 
 pytestmark = pytest.mark.cpu_test
+
+
+def test_async_load_single_request_ring_needs_no_speculative_reservation():
+    scheduler = create_scheduler(
+        max_num_seqs=1,
+        max_num_batched_tokens=16,
+        max_model_len=16,
+        block_size=4,
+        num_blocks=2,
+        num_speculative_tokens=3,
+        use_kv_connector=mock_kv(matched_tokens=4, is_async=True),
+        kv_cache_spec=CircularBufferSpec(
+            block_size=4,
+            num_kv_heads=1,
+            head_size=128,
+            head_size_v=0,
+            dtype=torch.bfloat16,
+        ),
+    )
+    (request,) = create_requests(
+        num_requests=1, num_tokens=8, block_size=4, max_tokens=4
+    )
+    scheduler.add_request(request)
+    output = scheduler.schedule()
+    assert request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+    assert not output.scheduled_new_reqs
+    (block_ids,) = scheduler.kv_cache_manager.get_block_ids(request.request_id)
+    assert len(block_ids) == 1 and block_ids[0] != 0
 
 
 def test_make_scheduled_encoder_input_stats_output_embeddings():
