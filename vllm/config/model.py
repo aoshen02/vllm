@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from collections.abc import Callable
 from dataclasses import InitVar, field
 from functools import cached_property
@@ -670,6 +671,7 @@ class ModelConfig:
 
         if self.checkpoint_prepare_on_startup and not self.enable_sleep_mode:
             raise ValueError("checkpoint_prepare_on_startup requires enable_sleep_mode")
+        self._verify_nccl_comm_suspend()
         if self.enable_sleep_mode:
             if not current_platform.is_sleep_mode_available():
                 raise ValueError("Sleep mode is not supported on current platform.")
@@ -1490,6 +1492,14 @@ class ModelConfig:
                     "set `--allow-deprecated-quantization`.",
                     self.quantization,
                 )
+
+    def _verify_nccl_comm_suspend(self) -> None:
+        # NCCL then allocates with cudaMalloc, which ncclCommSuspend cannot free.
+        if self.enable_nccl_comm_suspend and os.environ.get("NCCL_CUMEM_ENABLE") == "0":
+            raise ValueError(
+                "enable_nccl_comm_suspend requires NCCL's cuMem allocator; "
+                "unset NCCL_CUMEM_ENABLE=0."
+            )
 
     def _verify_cuda_graph(self) -> None:
         # CUDAGraph capture not supported for encoder-decoder models on ROCm

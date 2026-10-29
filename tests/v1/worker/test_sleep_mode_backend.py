@@ -88,6 +88,36 @@ def test_worker_drives_communicator_suspension(monkeypatch, enable_nccl_comm_sus
     assert calls == expected
 
 
+@pytest.mark.parametrize(
+    "enable_nccl_comm_suspend,nccl_cumem_enable,refused",
+    [
+        (True, None, False),
+        (True, "1", False),
+        (True, "0", True),
+        (False, "0", False),
+    ],
+    ids=["default", "cumem-on", "cumem-off", "suspend-off"],
+)
+def test_nccl_comm_suspend_requires_nccl_cumem(
+    monkeypatch, enable_nccl_comm_suspend, nccl_cumem_enable, refused
+):
+    """Without NCCL's cuMem allocator, ncclCommSuspend frees nothing."""
+    from types import SimpleNamespace
+
+    from vllm.config.model import ModelConfig
+
+    if nccl_cumem_enable is None:
+        monkeypatch.delenv("NCCL_CUMEM_ENABLE", raising=False)
+    else:
+        monkeypatch.setenv("NCCL_CUMEM_ENABLE", nccl_cumem_enable)
+    config = SimpleNamespace(enable_nccl_comm_suspend=enable_nccl_comm_suspend)
+    if refused:
+        with pytest.raises(ValueError, match="NCCL_CUMEM_ENABLE=0"):
+            ModelConfig._verify_nccl_comm_suspend(config)
+    else:
+        ModelConfig._verify_nccl_comm_suspend(config)
+
+
 def test_unknown_backend_raises():
     with pytest.raises(ValueError, match="Unsupported sleep-mode backend"):
         SleepModeBackendFactory.get_backend_class("does-not-exist")

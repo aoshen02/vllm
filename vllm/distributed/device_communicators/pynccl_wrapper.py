@@ -338,6 +338,13 @@ class NCCLLibrary:
         Function("ncclCommSuspend", ncclResult_t, [ncclComm_t, ctypes.c_int]),
         # ncclResult_t ncclCommResume(ncclComm_t comm);
         Function("ncclCommResume", ncclResult_t, [ncclComm_t]),
+        # ncclResult_t ncclCommMemStats(ncclComm_t comm, ncclCommMemStat_t stat,
+        #   uint64_t* value);
+        Function(
+            "ncclCommMemStats",
+            ncclResult_t,
+            [ncclComm_t, ctypes.c_int, ctypes.POINTER(ctypes.c_uint64)],
+        ),
         # ncclResult_t ncclGroupStart();
         Function("ncclGroupStart", ncclResult_t, []),
         # ncclResult_t ncclGroupEnd();
@@ -428,6 +435,9 @@ class NCCLLibrary:
                         continue
                     elif func.name == "ncclGetLastError":
                         # Only used to enrich error messages.
+                        continue
+                    elif func.name == "ncclCommMemStats":
+                        # Only used to check that suspension releases memory.
                         continue
                     elif func.name in ("ncclCommSuspend", "ncclCommResume"):
                         # RCCL doesn't export these; NCCL >= 2.29.7 does, and
@@ -638,6 +648,13 @@ class NCCLLibrary:
 
     def ncclCommResume(self, comm: ncclComm_t) -> None:
         self.NCCL_CHECK(self._funcs["ncclCommResume"](comm))
+
+    def ncclCommMemStats(self, comm: ncclComm_t, stat: int) -> int:
+        value = ctypes.c_uint64()
+        self.NCCL_CHECK(
+            self._funcs["ncclCommMemStats"](comm, stat, ctypes.byref(value))
+        )
+        return value.value
 
     def ncclGroupStart(self) -> None:
         self.NCCL_CHECK(self._funcs["ncclGroupStart"]())
