@@ -82,6 +82,22 @@ class WeightTransferEngineFactory:
             cls._registry[name] = lambda: engine_cls
 
     @classmethod
+    def get_engine_class(cls, backend: str) -> type[WeightTransferEngine]:
+        """Return the engine class registered for a backend name.
+
+        Raises:
+            ValueError: If the backend is not registered
+
+        """
+        if backend not in cls._registry:
+            available = list(cls._registry.keys())
+            raise ValueError(
+                f"Invalid weight transfer backend: {backend}. "
+                f"Available engines: {available}"
+            )
+        return cls._registry[backend]()
+
+    @classmethod
     def create_engine(
         cls,
         config: "WeightTransferConfig",
@@ -104,14 +120,7 @@ class WeightTransferEngineFactory:
             ValueError: If the backend is not registered
 
         """
-        backend = config.backend
-        if backend not in cls._registry:
-            available = list(cls._registry.keys())
-            raise ValueError(
-                f"Invalid weight transfer backend: {backend}. "
-                f"Available engines: {available}"
-            )
-        engine_cls = cls._registry[backend]()
+        engine_cls = cls.get_engine_class(config.backend)
 
         logger.info(
             "Creating weight transfer engine: %s",

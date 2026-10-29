@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """IPC-based weight transfer engine using CUDA IPC for communication."""
 
+import gc
 import pickle
 from dataclasses import asdict, dataclass
 from typing import TYPE_CHECKING, Any, ClassVar, Self
@@ -130,6 +131,8 @@ class IPCWeightTransferEngine(
     # Define backend-specific dataclass types
     init_info_cls = IPCWeightTransferInitInfo
     update_info_cls = IPCWeightTransferUpdateInfo
+    # Imports only live within an update; release_device_imports closes them.
+    supports_cuda_checkpoint = True
 
     def __init__(
         self,
@@ -243,6 +246,12 @@ class IPCWeightTransferEngine(
 
         with disable_mtp_completeness_check():
             self.model.load_weights(weights)
+
+    def release_device_imports(self) -> None:
+        self._packed_importer.close()
+        # Unpacked updates map each trainer tensor; drop the last references.
+        gc.collect()
+        torch.cuda.ipc_collect()
 
     def shutdown(self) -> None:
         self._packed_importer.close()

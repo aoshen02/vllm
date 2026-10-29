@@ -46,6 +46,10 @@ def _validate_nccl_checkpoint(worker, suspended):
         )
 
 
+def _release_weight_transfer_imports(worker):
+    worker.weight_transfer_engine.release_device_imports()
+
+
 class CUDACheckpointExecutor(MultiprocExecutor):
     """Use dedicated workers even at TP=1 so failed restoration is terminable."""
 
@@ -91,14 +95,21 @@ class CUDACheckpointExecutor(MultiprocExecutor):
             or parallel.world_size != parallel.tensor_parallel_size
         ):
             raise ValueError("CUDA checkpoint requires single-node tensor parallelism")
-        if (
-            vllm_config.kv_transfer_config
-            or vllm_config.ec_transfer_config
-            or vllm_config.weight_transfer_config
-        ):
-            raise ValueError(
-                "CUDA checkpoint does not support external cache or weight transfer"
+        if vllm_config.kv_transfer_config or vllm_config.ec_transfer_config:
+            raise ValueError("CUDA checkpoint does not support external cache transfer")
+        weight_transfer = vllm_config.weight_transfer_config
+        self._release_weight_imports = weight_transfer is not None
+        if weight_transfer is not None:
+            from vllm.distributed.weight_transfer import WeightTransferEngineFactory
+
+            engine_cls = WeightTransferEngineFactory.get_engine_class(
+                weight_transfer.backend
             )
+            if not engine_cls.supports_cuda_checkpoint:
+                raise ValueError(
+                    "CUDA checkpoint does not support weight transfer backend "
+                    f"{weight_transfer.backend!r}"
+                )
         if not vllm_config.model_config.enable_sleep_mode:
             raise ValueError("CUDA checkpoint requires enable_sleep_mode=True")
         if parallel.tensor_parallel_size > 1:
@@ -262,6 +273,8 @@ class CUDACheckpointExecutor(MultiprocExecutor):
                 self.collective_rpc(_validate_nccl_checkpoint, args=(True,), timeout=30)
             if self._checkpoint_flashinfer:
                 self.collective_rpc("checkpoint_prepare", timeout=120)
+            if self._release_weight_imports:
+                self.collective_rpc(_release_weight_transfer_imports, timeout=30)
             self._checkpoint.suspend([w.proc.pid for w in self.workers])
             self._checkpoint_active = True
         except Exception:
