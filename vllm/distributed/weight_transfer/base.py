@@ -465,6 +465,15 @@ class WeightTransferEngine(ABC, Generic[TInitInfo, TUpdateInfo]):
     "queued", not "applied".
     """
 
+    supports_cuda_checkpoint: bool = False
+    """Whether `release_device_imports` leaves nothing mapped from other processes
+    between updates, so that a CUDA process checkpoint can save the worker."""
+
+    def release_device_imports(self) -> None:
+        """Unmap device memory imported from the trainer. Called between updates,
+        before a CUDA process checkpoint, by engines with supports_cuda_checkpoint."""
+        return
+
     def drain_pending(self) -> None:
         """Block until every deferred update has been applied to the model.
 

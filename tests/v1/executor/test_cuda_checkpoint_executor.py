@@ -24,6 +24,7 @@ def executor():
     obj._checkpoint_active = False
     obj._use_nccl_suspend = False
     obj._checkpoint_flashinfer = False
+    obj._release_weight_imports = False
     obj.is_failed = False
     obj.sleeping_tags = set()
     obj.failure_callback = None
@@ -257,7 +258,8 @@ def test_transport_requires_suspension_and_no_nvls(
             sleep_mode_backend="cumem",
         ),
         use_v2_model_runner=True,
-        weight_transfer_config=None,
+        # IPC imports only live within an update, so the checkpoint accepts it.
+        weight_transfer_config=SimpleNamespace(backend="ipc"),
         kv_transfer_config=None,
         ec_transfer_config=None,
     )
@@ -268,6 +270,7 @@ def test_transport_requires_suspension_and_no_nvls(
         if accepted:
             obj = CUDACheckpointExecutor(config)
             assert obj._checkpoint_flashinfer == fusion
+            assert obj._release_weight_imports
             obj.shutdown()
         else:
             with pytest.raises(ValueError, match="NCCL checkpoint configuration"):
@@ -295,21 +298,35 @@ def test_validate_rejects_missing_or_inconsistent_nccl(
         _validate_nccl_checkpoint(None, expected)
 
 
-def test_flashinfer_hooks_wrap_driver_checkpoint_once(executor):
+@pytest.mark.parametrize(
+    "flashinfer,weight_transfer",
+    [(True, False), (False, True), (True, True)],
+    ids=["flashinfer", "weight-transfer", "both"],
+)
+def test_worker_hooks_wrap_driver_checkpoint_once(
+    executor, flashinfer, weight_transfer
+):
+    """FlashInfer workspaces and weight-transfer imports are released right before
+    the checkpoint, once per sleep; only FlashInfer needs a restore hook."""
     obj, calls = executor
-    obj._checkpoint_flashinfer = True
-    with patch.object(
-        obj, "collective_rpc", side_effect=lambda method, **kw: calls.append((method,))
-    ):
+    obj._checkpoint_flashinfer = flashinfer
+    obj._release_weight_imports = weight_transfer
+
+    def rpc(method, **kw):
+        calls.append((getattr(method, "__name__", method),))
+
+    with patch.object(obj, "collective_rpc", side_effect=rpc):
+        obj.sleep()
         obj.sleep()
         obj.wake_up(["weights"])
         obj.wake_up(["kv_cache"])
     assert calls == [
         ("sleep", 1),
-        ("checkpoint_prepare",),
+        *[("checkpoint_prepare",)] * flashinfer,
+        *[("_release_weight_transfer_imports",)] * weight_transfer,
         ("checkpoint", [11, 22]),
         ("restore",),
-        ("checkpoint_restore",),
+        *[("checkpoint_restore",)] * flashinfer,
         ("wake", ["weights"]),
         ("wake", ["kv_cache"]),
     ]
@@ -368,7 +385,8 @@ def test_kv_first_partial_wake_then_sleep_preserves_parent_noop(executor):
         ("parallel_config", "worker_cls", "custom.Worker"),
         ("model_config", "sleep_mode_backend", "custom"),
         (None, "use_v2_model_runner", False),
-        (None, "weight_transfer_config", object()),
+        (None, "kv_transfer_config", object()),
+        (None, "weight_transfer_config", SimpleNamespace(backend="nccl")),
         ("platform", "is_cuda", False),
         ("platform", "linux", False),
     ],
