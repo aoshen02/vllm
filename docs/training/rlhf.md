@@ -26,3 +26,41 @@ See the following notebooks showing how to use vLLM for GRPO:
 
 - [Efficient Online Training with GRPO and vLLM in TRL](https://huggingface.co/learn/cookbook/grpo_vllm_online_training)
 - [Qwen-3 4B GRPO using Unsloth + vLLM](https://colab.research.google.com/github/unslothai/notebooks/blob/main/nb/Qwen3_(4B)-GRPO.ipynb)
+
+## Worker extensions (`worker_extension_cls`)
+
+RL frameworks that need custom methods on vLLM's GPU workers (for example, to set up their own communicator) pass a worker extension class with `--worker-extension-cls pkg.module.Class` (CLI) or `LLM(worker_extension_cls="pkg.module.Class")`. The value must be a fully qualified name string that is importable in every worker process. Passing a class object is not supported.
+
+- vLLM mixes the class into the worker class by appending it to `worker_class.__bases__`. Inside its methods, `self` is the worker, which provides `self.device`, `self.rank`, `self.model_runner`, and so on.
+- No non-dunder attribute of the extension may already exist on the worker class. A name collision fails worker startup with `AssertionError: Worker class ... already has an attribute ...`.
+- Optional lifecycle hooks:
+    - `init_worker_extension(self)` runs once per worker, right after `init_device()`. At that point the device and `torch.distributed` are initialized, but the model weights are not loaded yet.
+    - `destroy_worker_extension(self)` runs at shutdown, before the worker's own `shutdown()`. This hook is best-effort. Exceptions are logged and not raised. With the default `mp` backend it runs when workers exit gracefully or on SIGTERM, but not after SIGKILL. With `--distributed-executor-backend ray`, the executor stops workers with `ray.kill`, so this hook does not run.
+- Call extension methods with `collective_rpc`, which returns a list with one result per worker. It is available as `LLM.collective_rpc(method, args=..., kwargs=...)` offline and as `await AsyncLLM.collective_rpc(...)` in async engines. Over HTTP, use `POST /collective_rpc` with `{"method": ..., "args": [...], "kwargs": {...}}`; it requires `VLLM_SERVER_DEV_MODE=1` and accepts string arguments only.
+
+```python
+# my_rl/worker_ext.py
+class MyWorkerExtension:
+    def init_worker_extension(self):
+        # Device and distributed state are ready; the model is not loaded yet.
+        self.my_comm = f"comm-on-{self.device}"
+
+    def destroy_worker_extension(self):
+        self.my_comm = None
+
+    def my_comm_info(self) -> str:
+        return f"rank={self.rank} {self.my_comm}"
+```
+
+```python
+from vllm import LLM
+
+llm = LLM(
+    model="Qwen/Qwen3-0.6B",
+    tensor_parallel_size=2,
+    worker_extension_cls="my_rl.worker_ext.MyWorkerExtension",
+)
+print(llm.collective_rpc("my_comm_info"))  # one entry per TP worker
+```
+
+For weight synchronization, prefer the built-in [Weight Transfer](weight_transfer/README.md) API over a custom extension. The older `examples/offline_inference/rlhf*.py` examples, which used `worker_extension_cls` for this, were removed in favor of that API.
