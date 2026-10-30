@@ -3,6 +3,7 @@
 
 import math
 import os
+from collections.abc import Sequence
 
 import torch
 
@@ -822,13 +823,27 @@ def _moe_lora_split_expand_kernel(
             tl.store(out_ptrs, acc.to(out_ptr.dtype.element_ty), mask=out_mask)
 
 
-# Use the split path for 1..VLLM_MOE_LORA_SPLIT_MAX_TOKENS tokens (decode
-# batches; 0 disables it). Read once at import by this module and by
-# punica_gpu, so both always agree. K/N chunk sizes per program: 0 = automatic
-# (GB200 sweep at E=128, H=6144, I=768, r=32). The K chunk depends only on K, so
-# a token's partial sums do not depend on the batch size within the split path.
-_MOE_LORA_SPLIT_MAX_TOKENS = int(
-    os.environ.get("VLLM_MOE_LORA_SPLIT_MAX_TOKENS", "256")
+# Token counts that take the split path. Unset, they depend on the LoRA rank
+# and the layer width (_MOE_LORA_SPLIT_RANGES); a set
+# VLLM_MOE_LORA_SPLIT_MAX_TOKENS means 1..value for every rank (0 disables the
+# path). Read once at import by this module and by punica_gpu, so both always
+# agree. K/N chunk sizes per program: 0 = automatic (GB200 sweep at E=128,
+# H=6144, I=768, r=32). The K chunk depends only on K, so a token's partial
+# sums do not depend on the batch size within the split path.
+_MOE_LORA_SPLIT_MAX_TOKENS: int | None = (
+    int(os.environ["VLLM_MOE_LORA_SPLIT_MAX_TOKENS"])
+    if os.environ.get("VLLM_MOE_LORA_SPLIT_MAX_TOKENS")
+    else None
+)
+# (max rank, min width, min tokens, max tokens), width = min(hidden, moe
+# intermediate per shard), the same for w13 and w2. The split path's measured
+# wins over the one-shot kernel with default configs on GB200 at E=128, top-4,
+# hidden 6144, moe intermediate 768/1536/6144 per shard, 1 and 4 LoRAs, w13+w2.
+_MOE_LORA_SPLIT_RANGES = (
+    (64, 0, 1, 1024),
+    (128, 0, 1, 4),
+    (128, 0, 17, 96),
+    (128, 4096, 1, 256),
 )
 _MOE_LORA_SPLIT_K_CHUNK = int(os.environ.get("VLLM_MOE_LORA_SPLIT_K_CHUNK", "0"))
 _MOE_LORA_SPLIT_N_CHUNK = int(os.environ.get("VLLM_MOE_LORA_SPLIT_N_CHUNK", "0"))
@@ -841,11 +856,29 @@ _MOE_LORA_SPLIT_BLOCK_M = 16
 _SPLIT_WORKSPACE: dict[torch.device, torch.Tensor] = {}
 
 
-def use_moe_lora_split(num_tokens: int, rank: int, fully_sharded: bool) -> bool:
-    return (
-        not fully_sharded
-        and rank <= _FUSED_MOE_LORA_ONE_SHOT_MAX_RANK
-        and 0 < num_tokens <= _MOE_LORA_SPLIT_MAX_TOKENS
+def moe_lora_split_width(
+    lora_a_stacked: Sequence[torch.Tensor], lora_b_stacked: Sequence[torch.Tensor]
+) -> int:
+    return min(lora_a_stacked[0].shape[-1], lora_b_stacked[0].shape[-2])
+
+
+def _moe_lora_split_ranges(rank: int, width: int) -> list[tuple[int, int]]:
+    if rank > _FUSED_MOE_LORA_ONE_SHOT_MAX_RANK:
+        return []
+    if _MOE_LORA_SPLIT_MAX_TOKENS is not None:
+        return [(1, _MOE_LORA_SPLIT_MAX_TOKENS)]
+    return [
+        (lo, hi)
+        for max_rank, min_width, lo, hi in _MOE_LORA_SPLIT_RANGES
+        if rank <= max_rank and width >= min_width
+    ]
+
+
+def use_moe_lora_split(
+    num_tokens: int, rank: int, width: int, fully_sharded: bool
+) -> bool:
+    return not fully_sharded and any(
+        lo <= num_tokens <= hi for lo, hi in _moe_lora_split_ranges(rank, width)
     )
 
 
@@ -2013,7 +2046,11 @@ def _fused_moe_lora(
 
     # Fast path: single fused kernel
     if not fully_sharded and max_lora_rank <= _FUSED_MOE_LORA_ONE_SHOT_MAX_RANK:
-        if _MOE_LORA_SPLIT_MAX_TOKENS > 0:
+        width = moe_lora_split_width(lora_a_stacked, lora_b_stacked)
+        split_max_tokens = max(
+            (hi for _, hi in _moe_lora_split_ranges(max_lora_rank, width)), default=0
+        )
+        if split_max_tokens > 0:
             # Size the workspace for the largest split batch on every non-captured
             # call (profile/warmup runs), so graph capture does not allocate. A
             # tuned block size other than 16 may need more and then falls back to
@@ -2021,14 +2058,16 @@ def _fused_moe_lora(
             _reserve_split_workspace(
                 _split_workspace_numel(
                     lora_a_stacked,
-                    _MOE_LORA_SPLIT_MAX_TOKENS,
+                    split_max_tokens,
                     top_k_num,
                     _MOE_LORA_SPLIT_BLOCK_M,
                     lora_a_stacked[0].shape[0] + 1,
                 ),
                 qcurr_hidden_states.device,
             )
-        if use_moe_lora_split(topk_weights.shape[0], max_lora_rank, fully_sharded):
+        if use_moe_lora_split(
+            topk_weights.shape[0], max_lora_rank, width, fully_sharded
+        ):
             _run_fused_moe_lora_split(
                 output,
                 qcurr_hidden_states,

@@ -1343,7 +1343,8 @@ def _split_call(
 
     max_loras, num_experts, rank = lora_a_stacked[0].shape[:3]
     num_tokens, top_k = topk_weights.shape
-    split = f.use_moe_lora_split(num_tokens, rank, False)
+    width = f.moe_lora_split_width(lora_a_stacked, lora_b_stacked)
+    split = f.use_moe_lora_split(num_tokens, rank, width, False)
     block = f._MOE_LORA_SPLIT_BLOCK_M if split else tuned_block_size
     naive = expert_map is None and num_tokens * top_k * 8 <= num_experts * max_loras
     if naive:
@@ -1429,10 +1430,14 @@ _ML4_W2 = dict(K=768, N=6144, num_slices=1, mul_routed_weight=True)
 
 @pytest.mark.parametrize("op", [_ML4_W13, _ML4_W2], ids=["w13", "w2"])
 @pytest.mark.parametrize("device", DEVICES)
-def test_fused_moe_lora_split_batch_invariant(op, device):
+def test_fused_moe_lora_split_batch_invariant(op, device, monkeypatch):
     """A token's LoRA delta is bitwise the same for every batch size on the split
-    path (1..256 tokens, naive and sorted) and matches the fp64 reference; the
-    one-shot path above 256 tokens is checked against the reference only."""
+    path (rank 32: 1..1024 tokens, naive and sorted) and matches the fp64
+    reference; the one-shot path above 1024 tokens is checked against the
+    reference only."""
+    from vllm.lora.ops.triton_ops import fused_moe_lora_op as f
+
+    monkeypatch.setattr(f, "_MOE_LORA_SPLIT_MAX_TOKENS", None)
     torch.set_default_device(device)
     set_random_seed(0)
     K, N, S, mul = op["K"], op["N"], op["num_slices"], op["mul_routed_weight"]
@@ -1443,7 +1448,7 @@ def test_fused_moe_lora_split_batch_invariant(op, device):
     probe_ids = torch.tensor([[3, 17, 64, 127]], dtype=torch.int32)
     probe_w = torch.tensor([[0.4, 0.3, 0.2, 0.1]], dtype=torch.float32)
     rows = {}
-    for M in [1, 4, 5, 64, 256, 257]:
+    for M in [1, 4, 5, 64, 256, 1024, 1025]:
         x = torch.cat([probe_x, torch.randn(M - 1, K, dtype=dtype)])
         ids = torch.cat(
             [probe_ids, torch.randint(0, E, (M - 1, top_k), dtype=torch.int32)]
@@ -1465,7 +1470,7 @@ def test_fused_moe_lora_split_batch_invariant(op, device):
             False,
         )
         rows[M] = out[0].clone()
-    for M in [4, 5, 64, 256]:
+    for M in [4, 5, 64, 256, 1024]:
         assert torch.equal(rows[M], rows[1]), M
     ref = torch.stack(
         [
@@ -1488,8 +1493,83 @@ def test_fused_moe_lora_split_batch_invariant(op, device):
     # Kernel and reference sum in different orders; allow a fraction of a bf16
     # ulp of the largest element for cancellations near zero.
     atol = ref.float().abs().max().item() * 2**-9
-    for M in [1, 257]:
+    for M in [1, 1025]:
         torch.testing.assert_close(rows[M], ref, atol=atol, rtol=2**-7)
+
+
+_DISPATCH_CASES = {
+    "r16-m1": (16, 256, 1, True),
+    "r64-m1024": (64, 256, 1024, True),
+    "r64-m1025": (64, 256, 1025, False),
+    "r128-m4": (128, 256, 4, True),
+    "r128-m5": (128, 256, 5, False),
+    "r128-m16": (128, 256, 16, False),
+    "r128-m17": (128, 256, 17, True),
+    "r128-m96": (128, 256, 96, True),
+    "r128-m97": (128, 256, 97, False),
+    "r128-wide-m8": (128, 4096, 8, True),
+    "r128-wide-m256": (128, 4096, 256, True),
+    "r128-wide-m257": (128, 4096, 257, False),
+    "r256-wide-m1": (256, 4096, 1, False),
+}
+
+
+@pytest.mark.parametrize(
+    "rank,width,num_tokens,split",
+    list(_DISPATCH_CASES.values()),
+    ids=list(_DISPATCH_CASES),
+)
+@pytest.mark.parametrize("device", DEVICES)
+def test_fused_moe_lora_split_dispatch(
+    rank, width, num_tokens, split, device, monkeypatch
+):
+    """The split/one-shot choice by rank, width (min of hidden and moe
+    intermediate) and token count is the one fused_moe_lora runs, and its
+    output matches the fp64 reference."""
+    from vllm.lora.ops.triton_ops import fused_moe_lora_op as f
+
+    monkeypatch.setattr(f, "_MOE_LORA_SPLIT_MAX_TOKENS", None)
+    assert f.use_moe_lora_split(num_tokens, rank, width, False) is split
+    assert not f.use_moe_lora_split(num_tokens, rank, width, True)
+    calls = []
+    run_split = f._run_fused_moe_lora_split
+    monkeypatch.setattr(
+        f,
+        "_run_fused_moe_lora_split",
+        lambda *args, **kwargs: calls.append(run_split(*args, **kwargs)),
+    )
+    torch.set_default_device(device)
+    set_random_seed(2)
+    K, N, S, E, top_k, dtype = 4096, width, 2, 16, 2, torch.bfloat16
+    a = [torch.randn(1, E, rank, K, dtype=dtype) * K**-0.5 for _ in range(S)]
+    b = [torch.randn(1, E, N, rank, dtype=dtype) * 0.01 for _ in range(S)]
+    x = torch.randn(num_tokens, K, dtype=dtype)
+    ids = torch.stack([torch.randperm(E)[:top_k] for _ in range(num_tokens)])
+    ids = ids.to(torch.int32)
+    w = torch.rand(num_tokens, top_k)
+    out = torch.zeros(num_tokens, top_k, S * N, dtype=dtype)
+    _split_call(
+        x,
+        a,
+        b,
+        ids,
+        w,
+        torch.zeros(num_tokens, dtype=torch.int32),
+        torch.tensor([0, -1], dtype=torch.int32),
+        torch.ones(2, dtype=torch.int32),
+        out,
+        False,
+        False,
+    )
+    assert len(calls) == int(split)
+    ae = torch.stack([a[s][0, ids.flatten().long()] for s in range(S)])
+    be = torch.stack([b[s][0, ids.flatten().long()] for s in range(S)])
+    xp = x.double().repeat_interleave(top_k, 0)
+    t = torch.einsum("pk,sprk->spr", xp, ae.double())
+    ref = torch.einsum("spr,spnr->psn", t.float().double(), be.double())
+    ref = ref.reshape(num_tokens, top_k, S * N)
+    err = (out.double() - ref).norm() / ref.norm()
+    assert err < 4e-3, err.item()
 
 
 @pytest.mark.parametrize("num_tokens", [1, 5, 64, 256])

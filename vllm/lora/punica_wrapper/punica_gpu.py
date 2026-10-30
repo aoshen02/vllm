@@ -35,16 +35,19 @@ def _use_split_block_m(
     expand_config: dict,
     num_tokens: int,
     rank: int,
+    lora_a_stacked: tuple[torch.Tensor, ...],
+    lora_b_stacked: tuple[torch.Tensor, ...],
     fully_sharded: bool,
     op_prefix: str,
 ) -> None:
-    """Batches that take the split MoE-LoRA path (1..256 tokens by default) use
+    """Batches that take the split MoE-LoRA path (see use_moe_lora_split) use
     16-row expert blocks, its fastest block size, unless a tuned config file for
     this op exists in VLLM_TUNED_CONFIG_FOLDER. Any power-of-2 block >= 16 is
     correct: the kernel takes the block size the align step used."""
     from vllm.lora.ops.triton_ops import fused_moe_lora_op as _f
 
-    if _f.use_moe_lora_split(num_tokens, rank, fully_sharded) and not (
+    width = _f.moe_lora_split_width(lora_a_stacked, lora_b_stacked)
+    if _f.use_moe_lora_split(num_tokens, rank, width, fully_sharded) and not (
         _has_tuned_moe_lora_config(op_prefix)
     ):
         shrink_config["BLOCK_SIZE_M"] = expand_config["BLOCK_SIZE_M"] = (
@@ -638,6 +641,8 @@ class PunicaWrapperGPU(PunicaWrapperBase):
             expand_config,
             num_tokens,
             max_lora_rank,
+            lora_a_stacked,
+            lora_b_stacked,
             fully_sharded,
             "fused_moe_lora_w13",
         )
@@ -777,6 +782,8 @@ class PunicaWrapperGPU(PunicaWrapperBase):
             expand_config,
             num_tokens,
             max_lora_rank,
+            lora_a_stacked,
+            lora_b_stacked,
             fully_sharded,
             "fused_moe_lora_w2",
         )
