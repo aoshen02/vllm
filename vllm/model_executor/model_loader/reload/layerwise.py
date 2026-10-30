@@ -27,6 +27,7 @@ from .utils import (
     get_layer_params_buffers,
     get_layer_size,
     get_layer_tensors,
+    get_tensor_load_numel,
     has_device_tensors,
 )
 
@@ -185,6 +186,9 @@ def make_online_process_loader(layer: torch.nn.Module, param_name: str) -> Calla
         info.loaded_weights.append((param_name, bound_args))
         num_loaded, ret = get_numel_loaded(original_loader, bound_args)
         info.load_numel += num_loaded
+        info.load_numel_by_name[param_name] = (
+            info.load_numel_by_name.get(param_name, 0) + num_loaded
+        )
 
         logger.debug(
             "%s: %d / %d",
@@ -239,6 +243,9 @@ def finalize_layerwise_processing(model: torch.nn.Module, model_config: ModelCon
     if hasattr(model, "_original_do_torchao_reload"):
         model._do_torchao_reload = model._original_do_torchao_reload
 
+    if any(getattr(m, "strict_weight_reload", False) for m in model.modules()):
+        _check_reload_complete(model)
+
     deferred_attn: list[tuple[torch.nn.Module, LayerReloadingInfo]] = []
 
     for layer in model.modules():
@@ -282,6 +289,45 @@ def finalize_layerwise_processing(model: torch.nn.Module, model_config: ModelCon
         info.reset()
 
     LOADING_LAYERS.clear()
+
+
+def _unloaded_tensors(layer: torch.nn.Module, info: LayerReloadingInfo) -> list[str]:
+    """Persistent tensors of a layer that received fewer elements than they hold."""
+    params, buffers = get_layer_params_buffers(layer)
+    persistent = params | {
+        name: buffer
+        for name, buffer in buffers.items()
+        if name not in info.kernel_non_persistent_buffers
+    }
+    return sorted(
+        name
+        for name, tensor in persistent.items()
+        if name not in SKIP_LOAD_TENSORS
+        and info.load_numel_by_name.get(name, 0) < get_tensor_load_numel(tensor)
+    )
+
+
+def _check_reload_complete(model: torch.nn.Module) -> None:
+    """Raise if a reload left any layer with weights it did not receive.
+
+    Used by models that declare ``strict_weight_reload``: without it, a layer
+    that received no weights keeps its previous values and a partially loaded
+    layer keeps uninitialized elements.
+    """
+    incomplete = {}
+    for name, layer in model.named_modules():
+        info = LAYERWISE_INFO.get(layer)
+        if (
+            info is None
+            or not info.can_load()
+            or info.kernel_tensors is None
+            or is_deferred_attention_layer(layer)
+        ):
+            continue
+        if missing := _unloaded_tensors(layer, info):
+            incomplete[name] = missing
+    if incomplete:
+        raise ValueError(f"Weight reload did not load every weight: {incomplete}")
 
 
 def finalize_layerwise_reload(*args, **kwargs):

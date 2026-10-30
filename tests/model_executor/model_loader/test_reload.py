@@ -921,6 +921,57 @@ def test_layerwise_reload_composed_loader_does_not_drop_params(monkeypatch):
     assert torch.equal(layer.D, loaded["D"])
 
 
+class _TwoExpertLayer(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.w = torch.nn.Parameter(torch.zeros(2, 3))
+        self.w.weight_loader = self._load_expert
+
+    @staticmethod
+    def _load_expert(param, loaded_weight, expert_id):
+        param.data[expert_id].copy_(loaded_weight)
+
+
+class _StrictReloadModel(torch.nn.Module):
+    def __init__(self, strict: bool):
+        super().__init__()
+        self.strict_weight_reload = strict
+        self.experts = _TwoExpertLayer()
+        self.norm = torch.nn.Linear(3, 3, bias=False)
+        self.norm.weight.weight_loader = default_weight_loader
+
+
+@pytest.mark.parametrize(
+    "strict,experts,load_norm,missing",
+    [
+        (True, (0, 1), True, None),
+        (True, (0,), True, "experts"),
+        (True, (0, 1), False, "norm"),
+        (False, (0,), False, None),
+    ],
+    ids=["complete", "missing-expert", "missing-layer", "not-strict"],
+)
+def test_strict_reload_rejects_incomplete_update(strict, experts, load_norm, missing):
+    model = _StrictReloadModel(strict)
+    record_metadata_for_reloading(model)
+    initialize_layerwise_reload(model)
+    for expert_id in experts:
+        model.experts.w.weight_loader(
+            model.experts.w, torch.full((3,), 1.0 + expert_id), expert_id
+        )
+    if load_norm:
+        model.norm.weight.weight_loader(model.norm.weight, torch.full((3, 3), 5.0))
+
+    if missing is not None:
+        with pytest.raises(ValueError, match=missing):
+            finalize_layerwise_reload(model, model_config=None)
+        return
+    finalize_layerwise_reload(model, model_config=None)
+    if strict:
+        assert torch.equal(model.experts.w, torch.tensor([[1.0] * 3, [2.0] * 3]))
+        assert torch.equal(model.norm.weight, torch.full((3, 3), 5.0))
+
+
 class _RecordingQuantMethod(QuantizeMethodBase):
     """Records the layer's bias at the moment processing runs."""
 
