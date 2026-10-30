@@ -1175,6 +1175,9 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C_custom_ar, custom_ar) {
   custom_ar.def("get_graph_buffer_ipc_meta(int fa) -> (int[], int[])");
   custom_ar.def(
       "register_graph_buffers(int fa, int[][] handles, int[][] offsets) -> ()");
+  custom_ar.def("get_graph_buffer_ptrs(int fa) -> int[]");
+  custom_ar.def(
+      "register_graph_buffer_ptrs(int fa, int[][] peer_ptrs) -> ()");
   custom_ar.def("allocate_shared_buffer_and_handle(int size) -> (int, Tensor)");
   custom_ar.def("open_mem_handle(Tensor mem_handle) -> int");
   custom_ar.def("free_shared_buffer(int ptr) -> ()");
@@ -1196,6 +1199,9 @@ STABLE_TORCH_LIBRARY_IMPL(_C_custom_ar, CompositeExplicitAutograd, custom_ar) {
   custom_ar.impl("get_graph_buffer_ipc_meta",
                  TORCH_BOX(&get_graph_buffer_ipc_meta));
   custom_ar.impl("register_graph_buffers", TORCH_BOX(&register_graph_buffers));
+  custom_ar.impl("get_graph_buffer_ptrs", TORCH_BOX(&get_graph_buffer_ptrs));
+  custom_ar.impl("register_graph_buffer_ptrs",
+                 TORCH_BOX(&register_graph_buffer_ptrs));
   custom_ar.impl("allocate_shared_buffer_and_handle",
                  TORCH_BOX(&allocate_shared_buffer_and_handle));
   custom_ar.impl("free_shared_buffer", TORCH_BOX(&free_shared_buffer));

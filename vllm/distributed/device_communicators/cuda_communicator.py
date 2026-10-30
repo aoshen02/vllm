@@ -7,7 +7,7 @@ from torch.distributed import ProcessGroup
 
 import vllm.envs as envs
 from vllm._aiter_ops import rocm_aiter_ops
-from vllm.config import get_current_vllm_config_or_none
+from vllm.config import VllmConfig, get_current_vllm_config_or_none
 from vllm.distributed.device_communicators.all_reduce_utils import (
     NCCL_SYMM_MEM_ALL_REDUCE_CONFIG,
     should_nccl_symm_mem_ag_rs,
@@ -30,6 +30,23 @@ logger = init_logger(__name__)
 # Since NCCL 2.29.2, ncclSymkPickKernel accepts registered input with
 # non-registered output for ReduceScatter (ncclSymSendRegRecvNonreg).
 NCCL_DIRECT_SYMM_RS_OUTPUT_MIN_VERSION = 22902
+
+
+def custom_all_reduce_ipc_mode(
+    config: VllmConfig | None, is_cuda: bool
+) -> tuple[bool, bool]:
+    """Return whether custom all-reduce registers graph buffers, and whether
+    it shares buffers by cuMem fd so that suspend can release peer imports.
+
+    Legacy CUDA IPC cannot register the cuMem graph pool that sleep offloads,
+    so graph capture then copies inputs into a pre-registered buffer. With
+    suspendable communicators, buffers are shared by cuMem fd instead, which
+    registers that pool too.
+    """
+    if config is None or not config.use_cumem_cudagraph_pool:
+        return True, False
+    suspendable = is_cuda and config.model_config.enable_nccl_comm_suspend
+    return suspendable, suspendable
 
 
 class CudaCommunicator(DeviceCommunicatorBase):
@@ -123,6 +140,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
         # cuMem graph buffers cannot be IPC-registered; capture copies them instead.
         config = get_current_vllm_config_or_none()
         register = config is None or not config.use_cumem_cudagraph_pool
+        ca_register, ca_suspendable = custom_all_reduce_ipc_mode(
+            config, current_platform.is_cuda()
+        )
 
         if use_torch_symm_mem and current_platform.is_cuda():
             self.symm_mem_comm = SymmMemCommunicator(
@@ -162,7 +182,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 symm_mem_enabled=(
                     self.symm_mem_comm is not None and not self.symm_mem_comm.disabled
                 ),
-                register_graph_buffers=register,
+                register_graph_buffers=ca_register,
+                suspendable=ca_suspendable,
             )
 
         # AITER custom all-gather/reduce-scatter DP-attention dispatch/combine.
@@ -861,6 +882,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
 
         # FlashInfer AR syncs over the gloo cpu_group, so order vs. NCCL is free.
         checkpoint_prepare_fi_ar_workspaces(self.cpu_group, skip_unsupported=True)
+        if self.ca_comm is not None:
+            self.ca_comm.suspend()
         if self.pynccl_comm is not None:
             self.pynccl_comm.suspend()
 
@@ -870,6 +893,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
         if self.pynccl_comm is not None:
             self.pynccl_comm.resume()
         checkpoint_restore_fi_ar_workspaces(self.cpu_group, skip_unsupported=True)
+        if self.ca_comm is not None:
+            self.ca_comm.resume()
 
     def checkpoint_prepare(self) -> None:
         # Only FlashInfer all-reduce and FlashInfer all2all are supported for now.

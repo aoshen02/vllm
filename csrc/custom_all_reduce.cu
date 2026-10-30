@@ -154,6 +154,30 @@ void register_graph_buffers(fptr_t _fa,
   fa->register_graph_buffers(bytes, offsets);
 }
 
+// Buffers captured since the last registration, in capture order.
+std::vector<int64_t> get_graph_buffer_ptrs(fptr_t _fa) {
+  auto fa = reinterpret_cast<vllm::CustomAllreduce*>(_fa);
+  std::vector<int64_t> ptrs;
+  ptrs.reserve(fa->graph_unreg_buffers_.size());
+  for (void* ptr : fa->graph_unreg_buffers_) {
+    ptrs.push_back(reinterpret_cast<int64_t>(ptr));
+  }
+  return ptrs;
+}
+
+// peer_ptrs[j][i]: rank j's copy of captured buffer i, mapped in this process.
+void register_graph_buffer_ptrs(
+    fptr_t _fa, const std::vector<std::vector<int64_t>>& peer_ptrs) {
+  auto fa = reinterpret_cast<vllm::CustomAllreduce*>(_fa);
+  std::vector<std::vector<void*>> ptrs(peer_ptrs.size());
+  for (size_t j = 0; j < peer_ptrs.size(); j++) {
+    for (int64_t ptr : peer_ptrs[j]) {
+      ptrs[j].push_back(reinterpret_cast<void*>(ptr));
+    }
+  }
+  fa->register_graph_buffer_ptrs(ptrs);
+}
+
 std::tuple<fptr_t, torch::stable::Tensor> allocate_shared_buffer_and_handle(
     int64_t size) {
   int device_index;

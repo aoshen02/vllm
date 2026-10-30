@@ -602,6 +602,9 @@ get_graph_buffer_ipc_meta(fptr_t _fa);
 void register_graph_buffers(fptr_t _fa,
                             const std::vector<std::vector<int64_t>>& handles,
                             const std::vector<std::vector<int64_t>>& offsets);
+std::vector<int64_t> get_graph_buffer_ptrs(fptr_t _fa);
+void register_graph_buffer_ptrs(
+    fptr_t _fa, const std::vector<std::vector<int64_t>>& peer_ptrs);
 std::tuple<int64_t, torch::stable::Tensor> allocate_shared_buffer_and_handle(
     int64_t size);
 int64_t open_mem_handle(torch::stable::Tensor& mem_handle);

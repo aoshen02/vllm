@@ -293,8 +293,12 @@ Level 0 remains
 a scheduler pause and does not perform a CUDA checkpoint.
 
 For tensor parallel sizes greater than 1, use NCCL 2.29.7 or later with memory
-suspension support, set `enable_nccl_comm_suspend=True`, and pass
-`disable_custom_all_reduce=True`. The following explicit configuration retains
+suspension support and set `enable_nccl_comm_suspend=True`. Custom all-reduce
+additionally needs `sleep_mode_offload_cudagraph=True` with CUDA graphs: its
+buffers and the cuMem graph pool are then shared by file descriptor, and each
+rank drops its peer mappings while suspended and maps them back at the same
+addresses on wake, so captured graphs keep registered all-reduce buffers.
+Otherwise pass `disable_custom_all_reduce=True`. The following explicit configuration retains
 NCCL GPU peer-to-peer or legacy shared-memory communication, selected by NCCL.
 `NCCL_P2P_DISABLE` and `NCCL_SHM_DISABLE` need not be set when communicator
 suspension is enabled. NCCL CUDA host-memory allocation remains disabled; it

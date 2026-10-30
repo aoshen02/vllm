@@ -135,12 +135,21 @@ class CUDACheckpointExecutor(MultiprocExecutor):
                 )
             if self._checkpoint_flashinfer:
                 required["VLLM_FLASHINFER_ALLREDUCE_BACKEND"] = "trtllm"
-            if not parallel.disable_custom_all_reduce or any(
-                os.environ.get(k) != v for k, v in required.items()
+            if any(os.environ.get(k) != v for k, v in required.items()):
+                raise ValueError(
+                    "CUDA checkpoint requires NCCL checkpoint configuration: "
+                    f"{required}"
+                )
+            # Custom all-reduce peers survive a checkpoint only as cuMem
+            # imports, which the device communicators release while suspended.
+            if not parallel.disable_custom_all_reduce and not (
+                vllm_config.model_config.enable_nccl_comm_suspend
+                and vllm_config.use_cumem_cudagraph_pool
             ):
                 raise ValueError(
-                    "CUDA checkpoint currently requires disabled custom "
-                    f"all-reduce and NCCL checkpoint configuration: {required}"
+                    "CUDA checkpoint with custom all-reduce requires "
+                    "enable_nccl_comm_suspend and sleep_mode_offload_cudagraph "
+                    "with CUDA graphs; otherwise disable custom all-reduce"
                 )
         super().__init__(vllm_config, monitor_workers)
 
