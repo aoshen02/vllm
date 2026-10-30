@@ -200,21 +200,39 @@ class CustomAllreduce {
   void register_graph_buffers(
       const std::vector<std::string>& handles,
       const std::vector<std::vector<int64_t>>& offsets) {
+    commit_graph_buffers([&](size_t i, int j) -> const void* {
+      char* ptr = open_ipc_handle(&handles[j][i * sizeof(cudaIpcMemHandle_t)]);
+      return ptr + offsets[j][i];
+    });
+  }
+
+  // Registers the buffers captured since the last registration with peer
+  // addresses the caller has already mapped into this process, e.g. cuMem
+  // allocations imported by shareable handle. peer_ptrs[j][i] is rank j's
+  // copy of captured buffer i; the entry for this rank is ignored.
+  void register_graph_buffer_ptrs(
+      const std::vector<std::vector<void*>>& peer_ptrs) {
+    if (peer_ptrs.size() != world_size_)
+      throw std::invalid_argument("expected one pointer list per rank");
+    for (const auto& ptrs : peer_ptrs) {
+      if (ptrs.size() != graph_unreg_buffers_.size())
+        throw std::invalid_argument("expected one pointer per graph buffer");
+    }
+    commit_graph_buffers([&](size_t i, int j) -> const void* {
+      return peer_ptrs[j][i];
+    });
+  }
+
+  // Fills the rank data slots that graph capture reserved, in capture order.
+  template <typename PeerPtr>
+  void commit_graph_buffers(PeerPtr peer_ptr) {
     auto num_buffers = graph_unreg_buffers_.size();
     check_rank_data_capacity(num_buffers);
     std::vector<RankData> rank_data(num_buffers);
-    for (int i = 0; i < num_buffers; i++) {
-      auto self_ptr = graph_unreg_buffers_[i];
+    for (size_t i = 0; i < num_buffers; i++) {
       auto& rd = rank_data[i];
       for (int j = 0; j < world_size_; j++) {
-        if (j != rank_) {
-          char* handle =
-              open_ipc_handle(&handles[j][i * sizeof(cudaIpcMemHandle_t)]);
-          handle += offsets[j][i];
-          rd.ptrs[j] = handle;
-        } else {
-          rd.ptrs[j] = self_ptr;
-        }
+        rd.ptrs[j] = j == rank_ ? graph_unreg_buffers_[i] : peer_ptr(i, j);
       }
     }
     CUDACHECK(cudaMemcpy(d_rank_data_base_, rank_data.data(),

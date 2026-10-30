@@ -341,6 +341,7 @@ def _fi_ar_communicator(
     communicator = CudaCommunicator.__new__(CudaCommunicator)
     communicator.cpu_group = group
     communicator.pynccl_comm = Mock()
+    communicator.ca_comm = Mock()
     communicator.all2all_manager = None
     return communicator
 
@@ -368,6 +369,8 @@ def test_cuda_communicator_suspend_detaches_flashinfer_workspaces(
         workspace.checkpoint_restore.assert_called_once_with(group)
     communicator.pynccl_comm.suspend.assert_called_once_with()
     communicator.pynccl_comm.resume.assert_called_once_with()
+    communicator.ca_comm.suspend.assert_called_once_with()
+    communicator.ca_comm.resume.assert_called_once_with()
 
 
 def test_cuda_communicator_checkpoint_rejects_symm_mem_workspace(

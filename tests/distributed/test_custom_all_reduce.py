@@ -2,14 +2,20 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import random
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import ray
 import torch
 import torch.distributed as dist
 
+from vllm.device_allocator.cumem import CuMemAllocator
 from vllm.distributed.communication_op import tensor_model_parallel_all_reduce  # noqa
 from vllm.distributed.device_communicators import custom_all_reduce as car
+from vllm.distributed.device_communicators.cuda_communicator import (
+    custom_all_reduce_ipc_mode,
+)
 from vllm.distributed.parallel_state import get_tp_group, graph_capture
 from vllm.platforms import current_platform
 
@@ -349,6 +355,68 @@ def test_custom_allreduce_filters_dtype(
     communicator.max_size = 1024
 
     assert communicator.should_custom_ar(torch.empty(16, dtype=dtype)) is expected
+
+
+def _ipc_config(cumem_graphs: bool, suspend: bool):
+    return SimpleNamespace(
+        use_cumem_cudagraph_pool=cumem_graphs,
+        model_config=SimpleNamespace(enable_nccl_comm_suspend=suspend),
+    )
+
+
+@pytest.mark.parametrize(
+    ("config", "is_cuda", "expected"),
+    [
+        (None, True, (True, False)),
+        (_ipc_config(False, True), True, (True, False)),
+        (_ipc_config(True, False), True, (False, False)),
+        (_ipc_config(True, True), True, (True, True)),
+        (_ipc_config(True, True), False, (False, False)),
+    ],
+    ids=["no-config", "caching-graph-pool", "cumem-pool", "suspendable", "rocm"],
+)
+def test_custom_allreduce_ipc_mode(config, is_cuda, expected):
+    """(register graph buffers, share by cuMem fd)."""
+    assert custom_all_reduce_ipc_mode(config, is_cuda) == expected
+
+
+@pytest.mark.parametrize(
+    ("registered", "suspendable", "is_cumem", "expected"),
+    [
+        (False, False, True, False),
+        (True, False, False, True),
+        (True, True, True, True),
+        (True, True, False, False),
+        (False, True, True, False),
+    ],
+    ids=["copy", "cuda-ipc", "cumem-input", "cudamalloc-input", "copy-suspendable"],
+)
+def test_capture_registers_only_mappable_inputs(
+    registered, suspendable, is_cumem, expected
+):
+    communicator = car.CustomAllreduce.__new__(car.CustomAllreduce)
+    communicator.disabled, communicator._ptr = True, 0
+    communicator._capture_registered = registered
+    communicator._vmm_driver = (
+        Mock(is_cumem=Mock(return_value=is_cumem)) if suspendable else None
+    )
+    assert communicator._can_register_for_capture(torch.empty(16)) is expected
+
+
+@pytest.mark.parametrize(
+    ("suspendable", "disabled", "expected_calls"),
+    [(True, False, 1), (True, True, 0), (False, False, 0)],
+    ids=["suspendable", "disabled", "cuda-ipc"],
+)
+def test_suspend_and_resume_cycle_peer_imports(suspendable, disabled, expected_calls):
+    communicator = car.CustomAllreduce.__new__(car.CustomAllreduce)
+    communicator.disabled, communicator._ptr = disabled, 0
+    peers = Mock()
+    communicator._vmm_peers = peers if suspendable else None
+    communicator.suspend()
+    communicator.resume()
+    assert peers.release.call_count == expected_calls
+    assert peers.reshare.call_count == expected_calls
 
 
 @pytest.mark.parametrize("batch_invariant", [False, True])
@@ -853,6 +921,74 @@ def chunked_allreduce(
                 out = fa.all_reduce(inp, registered=True)
         graph.replay()
         assert torch.equal(out, ref)
+
+
+@ray.remote(num_gpus=1, max_calls=1)
+def suspendable_allreduce(
+    monkeypatch: pytest.MonkeyPatch,
+    tp_size,
+    pp_size,
+    rank,
+    distributed_init_port,
+):
+    """A graph captured into the cuMem graph pool keeps reducing correctly after
+    suspend, a sleep that releases the pool, wake and resume, with every peer
+    mapped back at its old address."""
+    with monkeypatch.context() as m:
+        m.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+        device = torch.device(f"cuda:{rank}")
+        torch.accelerator.set_device_index(device)
+        init_test_distributed_environment(tp_size, pp_size, rank, distributed_init_port)
+        ensure_model_parallel_initialized(tp_size, pp_size)
+        fa = car.CustomAllreduce(get_tp_group().cpu_group, device, suspendable=True)
+        assert not fa.disabled
+        allocator = CuMemAllocator.get_instance()
+        inp = torch.empty(4096, dtype=torch.float32, device=device)
+        with fa.capture(), allocator.cudagraph_pool() as pool:
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, pool=pool):
+                staged = inp * 1  # from the cuMem graph pool
+                out = fa.custom_all_reduce(staged)
+        assert out is not None
+        peers = fa._vmm_peers
+        assert peers is not None
+        # Buffers, plus the graph pool segment holding the captured input.
+        assert len(peers._mappings) == 3 * (tp_size - 1)
+        addresses = {key: mapping.va for key, mapping in peers._mappings.items()}
+
+        def check(value: float) -> None:
+            inp.fill_(value * (rank + 1))
+            graph.replay()
+            torch.accelerator.synchronize()
+            expected = value * tp_size * (tp_size + 1) / 2
+            torch.testing.assert_close(out, torch.full_like(out, expected))
+
+        check(1.0)
+        for cycle in range(2):
+            torch.accelerator.synchronize()
+            fa.suspend()
+            assert all(m.handle is None for m in peers._mappings.values())
+            allocator.sleep(offload_tags=())
+            allocator.wake_up()
+            fa.resume()
+            remapped = {key: mapping.va for key, mapping in peers._mappings.items()}
+            assert remapped == addresses
+            check(2.0 + cycle)
+        eager = torch.full((1024,), float(rank + 1), device=device)
+        expected = tp_size * (tp_size + 1) / 2
+        torch.testing.assert_close(
+            fa.all_reduce(eager, registered=False), torch.full_like(eager, expected)
+        )
+        fa.close()
+
+
+@pytest.mark.parametrize("tp_size", [2, 4])
+def test_custom_allreduce_suspendable(monkeypatch: pytest.MonkeyPatch, tp_size):
+    if not current_platform.is_cuda():
+        pytest.skip("cuMem file descriptor sharing requires CUDA.")
+    if tp_size > torch.accelerator.device_count():
+        pytest.skip("Not enough GPUs to run the test.")
+    multi_process_parallel(monkeypatch, tp_size, 1, suspendable_allreduce)
 
 
 @pytest.mark.parametrize("tp_size", [2, 4])

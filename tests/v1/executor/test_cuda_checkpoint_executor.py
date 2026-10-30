@@ -194,6 +194,75 @@ def test_failed_executor_never_acknowledges_pause(executor):
         obj.collective_rpc("synchronize_device")
 
 
+def _set_checkpoint_env(monkeypatch, **overrides):
+    env = {
+        "NCCL_P2P_DISABLE": "0",
+        "NCCL_SHM_DISABLE": "0",
+        "NCCL_IB_DISABLE": "1",
+        "NCCL_CUMEM_ENABLE": "1",
+        "NCCL_CUMEM_HOST_ENABLE": "0",
+        "NCCL_NVLS_ENABLE": "0",
+        "VLLM_ALLREDUCE_USE_FLASHINFER": "0",
+        "VLLM_ALLREDUCE_USE_SYMM_MEM": "0",
+        "VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC": "0",
+        "VLLM_USE_NCCL_SYMM_MEM": "0",
+        "VLLM_FLASHINFER_ALLREDUCE_BACKEND": None,
+        **overrides,
+    }
+    for key, value in env.items():
+        if value is None:
+            monkeypatch.delenv(key, raising=False)
+        else:
+            monkeypatch.setenv(key, value)
+
+
+def _tp_config(
+    tp=2,
+    suspend=True,
+    fusion=False,
+    disable_custom_all_reduce=True,
+    cumem_graph_pool=False,
+):
+    return SimpleNamespace(
+        compilation_config=SimpleNamespace(
+            mode=3 if fusion else 0,
+            pass_config=SimpleNamespace(fuse_allreduce_rms=fusion),
+        ),
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=tp,
+            nnodes=1,
+            decode_context_parallel_size=1,
+            prefill_context_parallel_size=1,
+            pipeline_parallel_size=1,
+            data_parallel_size=1,
+            world_size=tp,
+            disable_custom_all_reduce=disable_custom_all_reduce,
+            enable_expert_parallel=False,
+            worker_cls="vllm.v1.worker.gpu_worker.Worker",
+        ),
+        model_config=SimpleNamespace(
+            enable_sleep_mode=True,
+            enable_nccl_comm_suspend=suspend,
+            sleep_mode_backend="cumem",
+        ),
+        use_cumem_cudagraph_pool=cumem_graph_pool,
+        use_v2_model_runner=True,
+        weight_transfer_config=None,
+        kv_transfer_config=None,
+        ec_transfer_config=None,
+    )
+
+
+def _construct(config):
+    with (
+        patch.object(MultiprocExecutor, "__init__", return_value=None),
+        patch.object(MultiprocExecutor, "shutdown"),
+    ):
+        obj = CUDACheckpointExecutor(config)
+        obj.shutdown()
+        return obj
+
+
 @pytest.mark.parametrize(
     "p2p,shm,tp,nvls,suspend,fusion,backend,accepted",
     [
@@ -214,64 +283,51 @@ def test_transport_requires_suspension_and_no_nvls(
     # Transport options are independent of the rejection rules; avoid their
     # Cartesian product while retaining each option and validation branch.
     monkeypatch.setattr("vllm.platforms.current_platform.is_cuda", lambda: True)
-    env = {
-        "NCCL_P2P_DISABLE": p2p,
-        "NCCL_SHM_DISABLE": shm,
-        "NCCL_IB_DISABLE": "1",
-        "NCCL_CUMEM_ENABLE": "1",
-        "NCCL_CUMEM_HOST_ENABLE": "0",
-        "NCCL_NVLS_ENABLE": nvls,
-        "VLLM_ALLREDUCE_USE_FLASHINFER": "0",
-        "VLLM_ALLREDUCE_USE_SYMM_MEM": "0",
-        "VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC": "0",
-        "VLLM_USE_NCCL_SYMM_MEM": "0",
-    }
-    for key, value in env.items():
-        if value is None:
-            monkeypatch.delenv(key, raising=False)
-        else:
-            monkeypatch.setenv(key, value)
-    monkeypatch.delenv("VLLM_FLASHINFER_ALLREDUCE_BACKEND", raising=False)
-    if backend is not None:
-        monkeypatch.setenv("VLLM_FLASHINFER_ALLREDUCE_BACKEND", backend)
-    config = SimpleNamespace(
-        compilation_config=SimpleNamespace(
-            mode=3 if fusion else 0,
-            pass_config=SimpleNamespace(fuse_allreduce_rms=fusion),
-        ),
-        parallel_config=SimpleNamespace(
-            tensor_parallel_size=tp,
-            nnodes=1,
-            decode_context_parallel_size=1,
-            prefill_context_parallel_size=1,
-            pipeline_parallel_size=1,
-            data_parallel_size=1,
-            world_size=tp,
-            disable_custom_all_reduce=True,
-            enable_expert_parallel=False,
-            worker_cls="vllm.v1.worker.gpu_worker.Worker",
-        ),
-        model_config=SimpleNamespace(
-            enable_sleep_mode=True,
-            enable_nccl_comm_suspend=suspend,
-            sleep_mode_backend="cumem",
-        ),
-        use_v2_model_runner=True,
-        weight_transfer_config=None,
-        kv_transfer_config=None,
-        ec_transfer_config=None,
+    _set_checkpoint_env(
+        monkeypatch,
+        NCCL_P2P_DISABLE=p2p,
+        NCCL_SHM_DISABLE=shm,
+        NCCL_NVLS_ENABLE=nvls,
+        VLLM_FLASHINFER_ALLREDUCE_BACKEND=backend,
     )
-    with (
-        patch.object(MultiprocExecutor, "__init__", return_value=None),
-        patch.object(MultiprocExecutor, "shutdown"),
-    ):
-        if accepted:
-            obj = CUDACheckpointExecutor(config)
-            assert obj._checkpoint_flashinfer == fusion
-            obj.shutdown()
-        else:
-            with pytest.raises(ValueError, match="NCCL checkpoint configuration"):
-                CUDACheckpointExecutor(config)
+    config = _tp_config(tp=tp, suspend=suspend, fusion=fusion)
+    if accepted:
+        assert _construct(config)._checkpoint_flashinfer == fusion
+    else:
+        with pytest.raises(ValueError, match="NCCL checkpoint configuration"):
+            _construct(config)
+
+
+@pytest.mark.parametrize(
+    "disable_custom_all_reduce,suspend,cumem_graph_pool,accepted",
+    [
+        pytest.param(True, True, False, True, id="disabled"),
+        pytest.param(False, True, True, True, id="suspendable-cumem-graphs"),
+        pytest.param(False, True, False, False, id="caching-graph-pool"),
+        pytest.param(False, False, True, False, id="no-suspend"),
+    ],
+)
+def test_custom_all_reduce_requires_suspendable_cumem_buffers(
+    monkeypatch, disable_custom_all_reduce, suspend, cumem_graph_pool, accepted
+):
+    monkeypatch.setattr("vllm.platforms.current_platform.is_cuda", lambda: True)
+    # Without suspension NCCL must not use P2P or SHM transports.
+    _set_checkpoint_env(
+        monkeypatch,
+        NCCL_P2P_DISABLE="0" if suspend else "1",
+        NCCL_SHM_DISABLE="0" if suspend else "1",
+        NCCL_CUMEM_ENABLE="1" if suspend else "0",
+    )
+    config = _tp_config(
+        suspend=suspend,
+        disable_custom_all_reduce=disable_custom_all_reduce,
+        cumem_graph_pool=cumem_graph_pool,
+    )
+    if accepted:
+        _construct(config)
+    else:
+        with pytest.raises(ValueError, match="custom all-reduce requires"):
+            _construct(config)
 
 
 @pytest.mark.parametrize(

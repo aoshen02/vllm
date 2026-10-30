@@ -3488,6 +3488,14 @@ def register_graph_buffers(
     torch.ops._C_custom_ar.register_graph_buffers(fa, handles, offsets)
 
 
+def get_graph_buffer_ptrs(fa: int) -> list[int]:
+    return torch.ops._C_custom_ar.get_graph_buffer_ptrs(fa)
+
+
+def register_graph_buffer_ptrs(fa: int, peer_ptrs: list[list[int]]) -> None:
+    torch.ops._C_custom_ar.register_graph_buffer_ptrs(fa, peer_ptrs)
+
+
 def allocate_shared_buffer_and_handle(size: int) -> tuple[int, torch.Tensor]:
     return torch.ops._C_custom_ar.allocate_shared_buffer_and_handle(size)
 

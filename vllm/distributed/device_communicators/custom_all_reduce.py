@@ -14,6 +14,11 @@ from vllm.distributed.device_communicators.all_reduce_utils import (
     CUSTOM_ALL_REDUCE_MAX_SIZES,
     gpu_p2p_access_check,
 )
+from vllm.distributed.device_communicators.cuda_vmm_ipc import (
+    CuMemDriver,
+    PeerAllocations,
+    VmmBuffer,
+)
 from vllm.distributed.parallel_state import in_the_same_node_as
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
@@ -146,6 +151,7 @@ class CustomAllreduce:
         symm_mem_enabled=False,
         *,
         register_graph_buffers: bool = True,
+        suspendable: bool = False,
     ) -> None:
         """Args:
             group: the process group to work on. If None, it will use the
@@ -153,6 +159,13 @@ class CustomAllreduce:
             device: the device to bind the CustomAllreduce to. If None,
                 it will be bound to f"cuda:{local_rank}".
             register_graph_buffers: whether graph capture IPC-registers its buffers.
+            suspendable: share buffers as cuMem allocations by POSIX fd instead
+                of legacy CUDA IPC, so `suspend` can drop every peer import and
+                `resume` can map them back at the same addresses. Graph
+                buffers must then be cuMem allocations; graph capture copies
+                any other input into the pre-registered buffer. MNNVL
+                collectives, whose symmetric memory cannot be suspended, are
+                disabled.
         It is the caller's responsibility to make sure each communicator
         is bind to a unique device, and all communicators in this group
         are in the same node.
@@ -160,6 +173,10 @@ class CustomAllreduce:
         """
         self._IS_CAPTURING = False
         self._capture_registered = register_graph_buffers
+        self._suspendable = suspendable
+        self._vmm_driver: CuMemDriver | None = None
+        self._vmm_buffers: list[VmmBuffer] = []
+        self._vmm_peers: PeerAllocations | None = None
         self._ptr = 0
         self.disabled = True
         self.mnnvl_buffer = None
@@ -200,6 +217,12 @@ class CustomAllreduce:
 
         same_node = all(in_the_same_node_as(group, source_rank=0))
         self.mnnvl_only = not same_node
+        if suspendable and not same_node:
+            logger.warning(
+                "Custom allreduce is disabled because suspendable buffers are "
+                "shared by file descriptor, which requires a single node."
+            )
+            return
 
         rank = dist.get_rank(group=self.group)
         self.rank = rank
@@ -291,22 +314,25 @@ class CustomAllreduce:
         # Buffers memory are owned by this Python class and passed to C++.
         # Metadata composes of two parts: metadata for synchronization and a
         # temporary buffer for storing intermediate allreduce results.
-        if same_node:
-            self.meta_ptrs = self.create_shared_buffer(
-                ops.meta_size() + max_size, group=group, uncached=True
-            )
-        else:
-            meta_ptr, _ = ops.allocate_shared_buffer_and_handle(ops.meta_size())
-            self.meta_ptrs = [meta_ptr] * world_size
+        meta_size = ops.meta_size() + max_size
         # This is a pre-registered IPC buffer. In eager mode, input tensors
         # are first copied into this buffer before the operation is performed
         legacy_buffer_size = max(max_size, max_all_gather_size, max_reduce_scatter_size)
-        if same_node:
+        if suspendable:
+            self.meta_ptrs, self.buffer_ptrs = self._create_vmm_buffers(
+                [meta_size, legacy_buffer_size]
+            )
+        elif same_node:
+            self.meta_ptrs = self.create_shared_buffer(
+                meta_size, group=group, uncached=True
+            )
             self.buffer_ptrs = self.create_shared_buffer(
                 legacy_buffer_size,
                 group=group,
             )
         else:
+            meta_ptr, _ = ops.allocate_shared_buffer_and_handle(ops.meta_size())
+            self.meta_ptrs = [meta_ptr] * world_size
             buffer_ptr, _ = ops.allocate_shared_buffer_and_handle(legacy_buffer_size)
             self.buffer_ptrs = [buffer_ptr] * world_size
         # This stores tuples of pointers to IPC buffers from all ranks.
@@ -335,12 +361,13 @@ class CustomAllreduce:
             self.meta_ptrs, self.rank_data, rank, self.fully_connected
         )
         ops.register_buffer(self._ptr, self.buffer_ptrs)
-        self._init_mnnvl_buffer(
-            max(
-                max_mnnvl_all_gather_size * world_size,
-                max_mnnvl_reduce_scatter_size,
+        if not suspendable:
+            self._init_mnnvl_buffer(
+                max(
+                    max_mnnvl_all_gather_size * world_size,
+                    max_mnnvl_reduce_scatter_size,
+                )
             )
-        )
         if world_size in _MNNVL_MULTIMEM_REDUCE_SCATTER_WORLD_SIZES:
             self.mnnvl_multimem_rs_supported = _all_ranks_true(
                 self.group,
@@ -475,6 +502,9 @@ class CustomAllreduce:
                 self.register_graph_buffers()
 
     def register_graph_buffers(self):
+        if self._vmm_peers is not None:
+            self._register_vmm_graph_buffers(self._vmm_peers)
+            return
         handle, offset = ops.get_graph_buffer_ipc_meta(self._ptr)
         logger.debug("Registering %d cuda graph addresses", len(offset))
         # We cannot directly use `dist.all_gather_object` here
@@ -492,6 +522,42 @@ class CustomAllreduce:
         handles = cast(list[list[int]], [d[0] for d in all_data])
         offsets = cast(list[list[int]], [d[1] for d in all_data])
         ops.register_graph_buffers(self._ptr, handles, offsets)
+
+    def _register_vmm_graph_buffers(self, peers: PeerAllocations) -> None:
+        ptrs = ops.get_graph_buffer_ptrs(self._ptr)
+        logger.debug("Registering %d cuda graph addresses by cuMem fd", len(ptrs))
+        shared = peers.share(ptrs)
+        if any(len(rank_ptrs) != len(ptrs) for rank_ptrs in shared):
+            raise RuntimeError("Ranks captured different numbers of all-reduces")
+        peer_ptrs = [[ptr for ptr, _ in rank_ptrs] for rank_ptrs in shared]
+        ops.register_graph_buffer_ptrs(self._ptr, peer_ptrs)
+
+    def _create_vmm_buffers(self, sizes: list[int]) -> list[list[int]]:
+        """Allocate zeroed cuMem buffers; return each one's per-rank pointers."""
+        driver = self._vmm_driver = CuMemDriver()
+        device = self.device.index
+        assert device is not None
+        for size in sizes:
+            self._vmm_buffers.append(VmmBuffer(size, device, driver))
+        self._vmm_peers = PeerAllocations(self.group, device, driver)
+        shared = self._vmm_peers.share([buffer.ptr for buffer in self._vmm_buffers])
+        return [[rank_ptrs[i][0] for rank_ptrs in shared] for i in range(len(sizes))]
+
+    def suspend(self) -> None:
+        """Drop every peer import (collective; communication must be idle)."""
+        if self._vmm_peers is not None and not self.disabled:
+            self._vmm_peers.release()
+
+    def resume(self) -> None:
+        """Map the peers' buffers back at the addresses held before `suspend`."""
+        if self._vmm_peers is not None and not self.disabled:
+            self._vmm_peers.reshare()
+
+    def _can_register_for_capture(self, inp: torch.Tensor) -> bool:
+        # Suspendable peers can map only cuMem graph memory (not cudaMalloc).
+        if not self._capture_registered:
+            return False
+        return self._vmm_driver is None or self._vmm_driver.is_cumem(inp.data_ptr())
 
     def should_custom_ar(self, inp: torch.Tensor):
         if self.disabled or self.world_size > 8:
@@ -550,7 +616,9 @@ class CustomAllreduce:
             return None
         if self._IS_CAPTURING:
             if torch.cuda.is_current_stream_capturing():
-                return self.all_reduce(input, registered=self._capture_registered)
+                return self.all_reduce(
+                    input, registered=self._can_register_for_capture(input)
+                )
             else:
                 # If warm up, mimic the allocation pattern since custom
                 # allreduce is out-of-place.
@@ -716,8 +784,15 @@ class CustomAllreduce:
             if ops is not None:
                 ops.dispose(self._ptr)
             self._ptr = 0
-            self.free_shared_buffer(self.meta_ptrs, rank=self.rank)
-            self.free_shared_buffer(self.buffer_ptrs, rank=self.rank)
+            if self._vmm_peers is not None:
+                self._vmm_peers.close()
+                for buffer in self._vmm_buffers:
+                    buffer.close()
+                self._vmm_buffers.clear()
+                self._vmm_peers = None
+            else:
+                self.free_shared_buffer(self.meta_ptrs, rank=self.rank)
+                self.free_shared_buffer(self.buffer_ptrs, rank=self.rank)
             self.mnnvl_peer_buffers = None
             self.mnnvl_handle = None
             self.mnnvl_buffer = None
