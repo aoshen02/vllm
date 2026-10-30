@@ -1138,11 +1138,8 @@ class AsyncLLM(EngineClient):
         """Require a scheduler reply when busy, or an inference result when idle."""
         async with asyncio.timeout(timeout):
             await self.check_health()
-            loads = await self.get_inflight_queue_diagnostics(0)
-            if any(
-                load.get("has_pending_work", False)
-                or any(queue["num_requests"] for queue in load["queues"])
-                for load in loads
+            if await self.is_sleeping() or any(
+                await self.engine_core.call_utility_all_async("has_work")
             ):
                 return
             request_id = f"healthcheck-{random_uuid()}"
