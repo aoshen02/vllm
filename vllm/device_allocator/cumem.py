@@ -10,6 +10,7 @@
 # the only successful approach is to call cuda driver API in C.
 import atexit
 import gc
+import mmap
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from typing import Any
@@ -59,6 +60,22 @@ def create_and_map(allocation_handle: HandleType) -> None:
 
 def unmap_and_release(allocation_handle: HandleType) -> None:
     python_unmap_and_release(*allocation_handle)
+
+
+def _host_backup_buffer(size_in_bytes: int) -> tuple[torch.Tensor, mmap.mmap, bool]:
+    # torch's pinned host allocator rounds every block up to a power of two
+    # and keeps freed blocks cached, so a sleep backup would cost up to 2x its
+    # size in host memory and never return it. Pin an exact-size anonymous
+    # mapping instead; it is unregistered and unmapped when the backup is
+    # dropped.
+    buf = mmap.mmap(-1, size_in_bytes, flags=mmap.MAP_PRIVATE)
+    tensor = torch.frombuffer(buf, dtype=torch.uint8)
+    pinned = False
+    if PIN_MEMORY:
+        pinned = libcudart.cudaHostRegister(tensor.data_ptr(), size_in_bytes) == 0
+        if not pinned:
+            libcudart.cudaGetLastError()
+    return tensor, buf, pinned
 
 
 def get_pluggable_allocator(
@@ -138,6 +155,7 @@ class CuMemAllocator:
 
     def __init__(self):
         self.pointer_to_data: dict[int, AllocationData] = {}
+        self.host_backup_buffers: dict[int, tuple[mmap.mmap, int, bool]] = {}
         self.current_tag: str = CuMemAllocator.default_tag
         self.allocator_and_pools: dict[str, list[Any]] = {}
         # Creating strong references to the two callbacks here to prevent
@@ -206,8 +224,7 @@ class CuMemAllocator:
         when memory is freed in the memory pool.
         """
         data = self.pointer_to_data.pop(ptr)
-        if data.cpu_backup_tensor is not None:
-            data.cpu_backup_tensor = None
+        self._drop_cpu_backup(ptr, data)
         if data.is_asleep and current_platform.is_rocm():
             # On ROCm, sleep() already unmapped and released this allocation's
             # physical chunks and holds its virtual address as a placeholder
@@ -230,6 +247,14 @@ class CuMemAllocator:
         )
         return data.handle
 
+    def _drop_cpu_backup(self, ptr: int, data: AllocationData) -> None:
+        data.cpu_backup_tensor = None
+        entry = self.host_backup_buffers.pop(ptr, None)
+        if entry is not None:
+            _, cpu_ptr, pinned = entry
+            if pinned and libcudart.cudaHostUnregister(cpu_ptr) != 0:
+                libcudart.cudaGetLastError()
+
     def sleep(self, offload_tags: tuple[str, ...] | str | None = None) -> None:
         """Put the allocator in sleep mode.
         All data in the memory allocation with the specified tag will be
@@ -251,6 +276,7 @@ class CuMemAllocator:
 
         total_bytes = 0
         backup_bytes = 0
+        unpinned_bytes = 0
         has_policy_conflict = False
 
         for ptr, data in self.pointer_to_data.items():
@@ -265,13 +291,11 @@ class CuMemAllocator:
             if data.tag in offload_tags:
                 backup_bytes += handle[1]
                 size_in_bytes = handle[1]
-                cpu_backup_tensor = torch.empty(
-                    size_in_bytes,
-                    dtype=torch.uint8,
-                    device="cpu",
-                    pin_memory=PIN_MEMORY,
-                )
+                cpu_backup_tensor, buf, pinned = _host_backup_buffer(size_in_bytes)
                 cpu_ptr = cpu_backup_tensor.data_ptr()
+                self.host_backup_buffers[ptr] = (buf, cpu_ptr, pinned)
+                if not pinned:
+                    unpinned_bytes += size_in_bytes
                 libcudart.cudaMemcpy(cpu_ptr, ptr, size_in_bytes)
                 data.cpu_backup_tensor = cpu_backup_tensor
             try:
@@ -287,6 +311,12 @@ class CuMemAllocator:
             backup_bytes / 1024**3,
             (total_bytes - backup_bytes) / 1024**3,
         )
+        if unpinned_bytes and PIN_MEMORY:
+            logger.warning(
+                "CuMemAllocator: could not pin %.2f GiB of the CPU backup; "
+                "it stays pageable.",
+                unpinned_bytes / 1024**3,
+            )
 
         if has_policy_conflict:
             logger.warning(
@@ -357,7 +387,8 @@ class CuMemAllocator:
                         )
                         cpu_ptr = cpu_backup_tensor.data_ptr()
                         libcudart.cudaMemcpy(ptr, cpu_ptr, size_in_bytes)
-                        data.cpu_backup_tensor = None
+                        del cpu_backup_tensor
+                        self._drop_cpu_backup(ptr, data)
                 elif current_platform.is_rocm():
                     # amdgpu <6.14 may return stale VRAM (#44972); drop with its support
                     libcudart.cudaMemset(ptr, 0, handle[1])
