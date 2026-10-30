@@ -27,6 +27,9 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from vllm.model_executor.model_loader.mtp_validation import (
+    is_mtp_completeness_check_enabled,
+)
 from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader,
 )
@@ -443,13 +446,18 @@ def _load_weights(
             getattr(param, "weight_loader", default_weight_loader)(param, weight)
         loaded.add(name)
 
-    # The default loader skips this check for quantized models.
-    if missing := sorted(set(params) - loaded):
+    # The default loader skips this check for quantized models. Weight
+    # transfer engines load one tensor or one bucket per call and disable it.
+    complete = is_mtp_completeness_check_enabled()
+    if complete and (missing := sorted(set(params) - loaded)):
         raise ValueError(f"Parameters not loaded from the checkpoint: {missing}")
 
     if getattr(config, "lerope", False):
-        assert lerope_alpha is not None, "Checkpoint is missing lerope.alpha"
-        mistral_model.rotary_emb.set_lerope_alpha(lerope_alpha)
+        assert lerope_alpha is not None or not complete, (
+            "Checkpoint is missing lerope.alpha"
+        )
+        if lerope_alpha is not None:
+            mistral_model.rotary_emb.set_lerope_alpha(lerope_alpha)
     return loaded
 
 
