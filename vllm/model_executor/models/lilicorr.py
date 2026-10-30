@@ -23,6 +23,9 @@ from vllm.model_executor.layers.quantization.base_config import QuantizationConf
 from vllm.model_executor.layers.quantization.modelopt import ModelOptLinearMethod
 from vllm.model_executor.layers.quantization.utils.quant_utils import kNvfp4Static
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
+from vllm.model_executor.model_loader.mtp_validation import (
+    is_mtp_completeness_check_enabled,
+)
 
 from .nemotron_h import NemotronHMLP
 from .qwen3_dflash import DFlashQwen3ForCausalLM, DFlashQwen3Model
@@ -537,7 +540,7 @@ class LiLiCorrForCausalLM(DFlashQwen3ForCausalLM):
         super().load_weights(normalized_weights())
         AutoWeightsLoader(self.model.lilicorr).load_weights(head_weights)
         missing = expected - seen
-        if missing:
+        if missing and is_mtp_completeness_check_enabled():
             raise ValueError(
                 f"LiLiCorr checkpoint coverage mismatch: missing={sorted(missing)}"
             )
