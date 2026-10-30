@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Exact-size pinned host memory.
+"""Pinned host memory whose registration can be dropped and restored in place.
 
 PyTorch pins host memory with ``cudaHostAlloc`` and rounds each block up to a
 power of two. Memory allocated here is instead an exact-size (page-rounded)
-anonymous mapping registered with ``cudaHostRegister`` for its owner's
-lifetime and returned to the OS when the owner frees it.
+anonymous mapping registered with ``cudaHostRegister``. Its owner keeps the
+pages and their address for its whole lifetime, so the registration can be
+released, e.g. around a CUDA process checkpoint, and restored at the same
+address; device views and CUDA graphs that read it through UVA stay valid.
 """
 
 import mmap
@@ -21,7 +23,7 @@ logger = init_logger(__name__)
 
 
 class _HostRegistration:
-    """One registered host range."""
+    """One registered host range; released and restored as a group."""
 
     def __init__(self, pointer: int, num_bytes: int):
         self.pointer = pointer
@@ -43,6 +45,11 @@ class _HostRegistration:
         self.registered = False
 
 
+# Registrations die with their owner array; the set only enumerates them.
+_registrations: "weakref.WeakSet[_HostRegistration]" = weakref.WeakSet()
+_released = False
+
+
 def _close(registration: _HostRegistration, keepalive: object) -> None:
     # `keepalive` (the mapping) outlives the registration it backs.
     if registration.registered:
@@ -59,8 +66,11 @@ def pin_host_array(array: np.ndarray, keepalive: object = None) -> torch.Tensor:
     ``keepalive`` must own its memory (e.g. the mapping it views) if the array
     does not. Returns a uint8 CPU tensor sharing the array's storage.
     """
+    if _released:
+        raise RuntimeError("Host registrations are released; restore them first")
     registration = _HostRegistration(array.ctypes.data, array.nbytes)
     registration.register()
+    _registrations.add(registration)
     # Torch storage retains the array (and through it the mapping), including
     # through cached views; unregister only once the array itself is gone.
     weakref.finalize(array, _close, registration, keepalive).atexit = False
@@ -84,3 +94,45 @@ def pinned_host_empty(
     mapping = mmap.mmap(-1, num_bytes, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS)
     raw = pin_host_array(np.frombuffer(mapping, dtype=np.uint8), mapping)
     return raw.view(dtype).view(size)
+
+
+def release_pinned_host_memory() -> None:
+    """Leave the process holding no pinned host memory, or raise.
+
+    Drops every registration made here (pages and addresses stay) and frees
+    PyTorch's cached pinned blocks. PyTorch-pinned blocks that are still in use
+    cannot be released in place, so they fail the call.
+    """
+    global _released
+    if _released:
+        return
+    torch._C._host_emptyCache()
+    stats = torch.cuda.host_memory_stats()
+    if stats.get("allocations.current", 0):
+        raise RuntimeError(
+            "Cannot release pinned host memory: PyTorch still holds "
+            f"{stats['allocations.current']} pinned blocks "
+            f"({stats.get('allocated_bytes.current', 0)} bytes) in use. "
+            "Allocate long-lived pinned buffers with "
+            "vllm.utils.pinned_host_memory.pinned_host_empty."
+        )
+    registrations = [r for r in _registrations if r.registered]
+    for registration in registrations:
+        registration.unregister()
+    _released = True
+    logger.info(
+        "Released %d pinned host ranges (%.2f GiB)",
+        len(registrations),
+        sum(r.num_bytes for r in registrations) / 2**30,
+    )
+
+
+def restore_pinned_host_memory() -> None:
+    """Register again, at the same addresses, every range released above."""
+    global _released
+    if not _released:
+        return
+    for registration in list(_registrations):
+        if not registration.registered:
+            registration.register()
+    _released = False

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Lifetime of registered pinned host memory, against a recording cudart."""
+"""Lifetime and checkpoint release of registered pinned host memory, against a
+recording cudart and PyTorch host-allocator stats."""
 
 import gc
 from types import SimpleNamespace
@@ -31,9 +32,18 @@ class FakeCudart:
 @pytest.fixture
 def cudart(monkeypatch):
     fake = FakeCudart()
+    fake.torch_blocks = 0  # PyTorch-pinned blocks still in use after emptyCache
     monkeypatch.setattr(torch.cuda, "cudart", lambda: fake)
     monkeypatch.setattr(phm.current_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(torch._C, "_host_emptyCache", lambda: None)
+    monkeypatch.setattr(
+        torch.cuda,
+        "host_memory_stats",
+        lambda: {"allocations.current": fake.torch_blocks},
+    )
+    monkeypatch.setattr(phm, "_released", False)
     yield fake
+    phm.restore_pinned_host_memory()
     gc.collect()
 
 
@@ -70,3 +80,37 @@ class TestPinnedHostEmpty:
     def test_empty_tensor_registers_nothing(self, cudart):
         assert phm.pinned_host_empty(0, torch.float32).numel() == 0
         assert cudart.calls == []
+
+
+class TestCheckpointRelease:
+    def test_release_then_restore_keeps_addresses_and_data(self, cudart):
+        tensors = [phm.pinned_host_empty(n, torch.uint8) for n in (4096, 70000)]
+        tensors[1][-1] = 7
+        pointers = {t.data_ptr(): t.numel() for t in tensors}
+        phm.release_pinned_host_memory()
+        assert cudart.registered == {}
+        phm.restore_pinned_host_memory()
+        assert cudart.registered == pointers
+        assert [t.data_ptr() for t in tensors] == list(pointers)
+        assert tensors[1][-1] == 7
+
+    def test_live_torch_pinned_blocks_fail_before_any_release(self, cudart):
+        t = phm.pinned_host_empty(4096, torch.uint8)
+        cudart.torch_blocks = 3
+        with pytest.raises(RuntimeError, match="3 pinned blocks"):
+            phm.release_pinned_host_memory()
+        assert cudart.registered == {t.data_ptr(): 4096}
+
+    def test_no_new_registration_while_released(self, cudart):
+        phm.release_pinned_host_memory()
+        with pytest.raises(RuntimeError, match="released"):
+            phm.pinned_host_empty(4096, torch.uint8)
+        assert cudart.registered == {}
+
+    def test_freed_while_released_is_not_reregistered(self, cudart):
+        t = phm.pinned_host_empty(4096, torch.uint8)
+        phm.release_pinned_host_memory()
+        del t
+        gc.collect()
+        phm.restore_pinned_host_memory()
+        assert cudart.registered == {}

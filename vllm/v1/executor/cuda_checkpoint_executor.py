@@ -260,8 +260,8 @@ class CUDACheckpointExecutor(MultiprocExecutor):
             super().sleep(level)
             if self._use_nccl_suspend:
                 self.collective_rpc(_validate_nccl_checkpoint, args=(True,), timeout=30)
-            if self._checkpoint_flashinfer:
-                self.collective_rpc("checkpoint_prepare", timeout=120)
+            # Workers release state the driver cannot checkpoint or restore.
+            self.collective_rpc("checkpoint_prepare", timeout=120)
             self._checkpoint.suspend([w.proc.pid for w in self.workers])
             self._checkpoint_active = True
         except Exception:
@@ -278,8 +278,7 @@ class CUDACheckpointExecutor(MultiprocExecutor):
             if self._checkpoint_active:
                 cast(CudaProcessCheckpoint, self._checkpoint).resume()
                 self._checkpoint_active = False
-                if self._checkpoint_flashinfer:
-                    self.collective_rpc("checkpoint_restore", timeout=120)
+                self.collective_rpc("checkpoint_restore", timeout=120)
             super().wake_up(tags)
             if self._use_nccl_suspend:
                 self.collective_rpc(
