@@ -1992,6 +1992,12 @@ class MooncakeStoreWorker:
         if self._capacity_only or not self.can_put:
             return
 
+        # Retire preempted attempts before queueing this step's jobs, which may
+        # belong to a request re-admitted in this step; it saves from the start.
+        assert self.kv_send_thread is not None
+        for req_id in metadata.preempted_req_ids:
+            self.kv_send_thread.delete_finished_stored_request(req_id)
+
         current_event = None
         for request in metadata.requests:
             if request.can_save:
@@ -2017,7 +2023,7 @@ class MooncakeStoreWorker:
             return set(), set()
 
         if self.can_put:
-            self._close_ended_store_requests(finished_req_ids, meta)
+            self._close_ended_store_requests(finished_req_ids)
 
         # Blocks read by a store job are released by the scheduler when the job
         # reports back (see build_connector_worker_meta), so no request ever waits
@@ -2090,21 +2096,13 @@ class MooncakeStoreWorker:
             self.kv_connector_stats = MooncakeStoreConnectorStats()
             return kv_connector_stats
 
-    def _close_ended_store_requests(
-        self,
-        finished_req_ids: set[str],
-        meta: MooncakeStoreConnectorMetadata,
-    ) -> None:
-        """Retire the ledger entries of requests that finished or were preempted.
+    def _close_ended_store_requests(self, finished_req_ids: set[str]) -> None:
+        """Retire the ledger entries of finished requests.
 
         An entry may only go once its jobs have drained, because they still read
-        the resume offset it owns; a request that comes back after preemption
-        then saves from the start rather than from where the last attempt got to.
+        the resume offset it owns.
         """
         assert self.kv_send_thread is not None
-
-        for req_id in meta.preempted_req_ids:
-            self.kv_send_thread.delete_finished_stored_request(req_id)
 
         for req_id in finished_req_ids | self.finished_store_req:
             if self.kv_send_thread.stored_requests.get(req_id):
