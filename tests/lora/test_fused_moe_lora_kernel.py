@@ -1319,3 +1319,231 @@ def test_fused_moe_lora_kernel_rejects_bad_block_size_m(device):
             adapter_enabled,
             block_size,
         )
+
+
+def _split_call(
+    hidden_states,
+    lora_a_stacked,
+    lora_b_stacked,
+    topk_ids,
+    topk_weights,
+    token_lora_mapping,
+    lora_ids,
+    adapter_enabled,
+    output,
+    mul_routed_weight,
+    add_inputs,
+    expert_map=None,
+    tuned_block_size=64,
+):
+    """Production routing of PunicaWrapperGPU.add_lora_w13/w2: naive below the
+    sparsity threshold, else align with 16-row blocks on the split path and the
+    tuned block size above it."""
+    from vllm.lora.ops.triton_ops import fused_moe_lora_op as f
+
+    max_loras, num_experts, rank = lora_a_stacked[0].shape[:3]
+    num_tokens, top_k = topk_weights.shape
+    split = f.use_moe_lora_split(num_tokens, rank, False)
+    block = f._MOE_LORA_SPLIT_BLOCK_M if split else tuned_block_size
+    naive = expert_map is None and num_tokens * top_k * 8 <= num_experts * max_loras
+    if naive:
+        sorted_ids, eids, ntpp = None, topk_ids.reshape(-1), None
+    else:
+        kernel_e = expert_map.numel() if expert_map is not None else num_experts
+        max_pad = topk_ids.numel() + kernel_e * (block - 1)
+        if topk_ids.numel() < kernel_e:
+            max_pad = topk_ids.numel() * block
+        blocks = CEILDIV(max_pad, block)
+        sorted_ids = torch.empty((max_loras * max_pad,), dtype=torch.int32)
+        eids = torch.full((max_loras * blocks,), -1, dtype=torch.int32)
+        ntpp = torch.empty((max_loras,), dtype=torch.int32)
+        ops.moe_lora_align_block_size(
+            topk_ids,
+            token_lora_mapping,
+            kernel_e,
+            block,
+            max_loras,
+            max_pad,
+            blocks,
+            sorted_ids,
+            eids,
+            ntpp,
+            adapter_enabled,
+            lora_ids,
+            expert_map,
+        )
+        sorted_ids = sorted_ids.view(max_loras, -1)
+        eids = eids.view(max_loras, -1)
+    num_active = torch.tensor([max_loras + 1], dtype=torch.int32, device="cpu")
+    fused_moe_lora(
+        output,
+        hidden_states,
+        lora_a_stacked,
+        lora_b_stacked,
+        topk_weights,
+        sorted_ids,
+        eids,
+        ntpp,
+        token_lora_mapping,
+        rank,
+        top_k,
+        lora_ids,
+        num_active,
+        adapter_enabled,
+        block,
+        32,
+        64,
+        1,
+        4,
+        3,
+        1,
+        block,
+        32,
+        64,
+        1,
+        4,
+        3,
+        1,
+        mul_routed_weight,
+        fully_sharded=False,
+        offset=0,
+        add_inputs=add_inputs,
+    )
+
+
+def _ref_one_shot(x, a, b, w, mul_routed_weight, prev):
+    """fp64 reference with the one-shot cast points: fp32 shrink -> output dtype
+    -> expand (fp32) -> * routing weight -> output dtype -> + prev."""
+    t = (x.double() @ a.double().T).float().to(prev.dtype)
+    o = (t.double() @ b.double().T).float()
+    if mul_routed_weight:
+        o = o * w.float()
+    return prev + o.to(prev.dtype)
+
+
+# ML4 TP8 shapes: w13 (2 slices, K=hidden, N=moe_intermediate/8) and w2
+# (1 slice, K=moe_intermediate/8, N=hidden, routing weight applied).
+_ML4_W13 = dict(K=6144, N=768, num_slices=2, mul_routed_weight=False)
+_ML4_W2 = dict(K=768, N=6144, num_slices=1, mul_routed_weight=True)
+
+
+@pytest.mark.parametrize("op", [_ML4_W13, _ML4_W2], ids=["w13", "w2"])
+@pytest.mark.parametrize("device", DEVICES)
+def test_fused_moe_lora_split_batch_invariant(op, device):
+    """A token's LoRA delta is bitwise the same for every batch size on the split
+    path (1..256 tokens, naive and sorted) and matches the fp64 reference; the
+    one-shot path above 256 tokens is checked against the reference only."""
+    torch.set_default_device(device)
+    set_random_seed(0)
+    K, N, S, mul = op["K"], op["N"], op["num_slices"], op["mul_routed_weight"]
+    E, R, top_k, dtype = 128, 32, 4, torch.bfloat16
+    a = [torch.randn(1, E, R, K, dtype=dtype) * 0.01 for _ in range(S)]
+    b = [torch.randn(1, E, N, R, dtype=dtype) * 0.01 for _ in range(S)]
+    probe_x = torch.randn(1, K, dtype=dtype)
+    probe_ids = torch.tensor([[3, 17, 64, 127]], dtype=torch.int32)
+    probe_w = torch.tensor([[0.4, 0.3, 0.2, 0.1]], dtype=torch.float32)
+    rows = {}
+    for M in [1, 4, 5, 64, 256, 257]:
+        x = torch.cat([probe_x, torch.randn(M - 1, K, dtype=dtype)])
+        ids = torch.cat(
+            [probe_ids, torch.randint(0, E, (M - 1, top_k), dtype=torch.int32)]
+        )
+        w = torch.cat([probe_w, torch.rand(M - 1, top_k)])
+        xin = x.repeat_interleave(top_k, 0) if mul else x
+        out = torch.zeros(M, top_k, S * N, dtype=dtype)
+        _split_call(
+            xin,
+            a,
+            b,
+            ids,
+            w,
+            torch.zeros(M, dtype=torch.int32),
+            torch.tensor([0, -1], dtype=torch.int32),
+            torch.ones(2, dtype=torch.int32),
+            out,
+            mul,
+            False,
+        )
+        rows[M] = out[0].clone()
+    for M in [4, 5, 64, 256]:
+        assert torch.equal(rows[M], rows[1]), M
+    ref = torch.stack(
+        [
+            torch.cat(
+                [
+                    _ref_one_shot(
+                        probe_x[0],
+                        a[s][0, e],
+                        b[s][0, e],
+                        probe_w[0, k],
+                        mul,
+                        torch.zeros(N, dtype=dtype),
+                    )
+                    for s in range(S)
+                ]
+            )
+            for k, e in enumerate(probe_ids[0].tolist())
+        ]
+    )
+    # Kernel and reference sum the fp32 shrink in different orders, so the
+    # intermediate can differ by one bf16 ulp; allow that relative to the delta.
+    atol = ref.float().abs().max().item() * 2**-8
+    for M in [1, 257]:
+        torch.testing.assert_close(rows[M], ref, atol=atol, rtol=2**-7)
+
+
+@pytest.mark.parametrize("num_tokens", [1, 5, 64, 256])
+@pytest.mark.parametrize("ep", [False, True])
+@pytest.mark.parametrize("device", DEVICES)
+def test_fused_moe_lora_split_empty_slots(num_tokens, ep, device):
+    """Empty LoRA slots, a disabled adapter, tokens without LoRA and (EP) experts
+    owned by another rank leave `output` untouched; every other (token, expert)
+    gets the fp64 reference delta."""
+    torch.set_default_device(device)
+    set_random_seed(1)
+    K, N, S, top_k, R, dtype = 6144, 768, 2, 4, 32, torch.bfloat16
+    E_global = 128
+    E = 64 if ep else E_global
+    max_loras = 3
+    a = [torch.randn(max_loras, E, R, K, dtype=dtype) * 0.01 for _ in range(S)]
+    b = [torch.randn(max_loras, E, N, R, dtype=dtype) * 0.01 for _ in range(S)]
+    x = torch.randn(num_tokens, K, dtype=dtype)
+    ids = torch.randint(0, E_global, (num_tokens, top_k), dtype=torch.int32)
+    w = torch.rand(num_tokens, top_k)
+    # slot 0 unused, slot 1 active, slot 2 disabled, -1 = no LoRA
+    pattern = torch.tensor([1, -1, 2, 1], dtype=torch.int32)
+    mapping = pattern.repeat(num_tokens)[:num_tokens].contiguous()
+    lora_ids = torch.tensor([1, 2, -1, -1], dtype=torch.int32)
+    enabled = torch.tensor([1, 1, 0, 1], dtype=torch.int32)
+    expert_map = None
+    if ep:
+        expert_map = torch.full((E_global,), -1, dtype=torch.int32)
+        expert_map[:E] = torch.arange(E, dtype=torch.int32)
+    prev = torch.randn(num_tokens, top_k, S * N, dtype=dtype)
+    out = prev.clone()
+    _split_call(
+        x, a, b, ids, w, mapping, lora_ids, enabled, out, False, True, expert_map
+    )
+    for t in range(num_tokens):
+        for k in range(top_k):
+            e, slot = int(ids[t, k]), int(mapping[t])
+            if slot != 1 or e >= E:
+                assert torch.equal(out[t, k], prev[t, k]), (t, k, slot, e)
+                continue
+            ref = torch.cat(
+                [
+                    _ref_one_shot(
+                        x[t],
+                        a[s][slot, e],
+                        b[s][slot, e],
+                        w[t, k],
+                        False,
+                        prev[t, k, s * N : (s + 1) * N],
+                    )
+                    for s in range(S)
+                ]
+            )
+            delta = (ref.float() - prev[t, k].float()).abs().max().item()
+            torch.testing.assert_close(
+                out[t, k], ref, atol=delta * 2**-8 + 2**-8, rtol=2**-7
+            )

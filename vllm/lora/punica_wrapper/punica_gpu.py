@@ -6,6 +6,7 @@ Punica: Multi-Tenant LoRA Serving.
 https://arxiv.org/abs/2310.18547
 """
 
+import functools
 from typing import Any, final
 
 import torch
@@ -35,17 +36,27 @@ def _use_split_block_m(
     num_tokens: int,
     rank: int,
     fully_sharded: bool,
+    op_prefix: str,
 ) -> None:
-    """Decode-sized batches run the split MoE-LoRA kernels, which are fastest
-    with 16-row expert blocks; the align block size must match the kernel's."""
+    """Batches that take the split MoE-LoRA path (1..256 tokens by default) use
+    16-row expert blocks, its fastest block size, unless a tuned config file for
+    this op exists in VLLM_TUNED_CONFIG_FOLDER. Any power-of-2 block >= 16 is
+    correct: the kernel takes the block size the align step used."""
     from vllm.lora.ops.triton_ops import fused_moe_lora_op as _f
 
-    if (
-        not fully_sharded
-        and rank <= _f._FUSED_MOE_LORA_ONE_SHOT_MAX_RANK
-        and num_tokens <= _f._MOE_LORA_SPLIT_MAX_TOKENS
+    if _f.use_moe_lora_split(num_tokens, rank, fully_sharded) and not (
+        _has_tuned_moe_lora_config(op_prefix)
     ):
-        shrink_config["BLOCK_SIZE_M"] = expand_config["BLOCK_SIZE_M"] = 16
+        shrink_config["BLOCK_SIZE_M"] = expand_config["BLOCK_SIZE_M"] = (
+            _f._MOE_LORA_SPLIT_BLOCK_M
+        )
+
+
+@functools.lru_cache
+def _has_tuned_moe_lora_config(op_prefix: str) -> bool:
+    from vllm.lora.ops.triton_ops.utils import load_lora_op_config
+
+    return load_lora_op_config(f"{op_prefix}_shrink", None) is not None
 
 
 @final
@@ -623,7 +634,12 @@ class PunicaWrapperGPU(PunicaWrapperBase):
         shrink_config = _normalize_lora_config_keys(shrink_config)
         expand_config = _normalize_lora_config_keys(expand_config)
         _use_split_block_m(
-            shrink_config, expand_config, num_tokens, max_lora_rank, fully_sharded
+            shrink_config,
+            expand_config,
+            num_tokens,
+            max_lora_rank,
+            fully_sharded,
+            "fused_moe_lora_w13",
         )
 
         SPARSITY_FACTOR = 8
@@ -757,7 +773,12 @@ class PunicaWrapperGPU(PunicaWrapperBase):
         shrink_config = _normalize_lora_config_keys(shrink_config)
         expand_config = _normalize_lora_config_keys(expand_config)
         _use_split_block_m(
-            shrink_config, expand_config, num_tokens, max_lora_rank, fully_sharded
+            shrink_config,
+            expand_config,
+            num_tokens,
+            max_lora_rank,
+            fully_sharded,
+            "fused_moe_lora_w2",
         )
 
         _sorted = sorted_token_ids_lora

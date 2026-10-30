@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import math
 import os
 
 import torch
@@ -802,15 +803,80 @@ def _moe_lora_split_expand_kernel(
             tl.store(out_ptrs, acc.to(out_ptr.dtype.element_ty), mask=out_mask)
 
 
-# Use the split path up to this many tokens (decode batches); env override
-# VLLM_MOE_LORA_SPLIT_MAX_TOKENS (0 disables the split path). K/N chunk sizes
-# per program: 0 = automatic (GB200 sweep at E=128, H=6144, I=768, r=32).
+# Use the split path for 1..VLLM_MOE_LORA_SPLIT_MAX_TOKENS tokens (decode
+# batches; 0 disables it). Read once at import by this module and by
+# punica_gpu, so both always agree. K/N chunk sizes per program: 0 = automatic
+# (GB200 sweep at E=128, H=6144, I=768, r=32). The K chunk depends only on K, so
+# a token's partial sums do not depend on the batch size within the split path.
 _MOE_LORA_SPLIT_MAX_TOKENS = int(
     os.environ.get("VLLM_MOE_LORA_SPLIT_MAX_TOKENS", "256")
 )
 _MOE_LORA_SPLIT_K_CHUNK = int(os.environ.get("VLLM_MOE_LORA_SPLIT_K_CHUNK", "0"))
 _MOE_LORA_SPLIT_N_CHUNK = int(os.environ.get("VLLM_MOE_LORA_SPLIT_N_CHUNK", "0"))
 _MOE_LORA_SPLIT_WARPS = int(os.environ.get("VLLM_MOE_LORA_SPLIT_WARPS", "4"))
+_MOE_LORA_SPLIT_BLOCK_M = 16
+
+# fp32 partials of the split path. One buffer per device, shared by all layers
+# (they run in stream order). It is sized outside CUDA-graph capture (profile
+# and warmup runs) for the largest split batch, so capture never allocates.
+_SPLIT_WORKSPACE: dict[torch.device, torch.Tensor] = {}
+
+
+def use_moe_lora_split(num_tokens: int, rank: int, fully_sharded: bool) -> bool:
+    return (
+        not fully_sharded
+        and rank <= _FUSED_MOE_LORA_ONE_SHOT_MAX_RANK
+        and 0 < num_tokens <= _MOE_LORA_SPLIT_MAX_TOKENS
+    )
+
+
+def _split_k_chunk(K: int) -> tuple[int, int, int]:
+    block_k = 128 if K >= 256 else 64
+    k_target = _MOE_LORA_SPLIT_K_CHUNK or 1024
+    k_chunk = max(block_k, triton.cdiv(k_target, block_k) * block_k)
+    num_split = triton.cdiv(K, k_chunk)
+    k_chunk = triton.cdiv(triton.cdiv(K, num_split), block_k) * block_k
+    num_split = triton.cdiv(K, k_chunk)
+    return block_k, k_chunk, num_split
+
+
+def _split_workspace_numel(
+    lora_a_stacked: list[torch.Tensor],
+    num_tokens: int,
+    top_k_num: int,
+    block_size_m: int,
+    grid_lora_dim: int,
+) -> int:
+    A0 = lora_a_stacked[0]
+    num_experts, rank, K = A0.shape[1], A0.shape[2], A0.shape[3]
+    pairs = num_tokens * top_k_num
+    if pairs < num_experts:
+        rows = pairs * block_size_m
+    else:
+        rows = pairs + num_experts * (block_size_m - 1)
+    rows = triton.cdiv(rows, block_size_m) * block_size_m
+    BLOCK_R = max(triton.next_power_of_2(rank), 16)
+    return len(lora_a_stacked) * grid_lora_dim * _split_k_chunk(K)[2] * rows * BLOCK_R
+
+
+def _reserve_split_workspace(numel: int, device: torch.device) -> None:
+    ws = _SPLIT_WORKSPACE.get(device)
+    if (ws is None or ws.numel() < numel) and not (
+        torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+    ):
+        _SPLIT_WORKSPACE[device] = torch.empty(
+            numel, dtype=torch.float32, device=device
+        )
+
+
+def _split_workspace(numel: int, device: torch.device) -> torch.Tensor:
+    _reserve_split_workspace(numel, device)
+    ws = _SPLIT_WORKSPACE.get(device)
+    if ws is None or ws.numel() < numel:
+        # Capture with a batch larger than any non-captured run so far (e.g.
+        # EP with more global than local experts): allocate in the graph pool.
+        return torch.empty(numel, dtype=torch.float32, device=device)
+    return ws[:numel]
 
 
 def _run_fused_moe_lora_split(
@@ -852,7 +918,9 @@ def _run_fused_moe_lora_split(
         stride_el = 0
         grid_lora_dim = 1
     else:
-        assert block_size_m >= 16 and (block_size_m & (block_size_m - 1)) == 0
+        assert block_size_m >= 16 and (block_size_m & (block_size_m - 1)) == 0, (
+            f"shrink_block_size_m must be a power of 2 and >=16; got {block_size_m}"
+        )
         BLOCK_M = block_size_m
         M_blocks = triton.cdiv(sorted_token_ids.shape[1], BLOCK_M)
         stride_tl_ = sorted_token_ids.stride(0)
@@ -868,18 +936,9 @@ def _run_fused_moe_lora_split(
     assert output.stride(0) == output.shape[1] * output.stride(1)
     out_view = output.view(-1, output.shape[-1])
 
-    block_k = 128 if K >= 256 else 64
-    k_target = _MOE_LORA_SPLIT_K_CHUNK or (512 if naive else 1024)
-    k_chunk = max(block_k, triton.cdiv(k_target, block_k) * block_k)
-    num_split = triton.cdiv(K, k_chunk)
-    k_chunk = triton.cdiv(triton.cdiv(K, num_split), block_k) * block_k
-    num_split = triton.cdiv(K, k_chunk)
-
-    part = torch.empty(
-        (num_slices, grid_lora_dim, num_split, M_blocks * BLOCK_M, BLOCK_R),
-        dtype=torch.float32,
-        device=device,
-    )
+    block_k, k_chunk, num_split = _split_k_chunk(K)
+    part_shape = (num_slices, grid_lora_dim, num_split, M_blocks * BLOCK_M, BLOCK_R)
+    part = _split_workspace(math.prod(part_shape), device).view(part_shape)
     _moe_lora_split_shrink_kernel[(M_blocks, num_slices, grid_lora_dim * num_split)](
         qcurr_hidden_states,
         A_ptrs,
@@ -1934,7 +1993,22 @@ def _fused_moe_lora(
 
     # Fast path: single fused kernel
     if not fully_sharded and max_lora_rank <= _FUSED_MOE_LORA_ONE_SHOT_MAX_RANK:
-        if topk_weights.shape[0] <= _MOE_LORA_SPLIT_MAX_TOKENS:
+        if _MOE_LORA_SPLIT_MAX_TOKENS > 0:
+            # Size the workspace for the largest split batch on every non-captured
+            # call (profile/warmup runs), so graph capture does not allocate. A
+            # tuned block size other than 16 may need more and then falls back to
+            # the graph pool.
+            _reserve_split_workspace(
+                _split_workspace_numel(
+                    lora_a_stacked,
+                    _MOE_LORA_SPLIT_MAX_TOKENS,
+                    top_k_num,
+                    _MOE_LORA_SPLIT_BLOCK_M,
+                    lora_a_stacked[0].shape[0] + 1,
+                ),
+                qcurr_hidden_states.device,
+            )
+        if use_moe_lora_split(topk_weights.shape[0], max_lora_rank, fully_sharded):
             _run_fused_moe_lora_split(
                 output,
                 qcurr_hidden_states,
