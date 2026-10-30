@@ -259,45 +259,7 @@ def _lora_shrink(
     if inputs.size(0) == 0:
         # An empty first call has no work to do.
         return
-    partials: torch.Tensor | None = None
-    if is_batch_invariant:
-        # Allocated before the no-LoRA return so profiling sees the scratch.
-        # Per-call allocation keeps each CUDA graph's scratch in its own pool.
-        partials = torch.empty(
-            (
-                output_tensor.size(0),
-                _BI_SPLIT_K,
-                inputs.size(0),
-                output_tensor.size(-1),
-            ),
-            dtype=torch.float32,
-            device=output_tensor.device,
-        )
-    if no_lora_flag_cpu.item():
-        # None of the inputs require LoRA.
-        return
-
-    assert inputs.dtype == lora_a_weights[0].dtype
-    assert inputs.dtype in [torch.float16, torch.bfloat16]
-    for weight in lora_a_weights:
-        assert weight.dtype in [torch.float16, torch.bfloat16]
-
-    assert inputs.size(1) == lora_a_weights[0].size(-1)
-    inputs = inputs.contiguous()
-    assert output_tensor.is_contiguous()
-
-    # metadata sanity check
     M = inputs.size(0)
-    assert token_lora_mapping.size(0) == M
-    assert token_lora_mapping.size(0) == token_indices_sorted_by_lora_ids.size(0)
-    assert lora_ids.size(0) == num_tokens_per_lora.size(0)
-    assert lora_token_start_loc.size(0) == lora_ids.size(0) + 1
-
-    output_tensor.zero_()
-
-    (lora_ptr_tensor, lora_strides_d0, lora_strides_d1, lora_strides_d2) = (
-        _get_lora_a_ptr(lora_a_weights, inputs.device)
-    )
     N, K = lora_a_weights[0].shape[-2:]  # K=hidden_size,N=rank
     NUM_SLICES = len(lora_a_weights)
     MAX_LORAS = lora_ids.size(0)
@@ -321,9 +283,50 @@ def _lora_shrink(
     GROUP_SIZE_M = kernel_config.get("group_size_m", 8)
 
     # Every M must keep the same K partition for batch invariance.
-    if partials is not None:
+    if is_batch_invariant:
         BLOCK_K = 256
         SPLIT_K = _BI_SPLIT_K
+
+    partials: torch.Tensor | None = None
+    if SPLIT_K > 1:
+        # Split-K partials are reduced in a fixed order instead of with
+        # atomics, so the result does not change from run to run.
+        # Allocated before the no-LoRA return so profiling sees the scratch.
+        # Per-call allocation keeps each CUDA graph's scratch in its own pool.
+        partials = torch.empty(
+            (
+                output_tensor.size(0),
+                SPLIT_K,
+                inputs.size(0),
+                output_tensor.size(-1),
+            ),
+            dtype=torch.float32,
+            device=output_tensor.device,
+        )
+    if no_lora_flag_cpu.item():
+        # None of the inputs require LoRA.
+        return
+
+    assert inputs.dtype == lora_a_weights[0].dtype
+    assert inputs.dtype in [torch.float16, torch.bfloat16]
+    for weight in lora_a_weights:
+        assert weight.dtype in [torch.float16, torch.bfloat16]
+
+    assert inputs.size(1) == lora_a_weights[0].size(-1)
+    inputs = inputs.contiguous()
+    assert output_tensor.is_contiguous()
+
+    # metadata sanity check
+    assert token_lora_mapping.size(0) == M
+    assert token_lora_mapping.size(0) == token_indices_sorted_by_lora_ids.size(0)
+    assert lora_ids.size(0) == num_tokens_per_lora.size(0)
+    assert lora_token_start_loc.size(0) == lora_ids.size(0) + 1
+
+    output_tensor.zero_()
+
+    (lora_ptr_tensor, lora_strides_d0, lora_strides_d1, lora_strides_d2) = (
+        _get_lora_a_ptr(lora_a_weights, inputs.device)
+    )
     EVEN_K = K % (BLOCK_K * SPLIT_K) == 0  # type: ignore
 
     # TODO (varun): This grid formulation maximizes parallelization at the
