@@ -63,6 +63,8 @@ vllm serve my-model \
     --weight-transfer-config '{"backend": "nccl"}'
 ```
 
+If the trainer pushes weights right after startup, add `load_format="dummy"` (`--load-format dummy`) to skip reading the checkpoint; see [Start with `load_format="dummy"`](../layerwise.md#start-with-load_formatdummy-load-real-weights-later).
+
 ### Trainer Side
 
 Build the engine once, then call `send_weights()` once per sync:
