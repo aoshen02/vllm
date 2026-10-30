@@ -55,6 +55,44 @@ def executor():
     obj._checkpoint = None
 
 
+def _config(**overrides):
+    """A config the executor accepts at TP=1; override keys are "component.field"."""
+    config = SimpleNamespace(
+        compilation_config=SimpleNamespace(
+            mode=0, pass_config=SimpleNamespace(fuse_allreduce_rms=False)
+        ),
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=1,
+            world_size=1,
+            nnodes_within_dp=1,
+            decode_context_parallel_size=1,
+            prefill_context_parallel_size=1,
+            pipeline_parallel_size=1,
+            data_parallel_size=1,
+            disable_custom_all_reduce=True,
+            enable_expert_parallel=False,
+            all2all_backend="allgather_reducescatter",
+            worker_cls="vllm.v1.worker.gpu_worker.Worker",
+        ),
+        model_config=SimpleNamespace(
+            enable_sleep_mode=True,
+            enable_nccl_comm_suspend=False,
+            sleep_mode_backend="cumem",
+        ),
+        use_v2_model_runner=True,
+        weight_transfer_config=None,
+        kv_transfer_config=None,
+        ec_transfer_config=None,
+    )
+    for key, value in overrides.items():
+        *path, field = key.split(".")
+        target = config
+        for name in path:
+            target = getattr(target, name)
+        setattr(target, field, value)
+    return config
+
+
 def test_sleep_then_restore_precedes_worker_wake(executor):
     obj, calls = executor
     obj.sleep()
@@ -195,21 +233,31 @@ def test_failed_executor_never_acknowledges_pause(executor):
 
 
 @pytest.mark.parametrize(
-    "p2p,shm,tp,nvls,suspend,fusion,backend,accepted",
+    "p2p,shm,ib,tp,dp,nvls,suspend,fusion,backend,accepted",
     [
-        pytest.param("0", "1", 2, "0", True, False, None, True, id="p2p-only"),
-        pytest.param("0", "0", 3, "0", True, False, None, True, id="p2p-and-shm"),
-        pytest.param("1", "0", 8, "0", True, False, None, True, id="shm-only"),
-        pytest.param(None, None, 2, "0", True, False, None, True, id="defaults"),
-        pytest.param("0", "0", 2, "0", True, True, "trtllm", True, id="trtllm"),
-        pytest.param("0", "0", 2, "1", True, False, None, False, id="nvls"),
-        pytest.param("0", "0", 2, "0", False, False, None, False, id="no-suspend"),
-        pytest.param("0", "0", 2, "0", True, True, None, False, id="fusion-default"),
-        pytest.param("0", "0", 2, "0", True, True, "mnnvl", False, id="mnnvl"),
+        pytest.param("0", "1", "1", 2, 1, "0", True, False, None, True, id="p2p-only"),
+        pytest.param("0", "0", "1", 3, 1, "0", True, False, None, True, id="p2p-shm"),
+        pytest.param("1", "0", "1", 8, 1, "0", True, False, None, True, id="shm-only"),
+        pytest.param(
+            None, None, None, 2, 1, "0", True, False, None, True, id="defaults"
+        ),
+        pytest.param("0", "0", "0", 2, 1, "0", True, False, None, True, id="ib"),
+        pytest.param("0", "0", "0", 1, 8, "0", True, False, None, True, id="dp-ep-ib"),
+        pytest.param("0", "0", "1", 2, 1, "0", True, True, "trtllm", True, id="trtllm"),
+        pytest.param("0", "0", "1", 2, 1, "1", True, False, None, False, id="nvls"),
+        pytest.param("0", "0", "1", 2, 1, "0", False, False, None, False, id="no-sus"),
+        pytest.param(
+            "1", "1", "0", 2, 1, "0", False, False, None, False, id="ib-no-sus"
+        ),
+        pytest.param(
+            "1", "1", "1", 1, 2, "0", False, False, None, False, id="dp-no-sus"
+        ),
+        pytest.param("0", "0", "1", 2, 1, "0", True, True, None, False, id="fusion"),
+        pytest.param("0", "0", "1", 2, 1, "0", True, True, "mnnvl", False, id="mnnvl"),
     ],
 )
 def test_transport_requires_suspension_and_no_nvls(
-    monkeypatch, nvls, suspend, accepted, fusion, backend, p2p, shm, tp
+    monkeypatch, nvls, suspend, accepted, fusion, backend, p2p, shm, ib, tp, dp
 ):
     # Transport options are independent of the rejection rules; avoid their
     # Cartesian product while retaining each option and validation branch.
@@ -217,7 +265,7 @@ def test_transport_requires_suspension_and_no_nvls(
     env = {
         "NCCL_P2P_DISABLE": p2p,
         "NCCL_SHM_DISABLE": shm,
-        "NCCL_IB_DISABLE": "1",
+        "NCCL_IB_DISABLE": ib,
         "NCCL_CUMEM_ENABLE": "1",
         "NCCL_CUMEM_HOST_ENABLE": "0",
         "NCCL_NVLS_ENABLE": nvls,
@@ -234,32 +282,16 @@ def test_transport_requires_suspension_and_no_nvls(
     monkeypatch.delenv("VLLM_FLASHINFER_ALLREDUCE_BACKEND", raising=False)
     if backend is not None:
         monkeypatch.setenv("VLLM_FLASHINFER_ALLREDUCE_BACKEND", backend)
-    config = SimpleNamespace(
-        compilation_config=SimpleNamespace(
-            mode=3 if fusion else 0,
-            pass_config=SimpleNamespace(fuse_allreduce_rms=fusion),
-        ),
-        parallel_config=SimpleNamespace(
-            tensor_parallel_size=tp,
-            nnodes=1,
-            decode_context_parallel_size=1,
-            prefill_context_parallel_size=1,
-            pipeline_parallel_size=1,
-            data_parallel_size=1,
-            world_size=tp,
-            disable_custom_all_reduce=True,
-            enable_expert_parallel=False,
-            worker_cls="vllm.v1.worker.gpu_worker.Worker",
-        ),
-        model_config=SimpleNamespace(
-            enable_sleep_mode=True,
-            enable_nccl_comm_suspend=suspend,
-            sleep_mode_backend="cumem",
-        ),
-        use_v2_model_runner=True,
-        weight_transfer_config=None,
-        kv_transfer_config=None,
-        ec_transfer_config=None,
+    config = _config(
+        **{
+            "compilation_config.mode": 3 if fusion else 0,
+            "compilation_config.pass_config.fuse_allreduce_rms": fusion,
+            "parallel_config.tensor_parallel_size": tp,
+            "parallel_config.world_size": tp,
+            "parallel_config.data_parallel_size": dp,
+            "parallel_config.enable_expert_parallel": dp > 1,
+            "model_config.enable_nccl_comm_suspend": suspend,
+        }
     )
     with (
         patch.object(MultiprocExecutor, "__init__", return_value=None),
@@ -268,31 +300,57 @@ def test_transport_requires_suspension_and_no_nvls(
         if accepted:
             obj = CUDACheckpointExecutor(config)
             assert obj._checkpoint_flashinfer == fusion
+            assert obj._use_nccl_suspend
             obj.shutdown()
         else:
             with pytest.raises(ValueError, match="NCCL checkpoint configuration"):
                 CUDACheckpointExecutor(config)
 
 
-@pytest.mark.parametrize(
-    "has_symbols,actual,expected",
-    [(False, True, True), (True, False, True), (True, True, False)],
-)
-def test_validate_rejects_missing_or_inconsistent_nccl(
-    monkeypatch, has_symbols, actual, expected
-):
-    from vllm.v1.executor.cuda_checkpoint_executor import _validate_nccl_checkpoint
-
+def _group(world_size, has_symbols=True, suspended=False, available=True):
     comm = SimpleNamespace(
-        available=True,
+        available=available,
         disabled=False,
-        _suspended=actual,
+        _suspended=suspended,
         nccl=SimpleNamespace(has_symbol=lambda _: has_symbols),
     )
-    group = SimpleNamespace(device_communicator=SimpleNamespace(pynccl_comm=comm))
-    monkeypatch.setattr("vllm.distributed.get_tp_group", lambda: group)
-    with pytest.raises(RuntimeError, match="active suspend/resume"):
+    return SimpleNamespace(
+        world_size=world_size, device_communicator=SimpleNamespace(pynccl_comm=comm)
+    )
+
+
+@pytest.mark.parametrize(
+    "groups,expected,valid",
+    [
+        pytest.param([_group(2, suspended=True)], True, True, id="tp-suspended"),
+        pytest.param([_group(2, has_symbols=False)], False, False, id="no-symbols"),
+        pytest.param([_group(2)], True, False, id="tp-not-suspended"),
+        pytest.param(
+            [_group(1), _group(8, suspended=True)], True, True, id="ep-at-tp1"
+        ),
+        pytest.param(
+            [_group(2, suspended=True), _group(8)], True, False, id="ep-not-suspended"
+        ),
+        pytest.param(
+            [_group(2, suspended=True), _group(8, available=False)],
+            True,
+            True,
+            id="unavailable-skipped",
+        ),
+        pytest.param([_group(1)], False, False, id="no-device-group"),
+    ],
+)
+def test_validate_checks_every_device_group(monkeypatch, groups, expected, valid):
+    from vllm.distributed import parallel_state
+    from vllm.v1.executor.cuda_checkpoint_executor import _validate_nccl_checkpoint
+
+    refs = {str(i): (lambda g=g: g) for i, g in enumerate(groups)}
+    monkeypatch.setattr(parallel_state, "_groups", refs)
+    if valid:
         _validate_nccl_checkpoint(None, expected)
+    else:
+        with pytest.raises(RuntimeError, match="active suspend/resume"):
+            _validate_nccl_checkpoint(None, expected)
 
 
 def test_flashinfer_hooks_wrap_driver_checkpoint_once(executor):
@@ -359,55 +417,37 @@ def test_kv_first_partial_wake_then_sleep_preserves_parent_noop(executor):
 
 
 @pytest.mark.parametrize(
-    "component,field,value",
+    "overrides",
     [
-        ("parallel_config", "tensor_parallel_size", 0),
-        ("parallel_config", "tensor_parallel_size", -1),
-        ("parallel_config", "nnodes", 2),
-        ("parallel_config", "enable_expert_parallel", True),
-        ("parallel_config", "worker_cls", "custom.Worker"),
-        ("model_config", "sleep_mode_backend", "custom"),
-        (None, "use_v2_model_runner", False),
-        (None, "weight_transfer_config", object()),
-        ("platform", "is_cuda", False),
-        ("platform", "linux", False),
+        pytest.param({"parallel_config.tensor_parallel_size": 0}, id="tp0"),
+        pytest.param({"parallel_config.tensor_parallel_size": -1}, id="tp-negative"),
+        pytest.param({"parallel_config.nnodes_within_dp": 2}, id="tp-across-nodes"),
+        pytest.param({"parallel_config.pipeline_parallel_size": 2}, id="pp"),
+        pytest.param(
+            {
+                "parallel_config.enable_expert_parallel": True,
+                "parallel_config.all2all_backend": "deepep_low_latency",
+            },
+            id="ep-deepep",
+        ),
+        pytest.param({"parallel_config.worker_cls": "custom.Worker"}, id="worker"),
+        pytest.param({"model_config.sleep_mode_backend": "custom"}, id="backend"),
+        pytest.param({"use_v2_model_runner": False}, id="v1-runner"),
+        pytest.param({"weight_transfer_config": object()}, id="weight-transfer"),
+        pytest.param({"platform.is_cuda": False}, id="not-cuda"),
+        pytest.param({"platform.linux": False}, id="not-linux"),
     ],
 )
 def test_unsupported_checkpoint_configuration_fails_before_workers(
-    component, field, value, monkeypatch
+    overrides, monkeypatch
 ):
-    config = SimpleNamespace(
-        parallel_config=SimpleNamespace(
-            tensor_parallel_size=1,
-            world_size=1,
-            nnodes=1,
-            decode_context_parallel_size=1,
-            prefill_context_parallel_size=1,
-            pipeline_parallel_size=1,
-            data_parallel_size=1,
-            enable_expert_parallel=False,
-            worker_cls="vllm.v1.worker.gpu_worker.Worker",
-        ),
-        model_config=SimpleNamespace(
-            enable_sleep_mode=True,
-            enable_nccl_comm_suspend=False,
-            sleep_mode_backend="cumem",
-        ),
-        use_v2_model_runner=True,
-        weight_transfer_config=None,
-        kv_transfer_config=None,
-        ec_transfer_config=None,
+    cuda = overrides.get("platform.is_cuda", True)
+    monkeypatch.setattr("vllm.platforms.current_platform.is_cuda", lambda: cuda)
+    if not overrides.get("platform.linux", True):
+        monkeypatch.setattr("sys.platform", "darwin")
+    config = _config(
+        **{k: v for k, v in overrides.items() if not k.startswith("platform.")}
     )
-    monkeypatch.setattr("vllm.platforms.current_platform.is_cuda", lambda: True)
-    if component == "platform":
-        if field == "is_cuda":
-            monkeypatch.setattr(
-                "vllm.platforms.current_platform.is_cuda", lambda: value
-            )
-        else:
-            monkeypatch.setattr("sys.platform", "darwin")
-    else:
-        setattr(getattr(config, component) if component else config, field, value)
     with (
         patch.object(MultiprocExecutor, "__init__") as initialize,
         patch.object(MultiprocExecutor, "shutdown"),

@@ -282,17 +282,22 @@ and FlashInfer 0.6.18.post1. See [PR #58183](https://github.com/vllm-project/vll
 for versioned test results and communication performance comparisons. Support
 for other GPU, driver, and communication-library combinations is not established.
 
-Only single-node tensor parallelism is accepted. Tensor parallel sizes 1, 2,
-and 4 have been GPU-tested; other sizes remain unvalidated. Use
+Tensor parallelism must stay within one node. Tensor parallel sizes 1, 2,
+and 4 have been GPU-tested; other sizes remain unvalidated. Data parallelism,
+including data parallel ranks on several nodes, is accepted with expert
+parallelism over the `allgather_reducescatter` all2all backend; each node's
+engines checkpoint their own workers. Data parallel size 4 with expert
+parallelism on one GB300 node, and size 8 over two GB300 nodes connected by
+multi-node NVLink, have been GPU-tested. Use
 `VLLM_USE_V2_MODEL_RUNNER=1`, the standard GPU worker and the `cumem` sleep
-backend. Pipeline, data, context and expert parallelism, external cache or
-weight transfer, custom worker classes, and sleep level 2 are rejected before
-worker startup (sleep level 2 is rejected when requested). Worker extensions
+backend. Pipeline and context parallelism, other all2all backends, external
+cache or weight transfer, custom worker classes, and sleep level 2 are rejected
+before worker startup (sleep level 2 is rejected when requested). Worker extensions
 that allocate additional CUDA IPC resources are outside the validated scope.
 Level 0 remains
 a scheduler pause and does not perform a CUDA checkpoint.
 
-For tensor parallel sizes greater than 1, use NCCL 2.29.7 or later with memory
+For tensor or data parallel sizes greater than 1, use NCCL 2.29.7 or later with memory
 suspension support, set `enable_nccl_comm_suspend=True`, and pass
 `disable_custom_all_reduce=True`. The following explicit configuration retains
 NCCL GPU peer-to-peer or legacy shared-memory communication, selected by NCCL.
@@ -304,13 +309,20 @@ sleep suspends NCCL mappings; worker wake restores them at their reserved
 addresses. The executor checks each rank's actual suspension state.
 
 ```bash
-export NCCL_IB_DISABLE=1
 export NCCL_CUMEM_ENABLE=1 NCCL_CUMEM_HOST_ENABLE=0 NCCL_NVLS_ENABLE=0
 export VLLM_ALLREDUCE_USE_SYMM_MEM=0 VLLM_USE_NCCL_SYMM_MEM=0
 export VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC=0
 export VLLM_ALLREDUCE_USE_FLASHINFER=1
 export VLLM_FLASHINFER_ALLREDUCE_BACKEND=trtllm
 ```
+
+InfiniBand/RoCE (NCCL NET transport) is accepted with communicator suspension,
+including GPUDirect RDMA. Its buffers are registered with the NIC, and a restore
+moves them to new physical pages, so NCCL must release the registrations on
+suspend and redo them on resume
+([NVIDIA/nccl#2530](https://github.com/NVIDIA/nccl/pull/2530)). Without that
+change, collectives over the network return wrong data or hang after a restore;
+the executor cannot detect the NCCL version that has it.
 
 FlashInfer must provide stable-address workspace `checkpoint_prepare` and
 `checkpoint_restore` methods. The executor calls existing worker hooks around
