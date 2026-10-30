@@ -279,8 +279,9 @@ def _safetensors_header(path: str) -> bytes:
 def hash_checkpoint(model: str) -> str | None:
     """Fingerprint checkpoint content from local safetensors metadata.
 
-    Hashes each shard's safetensors header so a daemon and an engine pointing
-    at identical weights in different directories produce the same key. Returns
+    Hashes each shard's safetensors header, size and modification time, so a
+    daemon and an engine pointing at the same files (or copies that keep the
+    modification time) produce the same key without reading weight bytes. Returns
     None when local safetensors files can't be located (e.g. an undownloaded
     Hugging Face repo id), leaving the caller to fall back to the model path.
     """
@@ -297,6 +298,10 @@ def hash_checkpoint(model: str) -> str | None:
     for path in sorted(files, key=os.path.basename):
         hasher.update(os.path.basename(path).encode())
         hasher.update(_safetensors_header(path))
+        # The header does not cover the tensor bytes: a rewritten shard with
+        # the same layout differs only in size or modification time.
+        info = os.stat(path)
+        hasher.update(f"{info.st_size}:{info.st_mtime_ns}".encode())
     return hasher.hexdigest()
 
 

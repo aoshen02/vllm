@@ -727,3 +727,31 @@ def test_ipc_cache_key_tracks_kv_quantization(
     assert len(requested_keys) == 2
     for key in requested_keys:
         assert server.cache_key.mismatched_fields(key) == mismatched_fields
+
+
+def test_checkpoint_hash_covers_tensor_bytes(tmp_path):
+    import os
+
+    import torch
+    from safetensors.torch import save_file
+
+    from vllm.model_executor.model_loader.weight_cache.protocol import (
+        hash_checkpoint,
+    )
+
+    ckpt = tmp_path / "ckpt"
+    ckpt.mkdir()
+    shard = ckpt / "model.safetensors"
+    save_file({"w": torch.ones(4)}, str(shard))
+    first = hash_checkpoint(str(ckpt))
+
+    copy = tmp_path / "copy"
+    copy.mkdir()
+    shutil.copy2(shard, copy / "model.safetensors")
+    assert hash_checkpoint(str(copy)) == first
+
+    # Same safetensors header, different tensor bytes.
+    stat = shard.stat()
+    save_file({"w": torch.full((4,), 2.0)}, str(shard))
+    os.utime(shard, ns=(stat.st_atime_ns, stat.st_mtime_ns + 10**9))
+    assert hash_checkpoint(str(ckpt)) != first
