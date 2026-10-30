@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Opt-in, single-node sleep executor preserving complete CUDA worker state."""
+"""Opt-in sleep executor preserving complete CUDA worker state."""
 
 import json
 import os
@@ -30,16 +30,25 @@ def _serialized(method):
 
 
 def _validate_nccl_checkpoint(worker, suspended):
-    from vllm.distributed import get_tp_group
+    from vllm.distributed import parallel_state
 
-    comm = cast(Any, get_tp_group().device_communicator).pynccl_comm
-    if (
-        comm is None
-        or not comm.available
-        or comm.disabled
-        or not comm.nccl.has_symbol("ncclCommSuspend")
+    # Every multi-rank device group (TP, and the EP group spanning DP ranks) holds
+    # NCCL memory that must be suspended before the checkpoint.
+    comms = [
+        comm
+        for ref in parallel_state._groups.values()
+        if (group := ref()) is not None
+        and group.world_size > 1
+        and (comm := getattr(group.device_communicator, "pynccl_comm", None))
+        is not None
+        and comm.available
+        and not comm.disabled
+    ]
+    if not comms or any(
+        not comm.nccl.has_symbol("ncclCommSuspend")
         or not comm.nccl.has_symbol("ncclCommResume")
         or comm._suspended != suspended
+        for comm in comms
     ):
         raise RuntimeError(
             "NCCL checkpoint requires an active suspend/resume implementation"
@@ -59,12 +68,21 @@ class CUDACheckpointExecutor(MultiprocExecutor):
         if (
             not vllm_config.use_v2_model_runner
             or vllm_config.model_config.sleep_mode_backend != "cumem"
-            or parallel.enable_expert_parallel
             or parallel.worker_cls not in ("auto", "vllm.v1.worker.gpu_worker.Worker")
         ):
             raise ValueError(
                 "CUDA checkpoint requires the V2 GPU model runner, cumem sleep "
-                "backend and standard GPU worker, without expert parallelism"
+                "backend and standard GPU worker"
+            )
+        # Other all2all backends allocate their own IPC/NVSHMEM buffers, which
+        # NCCL suspension does not release.
+        if (
+            parallel.enable_expert_parallel
+            and parallel.all2all_backend != "allgather_reducescatter"
+        ):
+            raise ValueError(
+                "CUDA checkpoint with expert parallelism requires the "
+                "allgather_reducescatter all2all backend"
             )
         compilation = getattr(vllm_config, "compilation_config", None)
         passes = getattr(compilation, "pass_config", None)
@@ -77,20 +95,28 @@ class CUDACheckpointExecutor(MultiprocExecutor):
         self._checkpoint_flashinfer = parallel.tensor_parallel_size > 1 and (
             standalone_flashinfer or fused_allreduce
         )
-        self._use_nccl_suspend = (
-            parallel.tensor_parallel_size > 1
-            and vllm_config.model_config.enable_nccl_comm_suspend
+        # Data parallel ranks share device groups (e.g. expert parallel) even at
+        # TP=1, so they need the same NCCL configuration as TP.
+        has_device_groups = (
+            parallel.tensor_parallel_size > 1 or parallel.data_parallel_size > 1
         )
+        self._use_nccl_suspend = (
+            has_device_groups and vllm_config.model_config.enable_nccl_comm_suspend
+        )
+        # Each engine checkpoints its own node's workers; data parallel ranks may
+        # span nodes, but one replica's tensor parallel group may not.
         if (
             parallel.tensor_parallel_size < 1
-            or parallel.nnodes != 1
+            or parallel.nnodes_within_dp != 1
             or parallel.decode_context_parallel_size != 1
             or parallel.prefill_context_parallel_size != 1
             or parallel.pipeline_parallel_size != 1
-            or parallel.data_parallel_size != 1
             or parallel.world_size != parallel.tensor_parallel_size
         ):
-            raise ValueError("CUDA checkpoint requires single-node tensor parallelism")
+            raise ValueError(
+                "CUDA checkpoint requires tensor parallelism within one node, "
+                "optionally with data and expert parallelism"
+            )
         if (
             vllm_config.kv_transfer_config
             or vllm_config.ec_transfer_config
@@ -101,7 +127,7 @@ class CUDACheckpointExecutor(MultiprocExecutor):
             )
         if not vllm_config.model_config.enable_sleep_mode:
             raise ValueError("CUDA checkpoint requires enable_sleep_mode=True")
-        if parallel.tensor_parallel_size > 1:
+        if has_device_groups:
             required = {
                 "NCCL_P2P_DISABLE": "1",
                 "NCCL_SHM_DISABLE": "1",
@@ -119,6 +145,9 @@ class CUDACheckpointExecutor(MultiprocExecutor):
                 # P2P or SHM rather than requiring one transport topology.
                 required.pop("NCCL_P2P_DISABLE")
                 required.pop("NCCL_SHM_DISABLE")
+                # Suspension also releases the NIC registrations of NET buffers
+                # and redoes them on resume (NVIDIA/nccl#2530).
+                required.pop("NCCL_IB_DISABLE")
                 # Live multicast allocations can block checkpoint even on
                 # newer user-mode drivers. Keep NVLS disabled until the sleep
                 # path can release those allocations before checkpoint.
