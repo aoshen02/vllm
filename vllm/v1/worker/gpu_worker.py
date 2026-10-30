@@ -60,6 +60,7 @@ from vllm.distributed.weight_transfer import (
     WeightTransferEngine,
     WeightTransferEngineFactory,
 )
+from vllm.distributed.weight_transfer.profile import WeightUpdateProfiler
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.model_executor.layers.quantization.online.lm_head import (
@@ -235,6 +236,7 @@ class Worker(WorkerBase):
         self.weight_transfer_engine: WeightTransferEngine | None = None
         self._weight_update_active = False
         self._weight_update_is_draft = False
+        self._weight_update_profiler = WeightUpdateProfiler(rank=self.rank)
 
         # Worker profiler. Enabled and configured through profiler_config.
         # Profiler wrapper is created lazily in profile() when start is called,
@@ -1583,7 +1585,8 @@ class Worker(WorkerBase):
                 # Load through the unquantized target head, as without
                 # draft_lm_head_quantization; finish re-derives the copies.
                 share_source_lm_heads(draft_model)
-            self.weight_transfer_engine.start_weight_update()
+            with self._weight_update_profiler.start(is_draft=is_draft):
+                self.weight_transfer_engine.start_weight_update()
         except BaseException:
             self.weight_transfer_engine.reset_weight_update_target()
             if draft_model is not None:
@@ -1623,7 +1626,8 @@ class Worker(WorkerBase):
                     ]
                 else:
                     local_update_info = update_info
-                self.weight_transfer_engine.update_weights(local_update_info)
+                with self._weight_update_profiler.update():
+                    self.weight_transfer_engine.update_weights(local_update_info)
             except BaseException:
                 self._weight_update_active = False
                 self.weight_transfer_engine.reset_weight_update_target()
@@ -1644,7 +1648,8 @@ class Worker(WorkerBase):
             )
 
         with set_current_vllm_config(self.vllm_config):
-            self.weight_transfer_engine.finish_weight_update()
+            with self._weight_update_profiler.finish():
+                self.weight_transfer_engine.finish_weight_update()
             self.weight_transfer_engine.reset_weight_update_target()
             self._weight_update_active = False
             if self._weight_update_is_draft and (
@@ -1655,6 +1660,10 @@ class Worker(WorkerBase):
         # Weight transfer bypasses GPUModelRunner.reload_weights().
         if not self._weight_update_is_draft:
             self.model_runner.reset_lora_state()
+
+    def get_weight_update_profile(self) -> dict[str, Any] | None:
+        """Cost breakdown of this worker's last finished weight update."""
+        return self._weight_update_profiler.last
 
     def shutdown(self) -> None:
         gc.unfreeze()
