@@ -34,6 +34,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
     MambaSpec,
 )
+from vllm.v1.request import RequestStatus
 
 
 def _make_bare_scheduler(
@@ -212,6 +213,12 @@ def _make_preemption_scheduler_output():
         num_scheduled_tokens={},
         scheduled_spec_decode_tokens={},
     )
+
+
+def _preempt(scheduler: MooncakeStoreScheduler) -> None:
+    """Preempt req-0 as Scheduler._preempt_request does, then report it."""
+    scheduler._unfinished_requests["req-0"][0].status = RequestStatus.PREEMPTED
+    scheduler.build_connector_meta(_make_preemption_scheduler_output())
 
 
 def _make_worker_output(completed_saves: dict[int, int]) -> SimpleNamespace:
@@ -521,7 +528,7 @@ def test_preemption_resets_tracker():
     )
     scheduler._request_trackers["req-0"].has_pending_offload = True
 
-    scheduler.build_connector_meta(_make_preemption_scheduler_output())
+    _preempt(scheduler)
 
     tracker = scheduler._request_trackers["req-0"]
     assert tracker.token_len == 0
@@ -532,25 +539,50 @@ def test_preemption_resets_tracker():
     assert tracker.prefill_end_tokens == 0
 
 
-def test_preemption_clears_stale_load_state():
+@pytest.mark.parametrize(
+    "status,make_output",
+    [
+        (RequestStatus.PREEMPTED, _make_preemption_scheduler_output),
+        (
+            RequestStatus.WAITING_FOR_REMOTE_KVS,
+            lambda: _make_pending_load_scheduler_output(),
+        ),
+        (
+            RequestStatus.RUNNING,
+            lambda: _make_resumed_scheduler_output(num_scheduled_tokens=48),
+        ),
+    ],
+    ids=["preempted", "readmitted-pending-load", "readmitted-scheduled"],
+)
+def test_preemption_clears_only_the_preempted_attempt(status, make_output):
+    # A pause preempts outside schedule(), so the step that re-admits the
+    # request also reports its preemption; the new attempt's load must survive.
     scheduler = _make_bare_scheduler()
-    _make_pending_load_unfinished_request(
-        scheduler,
+    request = SimpleNamespace(
+        status=status,
+        all_token_ids=list(range(48)),
         num_tokens=48,
+        num_prompt_tokens=48,
         block_hashes=[b"h0", b"h1", b"h2"],
-        block_ids=([10, 11, 12],),
+        num_computed_tokens=0,
+        num_output_placeholders=0,
     )
+    scheduler._unfinished_requests["req-0"] = (request, ([0, 1, 2],))
     scheduler.load_specs["req-0"] = LoadSpec(
         vllm_cached_tokens=0,
         kvpool_cached_tokens=48,
         can_load=True,
     )
+    output = make_output()
+    output.preempted_req_ids = {"req-0"}
 
-    meta = scheduler.build_connector_meta(_make_preemption_scheduler_output())
+    meta = scheduler.build_connector_meta(output)
 
-    assert meta.requests == []
+    readmitted = status != RequestStatus.PREEMPTED
+    loads = [r.req_id for r in meta.requests if r.load_spec and r.load_spec.can_load]
+    assert loads == (["req-0"] if readmitted else [])
     assert "req-0" not in scheduler.load_specs
-    assert "req-0" not in scheduler._unfinished_requests
+    assert ("req-0" in scheduler._unfinished_requests) == readmitted
 
 
 def _make_pending_load_unfinished_request(
@@ -1618,7 +1650,7 @@ def test_preemption_and_request_id_reuse_do_not_release_inflight_job():
     first = scheduler.build_connector_meta(_make_offload_only_output([(1, 7, 16)]))
     first_job_id = first.requests[0].store_job_id
 
-    scheduler.build_connector_meta(_make_preemption_scheduler_output())
+    _preempt(scheduler)
     assert scheduler._gpu_block_pool.blocks[7].ref_cnt == 1
     assert first_job_id in scheduler._pinned_saves
 

@@ -40,7 +40,7 @@ from vllm.v1.kv_cache_interface import (
     get_mamba_prefill_checkpoint_position,
 )
 from vllm.v1.outputs import KVConnectorOutput
-from vllm.v1.request import Request
+from vllm.v1.request import Request, RequestStatus
 
 logger = init_logger(__name__)
 
@@ -317,6 +317,11 @@ class MooncakeStoreScheduler:
 
         preempted_ids = scheduler_output.preempted_req_ids or set()
         for req_id in preempted_ids:
+            entry = self._unfinished_requests.get(req_id)
+            if entry is not None and entry[0].status != RequestStatus.PREEMPTED:
+                # Preempted outside schedule() and re-admitted in this step:
+                # the state held is the new attempt's.
+                continue
             self.load_specs.pop(req_id, None)
             if request_tracker := self._request_trackers.get(req_id):
                 request_tracker.reset()
