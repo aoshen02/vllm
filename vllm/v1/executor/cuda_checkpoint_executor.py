@@ -125,6 +125,18 @@ class CUDACheckpointExecutor(MultiprocExecutor):
             raise ValueError(
                 "CUDA checkpoint does not support external cache or weight transfer"
             )
+        engram = getattr(vllm_config, "engram_config", None)
+        if (
+            parallel.data_parallel_size > 1
+            and engram is not None
+            and (engram.dp_shared_memory or engram.peer_exchange)
+        ):
+            # Shared host tables and symmetric-memory peer mappings are not
+            # released by sleep mode.
+            raise ValueError(
+                "CUDA checkpoint with Engram across data parallel ranks requires "
+                "engram_config dp_shared_memory=False and peer_exchange=False"
+            )
         if not vllm_config.model_config.enable_sleep_mode:
             raise ValueError("CUDA checkpoint requires enable_sleep_mode=True")
         if has_device_groups:
