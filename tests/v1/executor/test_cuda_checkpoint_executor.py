@@ -315,13 +315,23 @@ def test_flashinfer_hooks_wrap_driver_checkpoint_once(executor):
     ]
 
 
-def test_sleep_worker_rpc_has_deadline(executor):
+@pytest.mark.parametrize(
+    "method,timeout,expected",
+    [
+        ("sleep", None, 300),
+        ("wake_up", None, 300),
+        ("wake_up", 7, 7),
+        ("checkpoint_prepare", None, None),
+    ],
+    ids=["sleep-copy-deadline", "wake-copy-deadline", "explicit-wins", "other-rpc"],
+)
+def test_worker_rpc_deadline(executor, method, timeout, expected):
+    # Sleep and wake copy the offloaded weights (81 GiB per DeepSeek-V4.1-Flash
+    # TP4 worker), so they get the same deadline as checkpoint and restore.
     obj, _ = executor
     with patch.object(MultiprocExecutor, "collective_rpc", return_value=[]) as rpc:
-        obj.collective_rpc("sleep")
-        assert rpc.call_args.kwargs["timeout"] == 120
-        obj.collective_rpc("wake_up", timeout=7)
-        assert rpc.call_args.kwargs["timeout"] == 7
+        obj.collective_rpc(method, timeout=timeout)
+    assert rpc.call_args.kwargs["timeout"] == expected
 
 
 def test_worker_termination_reaps_real_processes():
