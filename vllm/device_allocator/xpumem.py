@@ -188,6 +188,7 @@ class XpuMemAllocator:
             size_in_bytes = data.handle[1]
             total_bytes += size_in_bytes
             if data.tag not in offload_tags:
+                torch.accelerator.synchronize(data.handle[0])
                 unmap_and_release(data.handle)
                 data.is_asleep = True
                 continue

@@ -274,6 +274,8 @@ class CuMemAllocator:
                 cpu_ptr = cpu_backup_tensor.data_ptr()
                 libcudart.cudaMemcpy(cpu_ptr, ptr, size_in_bytes)
                 data.cpu_backup_tensor = cpu_backup_tensor
+            else:
+                torch.accelerator.synchronize(handle[0])
             try:
                 unmap_and_release(handle)
             finally:
