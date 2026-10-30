@@ -166,6 +166,11 @@ class EngineClient(ABC):
         ...
 
     @abstractmethod
+    async def check_health_generate(self, timeout: float = 20.0) -> None:
+        """Require a scheduler or inference response, not just a live frontend."""
+        ...
+
+    @abstractmethod
     async def start_profile(
         self,
         profile_prefix: str | None = None,

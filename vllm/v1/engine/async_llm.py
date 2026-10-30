@@ -51,6 +51,7 @@ from vllm.tokenizers import TokenizerLike
 from vllm.tracing import init_tracer, log_tracing_disabled_warning
 from vllm.transformers_utils.config import maybe_register_config_serialize_by_value
 from vllm.usage.usage_lib import UsageContext
+from vllm.utils import random_uuid
 from vllm.utils.async_utils import cancel_task_threadsafe
 from vllm.utils.collection_utils import as_list
 from vllm.v1.engine import EngineCoreRequest, PauseMode
@@ -1132,6 +1133,31 @@ class AsyncLLM(EngineClient):
             return
         if self.errored:
             raise self.dead_error
+
+    async def check_health_generate(self, timeout: float = 20.0) -> None:
+        """Require a scheduler reply when busy, or an inference result when idle."""
+        async with asyncio.timeout(timeout):
+            await self.check_health()
+            if await self.is_sleeping() or any(
+                await self.engine_core.call_utility_all_async("has_work")
+            ):
+                return
+            request_id = f"healthcheck-{random_uuid()}"
+            prompt = TokensPrompt(prompt_token_ids=[0])
+            generator = (
+                self.generate(
+                    prompt,
+                    SamplingParams(max_tokens=1, temperature=1, top_k=1),
+                    request_id,
+                )
+                if self.model_config.runner_type == "generate"
+                else self.encode(prompt, PoolingParams(), request_id)
+            )
+            try:
+                await anext(generator)
+            finally:
+                await self.abort(request_id)
+                await generator.aclose()
 
     async def start_profile(
         self,
