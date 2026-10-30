@@ -449,7 +449,9 @@ def _load_weights(
         loaded.add(name)
 
     # The default loader skips this check for quantized models. Weight
-    # transfer engines load one tensor or one bucket per call and disable it.
+    # transfer engines load one tensor or one bucket per call and disable it;
+    # the layerwise reload checks completeness when the update finishes
+    # (``strict_weight_reload``).
     complete = is_mtp_completeness_check_enabled()
     if complete and (missing := sorted(set(params) - loaded)):
         raise ValueError(f"Parameters not loaded from the checkpoint: {missing}")
@@ -459,11 +461,23 @@ def _load_weights(
             "Checkpoint is missing lerope.alpha"
         )
         if lerope_alpha is not None:
-            mistral_model.rotary_emb.set_lerope_alpha(lerope_alpha)
+            rotary_emb = mistral_model.rotary_emb
+            if rotary_emb.cos_sin_cache.is_meta:
+                # A layerwise reload restores the previous cos/sin cache.
+                current = rotary_emb.lerope_alpha
+                if current is None or not torch.equal(
+                    current, lerope_alpha.detach().float().to(current.device)
+                ):
+                    raise ValueError("lerope.alpha cannot change in a weight reload")
+            else:
+                rotary_emb.set_lerope_alpha(lerope_alpha)
     return loaded
 
 
 class MistralLarge4ForCausalLM(nn.Module, SupportsLoRA, SupportsEagle3):
+    # Weight transfers must deliver every weight; see _check_reload_complete.
+    strict_weight_reload = True
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
         config = vllm_config.model_config.hf_config
