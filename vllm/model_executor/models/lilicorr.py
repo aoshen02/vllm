@@ -23,10 +23,6 @@ from vllm.model_executor.layers.quantization.base_config import QuantizationConf
 from vllm.model_executor.layers.quantization.modelopt import ModelOptLinearMethod
 from vllm.model_executor.layers.quantization.utils.quant_utils import kNvfp4Static
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
-from vllm.model_executor.model_loader.mtp_validation import (
-    is_mtp_completeness_check_enabled,
-)
-from vllm.model_executor.utils import refill_derived
 
 from .nemotron_h import NemotronHMLP
 from .qwen3_dflash import DFlashQwen3ForCausalLM, DFlashQwen3Model
@@ -244,9 +240,6 @@ class LiLiCorrHead(nn.Module):
             quant_config=None,
             prefix=maybe_prefix(prefix, "in_head"),
         )
-        # Read raw by materialize_inference_buffers; CPU would repack them away.
-        for proj in (self.factor_input_proj, self.out_head, self.in_head):
-            proj._cpu_skip_gemm_dispatch = True
         self.anchor_out_head = ReplicatedLinear(
             hidden_size,
             self.factor_dim,
@@ -256,7 +249,7 @@ class LiLiCorrHead(nn.Module):
         )
         self._fused_edge_weight: torch.Tensor | None = None
         self._fused_edge_bias: torch.Tensor | None = None
-        self._factor_input_splits: tuple[torch.Tensor, ...] = ()
+        self._factor_input_splits: tuple[torch.Tensor, ...]
         self._attn_bias: torch.Tensor | None = None
         self._rank_frac_col: torch.Tensor
         self._is_top1_col: torch.Tensor
@@ -265,31 +258,23 @@ class LiLiCorrHead(nn.Module):
     def materialize_inference_buffers(
         self, device: torch.device, dtype: torch.dtype
     ) -> None:
-        """Build inference-only views/copies after checkpoint weights are loaded.
-        Reruns on every weight reload and refills them in place: captured CUDA
-        graphs keep the addresses from startup."""
+        """Build inference-only views/copies after checkpoint weights are loaded."""
         topk = self.candidate_topk
-        refill_derived(
-            self, "_attn_bias", self._build_attention_bias(device=device, dtype=dtype)
-        )
+        self._attn_bias = self._build_attention_bias(device=device, dtype=dtype)
         # Both projections consume the same candidate features f:
         #   out = W_out @ f + b_out
         #   incoming = W_in @ f + b_in
         # Stack weights and biases to compute both in one linear call. score()
         # splits the result and normalizes the two vectors separately.
-        refill_derived(
-            self,
-            "_fused_edge_weight",
+        self._fused_edge_weight = (
             torch.cat([self.out_head.weight, self.in_head.weight], dim=0)
             .to(device=device, dtype=dtype)
-            .contiguous(),
+            .contiguous()
         )
-        refill_derived(
-            self,
-            "_fused_edge_bias",
+        self._fused_edge_bias = (
             torch.cat([self.out_head.bias, self.in_head.bias], dim=0)
             .to(device=device, dtype=dtype)
-            .contiguous(),
+            .contiguous()
         )
         # For candidate state x and request anchor a, the trained projection is:
         #   W @ concat(x, a, x*a) + b
@@ -299,14 +284,11 @@ class LiLiCorrHead(nn.Module):
         # W_a @ a across candidates, adding the original bias only once.
         weight = self.factor_input_proj.weight
         hdim = self.hidden_size
-        splits = (weight[:, :hdim], weight[:, hdim : 2 * hdim], weight[:, 2 * hdim :])
-        if self._factor_input_splits:
-            for cached, split in zip(self._factor_input_splits, splits):
-                cached.copy_(split)
-        else:
-            self._factor_input_splits = tuple(s.contiguous() for s in splits)
-        if hasattr(self, "_rank_frac_col"):
-            return  # the rank constants depend on topk only
+        self._factor_input_splits = (
+            weight[:, :hdim].contiguous(),
+            weight[:, hdim : 2 * hdim].contiguous(),
+            weight[:, 2 * hdim :].contiguous(),
+        )
         if topk > 1:
             rank_frac = torch.arange(topk, device=device, dtype=torch.float32).view(
                 1, 1, topk
@@ -555,13 +537,10 @@ class LiLiCorrForCausalLM(DFlashQwen3ForCausalLM):
         super().load_weights(normalized_weights())
         AutoWeightsLoader(self.model.lilicorr).load_weights(head_weights)
         missing = expected - seen
-        if missing and is_mtp_completeness_check_enabled():
+        if missing:
             raise ValueError(
                 f"LiLiCorr checkpoint coverage mismatch: missing={sorted(missing)}"
             )
-
-    def process_weights_after_loading(self) -> None:
-        super().process_weights_after_loading()
         head = self.model.lilicorr
         parameter = head.slot_embedding
         head.materialize_inference_buffers(parameter.device, parameter.dtype)

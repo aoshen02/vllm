@@ -230,9 +230,9 @@ class MoESwiGLUFFNFP8(MoESwiGLUFFN):
 
     @torch.no_grad()
     def process_weights_after_loading(self) -> None:
-        # Reruns on every weight reload: rebuild the fused FP8 experts from the
-        # freshly loaded checkpoint experts, refilling the fused buffers in
-        # place (captured CUDA graphs keep the startup addresses).
+        if hasattr(self, "_fused_w13_fp8"):
+            return
+
         w13_weights = []
         w13_scales = []
         w2_weights = []
@@ -246,18 +246,27 @@ class MoESwiGLUFFNFP8(MoESwiGLUFFN):
             w2_weights.append(w2)
             w2_scales.append(s2)
 
-        # The checkpoint experts stay registered: a reload writes into them.
-        for name, parts in (
-            ("_fused_w13_fp8", w13_weights),
-            ("_fused_w13_scale", w13_scales),
-            ("_fused_w2_fp8", w2_weights),
-            ("_fused_w2_scale", w2_scales),
-        ):
-            fused = torch.stack(parts).contiguous()
-            if name in self._buffers:
-                self._buffers[name].copy_(fused)
-            else:
-                self.register_buffer(name, fused, persistent=False)
+        self.register_buffer(
+            "_fused_w13_fp8",
+            torch.stack(w13_weights).contiguous(),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_fused_w13_scale",
+            torch.stack(w13_scales).contiguous(),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_fused_w2_fp8",
+            torch.stack(w2_weights).contiguous(),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_fused_w2_scale",
+            torch.stack(w2_scales).contiguous(),
+            persistent=False,
+        )
+        del self.experts
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if not hasattr(self, "_fused_w13_fp8"):
@@ -545,9 +554,8 @@ class DotsMoEVitModel(PreTrainedModel):
             self.compile_block_modules()
 
     def compile_block_modules(self, **compile_kwargs: Any) -> None:
-        # Module.compile compiles in place: parameter names stay those of the
-        # checkpoint (no ``_orig_mod``), so weight reloads still find them.
-        # Post-load processing reruns on every reload; compile once.
+        # In-place compile keeps checkpoint parameter names (no ``_orig_mod``);
+        # post-load processing reruns on every reload, so compile once.
         if getattr(self, "_blocks_compiled", False):
             return
         for block in self.blocks:

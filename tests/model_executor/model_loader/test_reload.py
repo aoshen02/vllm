@@ -18,11 +18,18 @@ from torch.nn.parameter import UninitializedParameter
 import vllm.model_executor.model_loader.reload.layerwise as reload_layerwise
 import vllm.model_executor.model_loader.reload.meta as reload_meta
 from vllm.config import ModelConfig
+from vllm.distributed.weight_transfer.sparse_nccl_engine import (
+    SparseNCCLWeightTransferEngine,
+)
 from vllm.lora.request import LoRARequest
 from vllm.model_executor.layers.attention import MMEncoderAttention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.linear import QKVParallelLinear
 from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
+from vllm.model_executor.model_loader.checkpoint_weight_patch import (
+    CheckpointWeightPatch,
+    load_checkpoint_weight_patches,
+)
 from vllm.model_executor.model_loader.reload.layerwise import (
     finalize_layerwise_reload,
     initialize_layerwise_reload,
@@ -720,6 +727,7 @@ def test_padded_moe_reload_releases_each_layer(
         has_bias=has_bias,
         tp_rank=tp_rank,
         tp_shard_with_padding=False,
+        num_experts=experts,
         moe_parallel_config=SimpleNamespace(tp_size=2),
     )
     model = torch.nn.ModuleList()
@@ -735,9 +743,11 @@ def test_padded_moe_reload_releases_each_layer(
         layer.moe_config = config
         layer.quant_config = None
         layer.quant_method = method
-        layer.expert_map_manager = SimpleNamespace(map_global_to_local=lambda i: i)
+        layer.expert_map_manager = SimpleNamespace(
+            map_global_to_local=lambda i: i, num_fused_shared_experts=0
+        )
         layer._loaded_expert_biases = set()
-        layer._fused_shared_expert_quantizer = None
+        layer.shared_expert_online_loader = None
         method.create_weights(
             layer,
             experts,
@@ -1522,3 +1532,68 @@ def test_online_quantize_reload(
         mul_perp = llm.generate_prompt_perplexity(["3 4 = 12"], mask=["3 4 ="])[0]
         add_perp = llm.generate_prompt_perplexity(["3 4 = 7"], mask=["3 4 ="])[0]
         assert add_perp < mul_perp
+
+
+class _TwoLayerModel(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.a = torch.nn.Linear(2, 2, bias=False)
+        self.b = torch.nn.Linear(2, 2, bias=False)
+        self.hook_saw: list[tuple[float, float]] = []
+
+    def load_weights(self, weights) -> set[str]:
+        params = dict(self.named_parameters())
+        loaded = set()
+        for name, tensor in weights:
+            param = params[name]
+            getattr(param, "weight_loader", default_weight_loader)(param, tensor)
+            loaded.add(name)
+        return loaded
+
+    def process_weights_after_loading(self) -> None:
+        a, b = self.a.weight.mean().item(), self.b.weight.mean().item()
+        self.hook_saw.append((a, b))
+
+
+def _full(value: float) -> torch.Tensor:
+    return torch.full((2, 2), value)
+
+
+def _loaded_model() -> _TwoLayerModel:
+    model = _TwoLayerModel()
+    model.load_weights([("a.weight", _full(1.0)), ("b.weight", _full(2.0))])
+    return model
+
+
+class TestModelHookOnSplitLoad:
+    def test_layerwise_reload(self):
+        model = _loaded_model()
+        record_metadata_for_reloading(model)
+        config = SimpleNamespace(dtype=torch.float32)
+
+        initialize_layerwise_reload(model)
+        model.load_weights([("a.weight", _full(3.0))])
+        model.load_weights([("b.weight", _full(4.0))])
+        assert model.hook_saw == []
+        finalize_layerwise_reload(model, config)
+        assert model.hook_saw == [(3.0, 4.0)]
+
+        # Partial update: the untouched layer is restored before the hook runs.
+        initialize_layerwise_reload(model)
+        model.load_weights([("a.weight", _full(5.0))])
+        finalize_layerwise_reload(model, config)
+        assert model.hook_saw == [(3.0, 4.0), (5.0, 4.0)]
+
+    def test_sparse_update(self):
+        model = _loaded_model()
+        engine = object.__new__(SparseNCCLWeightTransferEngine)
+        engine.model = model
+
+        engine.start_weight_update()
+        for name, value in (("a.weight", 5.0), ("b.weight", 6.0)):
+            values, indices = torch.full((4,), value), torch.arange(4)
+            patch = CheckpointWeightPatch(name, (2, 2), torch.float32, values, indices)
+            load_checkpoint_weight_patches(model, [patch])
+        assert model.hook_saw == []
+        engine.finish_weight_update()
+        assert model.hook_saw == [(5.0, 6.0)]
