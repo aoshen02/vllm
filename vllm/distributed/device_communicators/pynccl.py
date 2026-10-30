@@ -540,6 +540,22 @@ class PyNcclCommunicator:
             cudaStream_t(stream.cuda_stream),
         )
 
+    def all_to_all_single(
+        self, output: torch.Tensor, input: torch.Tensor, stream=None
+    ) -> None:
+        """Exchange equal dim-0 chunks of `input` with every rank into `output`."""
+        if self.disabled:
+            return
+        if stream is None:
+            stream = current_stream()
+        self.group_start()
+        for peer, (sent, received) in enumerate(
+            zip(input.chunk(self.world_size), output.chunk(self.world_size))
+        ):
+            self.send(sent, peer, stream)
+            self.recv(received, peer, stream)
+        self.group_end()
+
     def broadcast(self, tensor: torch.Tensor, src: int, stream=None):
         if self.disabled:
             return

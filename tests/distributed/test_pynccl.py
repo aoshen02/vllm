@@ -282,6 +282,37 @@ def test_pynccl_all_gatherv():
 
 
 @worker_fn_wrapper
+def all_to_all_single_worker_fn():
+    # Rank r sends chunk p, filled with 16 * r + p, to rank p, so rank r must
+    # receive 16 * p + r in its chunk p. Through GroupCoordinator, as Engram does.
+    with ensure_current_vllm_config():
+        ensure_model_parallel_initialized(torch.distributed.get_world_size(), 1)
+    group = get_tp_group()
+    rank, world_size = group.rank_in_group, group.world_size
+    rows = 3  # rows per chunk; uint8 like Engram's packed FP8 rows
+    sent = torch.empty(world_size * rows, 5, dtype=torch.uint8, device=group.device)
+    for peer, chunk in enumerate(sent.chunk(world_size)):
+        chunk.fill_(16 * rank + peer)
+    received = torch.zeros_like(sent)
+    group.all_to_all_single(received, sent)
+    torch.accelerator.synchronize()
+    expected = torch.cat(
+        [
+            torch.full((rows, 5), 16 * p + rank, dtype=torch.uint8)
+            for p in range(world_size)
+        ]
+    )
+    torch.testing.assert_close(received.cpu(), expected)
+
+
+@pytest.mark.parametrize("world_size", [2, 4], ids=["2-ranks", "4-ranks"])
+def test_all_to_all_single(world_size):
+    if torch.accelerator.device_count() < world_size:
+        pytest.skip(f"Need at least {world_size} GPUs to run the test.")
+    distributed_run(all_to_all_single_worker_fn, world_size)
+
+
+@worker_fn_wrapper
 def reduce_scatter_worker_fn():
     pynccl_comm = PyNcclCommunicator(
         get_world_group().cpu_group, device=get_world_group().device

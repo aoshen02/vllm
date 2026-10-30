@@ -1382,6 +1382,12 @@ class GroupCoordinator:
         """In-place SUM all-reduce of a small CPU tensor over `cpu_group`."""
         return cpu_all_reduce_(tensor, self.cpu_group, self.cpu_timeout)
 
+    def all_to_all_single(self, output: torch.Tensor, input: torch.Tensor) -> None:
+        """Exchange equal dim-0 chunks of `input` with every rank into `output`."""
+        if self.device_communicator is None:
+            raise ValueError("No device communicator found")
+        self.device_communicator.all_to_all_single(output, input)
+
     def send(self, tensor: torch.Tensor, dst: int | None = None) -> None:
         """Sends a tensor to the destination rank in a blocking way."""
         """NOTE: `dst` is the local rank of the destination rank."""

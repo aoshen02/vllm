@@ -1552,7 +1552,8 @@ class EngramBatch(nn.Module):
             group = get_engram_dp_group()
             assert group is not None
             sent, rows = rows, self.exchanged_rows[: rows.shape[0]]
-            torch.distributed.all_to_all_single(rows, sent, group=group.device_group)
+            # Through the group's communicator, which sleep mode can suspend.
+            group.all_to_all_single(rows, sent)
         table = self.layers[0].embed_tokens
         heads = table.n_hash_cols
         grid = (triton.cdiv(slot, 128) * 128 * heads // 16, len(self.layers))
