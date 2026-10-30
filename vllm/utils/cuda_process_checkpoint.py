@@ -94,6 +94,12 @@ def _run_parallel_stage(pids, op: CheckpointOperation, invoke):
         return list(pool.map(run, pids))
 
 
+# Response deadline per stage. Checkpoint and restore copy each worker's device
+# memory to or from host memory, which takes tens of seconds for a large model
+# the first time; lock and unlock only change process state.
+_STAGE_DEADLINE_S = {"Lock": 30, "Checkpoint": 300, "Restore": 300, "Unlock": 30}
+
+
 class Driver:
     """Persistent helper isolates potentially blocking driver calls."""
 
@@ -145,7 +151,7 @@ class Driver:
         cast(TextIO, self.proc.stdin).write(json.dumps([pids, op]) + "\n")
         cast(TextIO, self.proc.stdin).flush()
         try:
-            response = self._read(30)
+            response = self._read(_STAGE_DEADLINE_S[op])
         except Exception as exc:
             self.emit(kind="control_failed", pids=pids, op=op, error=repr(exc))
             raise
