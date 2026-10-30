@@ -691,6 +691,11 @@ class ModelCudaGraphManager(CudaGraphManager):
                 "intermediate_tensors": None,
                 **model_state.prepare_dummy_inputs(num_reqs, num_tokens),
             }
+            if model_inputs.get(
+                "inputs_embeds"
+            ) is not None and not requires_raw_input_tokens(model):
+                # Match execute_model: the replay must see the same inputs.
+                model_inputs["input_ids"] = None
             if not self.is_first_pp_rank:
                 # Update for non-first PP ranks.
                 if not requires_raw_input_tokens(model):
