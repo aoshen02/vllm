@@ -116,6 +116,22 @@ def _get_direct_dcp_topk_workspace(
     )
 
 
+def _sort_topk_indices_(topk_indices: torch.Tensor) -> None:
+    """Sort each row's selected indices ascending in place, ``-1`` padding last.
+
+    The top-k kernels write a row's selection in a run-dependent order once a
+    row has more than ``topk`` candidates, and sparse attention accumulates the
+    keys in that order, so the same request gives different results from run to
+    run and with different batch companions.
+    """
+    if topk_indices.numel() == 0:
+        return
+    padding = topk_indices < 0
+    key = topk_indices.masked_fill(padding, torch.iinfo(topk_indices.dtype).max)
+    key = torch.sort(key, dim=-1).values
+    topk_indices.copy_(key.masked_fill_(key == torch.iinfo(key.dtype).max, -1))
+
+
 def _merge_dcp_topk_global(
     logits: torch.Tensor,
     topk_indices: torch.Tensor,
@@ -838,6 +854,8 @@ def sparse_attn_indexer(
                     score_bits=score_bits,
                     max_model_len=max_model_len,
                 )
+            if not 0 <= prefill_metadata.max_prefill_seq_len <= topk_tokens:
+                _sort_topk_indices_(topk_indices)
 
         if row_shard is not None:
             # Rows are already fully ranked, so this is a layout gather.
@@ -1003,6 +1021,7 @@ def sparse_attn_indexer(
                 score_bits=score_bits,
                 max_model_len=max_model_len,
             )
+        _sort_topk_indices_(topk_indices)
 
         if needs_padded_path:
             # if padded, we need to unpack
