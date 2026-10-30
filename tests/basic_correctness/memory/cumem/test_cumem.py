@@ -265,6 +265,27 @@ def test_discard_tags():
     assert torch.allclose(weights, torch.ones_like(weights))
 
 
+@pytest.mark.parametrize("use_sleep", [True, False], ids=["sleep", "discard"])
+@create_new_process_for_each_test("fork" if current_platform.is_cuda() else "spawn")
+@pytest.mark.skipif(not current_platform.is_cuda_alike(), reason="Uses cuda._sleep")
+def test_discard_waits_for_pending_writes(use_sleep):
+    allocator = get_mem_allocator_instance()
+    with allocator.use_memory_pool("kv_cache"):
+        kv = torch.zeros(4 << 20, dtype=torch.uint8, device=DEVICE_TYPE)
+
+    torch.cuda._sleep(1 << 28)
+    kv.fill_(1)
+    if use_sleep:
+        allocator.sleep(offload_tags=())
+    else:
+        allocator.discard("kv_cache")
+    torch.accelerator.synchronize()
+
+    allocator.wake_up()
+    kv.fill_(2)
+    assert torch.all(kv == 2)
+
+
 @pytest.mark.parametrize("tag", ["workspace", None], ids=["workspace", "default"])
 @create_new_process_for_each_test("fork" if current_platform.is_cuda() else "spawn")
 def test_selective_wake_restores_internal_tags(tag):
