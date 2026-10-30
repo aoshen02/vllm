@@ -29,6 +29,25 @@ from vllm import _custom_ops as ops
 from .punica_base import PunicaWrapperBase
 
 
+def _use_split_block_m(
+    shrink_config: dict,
+    expand_config: dict,
+    num_tokens: int,
+    rank: int,
+    fully_sharded: bool,
+) -> None:
+    """Decode-sized batches run the split MoE-LoRA kernels, which are fastest
+    with 16-row expert blocks; the align block size must match the kernel's."""
+    from vllm.lora.ops.triton_ops import fused_moe_lora_op as _f
+
+    if (
+        not fully_sharded
+        and rank <= _f._FUSED_MOE_LORA_ONE_SHOT_MAX_RANK
+        and num_tokens <= _f._MOE_LORA_SPLIT_MAX_TOKENS
+    ):
+        shrink_config["BLOCK_SIZE_M"] = expand_config["BLOCK_SIZE_M"] = 16
+
+
 @final
 class PunicaWrapperGPU(PunicaWrapperBase):
     """PunicaWrapperGPU is designed to manage and provide metadata for the punica
@@ -603,6 +622,9 @@ class PunicaWrapperGPU(PunicaWrapperBase):
 
         shrink_config = _normalize_lora_config_keys(shrink_config)
         expand_config = _normalize_lora_config_keys(expand_config)
+        _use_split_block_m(
+            shrink_config, expand_config, num_tokens, max_lora_rank, fully_sharded
+        )
 
         SPARSITY_FACTOR = 8
         naive_block_assignment = (
@@ -734,6 +756,9 @@ class PunicaWrapperGPU(PunicaWrapperBase):
 
         shrink_config = _normalize_lora_config_keys(shrink_config)
         expand_config = _normalize_lora_config_keys(expand_config)
+        _use_split_block_m(
+            shrink_config, expand_config, num_tokens, max_lora_rank, fully_sharded
+        )
 
         _sorted = sorted_token_ids_lora
         _eids = expert_ids_lora

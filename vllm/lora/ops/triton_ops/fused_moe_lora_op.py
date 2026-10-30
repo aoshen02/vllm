@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
+
 import torch
 
 from vllm.distributed import (
@@ -511,6 +513,453 @@ def _run_fused_moe_lora_one_shot(
         ADD_INPUTS=add_inputs,
         num_warps=nw,
         num_stages=ns,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Split MoE-LoRA path for decode-sized batches. The one-shot and small-batch
+# kernels give every program a whole (expert block, slice) shrink over K and,
+# for one-shot, the whole N range of the expand. With few tokens per expert
+# that is a long serial loop per program (w13: K = hidden; w2: N = hidden) and
+# the kernels run at a few percent of memory bandwidth. Here the shrink is
+# split over K across programs into fp32 partials, and the expand sums the
+# partials in a fixed order (deterministic) and splits N across programs.
+# The per-row semantics match the one-shot kernel: fp32 shrink accumulator,
+# cast to the activation dtype, then the expand dot.
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _moe_lora_split_resolve(
+    sorted_token_ids_ptr,
+    expert_ids_ptr,
+    num_tokens_post_padded_ptr,
+    token_lora_mapping_ptr,
+    lora_ids_ptr,
+    adapter_enabled_ptr,
+    pid_m,
+    lora_idx,
+    num_valid_tokens,
+    top_k_num,
+    max_loras,
+    stride_tl_,
+    stride_el,
+    naive_block_assignment: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+):
+    if naive_block_assignment:
+        lora_id = tl.load(token_lora_mapping_ptr + pid_m // top_k_num)
+    else:
+        lora_id = tl.load(lora_ids_ptr + lora_idx)
+    valid = (lora_id >= 0) & (lora_id < max_loras)
+    lora_id = tl.where(valid, lora_id, 0)
+    valid = valid & (tl.load(adapter_enabled_ptr + lora_id) != 0)
+    if not naive_block_assignment:
+        ntpp = tl.load(num_tokens_post_padded_ptr + lora_id)
+        valid = valid & (pid_m * BLOCK_M < ntpp)
+    if naive_block_assignment:
+        expert_id = tl.load(expert_ids_ptr + pid_m)
+    else:
+        ind = lora_id * stride_el + pid_m
+        expert_id = tl.load(
+            expert_ids_ptr + ind, mask=ind < max_loras * stride_el, other=-1
+        )
+    valid = valid & (expert_id >= 0)
+    offs = tl.arange(0, BLOCK_M).to(tl.int64)
+    if naive_block_assignment:
+        offs_token = tl.where(offs == 0, pid_m, num_valid_tokens)
+    else:
+        token_ind = stride_tl_ * lora_id + pid_m * BLOCK_M + offs
+        offs_token = tl.load(
+            sorted_token_ids_ptr + token_ind,
+            mask=token_ind < max_loras * stride_tl_,
+            other=num_valid_tokens,
+        )
+    return valid, lora_id, expert_id, offs_token
+
+
+@triton.jit
+def _moe_lora_split_shrink_kernel(
+    x_ptr,
+    A_ptrs,
+    part_ptr,  # fp32 (num_slices, lora_dim, num_split, M_blocks * BLOCK_M, BLOCK_R)
+    sorted_token_ids_ptr,
+    expert_ids_ptr,
+    num_tokens_post_padded_ptr,
+    token_lora_mapping_ptr,
+    lora_ids_ptr,
+    adapter_enabled_ptr,
+    K,
+    K_CHUNK,
+    NUM_SPLIT,
+    num_valid_tokens,
+    top_k_num,
+    max_loras,
+    stride_xm,
+    stride_xk,
+    stride_A_lora,
+    stride_A_expert,
+    stride_A_r,
+    stride_A_k,
+    stride_tl_,
+    stride_el,
+    stride_p_slice,
+    stride_p_lora,
+    stride_p_split,
+    out_dtype_ptr,
+    token_mapping_factor: tl.constexpr,
+    naive_block_assignment: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_R: tl.constexpr,
+    actual_rank: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    EVEN_R: tl.constexpr,
+):
+    pid_m = tl.program_id(axis=0)
+    slice_id = tl.program_id(axis=1)
+    pid_z = tl.program_id(axis=2)
+    lora_idx = pid_z // NUM_SPLIT
+    split = pid_z % NUM_SPLIT
+    valid, lora_id, expert_id, offs_token = _moe_lora_split_resolve(
+        sorted_token_ids_ptr,
+        expert_ids_ptr,
+        num_tokens_post_padded_ptr,
+        token_lora_mapping_ptr,
+        lora_ids_ptr,
+        adapter_enabled_ptr,
+        pid_m,
+        lora_idx,
+        num_valid_tokens,
+        top_k_num,
+        max_loras,
+        stride_tl_,
+        stride_el,
+        naive_block_assignment,
+        BLOCK_M,
+    )
+    if not valid:
+        return
+    token_mask = offs_token < num_valid_tokens
+    offs_r = tl.arange(0, BLOCK_R)
+    rank_mask = offs_r < actual_rank
+    safe_offs_r = tl.where(rank_mask, offs_r, 0)
+    offs_k = tl.arange(0, BLOCK_K)
+    cur_A_ptr = tl.load(A_ptrs + slice_id).to(
+        tl.pointer_type(out_dtype_ptr.dtype.element_ty)
+    )
+    A_base = cur_A_ptr + lora_id * stride_A_lora + expert_id * stride_A_expert
+    k_lo = split * K_CHUNK
+    k_hi = tl.minimum(k_lo + K_CHUNK, K)
+    offs_x_row = offs_token // token_mapping_factor
+    x_ptrs = (
+        x_ptr + offs_x_row[:, None] * stride_xm + (k_lo + offs_k)[None, :] * stride_xk
+    )
+    # A is (rank, K) with K contiguous: load (BLOCK_R, BLOCK_K) tiles row-major.
+    a_ptrs = (
+        A_base
+        + safe_offs_r[:, None] * stride_A_r
+        + (k_lo + offs_k)[None, :] * stride_A_k
+    )
+    tmp = tl.zeros((BLOCK_M, BLOCK_R), dtype=tl.float32)
+    for kb in range(k_lo, k_hi, BLOCK_K):
+        k_mask = (kb + offs_k) < k_hi
+        x = tl.load(x_ptrs, mask=token_mask[:, None] & k_mask[None, :], other=0.0)
+        if EVEN_R:
+            a = tl.load(a_ptrs, mask=k_mask[None, :], other=0.0)
+        else:
+            a = tl.load(a_ptrs, mask=rank_mask[:, None] & k_mask[None, :], other=0.0)
+        tmp += tl.dot(x, tl.trans(a))
+        x_ptrs += BLOCK_K * stride_xk
+        a_ptrs += BLOCK_K * stride_A_k
+    offs_row = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)).to(tl.int64)
+    p_ptrs = (
+        part_ptr
+        + slice_id * stride_p_slice
+        + lora_idx * stride_p_lora
+        + split * stride_p_split
+        + offs_row[:, None] * BLOCK_R
+        + offs_r[None, :]
+    )
+    tl.store(p_ptrs, tmp)
+
+
+@triton.jit
+def _moe_lora_split_expand_kernel(
+    part_ptr,
+    B_ptrs,
+    out_ptr,
+    topk_weights_ptr,
+    sorted_token_ids_ptr,
+    expert_ids_ptr,
+    num_tokens_post_padded_ptr,
+    token_lora_mapping_ptr,
+    lora_ids_ptr,
+    adapter_enabled_ptr,
+    N,
+    NUM_SPLIT,
+    num_valid_tokens,
+    top_k_num,
+    max_loras,
+    stride_B_lora,
+    stride_B_expert,
+    stride_B_n,
+    stride_B_r,
+    stride_om,
+    stride_on,
+    stride_tl_,
+    stride_el,
+    stride_p_slice,
+    stride_p_lora,
+    stride_p_split,
+    slice_n_offset,
+    naive_block_assignment: tl.constexpr,
+    MUL_ROUTED_WEIGHT: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_R: tl.constexpr,
+    actual_rank: tl.constexpr,
+    NPID_FACTOR: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    ADD_INPUTS: tl.constexpr,
+    EVEN_R: tl.constexpr,
+):
+    pid_full = tl.program_id(axis=0)
+    pid_m = pid_full // NPID_FACTOR
+    pid_n_outer = pid_full % NPID_FACTOR
+    slice_id = tl.program_id(axis=1)
+    lora_idx = tl.program_id(axis=2)
+    valid, lora_id, expert_id, offs_token = _moe_lora_split_resolve(
+        sorted_token_ids_ptr,
+        expert_ids_ptr,
+        num_tokens_post_padded_ptr,
+        token_lora_mapping_ptr,
+        lora_ids_ptr,
+        adapter_enabled_ptr,
+        pid_m,
+        lora_idx,
+        num_valid_tokens,
+        top_k_num,
+        max_loras,
+        stride_tl_,
+        stride_el,
+        naive_block_assignment,
+        BLOCK_M,
+    )
+    if not valid:
+        return
+    n_per_outer = tl.cdiv(N, NPID_FACTOR)
+    n_lo = pid_n_outer * n_per_outer
+    n_hi = tl.minimum((pid_n_outer + 1) * n_per_outer, N)
+    if n_lo >= N:
+        return
+    token_mask = offs_token < num_valid_tokens
+    offs_r = tl.arange(0, BLOCK_R)
+    rank_mask = offs_r < actual_rank
+    safe_offs_r = tl.where(rank_mask, offs_r, 0)
+    offs_row = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)).to(tl.int64)
+    p_ptrs = (
+        part_ptr
+        + slice_id * stride_p_slice
+        + lora_idx * stride_p_lora
+        + offs_row[:, None] * BLOCK_R
+        + offs_r[None, :]
+    )
+    tmp = tl.zeros((BLOCK_M, BLOCK_R), dtype=tl.float32)
+    for s in range(0, NUM_SPLIT):
+        tmp += tl.load(p_ptrs + s * stride_p_split)
+    tmp_typed = tmp.to(out_ptr.dtype.element_ty)
+
+    cur_B_ptr = tl.load(B_ptrs + slice_id).to(tl.pointer_type(out_ptr.dtype.element_ty))
+    B_base = cur_B_ptr + lora_id * stride_B_lora + expert_id * stride_B_expert
+    if MUL_ROUTED_WEIGHT:
+        moe_w = tl.load(topk_weights_ptr + offs_token, mask=token_mask, other=0.0).to(
+            tl.float32
+        )
+    out_slice_base = out_ptr + slice_id * slice_n_offset
+    for n_start in range(n_lo, n_hi, BLOCK_N):
+        offs_n = n_start + tl.arange(0, BLOCK_N)
+        n_mask = (offs_n < N) & (offs_n < n_hi)
+        # B is (N, rank) with rank contiguous: load (BLOCK_N, BLOCK_R) tiles.
+        b_ptrs = (
+            B_base + offs_n[:, None] * stride_B_n + safe_offs_r[None, :] * stride_B_r
+        )
+        if EVEN_R:
+            b = tl.load(b_ptrs, mask=n_mask[:, None], other=0.0)
+        else:
+            b = tl.load(b_ptrs, mask=n_mask[:, None] & rank_mask[None, :], other=0.0)
+        acc = tl.dot(tmp_typed, tl.trans(b))
+        if MUL_ROUTED_WEIGHT:
+            acc = acc * moe_w[:, None]
+        out_ptrs = (
+            out_slice_base
+            + offs_token[:, None] * stride_om
+            + offs_n[None, :] * stride_on
+        )
+        out_mask = token_mask[:, None] & n_mask[None, :]
+        if ADD_INPUTS:
+            prev = tl.load(out_ptrs, mask=out_mask, other=0.0)
+            tl.store(out_ptrs, prev + acc.to(out_ptr.dtype.element_ty), mask=out_mask)
+        else:
+            tl.store(out_ptrs, acc.to(out_ptr.dtype.element_ty), mask=out_mask)
+
+
+# Use the split path up to this many tokens (decode batches); env override
+# VLLM_MOE_LORA_SPLIT_MAX_TOKENS (0 disables the split path). K/N chunk sizes
+# per program: 0 = automatic (GB200 sweep at E=128, H=6144, I=768, r=32).
+_MOE_LORA_SPLIT_MAX_TOKENS = int(
+    os.environ.get("VLLM_MOE_LORA_SPLIT_MAX_TOKENS", "256")
+)
+_MOE_LORA_SPLIT_K_CHUNK = int(os.environ.get("VLLM_MOE_LORA_SPLIT_K_CHUNK", "0"))
+_MOE_LORA_SPLIT_N_CHUNK = int(os.environ.get("VLLM_MOE_LORA_SPLIT_N_CHUNK", "0"))
+_MOE_LORA_SPLIT_WARPS = int(os.environ.get("VLLM_MOE_LORA_SPLIT_WARPS", "4"))
+
+
+def _run_fused_moe_lora_split(
+    output: torch.Tensor,
+    qcurr_hidden_states: torch.Tensor,
+    lora_a_stacked: list[torch.Tensor],
+    lora_b_stacked: list[torch.Tensor],
+    topk_weights: torch.Tensor,
+    sorted_token_ids: torch.Tensor | None,
+    expert_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor | None,
+    token_lora_mapping: torch.Tensor,
+    top_k_num: int,
+    lora_ids: torch.Tensor,
+    num_active_loras: torch.Tensor,
+    adapter_enabled: torch.Tensor,
+    mul_routed_weight: bool,
+    block_size_m: int,
+    add_inputs: bool = True,
+) -> None:
+    """Shape contract of `_run_fused_moe_lora_one_shot`, two launches:
+    K-split shrink into fp32 partials, then expand with a fixed-order sum of
+    the partials and the N range split across programs."""
+    num_slices = len(lora_a_stacked)
+    device = qcurr_hidden_states.device
+    A0 = lora_a_stacked[0]
+    B0 = lora_b_stacked[0]
+    max_loras_w = A0.shape[0]
+    rank = A0.shape[2]
+    K = A0.shape[3]
+    N_per_slice = B0.shape[2]
+    BLOCK_R = max(triton.next_power_of_2(rank), 16)
+
+    naive = sorted_token_ids is None
+    if naive:
+        M_blocks = topk_weights.numel()
+        BLOCK_M = 16
+        stride_tl_ = 0
+        stride_el = 0
+        grid_lora_dim = 1
+    else:
+        assert block_size_m >= 16 and (block_size_m & (block_size_m - 1)) == 0
+        BLOCK_M = block_size_m
+        M_blocks = triton.cdiv(sorted_token_ids.shape[1], BLOCK_M)
+        stride_tl_ = sorted_token_ids.stride(0)
+        stride_el = expert_ids.stride(0)
+        grid_lora_dim = int(num_active_loras.item())
+    if M_blocks == 0 or grid_lora_dim == 0 or num_slices == 0:
+        return
+
+    token_mapping_factor = 1 if mul_routed_weight else top_k_num
+    A_ptrs = _get_ptr(lora_a_stacked, device)
+    B_ptrs = _get_ptr(lora_b_stacked, device)
+    assert output.dim() == 3
+    assert output.stride(0) == output.shape[1] * output.stride(1)
+    out_view = output.view(-1, output.shape[-1])
+
+    block_k = 128 if K >= 256 else 64
+    k_target = _MOE_LORA_SPLIT_K_CHUNK or (512 if naive else 1024)
+    k_chunk = max(block_k, triton.cdiv(k_target, block_k) * block_k)
+    num_split = triton.cdiv(K, k_chunk)
+    k_chunk = triton.cdiv(triton.cdiv(K, num_split), block_k) * block_k
+    num_split = triton.cdiv(K, k_chunk)
+
+    part = torch.empty(
+        (num_slices, grid_lora_dim, num_split, M_blocks * BLOCK_M, BLOCK_R),
+        dtype=torch.float32,
+        device=device,
+    )
+    _moe_lora_split_shrink_kernel[(M_blocks, num_slices, grid_lora_dim * num_split)](
+        qcurr_hidden_states,
+        A_ptrs,
+        part,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        token_lora_mapping,
+        lora_ids,
+        adapter_enabled,
+        K,
+        k_chunk,
+        num_split,
+        topk_weights.numel(),
+        top_k_num,
+        max_loras_w,
+        qcurr_hidden_states.stride(0),
+        qcurr_hidden_states.stride(1),
+        A0.stride(0),
+        A0.stride(1),
+        A0.stride(2),
+        A0.stride(3),
+        stride_tl_,
+        stride_el,
+        part.stride(0),
+        part.stride(1),
+        part.stride(2),
+        out_view,
+        token_mapping_factor=token_mapping_factor,
+        naive_block_assignment=naive,
+        BLOCK_M=BLOCK_M,
+        BLOCK_R=BLOCK_R,
+        actual_rank=rank,
+        BLOCK_K=block_k,
+        EVEN_R=rank == BLOCK_R,
+        num_warps=_MOE_LORA_SPLIT_WARPS,
+        num_stages=3,
+    )
+    block_n = 128
+    n_target = _MOE_LORA_SPLIT_N_CHUNK or (128 if N_per_slice <= 1024 else 256)
+    npid = max(1, triton.cdiv(N_per_slice, max(block_n, n_target)))
+    _moe_lora_split_expand_kernel[(M_blocks * npid, num_slices, grid_lora_dim)](
+        part,
+        B_ptrs,
+        out_view,
+        topk_weights,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        token_lora_mapping,
+        lora_ids,
+        adapter_enabled,
+        N_per_slice,
+        num_split,
+        topk_weights.numel(),
+        top_k_num,
+        max_loras_w,
+        B0.stride(0),
+        B0.stride(1),
+        B0.stride(2),
+        B0.stride(3),
+        out_view.stride(0),
+        out_view.stride(1),
+        stride_tl_,
+        stride_el,
+        part.stride(0),
+        part.stride(1),
+        part.stride(2),
+        N_per_slice,
+        naive_block_assignment=naive,
+        MUL_ROUTED_WEIGHT=mul_routed_weight,
+        BLOCK_M=BLOCK_M,
+        BLOCK_R=BLOCK_R,
+        actual_rank=rank,
+        NPID_FACTOR=npid,
+        BLOCK_N=block_n,
+        ADD_INPUTS=add_inputs,
+        EVEN_R=rank == BLOCK_R,
+        num_warps=_MOE_LORA_SPLIT_WARPS,
+        num_stages=2,
     )
 
 
@@ -1485,6 +1934,26 @@ def _fused_moe_lora(
 
     # Fast path: single fused kernel
     if not fully_sharded and max_lora_rank <= _FUSED_MOE_LORA_ONE_SHOT_MAX_RANK:
+        if topk_weights.shape[0] <= _MOE_LORA_SPLIT_MAX_TOKENS:
+            _run_fused_moe_lora_split(
+                output,
+                qcurr_hidden_states,
+                lora_a_stacked,
+                lora_b_stacked,
+                topk_weights,
+                sorted_token_ids,
+                expert_ids,
+                num_tokens_post_padded,
+                token_lora_mapping,
+                top_k_num,
+                lora_ids,
+                num_active_loras,
+                adapter_enabled,
+                mul_routed_weight,
+                shrink_block_size_m,
+                add_inputs=add_inputs,
+            )
+            return
         M_pairs = topk_weights.numel()
         if (
             sorted_token_ids is None
