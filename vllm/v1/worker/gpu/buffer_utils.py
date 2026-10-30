@@ -10,6 +10,7 @@ import torch
 
 from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
+from vllm.utils.pinned_host_memory import pinned_host_empty
 from vllm.utils.platform_utils import is_uva_available
 from vllm.utils.torch_utils import (
     TORCH_DTYPE_TO_ARRAY_TYPECODE,
@@ -39,7 +40,8 @@ class UvaBuffer:
     def __init__(self, size: int | Sequence[int], dtype: torch.dtype):
         if not is_uva_available():
             raise RuntimeError("UVA is not available")
-        self.cpu = torch.zeros(size, dtype=dtype, device="cpu", pin_memory=True)
+        # Re-registrable in place, so the UVA view survives process checkpoints.
+        self.cpu = pinned_host_empty(size, dtype)
         self.np = self.cpu.numpy()
         self._uva = get_accelerator_view_from_cpu_tensor(self.cpu)
 

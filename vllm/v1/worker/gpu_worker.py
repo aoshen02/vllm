@@ -93,6 +93,10 @@ from vllm.utils.mem_utils import (
     format_gib,
     memory_profiling,
 )
+from vllm.utils.pinned_host_memory import (
+    release_pinned_host_memory,
+    restore_pinned_host_memory,
+)
 from vllm.utils.torch_utils import set_random_seed, set_torch_threads_for_runtime
 from vllm.v1.attention.backends.utils import record_kv_cache_layout
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
@@ -373,8 +377,11 @@ class Worker(WorkerBase):
 
     def checkpoint_prepare(self) -> None:
         checkpoint_prepare_distributed_state()
+        # Some drivers cannot restore a process holding pinned host memory.
+        release_pinned_host_memory()
 
     def checkpoint_restore(self) -> None:
+        restore_pinned_host_memory()
         checkpoint_restore_distributed_state()
 
     def _weight_checksum_prefix(self) -> str:

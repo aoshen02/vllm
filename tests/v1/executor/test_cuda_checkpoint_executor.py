@@ -44,9 +44,14 @@ def executor():
         calls.append(("wake", tags))
         self.sleeping_tags -= set(tags) if tags else self.sleeping_tags.copy()
 
+    def rpc(self, method, **kwargs):
+        calls.append((getattr(method, "__name__", method),))
+        return [None] * len(self.workers)
+
     with (
         patch.object(MultiprocExecutor, "sleep", sleep),
         patch.object(MultiprocExecutor, "wake_up", wake),
+        patch.object(MultiprocExecutor, "collective_rpc", rpc),
         patch.object(
             MultiprocExecutor, "shutdown", lambda _: calls.append(("shutdown",))
         ),
@@ -55,32 +60,42 @@ def executor():
     obj._checkpoint = None
 
 
-def test_sleep_then_restore_precedes_worker_wake(executor):
+@pytest.mark.parametrize(
+    "wakes",
+    [[None], [["weights"], ["kv_cache"]]],
+    ids=["full-wake", "partial-wakes"],
+)
+def test_worker_hooks_wrap_driver_checkpoint_once(executor, wakes):
     obj, calls = executor
     obj.sleep()
-    obj.wake_up()
+    obj.sleep()
+    for tags in wakes:
+        obj.wake_up(tags)
     assert calls == [
         ("sleep", 1),
+        ("checkpoint_prepare",),
         ("checkpoint", [11, 22]),
         ("restore",),
-        ("wake", None),
+        ("checkpoint_restore",),
+        *(("wake", tags) for tags in wakes),
     ]
-
-
-def test_repeated_sleep_does_not_checkpoint_twice(executor):
-    obj, calls = executor
-    obj.sleep()
-    obj.sleep()
-    assert calls == [("sleep", 1), ("checkpoint", [11, 22])]
-
-
-def test_partial_wake_restores_process_only_once(executor):
-    obj, calls = executor
-    obj.sleep()
-    obj.wake_up(["weights"])
-    obj.wake_up(["kv_cache"])
-    assert calls.count(("restore",)) == 1
     assert not obj.is_sleeping
+
+
+def test_failed_worker_prepare_never_checkpoints(executor):
+    obj, calls = executor
+
+    def rpc(self, method, **kwargs):
+        if method == "checkpoint_prepare":
+            raise RuntimeError("pinned host memory still in use")
+        return [None, None]
+
+    with (
+        patch.object(MultiprocExecutor, "collective_rpc", rpc),
+        pytest.raises(RuntimeError, match="pinned"),
+    ):
+        obj.sleep()
+    assert obj.is_failed and not any(c[0] == "checkpoint" for c in calls)
 
 
 def test_invalid_tag_does_not_restore(executor):
@@ -293,26 +308,6 @@ def test_validate_rejects_missing_or_inconsistent_nccl(
     monkeypatch.setattr("vllm.distributed.get_tp_group", lambda: group)
     with pytest.raises(RuntimeError, match="active suspend/resume"):
         _validate_nccl_checkpoint(None, expected)
-
-
-def test_flashinfer_hooks_wrap_driver_checkpoint_once(executor):
-    obj, calls = executor
-    obj._checkpoint_flashinfer = True
-    with patch.object(
-        obj, "collective_rpc", side_effect=lambda method, **kw: calls.append((method,))
-    ):
-        obj.sleep()
-        obj.wake_up(["weights"])
-        obj.wake_up(["kv_cache"])
-    assert calls == [
-        ("sleep", 1),
-        ("checkpoint_prepare",),
-        ("checkpoint", [11, 22]),
-        ("restore",),
-        ("checkpoint_restore",),
-        ("wake", ["weights"]),
-        ("wake", ["kv_cache"]),
-    ]
 
 
 def test_sleep_worker_rpc_has_deadline(executor):

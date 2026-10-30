@@ -77,6 +77,7 @@ from vllm.models.deepseek_v41.common.ops.query_quant import (
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.cpu_resource_utils import get_available_memory
+from vllm.utils.pinned_host_memory import pin_host_array, pinned_host_empty
 from vllm.utils.platform_utils import is_uva_available
 from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
 
@@ -997,19 +998,11 @@ def _allocate_huge_page_storage(num_bytes: int) -> torch.Tensor | None:
     owner = np.frombuffer(mapping, dtype=np.uint8)
     # Fault the pages in before CUDA pins them, so they can be huge.
     owner[:: mmap.PAGESIZE] = 0
-    tensor = torch.from_numpy(owner)
-    pointer = tensor.data_ptr()
-    result = torch.cuda.cudart().cudaHostRegister(pointer, num_bytes, 0)
-    if result.value != 0:
-        logger.warning(
-            "Engram cudaHostRegister failed (%s); using pinned memory.", result
-        )
+    try:
+        tensor = pin_host_array(owner, mapping)
+    except RuntimeError as exc:
+        logger.warning("Engram %s; using pinned memory.", exc)
         return None
-    # Tensor views retain owner; its finalizer retains mapping until unregister.
-    finalizer = weakref.finalize(
-        owner, DPSharedEngramStorage._unregister, mapping, pointer
-    )
-    finalizer.atexit = False  # type: ignore[misc]
     if not tensor.is_pinned():
         logger.warning(
             "CUDA did not recognize Engram registration; using pinned memory."
@@ -1190,7 +1183,7 @@ class ParallelEngramEmbedding(nn.Module):
             self._shared_memory = storage
             self._weight_loader = storage.load_weight
             return storage.weight, storage.weight_scale_inv
-        # pin_memory rounds up to a power of two. ROCm pins huge pages either way.
+        # ROCm pins huge pages either way.
         if self.use_thp or current_platform.is_rocm():
             weight_bytes = self.part_num_embeddings * self.dim
             packed = _allocate_huge_page_storage(
@@ -1202,22 +1195,12 @@ class ParallelEngramEmbedding(nn.Module):
                     packed[:weight_bytes].view(torch.float8_e4m3fn).view(-1, self.dim),
                     packed[weight_bytes:].view(-1, scale_dim),
                 )
-        # Model initialization may be inside a CUDA device context.
+        # Exact size, and re-registrable in place across process checkpoints.
         return (
-            torch.empty(
-                self.part_num_embeddings,
-                self.dim,
-                dtype=torch.float8_e4m3fn,
-                device="cpu",
-                pin_memory=True,
+            pinned_host_empty(
+                (self.part_num_embeddings, self.dim), torch.float8_e4m3fn
             ),
-            torch.empty(
-                self.part_num_embeddings,
-                scale_dim,
-                dtype=torch.uint8,
-                device="cpu",
-                pin_memory=True,
-            ),
+            pinned_host_empty((self.part_num_embeddings, scale_dim), torch.uint8),
         )
 
     def collapse_huge_pages(self) -> None:

@@ -312,6 +312,14 @@ export VLLM_ALLREDUCE_USE_FLASHINFER=1
 export VLLM_FLASHINFER_ALLREDUCE_BACKEND=trtllm
 ```
 
+Some drivers (for example 580 on Grace GB200/GB300) cannot restore a process
+that holds pinned host memory. Before the driver checkpoint, workers therefore
+release the registrations of vLLM's pinned buffers (UVA buffers, the level-1
+weight backup, CPU-offloaded Engram tables) and PyTorch's cached pinned blocks,
+and register the same addresses again after restore. The checkpoint fails before
+any driver call if PyTorch-pinned memory is still in use. NCCL must likewise
+hold no pinned host memory or peer imports while suspended.
+
 FlashInfer must provide stable-address workspace `checkpoint_prepare` and
 `checkpoint_restore` methods. The executor calls existing worker hooks around
 the driver checkpoint. Disabling standalone FlashInfer all-reduce with
