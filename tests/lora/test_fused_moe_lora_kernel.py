@@ -1412,9 +1412,9 @@ def _split_call(
 
 
 def _ref_one_shot(x, a, b, w, mul_routed_weight, prev):
-    """fp64 reference with the one-shot cast points: fp32 shrink -> output dtype
-    -> expand (fp32) -> * routing weight -> output dtype -> + prev."""
-    t = (x.double() @ a.double().T).float().to(prev.dtype)
+    """fp64 reference with the kernels' rounding points: fp32 shrink -> expand
+    (fp32) -> * routing weight -> output dtype -> + prev."""
+    t = (x.double() @ a.double().T).float()
     o = (t.double() @ b.double().T).float()
     if mul_routed_weight:
         o = o * w.float()
@@ -1485,9 +1485,9 @@ def test_fused_moe_lora_split_batch_invariant(op, device):
             for k, e in enumerate(probe_ids[0].tolist())
         ]
     )
-    # Kernel and reference sum the fp32 shrink in different orders, so the
-    # intermediate can differ by one bf16 ulp; allow that relative to the delta.
-    atol = ref.float().abs().max().item() * 2**-8
+    # Kernel and reference sum in different orders; allow a fraction of a bf16
+    # ulp of the largest element for cancellations near zero.
+    atol = ref.float().abs().max().item() * 2**-9
     for M in [1, 257]:
         torch.testing.assert_close(rows[M], ref, atol=atol, rtol=2**-7)
 

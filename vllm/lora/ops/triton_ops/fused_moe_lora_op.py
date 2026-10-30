@@ -113,6 +113,13 @@ _LORA_PTR_DICT: dict[tuple[int, ...], torch.tensor] = {}
 # Larger ranks require rank tiling, so route them through the two-kernel path.
 _FUSED_MOE_LORA_ONE_SHOT_MAX_RANK = 128
 
+# One-shot and split kernels keep the shrink result at ~fp32 precision for the
+# expand (hi + lo in the activation dtype, two dots with fp32 accumulation)
+# instead of one cast, like the small-batch kernel's fp32 rank vector.
+_MOE_LORA_FP32_INTERMEDIATE = (
+    os.environ.get("VLLM_MOE_LORA_FP32_INTERMEDIATE", "1") == "1"
+)
+
 
 # ---------------------------------------------------------------------------
 # Fully-fused MoE-LoRA kernel (one-shot): shrink + expand combined into a single
@@ -174,6 +181,7 @@ def _fused_moe_lora_one_shot_kernel(
     BLOCK_K: tl.constexpr,
     EVEN_K: tl.constexpr,
     ADD_INPUTS: tl.constexpr,
+    FP32_INTERMEDIATE: tl.constexpr,
 ):
     pid_full = tl.program_id(axis=0)
     pid_m = pid_full // NPID_FACTOR
@@ -273,6 +281,7 @@ def _fused_moe_lora_one_shot_kernel(
             a_ptrs += BLOCK_K * stride_A_k
 
     tmp_typed = tmp.to(out_ptr.dtype.element_ty)
+    tmp_lo = (tmp - tmp_typed.to(tl.float32)).to(out_ptr.dtype.element_ty)
 
     # EXPAND: out[tokens, n] += tmp @ B^T, looped over BLOCK_N tiles within
     # this program's [n_lo, n_hi). The (offs_n < n_hi) mask is required
@@ -295,6 +304,8 @@ def _fused_moe_lora_one_shot_kernel(
         b = tl.load(b_ptrs, mask=rank_mask[:, None] & n_mask[None, :], other=0.0)
 
         acc = tl.dot(tmp_typed, b)  # (BLOCK_M, BLOCK_N) fp32
+        if FP32_INTERMEDIATE:
+            acc = tl.dot(tmp_lo, b, acc)
         if MUL_ROUTED_WEIGHT:
             acc = acc * moe_w[:, None]
 
@@ -512,6 +523,7 @@ def _run_fused_moe_lora_one_shot(
         BLOCK_N=block_n,
         BLOCK_K=block_k,
         ADD_INPUTS=add_inputs,
+        FP32_INTERMEDIATE=_MOE_LORA_FP32_INTERMEDIATE,
         num_warps=nw,
         num_stages=ns,
     )
@@ -722,6 +734,7 @@ def _moe_lora_split_expand_kernel(
     BLOCK_N: tl.constexpr,
     ADD_INPUTS: tl.constexpr,
     EVEN_R: tl.constexpr,
+    FP32_INTERMEDIATE: tl.constexpr,
 ):
     pid_full = tl.program_id(axis=0)
     pid_m = pid_full // NPID_FACTOR
@@ -767,7 +780,11 @@ def _moe_lora_split_expand_kernel(
     tmp = tl.zeros((BLOCK_M, BLOCK_R), dtype=tl.float32)
     for s in range(0, NUM_SPLIT):
         tmp += tl.load(p_ptrs + s * stride_p_split)
+    # FP32_INTERMEDIATE: split the fp32 shrink result into hi + lo in the
+    # activation dtype and expand both (two tensor-core dots, fp32 accumulate),
+    # which keeps ~16 more mantissa bits than casting it once.
     tmp_typed = tmp.to(out_ptr.dtype.element_ty)
+    tmp_lo = (tmp - tmp_typed.to(tl.float32)).to(out_ptr.dtype.element_ty)
 
     cur_B_ptr = tl.load(B_ptrs + slice_id).to(tl.pointer_type(out_ptr.dtype.element_ty))
     B_base = cur_B_ptr + lora_id * stride_B_lora + expert_id * stride_B_expert
@@ -788,6 +805,8 @@ def _moe_lora_split_expand_kernel(
         else:
             b = tl.load(b_ptrs, mask=n_mask[:, None] & rank_mask[None, :], other=0.0)
         acc = tl.dot(tmp_typed, tl.trans(b))
+        if FP32_INTERMEDIATE:
+            acc = tl.dot(tmp_lo, tl.trans(b), acc)
         if MUL_ROUTED_WEIGHT:
             acc = acc * moe_w[:, None]
         out_ptrs = (
@@ -1017,6 +1036,7 @@ def _run_fused_moe_lora_split(
         BLOCK_N=block_n,
         ADD_INPUTS=add_inputs,
         EVEN_R=rank == BLOCK_R,
+        FP32_INTERMEDIATE=_MOE_LORA_FP32_INTERMEDIATE,
         num_warps=_MOE_LORA_SPLIT_WARPS,
         num_stages=2,
     )
