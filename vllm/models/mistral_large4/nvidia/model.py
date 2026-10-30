@@ -30,7 +30,11 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader,
 )
-from vllm.model_executor.models.interfaces import EagleModelMixin, SupportsEagle3
+from vllm.model_executor.models.interfaces import (
+    EagleModelMixin,
+    SupportsEagle3,
+    SupportsLoRA,
+)
 from vllm.model_executor.models.utils import (
     PPMissingLayer,
     WeightsMapper,
@@ -446,13 +450,17 @@ def _load_weights(
     return loaded
 
 
-class MistralLarge4ForCausalLM(nn.Module, SupportsEagle3):
+class MistralLarge4ForCausalLM(nn.Module, SupportsLoRA, SupportsEagle3):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
         config = vllm_config.model_config.hf_config
         self.config = config
         if vllm_config.quant_config is not None:
             _map_quant_config_layers(vllm_config.quant_config, prefix)
+        # LoRA adapter names follow DeepseekV2ForCausalLM. Set per instance:
+        # the quantization config takes the class-level mapping by reference
+        # and needs the checkpoint names from _STACKED_PARAMS instead.
+        self.packed_modules_mapping = {"gate_up_proj": ["gate_proj", "up_proj"]}
         self.model = MistralLarge4Model(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
@@ -485,6 +493,17 @@ class MistralLarge4ForCausalLM(nn.Module, SupportsEagle3):
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         return self.logits_processor(self.lm_head, hidden_states)
+
+    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
+        # Per-expert LoRA names, as in DeepseekV2ForCausalLM.
+        return fused_moe_make_expert_params_mapping(
+            self,
+            ckpt_gate_proj_name="gate_proj",
+            ckpt_down_proj_name="down_proj",
+            ckpt_up_proj_name="up_proj",
+            num_experts=getattr(self.config, "n_routed_experts", None) or 0,
+            num_redundant_experts=0,
+        )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         return _load_weights(self, self.model, weights)
