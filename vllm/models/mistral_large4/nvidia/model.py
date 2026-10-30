@@ -328,6 +328,9 @@ _STACKED_PARAMS: list[tuple[str, str, int]] = [
     (".wk_weights_proj.", ".weights_proj.", 1),
 ]
 
+# LoRA adapter module names, as in DeepseekV2ForCausalLM.
+_LORA_PACKED_MODULES: dict[str, list[str]] = {"gate_up_proj": ["gate_proj", "up_proj"]}
+
 
 def _to_vllm_weight_name(name: str) -> str:
     for pattern, repl in _CHECKPOINT_NAME_MAP:
@@ -457,10 +460,11 @@ class MistralLarge4ForCausalLM(nn.Module, SupportsLoRA, SupportsEagle3):
         self.config = config
         if vllm_config.quant_config is not None:
             _map_quant_config_layers(vllm_config.quant_config, prefix)
-        # LoRA adapter names follow DeepseekV2ForCausalLM. Set per instance:
-        # the quantization config takes the class-level mapping by reference
-        # and needs the checkpoint names from _STACKED_PARAMS instead.
-        self.packed_modules_mapping = {"gate_up_proj": ["gate_proj", "up_proj"]}
+        # Set per instance: the quantization config takes the class-level
+        # mapping by reference and needs the checkpoint names instead.
+        self.packed_modules_mapping = {
+            k: list(v) for k, v in _LORA_PACKED_MODULES.items()
+        }
         self.model = MistralLarge4Model(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
