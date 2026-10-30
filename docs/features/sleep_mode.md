@@ -324,6 +324,24 @@ suspend and redo them on resume
 change, collectives over the network return wrong data or hang after a restore;
 the executor cannot detect the NCCL version that has it.
 
+Multi-node NVLink (MNNVL) needs two more things:
+
+- NCCL without the FABRIC handle leak in its MNNVL check
+  ([NVIDIA/nccl#2533](https://github.com/NVIDIA/nccl/pull/2533)). The leaked imported
+  handle otherwise makes `cuCheckpointProcessRestore` fail with
+  `CUDA_ERROR_OUT_OF_MEMORY`.
+- A driver that restores the process's IMEX channel subscription and fabric-import
+  event. Driver 610.43.02 does not
+  ([NVIDIA/cuda-checkpoint#64](https://github.com/NVIDIA/cuda-checkpoint/issues/64)), so
+  `ncclCommResume` cannot allocate or import FABRIC memory after a restore. Until it does,
+  preload the workaround from
+  [cuda-ckpt-fabric-restore](https://github.com/aoshen02/cuda-ckpt-fabric-restore) into the
+  workers.
+
+With [NVIDIA/nccl#2534](https://github.com/NVIDIA/nccl/pull/2534), a resume that cannot
+restore a peer buffer fails with an NCCL error. Without it, resume reports success and
+the next collective faults.
+
 FlashInfer must provide stable-address workspace `checkpoint_prepare` and
 `checkpoint_restore` methods. The executor calls existing worker hooks around
 the driver checkpoint. Disabling standalone FlashInfer all-reduce with
