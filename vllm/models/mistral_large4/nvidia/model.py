@@ -18,6 +18,7 @@ from transformers import PreTrainedConfig
 from vllm.config import VllmConfig
 from vllm.distributed import get_pp_group, tensor_model_parallel_all_reduce
 from vllm.model_executor.layers.fused_moe import (
+    RoutedExperts,
     fused_moe_make_expert_params_mapping,
 )
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -385,8 +386,7 @@ def _load_weights(
     params = {
         n.replace(".base_layer.", "."): p for n, p in model.named_parameters()
     }
-    expert_mapping = fused_moe_make_expert_params_mapping(
-        model,
+    expert_mapping = RoutedExperts.build_expert_params_mapping(
         ckpt_gate_proj_name="w1",
         ckpt_down_proj_name="w2",
         ckpt_up_proj_name="w3",
