@@ -769,6 +769,13 @@ class CudaCommunicator(DeviceCommunicatorBase):
         output = self._get_symm_scratch(role, shape, dtype, device)
         return output if is_symmetric_memory_tensor(output) else None
 
+    def all_to_all_single(self, output: torch.Tensor, input: torch.Tensor) -> None:
+        pynccl_comm = self.pynccl_comm
+        if pynccl_comm is not None and not pynccl_comm.disabled:
+            pynccl_comm.all_to_all_single(output, input)
+        else:
+            super().all_to_all_single(output, input)
+
     def send(self, tensor: torch.Tensor, dst: int | None = None) -> None:
         """Sends a tensor to the destination rank in a blocking way."""
         """NOTE: `dst` is the local rank of the destination rank."""

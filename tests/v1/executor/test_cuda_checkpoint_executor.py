@@ -261,27 +261,7 @@ def test_transport_requires_suspension_and_no_nvls(
 ):
     # Transport options are independent of the rejection rules; avoid their
     # Cartesian product while retaining each option and validation branch.
-    monkeypatch.setattr("vllm.platforms.current_platform.is_cuda", lambda: True)
-    env = {
-        "NCCL_P2P_DISABLE": p2p,
-        "NCCL_SHM_DISABLE": shm,
-        "NCCL_IB_DISABLE": ib,
-        "NCCL_CUMEM_ENABLE": "1",
-        "NCCL_CUMEM_HOST_ENABLE": "0",
-        "NCCL_NVLS_ENABLE": nvls,
-        "VLLM_ALLREDUCE_USE_FLASHINFER": "0",
-        "VLLM_ALLREDUCE_USE_SYMM_MEM": "0",
-        "VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC": "0",
-        "VLLM_USE_NCCL_SYMM_MEM": "0",
-    }
-    for key, value in env.items():
-        if value is None:
-            monkeypatch.delenv(key, raising=False)
-        else:
-            monkeypatch.setenv(key, value)
-    monkeypatch.delenv("VLLM_FLASHINFER_ALLREDUCE_BACKEND", raising=False)
-    if backend is not None:
-        monkeypatch.setenv("VLLM_FLASHINFER_ALLREDUCE_BACKEND", backend)
+    _set_nccl_env(monkeypatch, p2p, shm, ib, nvls, backend)
     config = _config(
         **{
             "compilation_config.mode": 3 if fusion else 0,
@@ -305,6 +285,64 @@ def test_transport_requires_suspension_and_no_nvls(
         else:
             with pytest.raises(ValueError, match="NCCL checkpoint configuration"):
                 CUDACheckpointExecutor(config)
+
+
+@pytest.mark.parametrize(
+    "dp,dp_shared_memory,peer_exchange,accepted",
+    [
+        pytest.param(4, False, False, True, id="dp-private-tables"),
+        pytest.param(4, True, False, False, id="dp-shared-tables"),
+        pytest.param(4, False, True, False, id="dp-peer-exchange"),
+        pytest.param(1, True, True, True, id="no-dp"),
+    ],
+)
+def test_engram_across_dp_requires_releasable_tables(
+    monkeypatch, dp, dp_shared_memory, peer_exchange, accepted
+):
+    _set_nccl_env(monkeypatch, "0", "0", "0", "0", None)
+    config = _config(
+        **{
+            "parallel_config.data_parallel_size": dp,
+            "parallel_config.enable_expert_parallel": dp > 1,
+            "model_config.enable_nccl_comm_suspend": True,
+        }
+    )
+    config.engram_config = SimpleNamespace(
+        dp_shared_memory=dp_shared_memory, peer_exchange=peer_exchange
+    )
+    with (
+        patch.object(MultiprocExecutor, "__init__", return_value=None),
+        patch.object(MultiprocExecutor, "shutdown"),
+    ):
+        if accepted:
+            CUDACheckpointExecutor(config).shutdown()
+        else:
+            with pytest.raises(ValueError, match="Engram"):
+                CUDACheckpointExecutor(config)
+
+
+def _set_nccl_env(monkeypatch, p2p, shm, ib, nvls, backend):
+    monkeypatch.setattr("vllm.platforms.current_platform.is_cuda", lambda: True)
+    env = {
+        "NCCL_P2P_DISABLE": p2p,
+        "NCCL_SHM_DISABLE": shm,
+        "NCCL_IB_DISABLE": ib,
+        "NCCL_CUMEM_ENABLE": "1",
+        "NCCL_CUMEM_HOST_ENABLE": "0",
+        "NCCL_NVLS_ENABLE": nvls,
+        "VLLM_ALLREDUCE_USE_FLASHINFER": "0",
+        "VLLM_ALLREDUCE_USE_SYMM_MEM": "0",
+        "VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC": "0",
+        "VLLM_USE_NCCL_SYMM_MEM": "0",
+    }
+    for key, value in env.items():
+        if value is None:
+            monkeypatch.delenv(key, raising=False)
+        else:
+            monkeypatch.setenv(key, value)
+    monkeypatch.delenv("VLLM_FLASHINFER_ALLREDUCE_BACKEND", raising=False)
+    if backend is not None:
+        monkeypatch.setenv("VLLM_FLASHINFER_ALLREDUCE_BACKEND", backend)
 
 
 def _group(world_size, has_symbols=True, suspended=False, available=True):

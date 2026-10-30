@@ -382,6 +382,10 @@ class DeviceCommunicatorBase:
             output_tensor = None
         return output_tensor
 
+    def all_to_all_single(self, output: torch.Tensor, input: torch.Tensor) -> None:
+        """Exchange equal dim-0 chunks of `input` with every rank into `output`."""
+        torch.distributed.all_to_all_single(output, input, group=self.device_group)
+
     def send(self, tensor: torch.Tensor, dst: int | None = None) -> None:
         """Sends a tensor to the destination rank in a blocking way."""
         """NOTE: `dst` is the local rank of the destination rank."""

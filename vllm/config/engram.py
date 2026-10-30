@@ -49,6 +49,12 @@ class EngramConfig:
     the other settings allow it, falling back to per-replica tables when DP
     replicas are not co-located on one node or /dev/shm cannot hold them."""
 
+    peer_exchange: bool = True
+    """Let node-local DP ranks read each other's Engram rows through PyTorch
+    symmetric memory where the GPUs are fully connected, instead of an NCCL
+    all-to-all. Its peer mappings are not released by sleep mode, so the CUDA
+    checkpoint executor requires this to be disabled with data parallelism."""
+
     use_thp: bool = False
     """Back private CPU-offloaded tables with transparent huge pages (best
     effort, falls back to ordinary pinned pages). Prefaulting the tables at

@@ -324,6 +324,10 @@ suspend and redo them on resume
 change, collectives over the network return wrong data or hang after a restore;
 the executor cannot detect the NCCL version that has it.
 
+With data parallelism, Engram models must keep private host tables and skip
+the symmetric-memory peer exchange, whose mappings sleep mode does not
+release: `--engram-config '{"dp_shared_memory": false, "peer_exchange": false}'`.
+
 FlashInfer must provide stable-address workspace `checkpoint_prepare` and
 `checkpoint_restore` methods. The executor calls existing worker hooks around
 the driver checkpoint. Disabling standalone FlashInfer all-reduce with

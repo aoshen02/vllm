@@ -970,6 +970,7 @@ class ParallelEngramEmbedding(nn.Module):
         cpu_offload: bool = False,
         dp_shared_memory: bool = False,
         use_thp: bool = False,
+        peer_exchange: bool = True,
     ) -> None:
         super().__init__()
         assert head_sizes and all(size > 0 for size in head_sizes)
@@ -977,6 +978,7 @@ class ParallelEngramEmbedding(nn.Module):
         self.cpu_offload = cpu_offload
         self.dp_shared_memory = dp_shared_memory
         self.use_thp = use_thp
+        self.peer_exchange = peer_exchange
         self.dp_size = get_engram_dp_size()
         if dp_shared_memory:
             if not cpu_offload:
@@ -994,6 +996,7 @@ class ParallelEngramEmbedding(nn.Module):
         peer_group = None
         if (
             not cpu_offload
+            and peer_exchange
             and self.dp_size > 1
             and get_tensor_model_parallel_world_size() == 1
         ):
@@ -1496,7 +1499,7 @@ class EngramBatch(nn.Module):
         )
         max_peer_slot = min(max_tokens, ENGRAM_A2A_MIN_SLOT - 1)
         self.peer_exchange = None
-        if table.cpu_offload:
+        if table.cpu_offload and table.peer_exchange:
             from vllm.models.deepseek_v41.nvidia.ops.engram_peer import (
                 EngramPeerExchange,
             )
@@ -1552,7 +1555,8 @@ class EngramBatch(nn.Module):
             group = get_engram_dp_group()
             assert group is not None
             sent, rows = rows, self.exchanged_rows[: rows.shape[0]]
-            torch.distributed.all_to_all_single(rows, sent, group=group.device_group)
+            # Through the group's communicator, which sleep mode can suspend.
+            group.all_to_all_single(rows, sent)
         table = self.layers[0].embed_tokens
         heads = table.n_hash_cols
         grid = (triton.cdiv(slot, 128) * 128 * heads // 16, len(self.layers))
@@ -1660,6 +1664,7 @@ class Engram(nn.Module):
             cpu_offload=engram_config.cpu_offload,
             dp_shared_memory=bool(engram_config.dp_shared_memory),
             use_thp=engram_config.use_thp,
+            peer_exchange=engram_config.peer_exchange,
         )
 
     def _init_staging(self, max_tokens: int, head_dim: int) -> None:
