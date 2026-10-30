@@ -4,12 +4,14 @@ import os
 import subprocess
 import sys
 import time
+from types import SimpleNamespace
 
 import pytest
 from opentelemetry.sdk.environment_variables import (
     OTEL_EXPORTER_OTLP_TRACES_INSECURE,
 )
 
+import vllm.v1.request as request_module
 from tests.tracing.conftest import FAKE_TRACE_SERVER_ADDRESS, FakeTraceService
 from tests.v1.core.utils import create_requests, create_scheduler, mock_kv
 from vllm.sampling_params import SamplingParams
@@ -39,6 +41,57 @@ class TestRequestLifecycleTracing:
     def setup_tracing(self, monkeypatch):
         monkeypatch.setenv(OTEL_EXPORTER_OTLP_TRACES_INSECURE, "true")
         init_tracer("test.request_lifecycle", FAKE_TRACE_SERVER_ADDRESS)
+
+    @pytest.mark.parametrize(
+        "status",
+        [
+            RequestStatus.FINISHED_STOPPED,
+            RequestStatus.FINISHED_ABORTED,
+            RequestStatus.FINISHED_ERROR,
+        ],
+    )
+    def test_remote_wait_accumulates_and_cleanup_ends_once(
+        self, trace_service, monkeypatch, status
+    ):
+        root, headers = start_request_span("llm_request", time.time_ns())
+        request = Request.from_engine_core_request(make_engine_request(headers), None)
+        timestamps = iter([10.0, 10.75, 20.0, 21.25])
+        anchors = iter([100_000_000_000, 200_000_000_000])
+        monkeypatch.setattr(
+            request_module,
+            "time",
+            SimpleNamespace(
+                monotonic=lambda: next(timestamps), time_ns=lambda: next(anchors)
+            ),
+        )
+        request.start_remote_kv_wait()
+        request.stop_remote_kv_wait()
+        request.start_remote_kv_wait()
+        request.status = status
+        request.trace_cleanup()
+        request.trace_cleanup()
+        request.stop_remote_kv_wait()
+        root.end()
+        assert request.remote_kv_wait_time == 2.0
+        assert request.remote_kv_wait_started_at is None
+        assert request.async_kv_load_start_time_ns is None
+        assert otel._GLOBAL_TRACER_PROVIDER.force_flush()
+        spans = [
+            span
+            for span in trace_service.get_all_spans()
+            if span["name"] == "vllm.request.wait_remote_kv"
+        ]
+        assert len(spans) == 2
+        assert (
+            sum(
+                span["end_time_unix_nano"] - span["start_time_unix_nano"]
+                for span in spans
+            )
+            == 2_000_000_000
+        )
+        assert sum(bool(span["attributes"].get("aborted")) for span in spans) == int(
+            status in (RequestStatus.FINISHED_ABORTED, RequestStatus.FINISHED_ERROR)
+        )
 
     def test_lifecycle_spans_nested_under_root_request(
         self, trace_service: FakeTraceService

@@ -103,6 +103,11 @@ class Request:
 
         # P/D: Connector-specific KV transfer parameters.
         self.kv_transfer_params: dict[str, Any] | None = None
+        self.remote_kv_wait_started_at: float | None = None
+        self.remote_kv_wait_time = 0.0
+        self.kv_transfer_metrics: dict[str, float] = {}
+        self.kv_allocation_started_at: float | None = None
+        self.kv_queue_started_at: dict[str, float] = {}
         # E/P/D: Connector-specific encoder-cache transfer parameters.
         self.ec_transfer_params: dict[str, Any] | None = None
 
@@ -347,6 +352,30 @@ class Request:
     ) -> None:
         self.events.append(EngineCoreEvent.new_event(event_type, timestamp))
 
+    def start_remote_kv_wait(self) -> None:
+        assert self.remote_kv_wait_started_at is None
+        self.remote_kv_wait_started_at = time.monotonic()
+        self.async_kv_load_start_time_ns = time.time_ns()
+
+    def stop_remote_kv_wait(self, aborted: bool = False) -> None:
+        """Accumulate remote-KV wait and emit its span from one elapsed time."""
+        if self.remote_kv_wait_started_at is None:
+            return
+
+        elapsed = time.monotonic() - self.remote_kv_wait_started_at
+        self.remote_kv_wait_time += elapsed
+        self.remote_kv_wait_started_at = None
+        start_time_ns = self.async_kv_load_start_time_ns
+        self.async_kv_load_start_time_ns = None
+        assert start_time_ns is not None
+        attributes = {"aborted": True} if aborted else None
+        self.emit_span(
+            "vllm.request.wait_remote_kv",
+            start_time_ns,
+            start_time_ns + int(elapsed * 1e9),
+            attributes,
+        )
+
     def take_events(self) -> list[EngineCoreEvent] | None:
         if not self.events:
             return None
@@ -410,23 +439,6 @@ class Request:
         self.emit_span("vllm.request.queue", self.arrival_time_ns, now)
         self.arrival_time_ns = None  # prevent double queue spans
 
-    def trace_end_kv_transfer(self, aborted: bool = False) -> None:
-        """Transition request out of KV transfer. Closes
-        vllm.request.wait_remote_kv span.
-        """
-        if self.async_kv_load_start_time_ns is None:
-            return
-
-        now = time.time_ns()
-        attributes = {"aborted": True} if aborted else None
-        self.emit_span(
-            "vllm.request.wait_remote_kv",
-            self.async_kv_load_start_time_ns,
-            now,
-            attributes,
-        )
-        self.async_kv_load_start_time_ns = None
-
     def trace_end_prefill(self, aborted: bool = False) -> None:
         """Transition request out of prefill. Closes vllm.request.prefill span."""
         if self.prefill_start_time_ns is None:
@@ -475,7 +487,7 @@ class Request:
             self.status == RequestStatus.FINISHED_ABORTED
             or self.status == RequestStatus.FINISHED_ERROR
         )
-        self.trace_end_kv_transfer(aborted=is_aborted)
+        self.stop_remote_kv_wait(aborted=is_aborted)
         self.trace_end_prefill(aborted=is_aborted)
         self.trace_end_decode(aborted=is_aborted)
 

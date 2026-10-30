@@ -3,11 +3,13 @@
 
 import json
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+import vllm.v1.request as request_module
 from vllm.config.multimodal import MultiModalConfig
 from vllm.entrypoints.generate.base.protocol import StreamOptions
 from vllm.entrypoints.openai.models.protocol import BaseModelPath
@@ -41,12 +43,89 @@ from vllm.renderers.online_derenderer import OnlineDerenderer
 from vllm.renderers.online_renderer import OnlineRenderer
 from vllm.sampling_params import SamplingParams
 from vllm.v1.engine.async_llm import AsyncLLM
-from vllm.v1.metrics.stats import RequestSpecDecodeMetrics
+from vllm.v1.metrics.stats import RequestSpecDecodeMetrics, RequestStateStats
+from vllm.v1.request import Request
 
 MODEL_NAME = "openai-community/gpt2"
 BASE_MODEL_PATHS = [
     BaseModelPath(name=MODEL_NAME, model_path=MODEL_NAME),
 ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("metrics_enabled", [False, True])
+@pytest.mark.parametrize("trace_enabled", [False, True])
+async def test_remote_wait_exports_are_independent(
+    monkeypatch, stream, metrics_enabled, trace_enabled
+):
+    request = Request(
+        request_id="req-1",
+        prompt_token_ids=[1, 2, 3],
+        sampling_params=SamplingParams(max_tokens=1),
+        pooling_params=None,
+        arrival_time=0.0,
+        trace_headers=(
+            {"traceparent": "00-" + "a" * 32 + "-" + "b" * 16 + "-01"}
+            if trace_enabled
+            else None
+        ),
+    )
+    timestamps = iter([10.0, 10.75])
+    monkeypatch.setattr(
+        request_module,
+        "time",
+        SimpleNamespace(
+            monotonic=lambda: next(timestamps), time_ns=lambda: 123_000_000_000
+        ),
+    )
+    spans = []
+    monkeypatch.setattr(
+        "vllm.tracing.instrument_manual", lambda **span: spans.append(span)
+    )
+    request.start_remote_kv_wait()
+    request.stop_remote_kv_wait()
+    assert request.remote_kv_wait_time == 0.75
+    assert len(spans) == int(trace_enabled)
+    if trace_enabled:
+        assert spans[0]["end_time"] - spans[0]["start_time"] == 750_000_000
+
+    engine = _mock_engine()
+
+    async def mock_generate(*args, **kwargs):
+        output = _make_request_output(
+            "req-1", token_ids=[10], finish_reason="stop", finished=True
+        )
+        output.metrics = RequestStateStats(
+            remote_kv_wait_time=request.remote_kv_wait_time,
+            kv_transfer_metrics={"kv_transfer_worker_time_ms": 250.0},
+        )
+        yield output
+
+    engine.generate = MagicMock(side_effect=mock_generate)
+    serving = _build_serving_tokens(engine, enable_per_request_metrics=metrics_enabled)
+    response = await serving.serve_tokens(
+        GenerateRequest(
+            token_ids=[1, 2, 3],
+            sampling_params=SamplingParams(max_tokens=1),
+            model=MODEL_NAME,
+            stream=stream,
+            stream_options=StreamOptions(include_usage=True) if stream else None,
+        )
+    )
+    if stream:
+        chunks = _parse_sse_chunks([chunk async for chunk in response])
+        payload = next(chunk for chunk in reversed(chunks) if isinstance(chunk, dict))
+        metrics = payload.get("metrics")
+    else:
+        metrics = (
+            response.metrics.model_dump() if response.metrics is not None else None
+        )
+    if metrics_enabled:
+        assert metrics["remote_kv_wait_time_ms"] == 750.0
+        assert metrics["kv_transfer_worker_time_ms"] == 250.0
+    else:
+        assert metrics is None
 
 
 @dataclass
@@ -149,6 +228,7 @@ def _make_request_output(
     index: int = 0,
     spec_decode_metrics: RequestSpecDecodeMetrics | None = None,
     text: str = "",
+    metrics: RequestStateStats | None = None,
 ) -> RequestOutput:
     return RequestOutput(
         request_id=request_id,
@@ -168,7 +248,7 @@ def _make_request_output(
             )
         ],
         finished=finished,
-        metrics=None,
+        metrics=metrics,
         lora_request=None,
         encoder_prompt=None,
         encoder_prompt_token_ids=None,
@@ -250,6 +330,116 @@ async def test_serve_tokens_skips_mm_cache_for_remote_engine_execution():
         serving.online_renderer.preprocess_completion.call_args.kwargs["skip_mm_cache"]
         is True
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("num_choices", [1, 2])
+@pytest.mark.parametrize("null_prefill", [False, True])
+@pytest.mark.parametrize("export_kv", [False, True])
+async def test_serve_tokens_returns_enabled_request_metrics(
+    stream, num_choices, null_prefill, export_kv
+):
+    engine = _mock_engine()
+    metrics = RequestStateStats(
+        queued_ts=1.0,
+        scheduled_ts=2.0,
+        first_token_ts=5.0,
+        last_token_ts=9.0,
+        first_token_latency=6.0,
+        remote_kv_wait_time=0.75,
+        kv_transfer_metrics={
+            "kv_initial_queue_wait_time_ms": 7.0,
+            "kv_post_receive_queue_wait_time_ms": 2.0,
+            "kv_transfer_worker_time_ms": 10.0,
+            "kv_transfer_bytes": 1024,
+        },
+    )
+
+    async def mock_generate(*args, **kwargs):
+        output = _make_request_output(
+            "req-1",
+            token_ids=[10],
+            finish_reason="stop",
+            finished=True,
+            metrics=metrics,
+        )
+        if export_kv:
+            output.kv_transfer_params = {"do_remote_decode": True}
+        if num_choices == 2:
+            output.outputs.extend(
+                _make_request_output(
+                    "req-1", token_ids=[11], index=1, finish_reason="stop"
+                ).outputs
+            )
+        yield output
+
+    engine.generate = MagicMock(side_effect=mock_generate)
+    serving = _build_serving_tokens(engine, enable_per_request_metrics=True)
+    request = GenerateRequest(
+        token_ids=[1, 2, 3],
+        sampling_params=SamplingParams(max_tokens=1, n=num_choices),
+        model=MODEL_NAME,
+        stream=stream,
+        kv_transfer_params={
+            "prefill_metrics": None
+            if null_prefill
+            else {
+                "queue_time_ms": 12.0,
+                "time_to_first_token_ms": 25.0,
+                "kv_allocation_wait_time_ms": 3.0,
+                "kv_initial_queue_wait_time_ms": 4.0,
+            }
+        },
+        stream_options=StreamOptions(include_usage=True) if stream else None,
+    )
+
+    response = await serving.serve_tokens(request)
+
+    if stream:
+        chunks = _parse_sse_chunks([chunk async for chunk in response])
+        final_chunk = next(
+            chunk
+            for chunk in chunks
+            if chunk != "[DONE]" and chunk.get("usage") and not chunk.get("choices")
+        )
+        assert final_chunk["usage"]["completion_tokens"] == num_choices
+        result = final_chunk.get("metrics")
+    else:
+        assert isinstance(response, GenerateTokensResponse)
+        assert len(response.choices) == num_choices
+        assert response.usage.completion_tokens == num_choices
+        result = response.metrics.model_dump() if response.metrics is not None else None
+        if export_kv:
+            assert response.kv_transfer_params["do_remote_decode"] is True
+            if num_choices == 1:
+                assert (
+                    response.kv_transfer_params["prefill_metrics"]["queue_time_ms"]
+                    == 1000.0
+                )
+            else:
+                assert "prefill_metrics" not in response.kv_transfer_params
+    if num_choices != 1:
+        assert result is None
+        return
+    assert result["queue_time_ms"] == 1000.0
+    assert result["time_to_first_token_ms"] == 3000.0
+    assert result["generation_time_ms"] == 4000.0
+    assert result["remote_kv_wait_time_ms"] == 750.0
+    assert result["kv_transfer_worker_time_ms"] == 10.0
+    assert result["kv_transfer_bytes"] == 1024
+    assert result.get("prefill_queue_time_ms") == (None if null_prefill else 12.0)
+    assert result.get("prefill_time_to_first_token_ms") == (
+        None if null_prefill else 25.0
+    )
+    assert result.get("prefill_kv_allocation_wait_time_ms") == (
+        None if null_prefill else 3.0
+    )
+    assert result.get("prefill_kv_initial_queue_wait_time_ms") == (
+        None if null_prefill else 4.0
+    )
+    assert result["kv_initial_queue_wait_time_ms"] == 7.0
+    assert result["kv_post_receive_queue_wait_time_ms"] == 2.0
 
 
 @pytest.mark.asyncio
