@@ -161,7 +161,9 @@ By default, NCCL communicators keep their GPU buffers while asleep. With
 them with `ncclCommSuspend` and wake restores them with `ncclCommResume`. The
 communicators keep their topology, so they are not re-created. It needs NCCL
 2.29.7 or newer; with an older library, a warning is logged and the memory stays
-on the GPU.
+on the GPU. It also needs NCCL's cuMem allocator (the default): with
+`NCCL_CUMEM_ENABLE=0`, NCCL allocates with `cudaMalloc`, which suspension cannot
+release, so startup refuses that combination.
 
 ```python
 llm = LLM("Qwen/Qwen3-8B", enable_sleep_mode=True, enable_nccl_comm_suspend=True)

@@ -57,6 +57,8 @@ def defer_comm_warmup_on_rocm():
 _NCCL_SYMM_OPS_REGISTERED = False
 
 _NCCL_SUSPEND_MEM = 0x01
+# ncclCommMemStat_t: allocated GPU memory that ncclCommSuspend can release.
+_NCCL_STAT_GPU_MEM_SUSPEND = 0
 
 
 def register_nccl_symmetric_ops(pynccl_comm):
@@ -597,6 +599,16 @@ class PyNcclCommunicator:
                 "memory suspension."
             )
             return
+        # Without NCCL's cuMem allocator, suspension succeeds but frees nothing.
+        if self.nccl.has_symbol("ncclCommMemStats") and not (
+            self.nccl.ncclCommMemStats(self.comm, _NCCL_STAT_GPU_MEM_SUSPEND)
+        ):
+            raise RuntimeError(
+                "NCCL has no suspendable memory, so ncclCommSuspend would release "
+                "nothing. NCCL allocates with cudaMalloc when its cuMem allocator "
+                "is off (NCCL_CUMEM_ENABLE=0, or a driver without cuMem support); "
+                "enable it to use enable_nccl_comm_suspend."
+            )
         self.nccl.ncclCommSuspend(self.comm, _NCCL_SUSPEND_MEM)
         self._suspended = True
 

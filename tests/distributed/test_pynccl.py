@@ -482,8 +482,21 @@ def test_nccl_error_includes_last_error():
         lib.NCCL_CHECK(lib._funcs["ncclGetUniqueId"](None))
 
 
-def test_pynccl_suspend_resume_idempotent():
-    """Repeated suspend/resume (e.g. staged wake-ups) reach NCCL once each."""
+@pytest.mark.parametrize(
+    "symbols,suspendable_bytes,suspends",
+    [
+        ({"ncclCommSuspend", "ncclCommMemStats"}, 1 << 20, True),
+        ({"ncclCommSuspend"}, None, True),
+        (set(), None, False),
+        ({"ncclCommSuspend", "ncclCommMemStats"}, 0, None),
+    ],
+    ids=["suspendable", "no-mem-stats", "no-suspend-symbol", "nothing-to-release"],
+)
+def test_pynccl_suspend_resume(symbols, suspendable_bytes, suspends):
+    """Repeated suspend/resume (e.g. staged wake-ups) reach NCCL at most once
+    each. Without ncclCommSuspend (RCCL, NCCL < 2.29.7) both are no-ops. With
+    nothing to release (NCCL without its cuMem allocator), suspend() raises
+    instead of silently keeping the memory."""
     from unittest.mock import Mock
 
     comm = object.__new__(PyNcclCommunicator)
@@ -491,31 +504,19 @@ def test_pynccl_suspend_resume_idempotent():
     comm._suspended = False
     comm.comm = object()
     comm.nccl = Mock()
+    comm.nccl.has_symbol.side_effect = symbols.__contains__
+    comm.nccl.ncclCommMemStats.return_value = suspendable_bytes
 
-    comm.suspend()
-    comm.suspend()
+    if suspends is None:
+        with pytest.raises(RuntimeError, match="NCCL_CUMEM_ENABLE=0"):
+            comm.suspend()
+    else:
+        comm.suspend()
+        comm.suspend()
     comm.resume()
     comm.resume()
 
-    assert comm.nccl.ncclCommSuspend.call_count == 1
-    assert comm.nccl.ncclCommResume.call_count == 1
-
-
-def test_pynccl_suspend_noop_without_symbol():
-    """RCCL / NCCL < 2.29.7 lack ncclCommSuspend; suspend() must no-op, not
-    crash, and resume() must then no-op too since nothing was suspended."""
-    from unittest.mock import Mock
-
-    comm = object.__new__(PyNcclCommunicator)
-    comm.disabled = False
-    comm._suspended = False
-    comm.comm = object()
-    comm.nccl = Mock()
-    comm.nccl.has_symbol.return_value = False
-
-    comm.suspend()
-    comm.resume()
-
-    comm.nccl.ncclCommSuspend.assert_not_called()
-    comm.nccl.ncclCommResume.assert_not_called()
+    calls = int(bool(suspends))
+    assert comm.nccl.ncclCommSuspend.call_count == calls
+    assert comm.nccl.ncclCommResume.call_count == calls
     assert comm._suspended is False
