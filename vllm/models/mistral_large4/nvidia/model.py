@@ -383,9 +383,7 @@ def _load_weights(
     config = mistral_model.config
     # LoRA wraps layers after the first load; a later reload sees their
     # parameters under ``<module>.base_layer.<param>``.
-    params = {
-        n.replace(".base_layer.", "."): p for n, p in model.named_parameters()
-    }
+    params = {n.replace(".base_layer.", "."): p for n, p in model.named_parameters()}
     expert_mapping = RoutedExperts.build_expert_params_mapping(
         ckpt_gate_proj_name="w1",
         ckpt_down_proj_name="w2",

@@ -710,7 +710,10 @@ class RoutedExperts(PluggableLayer):
             OnlineMoEMethodBase,
         )
 
-        base_quant_method = self.quant_method
+        # LoRA swaps in FusedMoEModularMethod; load with the method it wraps.
+        base_quant_method = getattr(
+            self.quant_method, "old_quant_method", self.quant_method
+        )
 
         # In case online MOE re-quantization is used, loading is handled
         # by the original quant method.
