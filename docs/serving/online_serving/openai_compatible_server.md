@@ -92,6 +92,54 @@ completion = client.chat.completions.create(
 )
 ```
 
+### Logprobs for chosen token IDs (`logprob_token_ids`)
+
+Set `logprob_token_ids` to get the logprob of a fixed set of token IDs that you choose (not the top-k) at every generated position.
+At each position the response contains your IDs plus the sampled token, which is always included.
+
+```python
+label_ids = tokenizer.convert_tokens_to_ids(["yes", "no"])  # any in-vocab ids
+
+# Chat Completions: `logprobs` must be true. The IDs replace `top_logprobs`, which is ignored.
+completion = client.chat.completions.create(
+    model="Qwen/Qwen2.5-1.5B-Instruct",
+    messages=[{"role": "user", "content": "Is the sky blue? Answer yes or no."}],
+    max_tokens=1,
+    logprobs=True,
+    extra_body={"logprob_token_ids": label_ids, "return_tokens_as_token_ids": True},
+)
+print(completion.choices[0].logprobs.content[0].top_logprobs)
+
+# Completions: `logprobs` must be set (any integer); the IDs replace the top-k.
+completion = client.completions.create(
+    model="Qwen/Qwen2.5-1.5B-Instruct",
+    prompt="The sky is",
+    max_tokens=4,
+    logprobs=1,
+    extra_body={"logprob_token_ids": label_ids},
+)
+```
+
+Offline, pass the field to `SamplingParams`. `outputs[0].logprobs` then has one `{token_id: Logprob}` dict per generated position:
+
+```python
+params = SamplingParams(max_tokens=4, logprob_token_ids=label_ids)
+```
+
+Requirements and limits:
+
+- At most 128 IDs (`MAX_LOGPROB_TOKEN_IDS`, independent of `--max-logprobs`). Each ID must satisfy `0 <= id < vocab_size`.
+- Offline, leave `logprobs` unset or set it to `len(logprob_token_ids)`. Any other value raises a validation error, and a set value is also checked against `--max-logprobs`.
+- `/v1/completions` rejects the request if `logprobs` is null. `/v1/chat/completions` rejects it unless `logprobs` is `true`.
+- Not supported with `use_beam_search`. Completions also rejects `echo=True` with `max_tokens=0`, because no tokens are generated.
+- With `return_tokens_as_token_ids: true`, entries appear as `token_id:<int>`, so you can map them back to your IDs. The values follow `--logprobs-mode` (default `raw_logprobs`).
+
+!!! warning
+    On the V1 model runner, if any request in a batch sets `logprob_token_ids`, the sampler replaces the logprobs of every request in that batch. Concurrent requests that asked for top-k `logprobs` lose their top-k entries; only their sampled token stays valid.
+    Model Runner V2, which is the default, builds rows per request and does not have this problem.
+    vLLM falls back to V1 when you set `VLLM_USE_V2_MODEL_RUNNER=0` or when a feature is unsupported; it logs "using the V1 model runner instead".
+    If you must run on V1, serve `logprob_token_ids` traffic on a dedicated instance.
+
 ## Extra HTTP Headers
 
 The `X-Request-Id` HTTP request header can be enabled with
