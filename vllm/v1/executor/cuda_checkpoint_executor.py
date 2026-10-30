@@ -14,7 +14,10 @@ from typing import Any, cast
 
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
-from vllm.utils.cuda_process_checkpoint import CudaProcessCheckpoint
+from vllm.utils.cuda_process_checkpoint import (
+    HOST_COPY_DEADLINE_S,
+    CudaProcessCheckpoint,
+)
 from vllm.v1.executor.multiproc_executor import MultiprocExecutor
 
 logger = init_logger(__name__)
@@ -184,7 +187,9 @@ class CUDACheckpointExecutor(MultiprocExecutor):
                 "Workers are checkpointed; wake them before issuing RPCs"
             )
         if method in ("sleep", "wake_up") and timeout is None:
-            timeout = 120
+            # Worker sleep and wake copy the offloaded weights to or from host
+            # memory, like checkpoint and restore do for the remaining state.
+            timeout = HOST_COPY_DEADLINE_S
         return super().collective_rpc(
             method,
             timeout=timeout,

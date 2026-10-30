@@ -347,8 +347,9 @@ All ranks are locked before any is checkpointed. All ranks are restored before
 any is unlocked. Operations within each stage run concurrently across workers.
 Lock and unlock stages have a 30-second response deadline (each lock also has a
 10-second driver timeout); checkpoint and restore stages, which copy device
-memory, have 300 seconds. Worker sleep/wake and FlashInfer workspace
-hooks have a 120-second response deadline. Failure terminates the workers rather than
+memory, have 300 seconds. Worker sleep and wake, which copy the offloaded
+weights, share that 300-second deadline; FlashInfer workspace hooks have 120
+seconds. Failure terminates the workers rather than
 serving with a partially restored rank set; restart the engine after failure.
 Shutdown terminates the dedicated worker and helper processes without restoring
 their CUDA state or requiring free GPU memory for the model.
