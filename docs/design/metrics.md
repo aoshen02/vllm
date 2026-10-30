@@ -683,6 +683,28 @@ OpenTelemetry has a
 Since metrics is a big enough topic on its own, we consider the topic
 of tracing to be quite separate from metrics.
 
+### Request Lifecycle Spans
+
+With an OTLP endpoint configured, the Python output processor starts an
+`llm_request` span and propagates its W3C trace context to the engine request.
+Incoming `traceparent` and `tracestate` headers connect it to the caller's trace.
+The scheduler emits child spans for `vllm.request.queue`,
+`vllm.request.wait_remote_kv`, `vllm.request.prefill`, and `vllm.request.decode`.
+These measure request lifecycle intervals, not individual GPU kernel durations.
+
+Preemption closes active compute intervals with `preempted=true`. Cleanup closes
+remaining intervals, marking aborted or errored work with `aborted=true`.
+Completion and cancellation close the output processor's owned request span.
+Partial remote prompt-cache hits remain prefill until the prompt-completion
+threshold is reached; cached tokens alone do not imply decode.
+
+Lifecycle children require trace headers, and root creation requires tracing to
+be enabled. These guards do not imply zero disabled-tracing bookkeeping cost.
+The engine launch path propagates the configured OTLP endpoint to child
+processes; this is not a replacement for API-server-worker initialization.
+This Python lifecycle implementation does not establish Rust frontend parity,
+real distributed KV transport coverage, or error-detail attributes on root spans.
+
 ### OpenTelemetry Model Forward vs Execute Time
 
 The current implementation exposes the following two metrics:

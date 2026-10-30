@@ -103,8 +103,19 @@ class Request:
 
         # P/D: Connector-specific KV transfer parameters.
         self.kv_transfer_params: dict[str, Any] | None = None
+        self.remote_kv_wait_started_at: float | None = None
+        self.remote_kv_wait_time = 0.0
+        self.kv_transfer_metrics: dict[str, float] = {}
+        self.kv_allocation_started_at: float | None = None
+        self.kv_queue_started_at: dict[str, float] = {}
         # E/P/D: Connector-specific encoder-cache transfer parameters.
         self.ec_transfer_params: dict[str, Any] | None = None
+
+        # Distributed Tracing: Explicit state transition timing fields.
+        self.arrival_time_ns: int | None = int(self.arrival_time * 1e9)
+        self.async_kv_load_start_time_ns: int | None = None
+        self.prefill_start_time_ns: int | None = None
+        self.decode_start_time_ns: int | None = None
 
         if pooling_params is not None:
             # Pooling models.
@@ -341,6 +352,30 @@ class Request:
     ) -> None:
         self.events.append(EngineCoreEvent.new_event(event_type, timestamp))
 
+    def start_remote_kv_wait(self) -> None:
+        assert self.remote_kv_wait_started_at is None
+        self.remote_kv_wait_started_at = time.monotonic()
+        self.async_kv_load_start_time_ns = time.time_ns()
+
+    def stop_remote_kv_wait(self, aborted: bool = False) -> None:
+        """Accumulate remote-KV wait and emit its span from one elapsed time."""
+        if self.remote_kv_wait_started_at is None:
+            return
+
+        elapsed = time.monotonic() - self.remote_kv_wait_started_at
+        self.remote_kv_wait_time += elapsed
+        self.remote_kv_wait_started_at = None
+        start_time_ns = self.async_kv_load_start_time_ns
+        self.async_kv_load_start_time_ns = None
+        assert start_time_ns is not None
+        attributes = {"aborted": True} if aborted else None
+        self.emit_span(
+            "vllm.request.wait_remote_kv",
+            start_time_ns,
+            start_time_ns + int(elapsed * 1e9),
+            attributes,
+        )
+
     def take_events(self) -> list[EngineCoreEvent] | None:
         if not self.events:
             return None
@@ -365,6 +400,96 @@ class Request:
         if self.request_id != other.request_id:
             return self.request_id < other.request_id
         return id(self) < id(other)
+
+    def emit_span(
+        self,
+        span_name: str,
+        start_time: int,
+        end_time: int,
+        attributes: dict[str, Any] | None = None,
+    ) -> None:
+        """Helper to manually emit an OTel trace span linked to this request's
+        context."""
+        if not self.trace_headers:
+            return
+        from vllm.tracing import extract_trace_context, instrument_manual
+
+        trace_context = (
+            extract_trace_context(self.trace_headers) if self.trace_headers else None
+        )
+
+        merged_attributes = {"request_id": self.request_id}
+        if attributes:
+            merged_attributes.update(attributes)
+
+        instrument_manual(
+            span_name=span_name,
+            start_time=start_time,
+            end_time=end_time,
+            context=trace_context,
+            attributes=merged_attributes,
+        )
+
+    def trace_end_queuing(self) -> None:
+        """Transition request out of the queue. Closes vllm.request.queue span."""
+        if self.arrival_time_ns is None:
+            return
+
+        now = time.time_ns()
+        self.emit_span("vllm.request.queue", self.arrival_time_ns, now)
+        self.arrival_time_ns = None  # prevent double queue spans
+
+    def trace_end_prefill(self, aborted: bool = False) -> None:
+        """Transition request out of prefill. Closes vllm.request.prefill span."""
+        if self.prefill_start_time_ns is None:
+            return
+
+        now = time.time_ns()
+        attributes = {"aborted": True} if aborted else None
+        self.emit_span(
+            "vllm.request.prefill", self.prefill_start_time_ns, now, attributes
+        )
+        self.prefill_start_time_ns = None
+
+    def trace_end_decode(self, aborted: bool = False) -> None:
+        """Transition request out of decode. Closes vllm.request.decode span."""
+        if self.decode_start_time_ns is None:
+            return
+
+        now = time.time_ns()
+        attributes = {"aborted": True} if aborted else None
+        self.emit_span(
+            "vllm.request.decode", self.decode_start_time_ns, now, attributes
+        )
+        self.decode_start_time_ns = None
+
+    def trace_preempt(self) -> None:
+        """Transition request to PREEMPTED. Closes active prefill or decode spans."""
+        now = time.time_ns()
+        attributes = {"preempted": True}
+
+        if self.prefill_start_time_ns is not None:
+            self.emit_span(
+                "vllm.request.prefill", self.prefill_start_time_ns, now, attributes
+            )
+            self.prefill_start_time_ns = None
+
+        if self.decode_start_time_ns is not None:
+            self.emit_span(
+                "vllm.request.decode", self.decode_start_time_ns, now, attributes
+            )
+            self.decode_start_time_ns = None
+
+    def trace_cleanup(self) -> None:
+        """Catch-all transition to clean up any lingering active spans when
+        request is freed."""
+        is_aborted = (
+            self.status == RequestStatus.FINISHED_ABORTED
+            or self.status == RequestStatus.FINISHED_ERROR
+        )
+        self.stop_remote_kv_wait(aborted=is_aborted)
+        self.trace_end_prefill(aborted=is_aborted)
+        self.trace_end_decode(aborted=is_aborted)
 
 
 class RequestStatus(enum.IntEnum):

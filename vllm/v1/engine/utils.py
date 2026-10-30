@@ -1205,6 +1205,8 @@ def launch_core_engines(
     addresses: EngineZmqAddresses,
 ) -> Iterator[CoreEngineLaunch]:
     """Launch engine and DP coordinator processes as needed."""
+    if endpoint := vllm_config.observability_config.otlp_traces_endpoint:
+        os.environ["OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"] = endpoint
     parallel_config = vllm_config.parallel_config
     dp_size = parallel_config.data_parallel_size
     local_engine_count = parallel_config.data_parallel_size_local
