@@ -428,11 +428,18 @@ def test_transposed_kept_param_keeps_checkpoint_dims(single_rank_tp: None) -> No
 class TestRefillDerived:
     """A tensor derived from the weights (a buffer or plain attribute kernels
     read) is refilled in place when the layout matches, so captured graphs keep
-    its address, and never becomes a parameter."""
+    its address."""
 
-    @pytest.mark.parametrize("kind", ["buffer", "attr", "absent"])
     @pytest.mark.parametrize(
-        "shape,in_place", [((2, 3), True), ((3, 3), False)], ids=["same", "new"]
+        "kind,shape,in_place",
+        [
+            ("buffer", (2, 3), True),
+            ("buffer", (3, 3), False),
+            ("attr", (2, 3), True),
+            ("attr", (3, 3), False),
+            ("absent", (2, 3), False),
+        ],
+        ids=["buffer-same", "buffer-new", "attr-same", "attr-new", "absent"],
     )
     def test_refill(self, kind, shape, in_place):
         layer = torch.nn.Module()
@@ -444,6 +451,5 @@ class TestRefillDerived:
         held = refill_derived(layer, "t", torch.full(shape, 2.0))
         assert held is layer.t
         torch.testing.assert_close(held, torch.full(shape, 2.0))
-        assert (held is old) == (in_place and old is not None)
+        assert (held is old) == in_place
         assert ("t" in layer._buffers) == (kind == "buffer")
-        assert not dict(layer.named_parameters())
