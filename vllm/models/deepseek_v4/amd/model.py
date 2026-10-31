@@ -78,7 +78,10 @@ from vllm.models.deepseek_v4.amd.mega_moe import (
     finalize_mega_moe_weights,
 )
 from vllm.models.deepseek_v4.amd.mono_decode import MonoDecodeLayer
-from vllm.models.deepseek_v4.amd.rocm import DeepseekV4ROCMAiterMLAAttention
+from vllm.models.deepseek_v4.amd.rocm import (
+    DeepseekV4ROCMAiterMLAAttention,
+    keep_storage,
+)
 from vllm.models.deepseek_v4.common.spec_decode import needs_mtp_hidden_buffer
 from vllm.platforms import current_platform
 from vllm.platforms.rocm import on_gfx950, on_gfx1250
@@ -172,7 +175,7 @@ class DeepseekV4MLP(nn.Module):
                 "weight",
                 rocm_aiter_ops.shuffle_weight(w.data, layout=(16, 16)),
             )
-        self._gateup_scale = ws
+        self._gateup_scale = keep_storage(self._gateup_scale, ws)
 
     def forward(self, x):
         if self._gateup_scale is not None and x.dim() == 2:
@@ -1577,6 +1580,7 @@ class DeepseekV4ForCausalLM(nn.Module, SupportsPP, SupportsEagle3):
             if isinstance(module, DeepseekV4ROCMAiterMLAAttention):
                 fused_compressor_layers += module.prepare_compressor_gemm_fusion()
                 module.prepare_attn_preshuffle()
+                module.refresh_wo_a_cache()
             elif isinstance(module, DeepseekV4MLP):
                 module.prepare_gateup_preshuffle()
         if fused_compressor_layers:
