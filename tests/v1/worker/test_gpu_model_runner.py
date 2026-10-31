@@ -4,7 +4,7 @@
 import gc
 from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, call
 
 import numpy as np
 import pytest
@@ -1176,6 +1176,42 @@ def test_reload_weights_path_replaces_object_storage_source(monkeypatch):
     loader.get_all_weights.assert_called_once_with(vllm_config.model_config, model)
     cfg = vllm_config.model_config
     assert (cfg.model, cfg.model_weights, cfg.revision) == ("org/new-model", "", None)
+
+
+@pytest.mark.parametrize(
+    "load_device,device,expected",
+    [(None, "cpu", "cpu"), ("cpu", "cuda", "cpu")],
+    ids=["device-config", "load-config-overrides"],
+)
+def test_reload_weights_wraps_load_in_reload(
+    monkeypatch, load_device, device, expected
+):
+    # A checkpoint-format reload starts the reload before loading and finishes
+    # it after, on the load device when one is set.
+    calls = Mock()
+    monkeypatch.setattr(reload_inplace_module, "start_reload", calls.start)
+    monkeypatch.setattr(reload_inplace_module, "finish_reload", calls.finish)
+    model = Mock()
+    model.named_parameters.return_value = []
+    model.load_weights = calls.load
+    calls.load.return_value = None
+    vllm_config = SimpleNamespace(
+        lora_config=None,
+        load_config=SimpleNamespace(device=load_device),
+        device_config=SimpleNamespace(device=device),
+        model_config=SimpleNamespace(quantization=None),
+    )
+    weights = [("w", torch.zeros(1))]
+
+    reload_inplace_module.reload_weights(
+        vllm_config, model, weights, weights_path=None, is_checkpoint_format=True
+    )
+
+    assert calls.mock_calls == [
+        call.start(model),
+        call.load(weights),
+        call.finish(model, vllm_config.model_config, torch.device(expected)),
+    ]
 
 
 def test_sample_passes_reordered_draft_probs_to_rejection_sampler():
