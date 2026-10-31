@@ -52,6 +52,7 @@ from vllm.v1.attention.backends.mla.sparse_swa import (
     DeepseekSparseSWAMetadataBuilder,
 )
 from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
+    _get_cached_wo_a_bf16,
     build_prefill_topk_ragged_indices,
     build_ragged_indices_from_dense,
     rocm_inv_rope_einsum,
@@ -840,6 +841,29 @@ class DeepseekV4ROCMAiterMLASparseBackend(DeepseekV4SparseMLABackend):
         return DeepseekV4ROCMAiterMLASparseMetadataBuilder
 
 
+def keep_storage(
+    old: torch.Tensor | None, new: torch.Tensor | None
+) -> torch.Tensor | None:
+    """Write a tensor derived after loading into the one from the previous load.
+
+    Post-load processing reruns after every weight reload, and a captured CUDA
+    graph keeps reading the first tensor. Detached so that a scale parameter
+    is not registered again on the module that caches it.
+    """
+    if new is None:
+        return None
+    new = new.detach()
+    if (
+        old is not None
+        and old.shape == new.shape
+        and old.dtype == new.dtype
+        and old.data_ptr() != new.data_ptr()
+    ):
+        old.copy_(new)
+        return old
+    return new
+
+
 class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
     """ROCm sparse MLA attention layer for DeepSeek V4."""
 
@@ -1124,8 +1148,10 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
                 )
             return ws
 
-        self._wqa_wkv_scale = _prep(self.fused_wqa_wkv)
-        self._wo_b_scale = _prep(self.wo_b)
+        self._wqa_wkv_scale = keep_storage(
+            self._wqa_wkv_scale, _prep(self.fused_wqa_wkv)
+        )
+        self._wo_b_scale = keep_storage(self._wo_b_scale, _prep(self.wo_b))
         if _ON_GFX950 and envs.VLLM_ROCM_USE_AITER_FP8BMM:
             self._prepare_fp8_wo_a()
 
@@ -1204,8 +1230,9 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
             return
 
         self._wo_a_fp8_weight = weight.view(groups, out_per_group, in_features)
-        self._wo_a_e8m0_scale = e8m0_scale.view(
-            groups, out_per_group // 128, in_features // 128
+        self._wo_a_e8m0_scale = keep_storage(
+            self._wo_a_e8m0_scale,
+            e8m0_scale.view(groups, out_per_group // 128, in_features // 128),
         )
         cache = getattr(self.rotary_emb, "cos_sin_cache_bf16", None)
         if cache is None:
@@ -1213,6 +1240,17 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
         cos_cache, sin_cache = cache.chunk(2, dim=-1)
         self._wo_a_cos_cache = cos_cache.contiguous()
         self._wo_a_sin_cache = sin_cache.contiguous()
+
+    def refresh_wo_a_cache(self) -> None:
+        """Rebuild the bf16 wo_a that the first forward cached, in place."""
+        cached = getattr(self.wo_a, "_dsv4_wo_a_bf16", None)
+        if cached is None:
+            return
+        del self.wo_a._dsv4_wo_a_bf16
+        # Built during a forward pass, so it is an inference tensor.
+        with torch.inference_mode():
+            cached.copy_(_get_cached_wo_a_bf16(self.wo_a, *cached.shape))
+        self.wo_a._dsv4_wo_a_bf16 = cached
 
     def prepare_compressor_gemm_fusion(self) -> bool:
         if self._fused_compressor_weight is not None:
