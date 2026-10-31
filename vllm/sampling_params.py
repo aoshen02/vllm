@@ -875,6 +875,15 @@ class SamplingParams(
             return SamplingType.RANDOM_SEED
         return SamplingType.RANDOM
 
+    @cached_property
+    def skips_rl_outputs(self) -> bool:
+        """Whether `extra_args["return_rl_outputs"]` is false: the request
+        neither records nor returns routed experts, and gets no sampling
+        masks."""
+        return (
+            bool(self.extra_args) and self.extra_args.get("return_rl_outputs") is False
+        )
+
     @property
     def eos_token_id(self) -> int | None:
         return self._eos_token_id
