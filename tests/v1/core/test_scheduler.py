@@ -315,14 +315,13 @@ def test_evicted_blocks_release_their_auxiliary_outputs_past_capacity():
     assert list(metadata.released_block_hashes) == first.block_hashes[:3]
 
 
-def _rl_outputs_params(return_rl_outputs: bool, max_tokens: int = 16) -> SamplingParams:
-    return SamplingParams(
-        max_tokens=max_tokens,
-        extra_args=None if return_rl_outputs else {"return_rl_outputs": False},
-    )
+def _aux_outputs_params(
+    return_aux_outputs: bool, max_tokens: int = 16
+) -> SamplingParams:
+    return SamplingParams(max_tokens=max_tokens, return_aux_outputs=return_aux_outputs)
 
 
-def test_rl_outputs_opt_out_is_not_recorded():
+def test_aux_outputs_opt_out_is_not_recorded():
     scheduler = create_scheduler(enable_prefix_caching=True)
     scheduler.aux_output_connector = AuxOutputSchedulerConnector(
         scheduler.kv_cache_manager
@@ -334,7 +333,7 @@ def test_rl_outputs_opt_out_is_not_recorded():
         num_requests=1,
         num_tokens=32,
         req_ids=["skipped"],
-        sampling_params=_rl_outputs_params(False, max_tokens=1),
+        sampling_params=_aux_outputs_params(False, max_tokens=1),
     )
     scheduler.add_request(recorded)
     scheduler.add_request(skipped)
@@ -365,25 +364,25 @@ def test_rl_outputs_opt_out_is_not_recorded():
     assert metadata.finished_requests == ("recorded",)
 
 
-def test_rl_outputs_opt_out_prefix_cache_is_separate():
+def test_aux_outputs_opt_out_prefix_cache_is_separate():
     scheduler = create_scheduler(enable_prefix_caching=True)
     scheduler.aux_output_connector = AuxOutputSchedulerConnector(
         scheduler.kv_cache_manager
     )
 
-    def run(request_id: str, return_rl_outputs: bool) -> int:
+    def run(request_id: str, return_aux_outputs: bool) -> int:
         (request,) = create_requests(
             num_requests=1,
             num_tokens=48,
             req_ids=[request_id],
-            sampling_params=_rl_outputs_params(return_rl_outputs, max_tokens=1),
+            sampling_params=_aux_outputs_params(return_aux_outputs, max_tokens=1),
         )
         scheduler.add_request(request)
         scheduler_output = scheduler.schedule()
         (new_request,) = scheduler_output.scheduled_new_reqs
         rows = (
             {request_id: AuxRequestOutput(0, np.zeros((48, 1, 1), np.uint8))}
-            if return_rl_outputs
+            if return_aux_outputs
             else None
         )
         scheduler.update_from_output(
@@ -401,14 +400,14 @@ def test_rl_outputs_opt_out_prefix_cache_is_separate():
         assert request.is_finished()
         return new_request.num_computed_tokens
 
-    assert run("skipped-0", return_rl_outputs=False) == 0
-    assert run("skipped-1", return_rl_outputs=False) == 32
-    assert run("recorded-0", return_rl_outputs=True) == 0
-    assert run("recorded-1", return_rl_outputs=True) == 32
+    assert run("skipped-0", return_aux_outputs=False) == 0
+    assert run("skipped-1", return_aux_outputs=False) == 32
+    assert run("recorded-0", return_aux_outputs=True) == 0
+    assert run("recorded-1", return_aux_outputs=True) == 32
 
 
-@pytest.mark.parametrize("return_rl_outputs", [True, False])
-def test_rl_outputs_opt_out_skips_retention(return_rl_outputs):
+@pytest.mark.parametrize("return_aux_outputs", [True, False])
+def test_aux_outputs_opt_out_skips_retention(return_aux_outputs):
     scheduler = create_scheduler(
         enable_prefix_caching=True,
         use_kv_connector=mock_kv(matched_tokens=32, is_async=False),
@@ -419,7 +418,7 @@ def test_rl_outputs_opt_out_skips_retention(return_rl_outputs):
     first, second = create_requests(
         num_requests=2,
         num_tokens=80,
-        sampling_params=_rl_outputs_params(return_rl_outputs),
+        sampling_params=_aux_outputs_params(return_aux_outputs),
     )
     scheduler.add_request(first)
     output = scheduler.schedule()
@@ -428,7 +427,7 @@ def test_rl_outputs_opt_out_skips_retention(return_rl_outputs):
     scheduler.add_request(second)
     metadata = scheduler.schedule().aux_output_connector_metadata
 
-    if return_rl_outputs:
+    if return_aux_outputs:
         assert output.num_scheduled_tokens[first.request_id] == 80
         assert list(metadata.retained_block_hashes) == first.block_hashes
     else:
@@ -1840,7 +1839,7 @@ def test_update_from_output_routes_sampling_masks_by_request():
     assert all(out.new_sampling_mask.offsets is None for out in outputs)
 
 
-def test_rl_outputs_opt_out_gets_no_sampling_mask():
+def test_aux_outputs_opt_out_gets_no_sampling_mask():
     scheduler = create_scheduler()
     scheduler.return_sampling_mask = True
     requests = [
@@ -1848,7 +1847,7 @@ def test_rl_outputs_opt_out_gets_no_sampling_mask():
         *create_requests(
             num_requests=1,
             req_ids=["skipped"],
-            sampling_params=_rl_outputs_params(False, max_tokens=10),
+            sampling_params=_aux_outputs_params(False, max_tokens=10),
         ),
     ]
     for req in requests:

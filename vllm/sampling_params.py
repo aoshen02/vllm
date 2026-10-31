@@ -447,6 +447,11 @@ class SamplingParams(
     already-returned prefix to avoid duplicating routing for prompt tokens
     covered by earlier turns. Default 0 returns routing for all prompt
     tokens."""
+    return_aux_outputs: bool = True
+    """Set False to skip this request's auxiliary outputs: its routed experts
+    are neither recorded nor returned, and it gets no sampling masks, sample
+    logprobs or logprob_token_ids. Its prefix-cache blocks are kept apart from
+    those of requests that record routed experts."""
     trace_decode_token_ids: list[int] | None = None
     """If provided, forces the engine to emit this predetermined sequence of
     token IDs during decoding instead of sampling randomly. Real logprobs are
@@ -598,6 +603,10 @@ class SamplingParams(
 
         if self.prompt_logprobs is True:
             self.prompt_logprobs = 1
+
+        if not self.return_aux_outputs:
+            self.logprobs = None
+            self.logprob_token_ids = None
 
         # Number of characters to hold back for stop string evaluation
         # until sequence is finished.
@@ -874,15 +883,6 @@ class SamplingParams(
         if self.seed is not None:
             return SamplingType.RANDOM_SEED
         return SamplingType.RANDOM
-
-    @cached_property
-    def skips_rl_outputs(self) -> bool:
-        """Whether `extra_args["return_rl_outputs"]` is false: the request
-        neither records nor returns routed experts, and gets no sampling
-        masks."""
-        return (
-            bool(self.extra_args) and self.extra_args.get("return_rl_outputs") is False
-        )
 
     @property
     def eos_token_id(self) -> int | None:

@@ -246,7 +246,7 @@ class AuxOutputSchedulerConnector:
     @staticmethod
     def _skips(request: Request) -> bool:
         params = request.sampling_params
-        return params is not None and params.skips_rl_outputs
+        return params is not None and not params.return_aux_outputs
 
     @staticmethod
     def _pack_hashes(hashes: Sequence[bytes]) -> PackedBlockHashes | None:

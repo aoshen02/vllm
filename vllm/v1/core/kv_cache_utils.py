@@ -664,9 +664,9 @@ def generate_block_hash_extra_keys(
     if (
         start_token_idx == 0
         and request.sampling_params is not None
-        and request.sampling_params.skips_rl_outputs
+        and not request.sampling_params.return_aux_outputs
     ):
-        cache_salt_keys.append(("rl_outputs", False))
+        cache_salt_keys.append(("aux_outputs", False))
     prompt_embeds_keys = _gen_prompt_embeds_extra_hash_keys(
         request, start_token_idx, end_token_idx
     )
