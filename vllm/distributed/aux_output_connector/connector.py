@@ -15,12 +15,30 @@ import numpy as np
 from vllm.v1.core.kv_cache_utils import maybe_convert_block_hash
 
 if TYPE_CHECKING:
+    from vllm.config import VllmConfig
     from vllm.distributed.kv_events import ExternalBlockHash
     from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorBase_V1
+    from vllm.sampling_params import SamplingParams
     from vllm.v1.core.kv_cache_manager import KVCacheManager
     from vllm.v1.core.kv_cache_utils import BlockHash, KVCacheBlock
     from vllm.v1.core.sched.output import SchedulerOutput
     from vllm.v1.request import Request
+
+
+def aux_output_cache_salt(
+    cache_salt: str | None,
+    sampling_params: SamplingParams | None,
+    vllm_config: VllmConfig,
+) -> str | None:
+    """Salt a request that skips auxiliary outputs on a server recording
+    routed experts: its blocks have no recorded routing to serve."""
+    if (
+        sampling_params is None
+        or sampling_params.return_aux_outputs
+        or not vllm_config.aux_output_config.enable_return_routed_experts
+    ):
+        return cache_salt
+    return f"{cache_salt or ''}\x00aux_outputs=off"
 
 
 @dataclass
@@ -225,10 +243,10 @@ class AuxOutputSchedulerConnector:
 
     def request_finished(self, request: Request) -> None:
         """Queue a request's terminal event and final block hashes."""
-        request_id = request.request_id
-        self._loading.pop(request_id, None)
         if self._skips(request):
             return
+        request_id = request.request_id
+        self._loading.pop(request_id, None)
         num_blocks = request.num_computed_tokens // self._block_size
         for block, keys in islice(self._kv_blocks(request.block_hashes), num_blocks):
             if block not in self._kv_cached and self._gpu_cached(keys[-1]):

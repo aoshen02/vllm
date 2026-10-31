@@ -24,6 +24,7 @@ from vllm.config import (
 from vllm.distributed.aux_output_connector.connector import (
     AuxOutputSchedulerConnector,
     AuxRequestOutput,
+    aux_output_cache_salt,
 )
 from vllm.distributed.ec_transfer.ec_connector.metrics import ECConnectorStats
 from vllm.distributed.kv_transfer.kv_connector.v1.hisparse.connector import (
@@ -364,18 +365,41 @@ def test_aux_outputs_opt_out_is_not_recorded():
     assert metadata.finished_requests == ("recorded",)
 
 
+def _routed_experts_config(enabled: bool) -> SimpleNamespace:
+    return SimpleNamespace(
+        aux_output_config=SimpleNamespace(enable_return_routed_experts=enabled)
+    )
+
+
+@pytest.mark.parametrize(
+    "return_aux_outputs,recording,salted",
+    [(True, True, False), (False, True, True), (False, False, False)],
+    ids=["records", "skips", "skips-without-recording"],
+)
+def test_aux_output_cache_salt(return_aux_outputs, recording, salted):
+    params = _aux_outputs_params(return_aux_outputs)
+    config = _routed_experts_config(recording)
+    for salt in (None, "user"):
+        got = aux_output_cache_salt(salt, params, config)
+        assert (got != salt) == salted
+        assert aux_output_cache_salt(salt, None, config) == salt
+
+
 def test_aux_outputs_opt_out_prefix_cache_is_separate():
     scheduler = create_scheduler(enable_prefix_caching=True)
     scheduler.aux_output_connector = AuxOutputSchedulerConnector(
         scheduler.kv_cache_manager
     )
+    config = _routed_experts_config(True)
 
     def run(request_id: str, return_aux_outputs: bool) -> int:
+        params = _aux_outputs_params(return_aux_outputs, max_tokens=1)
         (request,) = create_requests(
             num_requests=1,
             num_tokens=48,
             req_ids=[request_id],
-            sampling_params=_aux_outputs_params(return_aux_outputs, max_tokens=1),
+            sampling_params=params,
+            cache_salt=aux_output_cache_salt(None, params, config),
         )
         scheduler.add_request(request)
         scheduler_output = scheduler.schedule()

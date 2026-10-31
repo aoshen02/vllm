@@ -8,6 +8,7 @@ from typing import Any, Literal
 
 import vllm.envs as envs
 from vllm.config import VllmConfig
+from vllm.distributed.aux_output_connector.connector import aux_output_cache_salt
 from vllm.exceptions import VLLMValidationError
 from vllm.inputs import (
     EngineInput,
@@ -561,7 +562,9 @@ class InputProcessor:
             pooling_params=pooling_params,
             arrival_time=arrival_time,
             lora_request=lora_request,
-            cache_salt=decoder_input.get("cache_salt"),
+            cache_salt=aux_output_cache_salt(
+                decoder_input.get("cache_salt"), sampling_params, self.vllm_config
+            ),
             priority=priority,
             data_parallel_rank=data_parallel_rank,
             trace_headers=trace_headers,
