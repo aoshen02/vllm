@@ -1276,6 +1276,14 @@ class VllmConfig:
                 "Direct reload does not support the sharded_rdt weight-transfer "
                 "backend. Use VLLM_RELOAD_MODE=layerwise or another backend."
             )
+        if transfer is not None and transfer.backend == "sparse_nccl":
+            # a sparse update resends only changed tensors: rerunning post-load
+            # processing would reprocess the others (re-laid out or folded in
+            # place), and without the rerun weight-derived tensors go stale
+            raise ValueError(
+                "Direct reload does not support the sparse_nccl weight-transfer "
+                "backend. Use full updates (the nccl backend) instead."
+            )
 
     def _verify_kv_transfer_compat(self) -> None:
         """Reject configurations that silently corrupt KV transfers."""
