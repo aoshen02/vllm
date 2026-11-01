@@ -65,12 +65,22 @@ def _unfused_all_reduce_mhc(peers, residual, post, comb, pre, weight, eps):
     return output, (prenorm * inv_rms * weight.float()).bfloat16()
 
 
-@ray.remote(num_gpus=1, max_calls=1)
-def _all_reduce_mhc(monkeypatch, tp_size, pp_size, rank, distributed_init_port):
+def _run_all_reduce_mhc(
+    monkeypatch, tp_size, pp_size, rank, distributed_init_port, suspend_cycles
+):
+    """Check the fused kernel eagerly and in replayed graphs; with
+    ``suspend_cycles``, on a suspendable TP communicator, again after each
+    suspend and resume, with every graph captured before the first."""
+    from vllm.distributed.device_communicators import cuda_communicator
     from vllm.models.deepseek_v41.nvidia.ops.cute_dsl import AllReduceMHC
 
     with monkeypatch.context() as m:
         m.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+        if suspend_cycles:
+            m.setattr(
+                cuda_communicator, "suspendable_symmetric_memory", lambda *_: True
+            )
+            m.setenv("NCCL_CUMEM_ENABLE", "1")
         device = torch.device(f"cuda:{rank}")
         torch.accelerator.set_device_index(device)
         init_test_distributed_environment(tp_size, pp_size, rank, distributed_init_port)
@@ -78,6 +88,7 @@ def _all_reduce_mhc(monkeypatch, tp_size, pp_size, rank, distributed_init_port):
         op = AllReduceMHC(
             hidden_size=5120, hc_mult=4, max_num_tokens=16, top_k=6, device=device
         )
+        rechecks = []
 
         def check_eager_and_replayed(fused, check, halved, doubled):
             check(fused())
@@ -94,6 +105,14 @@ def _all_reduce_mhc(monkeypatch, tp_size, pp_size, rank, distributed_init_port):
             doubled.mul_(2)
             graph.replay()
             check(captured)
+
+            def recheck():
+                halved.mul_(0.5)
+                check(fused())
+                graph.replay()
+                check(captured)
+
+            rechecks.append(recheck)
 
         def mhc_inputs(n):
             torch.manual_seed(123)
@@ -178,14 +197,42 @@ def _all_reduce_mhc(monkeypatch, tp_size, pp_size, rank, distributed_init_port):
             run(n)
             run_finalize(n)
 
+        communicator = get_tp_group().device_communicator
+        addresses = (op._multicast, op._mailbox.data_ptr())
+        for _ in range(suspend_cycles):
+            torch.accelerator.synchronize()
+            communicator.suspend()
+            assert not op._mailbox_buffer._multicast.bound
+            communicator.resume()
+            assert (op._multicast, op._mailbox.data_ptr()) == addresses
+            for recheck in rechecks:
+                recheck()
+
+
+@ray.remote(num_gpus=1, max_calls=1)
+def _all_reduce_mhc(monkeypatch, tp_size, pp_size, rank, distributed_init_port):
+    _run_all_reduce_mhc(monkeypatch, tp_size, pp_size, rank, distributed_init_port, 0)
+
+
+@ray.remote(num_gpus=1, max_calls=1)
+def _suspendable_all_reduce_mhc(
+    monkeypatch, tp_size, pp_size, rank, distributed_init_port
+):
+    _run_all_reduce_mhc(monkeypatch, tp_size, pp_size, rank, distributed_init_port, 2)
+
 
 @pytest.mark.skipif(
     not current_platform.is_device_capability_family(100), reason="Requires SM100"
 )
-def test_all_reduce_mhc_matches_unfused_path(monkeypatch):
+@pytest.mark.parametrize(
+    "target",
+    [_all_reduce_mhc, _suspendable_all_reduce_mhc],
+    ids=["symm-mem", "suspendable"],
+)
+def test_all_reduce_mhc_matches_unfused_path(monkeypatch, target):
     if torch.accelerator.device_count() < 4:
         pytest.skip("Requires four GPUs with NVLink multicast")
-    multi_process_parallel(monkeypatch, 4, 1, _all_reduce_mhc)
+    multi_process_parallel(monkeypatch, 4, 1, target)
 
 
 def _swizzled_scale_rows(scales: torch.Tensor, rows: int, cols: int) -> torch.Tensor:
@@ -409,14 +456,20 @@ def test_capture_registers_only_mappable_inputs(
     ids=["suspendable", "disabled", "cuda-ipc"],
 )
 def test_suspend_and_resume_cycle_peer_imports(suspendable, disabled, expected_calls):
+    """Peer imports and the MNNVL buffers' multicast objects are released
+    and mapped back together."""
     communicator = car.CustomAllreduce.__new__(car.CustomAllreduce)
     communicator.disabled, communicator._ptr = disabled, 0
     peers = Mock()
     communicator._vmm_peers = peers if suspendable else None
+    communicator._vmm_symmetric = [Mock(), Mock()]
     communicator.suspend()
     communicator.resume()
     assert peers.release.call_count == expected_calls
     assert peers.reshare.call_count == expected_calls
+    for handle in communicator._vmm_symmetric:
+        assert handle.suspend.call_count == expected_calls
+        assert handle.resume.call_count == expected_calls
 
 
 @pytest.mark.parametrize("batch_invariant", [False, True])
@@ -942,37 +995,54 @@ def suspendable_allreduce(
         ensure_model_parallel_initialized(tp_size, pp_size)
         fa = car.CustomAllreduce(get_tp_group().cpu_group, device, suspendable=True)
         assert not fa.disabled
+        mnnvl = car._has_local_multicast_support(device)
+        assert bool(fa.mnnvl_multicast_ptr) == mnnvl
         allocator = CuMemAllocator.get_instance()
         inp = torch.empty(4096, dtype=torch.float32, device=device)
+        gather_inp = torch.empty(2, 256, dtype=torch.bfloat16, device=device)
         with fa.capture(), allocator.cudagraph_pool() as pool:
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph, pool=pool):
                 staged = inp * 1  # from the cuMem graph pool
                 out = fa.custom_all_reduce(staged)
-        assert out is not None
+                # The MNNVL Lamport all-gather when multicast is available.
+                gathered = fa.custom_all_gather(gather_inp)
+        assert out is not None and gathered is not None
         peers = fa._vmm_peers
         assert peers is not None
         # Buffers, plus the graph pool segment holding the captured input.
         assert len(peers._mappings) == 3 * (tp_size - 1)
-        addresses = {key: mapping.va for key, mapping in peers._mappings.items()}
+
+        def mapped_addresses():
+            mapped = {key: mapping.va for key, mapping in peers._mappings.items()}
+            for i, handle in enumerate(fa._vmm_symmetric):
+                mapped[f"mnnvl{i}"] = (handle.multicast_ptr, *handle.peer_ptrs)
+            return mapped
+
+        addresses = mapped_addresses()
+        assert len(fa._vmm_symmetric) == mnnvl
 
         def check(value: float) -> None:
             inp.fill_(value * (rank + 1))
+            gather_inp.fill_(value + rank)
             graph.replay()
             torch.accelerator.synchronize()
             expected = value * tp_size * (tp_size + 1) / 2
             torch.testing.assert_close(out, torch.full_like(out, expected))
+            ranks = torch.arange(tp_size, device=device).repeat_interleave(2)
+            expected_gather = (value + ranks)[:, None].expand(-1, 256)
+            assert torch.equal(gathered, expected_gather.to(torch.bfloat16))
 
         check(1.0)
         for cycle in range(2):
             torch.accelerator.synchronize()
             fa.suspend()
             assert all(m.handle is None for m in peers._mappings.values())
+            assert not any(h._multicast.bound for h in fa._vmm_symmetric)
             allocator.sleep(offload_tags=())
             allocator.wake_up()
             fa.resume()
-            remapped = {key: mapping.va for key, mapping in peers._mappings.items()}
-            assert remapped == addresses
+            assert mapped_addresses() == addresses
             check(2.0 + cycle)
         eager = torch.full((1024,), float(rank + 1), device=device)
         expected = tp_size * (tp_size + 1) / 2

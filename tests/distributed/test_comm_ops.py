@@ -21,8 +21,14 @@ from vllm.distributed import (
     tensor_model_parallel_all_reduce,
     tensor_model_parallel_reduce_scatter,
 )
-from vllm.distributed.device_communicators import flashinfer_all_reduce
-from vllm.distributed.device_communicators.cuda_communicator import CudaCommunicator
+from vllm.distributed.device_communicators import (
+    cuda_communicator,
+    flashinfer_all_reduce,
+)
+from vllm.distributed.device_communicators.cuda_communicator import (
+    CudaCommunicator,
+    suspendable_symmetric_memory,
+)
 from vllm.distributed.parallel_state import GroupCoordinator, TensorMetadata
 from vllm.v1.worker.gpu_worker import AsyncIntermediateTensors
 
@@ -343,6 +349,7 @@ def _fi_ar_communicator(
     communicator.pynccl_comm = Mock()
     communicator.ca_comm = Mock()
     communicator.all2all_manager = None
+    communicator._symmetric_buffers = [Mock(), Mock()]
     return communicator
 
 
@@ -371,6 +378,58 @@ def test_cuda_communicator_suspend_detaches_flashinfer_workspaces(
     communicator.pynccl_comm.resume.assert_called_once_with()
     communicator.ca_comm.suspend.assert_called_once_with()
     communicator.ca_comm.resume.assert_called_once_with()
+    for buffer in communicator._symmetric_buffers:
+        buffer.suspend.assert_called_once_with()
+        buffer.resume.assert_called_once_with()
+
+
+def _suspend_config(suspend: bool | None):
+    model_config = None if suspend is None else Mock(enable_nccl_comm_suspend=suspend)
+    return Mock(model_config=model_config)
+
+
+@pytest.mark.parametrize(
+    "config,is_cuda,expected",
+    [
+        (None, True, False),
+        (_suspend_config(None), True, False),
+        (_suspend_config(False), True, False),
+        (_suspend_config(True), True, True),
+        (_suspend_config(True), False, False),
+    ],
+    ids=["no-config", "no-model", "not-suspendable", "suspendable", "rocm"],
+)
+def test_suspendable_symmetric_memory(config, is_cuda, expected):
+    assert suspendable_symmetric_memory(config, is_cuda) is expected
+
+
+@pytest.mark.parametrize("suspendable", [True, False], ids=["vmm", "torch"])
+def test_symmetric_buffers_follow_the_communicator(
+    monkeypatch: pytest.MonkeyPatch, suspendable: bool
+) -> None:
+    """Suspendable buffers share over the gloo group; PyTorch's use NCCL's."""
+    made = []
+    monkeypatch.setattr(
+        cuda_communicator,
+        "VmmSymmetricBuffer",
+        lambda *args, **kwargs: made.append(("vmm", args, kwargs)) or Mock(),
+    )
+    monkeypatch.setattr(
+        cuda_communicator,
+        "TorchSymmetricBuffer",
+        lambda *args, **kwargs: made.append(("torch", args, kwargs)) or Mock(),
+    )
+    communicator = CudaCommunicator.__new__(CudaCommunicator)
+    communicator.cpu_group, communicator.device_group = "gloo", "nccl"
+    communicator.device = torch.device("cuda:3")
+    communicator._symmetric_suspendable = suspendable
+    communicator._symmetric_buffers = []
+    buffer = communicator.allocate_symmetric_buffer(64, multicast=True)
+    assert communicator._symmetric_buffers == [buffer]
+    if suspendable:
+        assert made == [("vmm", (64, 3, "gloo"), {"peers": False, "multicast": True})]
+    else:
+        assert made == [("torch", (64, torch.device("cuda:3"), "nccl"), {})]
 
 
 def test_cuda_communicator_checkpoint_rejects_symm_mem_workspace(

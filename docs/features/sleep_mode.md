@@ -298,7 +298,11 @@ additionally needs `sleep_mode_offload_cudagraph=True` with CUDA graphs: its
 buffers and the cuMem graph pool are then shared by file descriptor, and each
 rank drops its peer mappings while suspended and maps them back at the same
 addresses on wake, so captured graphs keep registered all-reduce buffers.
-Otherwise pass `disable_custom_all_reduce=True`. The following explicit configuration retains
+Its MNNVL collectives, and symmetric buffers that model code allocates through
+the device communicator (such as the mailbox of DeepSeek-V4.1's fused
+all-reduce + mHC kernel), are cuMem allocations too: suspension also releases
+their NVLink multicast objects, and wake rebinds new ones at the same
+addresses. Otherwise pass `disable_custom_all_reduce=True`. The following explicit configuration retains
 NCCL GPU peer-to-peer or legacy shared-memory communication, selected by NCCL.
 `NCCL_P2P_DISABLE` and `NCCL_SHM_DISABLE` need not be set when communicator
 suspension is enabled. NCCL CUDA host-memory allocation remains disabled; it
