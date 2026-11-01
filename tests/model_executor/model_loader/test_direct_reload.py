@@ -553,6 +553,11 @@ _ONLINE = object.__new__(OnlineQuantizationConfig)
             {"weight_transfer_config": SimpleNamespace(backend="sharded_rdt")},
             "sharded_rdt",
         ),
+        (
+            "direct",
+            {"weight_transfer_config": SimpleNamespace(backend="sparse_nccl")},
+            "sparse_nccl",
+        ),
     ],
     ids=[
         "defaults",
@@ -566,6 +571,7 @@ _ONLINE = object.__new__(OnlineQuantizationConfig)
         "lora",
         "draft-lm-head-quant",
         "sharded-rdt",
+        "sparse-nccl",
     ],
 )
 def test_verify_direct_reload_compat(monkeypatch, mode, overrides, match):
