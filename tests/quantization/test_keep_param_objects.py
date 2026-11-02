@@ -10,6 +10,7 @@ import torch
 from vllm.config.model import ModelConfig
 from vllm.distributed.localization import LocalizedResources
 from vllm.model_executor.layers.fused_moe import FusedMoEFactory, RoutedExperts
+from vllm.model_executor.layers.fused_moe.modular_kernel import FusedMoEExperts
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.quantization import auto_gptq
 from vllm.model_executor.layers.quantization.auto_gptq import AutoGPTQConfig
@@ -269,7 +270,13 @@ def _kernel_tensors(layer: torch.nn.Module, method) -> dict[str, torch.Tensor]:
     holders: dict[str, object] = {"layer": layer}
     if isinstance(layer, RoutedExperts):
         config = method.moe_quant_config
-        holders["experts"] = method.moe_kernel.fused_experts
+        holders["experts"] = experts = method.moe_kernel.fused_experts
+        # wrappers (e.g. FallbackExperts) hold the experts objects that run
+        holders |= {
+            f"experts.{n}": v
+            for n, v in vars(experts).items()
+            if isinstance(v, FusedMoEExperts)
+        }
         holders |= {
             f"config.{q}": getattr(config, q) for q in ("_a1", "_a2", "_w1", "_w2")
         }
@@ -325,54 +332,7 @@ GPT_OSS_SWIGLU = dict(
     activation="swigluoai", swiglu_limit=7.0, swiglu_alpha=1.702, swiglu_beta=1.0
 )
 RELOAD_CASES = [
-    pytest.param(
-        lambda: _moe(Mxfp4Config(), **GPT_OSS_SWIGLU),
-        "flashinfer_trtllm",
-        None,
-        id="mxfp4-trtllm",
-    ),
-    pytest.param(
-        lambda: _moe(Mxfp4Config(), has_bias=True, **GPT_OSS_SWIGLU),
-        "marlin",
-        None,
-        id="mxfp4-marlin",
-    ),
-    pytest.param(
-        lambda: _moe(_ct(*CT_NVFP4)),
-        "flashinfer_cutedsl",
-        None,
-        id="ct-nvfp4-cutedsl",
-    ),
-    pytest.param(
-        lambda: _moe(ModelOptNvFp4Config(**NVFP4, exclude_modules=[])),
-        "flashinfer_trtllm",
-        None,
-        id="modelopt-nvfp4-trtllm",
-    ),
-    pytest.param(
-        lambda: _moe(ModelOptNvFp4Config(**NVFP4, exclude_modules=[])),
-        "flashinfer_cutlass",
-        None,
-        id="modelopt-nvfp4-cutlass",
-    ),
-    pytest.param(
-        lambda: _moe(Fp8Config(activation_scheme="static")),
-        "flashinfer_cutlass",
-        None,
-        id="fp8-static-cutlass",
-    ),
-    pytest.param(
-        lambda: _moe(Fp8Config(activation_scheme="static")),
-        "flashinfer_trtllm",
-        None,
-        id="fp8-static-trtllm",
-    ),
-    pytest.param(
-        lambda: _moe(Fp8Config(weight_block_size=[128, 128])),
-        "flashinfer_trtllm",
-        None,
-        id="fp8-block-trtllm",
-    ),
+    # MoE experts: test_reload_moe_experts.py enumerates them from the oracles
     # Marlin W4A8-INT8 registers the input global scales
     pytest.param(
         lambda: _moe(_ct_int(W4_GROUP)), "marlin", "int8", id="ct-w4a8-int8-marlin"
