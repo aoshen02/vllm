@@ -1522,8 +1522,17 @@ def finalize_model_weights(model: torch.nn.Module) -> None:
         QuantizeMethodBase,
     )
 
-    # modules() is pre-order, so reversed it puts every module after its subtree
-    for module in reversed(list(model.modules())):
+    seen: set[torch.nn.Module] = set()
+
+    def children_first(module: torch.nn.Module) -> Iterable[torch.nn.Module]:
+        # a module shared by several parents runs once, before all of them
+        for child in module.children():
+            if child not in seen:
+                seen.add(child)
+                yield from children_first(child)
+        yield module
+
+    for module in children_first(model):
         if isinstance(module, QuantizeMethodBase) or is_deferred_attention_layer(
             module
         ):
