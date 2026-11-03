@@ -88,6 +88,7 @@ from vllm.platforms.rocm import on_gfx950, on_gfx1250
 from vllm.sequence import IntermediateTensors
 from vllm.utils.multi_stream_utils import maybe_execute_in_parallel
 from vllm.utils.torch_utils import aux_stream
+from vllm.v1.attention.ops.rocm_aiter_mla_sparse import refresh_cached_wo_a_bf16
 from vllm.v1.worker.ubatching import dbo_current_ubatch_token_offset
 
 from ..common.mm_preprocess import IMAGE_SENTINEL_BASE_ID
@@ -1598,6 +1599,7 @@ class DeepseekV4ForCausalLM(nn.Module, SupportsPP, SupportsEagle3):
             if isinstance(module, DeepseekV4ROCMAiterMLAAttention):
                 fused_compressor_layers += module.prepare_compressor_gemm_fusion()
                 module.prepare_attn_preshuffle()
+                refresh_cached_wo_a_bf16(module.wo_a)
             elif isinstance(module, DeepseekV4MLP):
                 module.prepare_gateup_preshuffle()
         if fused_compressor_layers:
