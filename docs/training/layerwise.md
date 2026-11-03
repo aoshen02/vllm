@@ -50,7 +50,8 @@ class Fp8PerTensorOnlineLinearMethod(LinearMethodBase):
 
         layer.weight, layer.weight_scale = ops.scaled_fp8_quant(layer.weight)
 
-        # Prevent duplicate processing (e.g., during weight reload)
+        # Process once per load; a reload clears this flag so the new weights
+        # are processed again
         layer._already_called_process_weights_after_loading = True
 ```
 
