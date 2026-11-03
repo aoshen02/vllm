@@ -8,10 +8,6 @@ from typing import Any, cast
 import torch
 
 from vllm.config import VllmConfig, get_current_vllm_config
-from vllm.distributed import (
-    get_tensor_model_parallel_world_size,
-    tensor_model_parallel_all_reduce,
-)
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fusion.quant_activation import QuantizedActivation
@@ -567,12 +563,6 @@ class DeepseekV41ROCMAiterMLAAttention(DeepseekV4Attention):
         # instead of asking for the CUDA-only BMM kernel.
         self.wo_a.is_bmm = False
         self._has_kv_transfer = vllm_config.kv_transfer_config is not None
-        # Block scale for the preshuffled weight; None = not preshuffled.
-        self._wqa_wkv_scale: torch.Tensor | None = None
-        self._wo_b_scale: torch.Tensor | None = None
-        self._fused_compressor_weight: torch.Tensor | None
-        self.register_buffer("_fused_compressor_weight", None, persistent=False)
-        self._fused_compressor_split_sizes: tuple[int, int] | None = None
         # Decode ragged topk metadata is a pure function of the indices its
         # index source published, so every consumer of a source rebuilds the
         # same thing. The source owns one cache per compress ratio, refreshed
@@ -601,69 +591,6 @@ class DeepseekV41ROCMAiterMLAAttention(DeepseekV4Attention):
     @classmethod
     def get_padded_num_q_heads(cls, num_heads: int) -> int:
         return num_heads
-
-    def prepare_attn_preshuffle(self) -> None:
-        from vllm._aiter_ops import rocm_aiter_ops
-
-        if not rocm_aiter_ops.is_enabled():
-            return
-        from vllm.model_executor.layers.quantization.utils.fp8_utils import (
-            _upcast_e8m0_to_fp32,
-        )
-        from vllm.model_executor.utils import replace_parameter
-
-        def _prep(linear) -> torch.Tensor | None:
-            w = getattr(linear, "weight", None)
-            if w is None or w.dim() != 2:
-                return None
-            # K % 128 (group-128 quant) and N % 16 (shuffle_weight) must hold.
-            if w.shape[-1] % 128 != 0 or w.shape[0] % 16 != 0:
-                return None
-            ws = getattr(linear, "weight_scale_inv", None)  # per-block scale
-            if ws is None:
-                return None
-            if ws.dtype == torch.float8_e8m0fnu:
-                ws = _upcast_e8m0_to_fp32(ws).contiguous()
-            # Shuffle the weight in place (single weight, no unshuffled copy).
-            replace_parameter(
-                linear,
-                "weight",
-                rocm_aiter_ops.shuffle_weight(w.data, layout=(16, 16)),
-            )
-            return ws
-
-        self._wqa_wkv_scale = _prep(self.fused_wqa_wkv)
-        self._wo_b_scale = _prep(self.wo_b)
-
-    def prepare_compressor_gemm_fusion(self) -> bool:
-        # V4.1 derives index keys from the source compressor's emitted latent
-        # and has no nested ``indexer.compressor``.  Keep the projections
-        # separate and use the shared linear/PyTorch correctness path.
-        return False
-
-    def _bpre_attn_gemm(
-        self,
-        weight: torch.Tensor,
-        scale: torch.Tensor,
-        x: torch.Tensor,
-        reduce_tp: bool,
-    ) -> torch.Tensor:
-        from vllm._aiter_ops import rocm_aiter_ops
-
-        x_fp8, x_scale = rocm_aiter_ops.group_fp8_quant(x, transpose_scale=True)
-        out = rocm_aiter_ops.gemm_a8w8_blockscale_bpreshuffle(
-            x_fp8, weight, x_scale, scale, output_dtype=x.dtype
-        )
-        if reduce_tp and get_tensor_model_parallel_world_size() > 1:
-            out = tensor_model_parallel_all_reduce(out)
-        return out
-
-    def _fused_wqa_wkv_gemm(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if self._wqa_wkv_scale is not None and hidden_states.dim() == 2:
-            return self._bpre_attn_gemm(
-                self.fused_wqa_wkv.weight, self._wqa_wkv_scale, hidden_states, False
-            )
-        return super()._fused_wqa_wkv_gemm(hidden_states)
 
     def _run_parallel_input_projections(
         self, hidden_states: torch.Tensor
@@ -938,7 +865,7 @@ class DeepseekV41ROCMAiterMLAAttention(DeepseekV4Attention):
                 self.n_local_groups,
                 self.o_lora_rank,
             )
-            return self._wo_b_after_wo_a(z)
+            return self.wo_b(z)
         o = attn_out[:, : self.n_local_heads, :]
         # ROCm BF16 reference wo_a path (inverse RoPE + einsum) + wo_b.
         z = rocm_inv_rope_einsum(
@@ -951,14 +878,7 @@ class DeepseekV41ROCMAiterMLAAttention(DeepseekV4Attention):
             self.wo_a,
             inverse_rope=False,
         )
-        return self._wo_b_after_wo_a(z.flatten(1))
-
-    def _wo_b_after_wo_a(self, zf: torch.Tensor) -> torch.Tensor:
-        if self._wo_b_scale is not None and zf.dim() == 2:
-            return self._bpre_attn_gemm(
-                self.wo_b.weight, self._wo_b_scale, zf, self.wo_b.reduce_results
-            )
-        return self.wo_b(zf)
+        return self.wo_b(z.flatten(1))
 
     def forward_mqa(
         self,
