@@ -20,6 +20,7 @@ from vllm.model_executor.layers.rocm_paged_mxfp4_indexer import (
     RocmSparseAttnIndexer,
     RocmSparseMQAIndexer,
 )
+from vllm.model_executor.utils import refill_derived, replace_parameter
 from vllm.models.deepseek_v41.amd.ops.sparse_indexer import Gfx942SparseAttnIndexer
 from vllm.models.deepseek_v41.attention import (
     DeepseekV4Attention,
@@ -610,7 +611,6 @@ class DeepseekV41ROCMAiterMLAAttention(DeepseekV4Attention):
         from vllm.model_executor.layers.quantization.utils.fp8_utils import (
             _upcast_e8m0_to_fp32,
         )
-        from vllm.model_executor.utils import replace_parameter
 
         def _prep(linear) -> torch.Tensor | None:
             w = getattr(linear, "weight", None)
@@ -630,10 +630,13 @@ class DeepseekV41ROCMAiterMLAAttention(DeepseekV4Attention):
                 "weight",
                 rocm_aiter_ops.shuffle_weight(w.data, layout=(16, 16)),
             )
-            return ws
+            # A plain tensor: assigning the scale Parameter itself would register
+            # it a second time on this module, under the name below.
+            return ws.detach()
 
-        self._wqa_wkv_scale = _prep(self.fused_wqa_wkv)
-        self._wo_b_scale = _prep(self.wo_b)
+        # Refilled in place on reloads: captured CUDA graphs read them.
+        refill_derived(self, "_wqa_wkv_scale", _prep(self.fused_wqa_wkv))
+        refill_derived(self, "_wo_b_scale", _prep(self.wo_b))
 
     def prepare_compressor_gemm_fusion(self) -> bool:
         # V4.1 derives index keys from the source compressor's emitted latent

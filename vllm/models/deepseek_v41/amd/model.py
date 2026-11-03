@@ -66,6 +66,7 @@ from vllm.models.deepseek_v41.decoder_replay_layers import DecoderReplayLayers
 from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
+from vllm.v1.attention.ops.rocm_aiter_mla_sparse import refresh_cached_wo_a_bf16
 from vllm.v1.worker.ubatching import dbo_current_ubatch_id
 
 from ..common.engram import (
@@ -1454,6 +1455,9 @@ class DeepseekV41LLMForCausalLM(
     def process_weights_after_loading(self) -> None:
         self.model.finalize_mega_moe_weights()
         self.model.finalize_mhc_broadcast_weights()
+        for module in self.modules():
+            if isinstance(module, DeepseekV41ROCMAiterMLAAttention):
+                refresh_cached_wo_a_bf16(module.wo_a)
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         return self.model.get_expert_mapping()

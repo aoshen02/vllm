@@ -1924,6 +1924,17 @@ def _get_cached_wo_a_bf16(
     return cached
 
 
+def refresh_cached_wo_a_bf16(wo_a: torch.nn.Module) -> None:
+    """Rebuild in place the bf16 wo_a cached by the first forward: after a
+    reload it would keep the previous weights, and CUDA graphs read it."""
+    cached = wo_a.__dict__.pop("_dsv4_wo_a_bf16", None)
+    if cached is None:
+        return
+    with torch.inference_mode():  # built in a forward: an inference tensor
+        cached.copy_(_get_cached_wo_a_bf16(wo_a, *cached.shape))
+    wo_a._dsv4_wo_a_bf16 = cached
+
+
 def rocm_inv_rope_einsum(
     rotary_emb: torch.nn.Module,
     o: torch.Tensor,
