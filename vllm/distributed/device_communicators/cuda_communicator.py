@@ -18,6 +18,11 @@ from vllm.distributed.device_communicators.pynccl_allocator import (
     is_symmetric_memory_enabled,
     is_symmetric_memory_tensor,
 )
+from vllm.distributed.device_communicators.symmetric_buffer import (
+    SymmetricBuffer,
+    TorchSymmetricBuffer,
+    VmmSymmetricBuffer,
+)
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 
@@ -47,6 +52,15 @@ def custom_all_reduce_ipc_mode(
         return True, False
     suspendable = is_cuda and config.model_config.enable_nccl_comm_suspend
     return suspendable, suspendable
+
+
+def suspendable_symmetric_memory(config: VllmConfig | None, is_cuda: bool) -> bool:
+    """Whether symmetric buffers must release their peer and multicast
+    mappings while device communicators are suspended."""
+    model_config = None if config is None else config.model_config
+    return (
+        is_cuda and model_config is not None and model_config.enable_nccl_comm_suspend
+    )
 
 
 class CudaCommunicator(DeviceCommunicatorBase):
@@ -143,6 +157,10 @@ class CudaCommunicator(DeviceCommunicatorBase):
         ca_register, ca_suspendable = custom_all_reduce_ipc_mode(
             config, current_platform.is_cuda()
         )
+        self._symmetric_suspendable = suspendable_symmetric_memory(
+            config, current_platform.is_cuda()
+        )
+        self._symmetric_buffers: list[SymmetricBuffer] = []
 
         if use_torch_symm_mem and current_platform.is_cuda():
             self.symm_mem_comm = SymmMemCommunicator(
@@ -830,7 +848,36 @@ class CudaCommunicator(DeviceCommunicatorBase):
         else:
             raise ValueError("No PyNCCL communicator found")
 
+    def allocate_symmetric_buffer(
+        self, nbytes: int, *, peers: bool = False, multicast: bool = False
+    ) -> SymmetricBuffer:
+        """Allocate this rank's ``nbytes`` of a buffer reachable from every
+        rank of the group: by peer address with ``peers``, by NVLink
+        multicast with ``multicast`` (``multicast_ptr`` 0 if unavailable).
+
+        Collective. The communicator owns the buffer. When the communicator is
+        suspendable, `suspend` releases the buffer's peer and multicast
+        mappings and `resume` maps them back at the same addresses.
+        """
+        buffer: SymmetricBuffer
+        if self._symmetric_suspendable:
+            assert self.device.index is not None
+            buffer = VmmSymmetricBuffer(
+                nbytes,
+                self.device.index,
+                self.cpu_group,
+                peers=peers,
+                multicast=multicast,
+            )
+        else:
+            buffer = TorchSymmetricBuffer(nbytes, self.device, self.device_group)
+        self._symmetric_buffers.append(buffer)
+        return buffer
+
     def destroy(self):
+        for buffer in self._symmetric_buffers:
+            buffer.close()
+        self._symmetric_buffers.clear()
         if self.pynccl_comm is not None:
             self.pynccl_comm.destroy()
             self.pynccl_comm = None
@@ -884,6 +931,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
         checkpoint_prepare_fi_ar_workspaces(self.cpu_group, skip_unsupported=True)
         if self.ca_comm is not None:
             self.ca_comm.suspend()
+        for buffer in self._symmetric_buffers:
+            buffer.suspend()
         if self.pynccl_comm is not None:
             self.pynccl_comm.suspend()
 
@@ -895,6 +944,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
         checkpoint_restore_fi_ar_workspaces(self.cpu_group, skip_unsupported=True)
         if self.ca_comm is not None:
             self.ca_comm.resume()
+        for buffer in self._symmetric_buffers:
+            buffer.resume()
 
     def checkpoint_prepare(self) -> None:
         # Only FlashInfer all-reduce and FlashInfer all2all are supported for now.

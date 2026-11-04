@@ -19,6 +19,9 @@ from vllm.distributed.device_communicators.cuda_vmm_ipc import (
     PeerAllocations,
     VmmBuffer,
 )
+from vllm.distributed.device_communicators.symmetric_buffer import (
+    VmmSymmetricBuffer,
+)
 from vllm.distributed.parallel_state import in_the_same_node_as
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
@@ -164,8 +167,8 @@ class CustomAllreduce:
                 `resume` can map them back at the same addresses. Graph
                 buffers must then be cuMem allocations; graph capture copies
                 any other input into the pre-registered buffer. MNNVL
-                collectives, whose symmetric memory cannot be suspended, are
-                disabled.
+                collectives then use `VmmSymmetricBuffer`s, whose multicast
+                objects `suspend` releases and `resume` rebinds.
         It is the caller's responsibility to make sure each communicator
         is bind to a unique device, and all communicators in this group
         are in the same node.
@@ -177,6 +180,7 @@ class CustomAllreduce:
         self._vmm_driver: CuMemDriver | None = None
         self._vmm_buffers: list[VmmBuffer] = []
         self._vmm_peers: PeerAllocations | None = None
+        self._vmm_symmetric: list[VmmSymmetricBuffer] = []
         self._ptr = 0
         self.disabled = True
         self.mnnvl_buffer = None
@@ -361,13 +365,12 @@ class CustomAllreduce:
             self.meta_ptrs, self.rank_data, rank, self.fully_connected
         )
         ops.register_buffer(self._ptr, self.buffer_ptrs)
-        if not suspendable:
-            self._init_mnnvl_buffer(
-                max(
-                    max_mnnvl_all_gather_size * world_size,
-                    max_mnnvl_reduce_scatter_size,
-                )
+        self._init_mnnvl_buffer(
+            max(
+                max_mnnvl_all_gather_size * world_size,
+                max_mnnvl_reduce_scatter_size,
             )
+        )
         if world_size in _MNNVL_MULTIMEM_REDUCE_SCATTER_WORLD_SIZES:
             self.mnnvl_multimem_rs_supported = _all_ranks_true(
                 self.group,
@@ -386,22 +389,27 @@ class CustomAllreduce:
             return
         try:
             buffer_size = stage_size * 6
-            buffer = torch_symm_mem.empty(
-                buffer_size, dtype=torch.uint8, device=self.device
-            )
-            handle = torch_symm_mem.rendezvous(buffer, self.group.group_name)
-            if handle.multicast_ptr == 0:
-                return
-            peer_buffers = [
-                handle.get_buffer(
-                    peer,
-                    (buffer_size,),
-                    torch.uint8,
-                    storage_offset=0,
+            if self._suspendable:
+                handle = self._vmm_symmetric_buffer(buffer_size, peers=True)
+                buffer, ptrs = handle.tensor, handle.peer_ptrs
+                peer_buffers = None
+            else:
+                buffer = torch_symm_mem.empty(
+                    buffer_size, dtype=torch.uint8, device=self.device
                 )
-                for peer in range(self.world_size)
-            ]
-            ptrs = [peer_buffer.data_ptr() for peer_buffer in peer_buffers]
+                handle = torch_symm_mem.rendezvous(buffer, self.group.group_name)
+                if handle.multicast_ptr == 0:
+                    return
+                peer_buffers = [
+                    handle.get_buffer(
+                        peer,
+                        (buffer_size,),
+                        torch.uint8,
+                        storage_offset=0,
+                    )
+                    for peer in range(self.world_size)
+                ]
+                ptrs = [peer_buffer.data_ptr() for peer_buffer in peer_buffers]
             lamport_ag_offset = 0
             lamport_rs_offset = stage_size * 3
             lamport_ag_ptrs = [ptr + lamport_ag_offset for ptr in ptrs]
@@ -441,15 +449,28 @@ class CustomAllreduce:
         if not self.mnnvl_multimem_rs_supported:
             return
 
+        signal_size = ops.meta_size()
+        size = signal_size + self.max_mnnvl_multimem_reduce_scatter_size
+        if self._suspendable:
+            try:
+                # The kernel reaches peers through the multicast address only.
+                handle = self._vmm_symmetric_buffer(size, peers=False)
+            except RuntimeError as error:
+                # Every rank fails together.
+                logger.warning_once(
+                    "MNNVL multimem reduce-scatter buffer failed (%s); falling "
+                    "back to NCCL.",
+                    error,
+                    scope="global",
+                )
+                return
+            self._set_mnnvl_multimem_rs_buffer(handle, handle.tensor, signal_size)
+            return
+
         assert torch_symm_mem is not None
         buffer = None
-        signal_size = ops.meta_size()
         try:
-            buffer = torch_symm_mem.empty(
-                signal_size + self.max_mnnvl_multimem_reduce_scatter_size,
-                dtype=torch.uint8,
-                device=self.device,
-            )
+            buffer = torch_symm_mem.empty(size, dtype=torch.uint8, device=self.device)
         except RuntimeError as error:
             logger.debug("MNNVL multimem RS allocation failed: %s", error)
         if not _all_ranks_true(self.group, buffer is not None):
@@ -480,12 +501,25 @@ class CustomAllreduce:
             )
             return
         assert handle is not None
+        self._set_mnnvl_multimem_rs_buffer(handle, buffer, signal_size)
 
+    def _set_mnnvl_multimem_rs_buffer(
+        self, handle, buffer: torch.Tensor, signal_size: int
+    ) -> None:
         self.mnnvl_multimem_rs_buffer = buffer
         self.mnnvl_multimem_rs_handle = handle
         self.mnnvl_multimem_rs_buffer_size = self.max_mnnvl_multimem_reduce_scatter_size
         self.mnnvl_multimem_rs_local_ptr = buffer.data_ptr() + signal_size
         self.mnnvl_multimem_rs_multicast_ptr = handle.multicast_ptr + signal_size
+
+    def _vmm_symmetric_buffer(self, size: int, peers: bool) -> VmmSymmetricBuffer:
+        """A zeroed multicast buffer that `suspend` and `resume` cycle."""
+        assert self.device.index is not None
+        handle = VmmSymmetricBuffer(
+            size, self.device.index, self.group, peers=peers, multicast=True
+        )
+        self._vmm_symmetric.append(handle)
+        return handle
 
     @contextmanager
     def capture(self):
@@ -544,14 +578,20 @@ class CustomAllreduce:
         return [[rank_ptrs[i][0] for rank_ptrs in shared] for i in range(len(sizes))]
 
     def suspend(self) -> None:
-        """Drop every peer import (collective; communication must be idle)."""
+        """Drop every peer import and multicast object (collective;
+        communication must be idle)."""
         if self._vmm_peers is not None and not self.disabled:
+            for handle in self._vmm_symmetric:
+                handle.suspend()
             self._vmm_peers.release()
 
     def resume(self) -> None:
-        """Map the peers' buffers back at the addresses held before `suspend`."""
+        """Map the peers' buffers and multicast objects back at the addresses
+        held before `suspend`."""
         if self._vmm_peers is not None and not self.disabled:
             self._vmm_peers.reshare()
+            for handle in self._vmm_symmetric:
+                handle.resume()
 
     def _can_register_for_capture(self, inp: torch.Tensor) -> bool:
         # Suspendable peers can map only cuMem graph memory (not cudaMalloc).
@@ -789,6 +829,9 @@ class CustomAllreduce:
                 for buffer in self._vmm_buffers:
                     buffer.close()
                 self._vmm_buffers.clear()
+                for handle in self._vmm_symmetric:
+                    handle.close()
+                self._vmm_symmetric.clear()
                 self._vmm_peers = None
             else:
                 self.free_shared_buffer(self.meta_ptrs, rank=self.rank)

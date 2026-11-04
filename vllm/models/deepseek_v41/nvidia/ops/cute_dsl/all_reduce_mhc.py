@@ -22,14 +22,13 @@ bit-identical to ``mxfp8_quantize`` of the BF16 output, without its launch.
 from __future__ import annotations
 
 import math
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
 
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import torch
 import torch.distributed as dist
-import torch.distributed._symmetric_memory as symm_mem
 from cutlass import BFloat16, Float32, Int32, Int64, Uint8, Uint32
 from cutlass.cute.runtime import make_fake_compact_tensor
 
@@ -70,6 +69,11 @@ from vllm.models.common.ops.moe_tail_fusion.primitives import (
     to_cute_dynamic,
 )
 from vllm.models.deepseek_v41.common.ops.query_quant import mxfp8_scale_bytes
+
+if TYPE_CHECKING:
+    from vllm.distributed.device_communicators.cuda_communicator import (
+        CudaCommunicator,
+    )
 
 # One UE8M0 scale per 32 values: four adjacent threads' BF16 fragments.
 MXFP8_BLOCK = 32
@@ -953,7 +957,11 @@ class AllReduceMHC:
         quantize_layer_input: bool = False,
         residual_only: bool = False,
     ) -> None:
-        group = get_tp_group().device_group
+        # The CPU group: a collective on the device group would create a
+        # PyTorch NCCL communicator that nothing suspends, whose peer mappings
+        # make a CUDA process checkpoint fail to restore.
+        tp_group = get_tp_group()
+        group = tp_group.cpu_group
         self.hidden_size = hidden = hidden_size
         self.hc_mult = hc = hc_mult
         self.capacity = capacity = max_num_tokens
@@ -1102,13 +1110,16 @@ class AllReduceMHC:
                     hidden, dtype=torch.bfloat16, device=device
                 )
 
-            self._mailbox = symm_mem.empty(
-                (LAMPORT_GENERATIONS, tp, capacity, hidden),
-                dtype=torch.bfloat16,
-                device=device,
+            # The TP communicator owns the mailbox, so a suspendable one can
+            # release its multicast object for a CUDA process checkpoint.
+            mailbox_shape = (LAMPORT_GENERATIONS, tp, capacity, hidden)
+            self._mailbox_buffer = cast(
+                "CudaCommunicator", tp_group.device_communicator
+            ).allocate_symmetric_buffer(math.prod(mailbox_shape) * 2, multicast=True)
+            self._mailbox = self._mailbox_buffer.tensor.view(torch.bfloat16).view(
+                mailbox_shape
             )
-            self._mailbox_handle = symm_mem.rendezvous(self._mailbox, group)
-            multicast = int(self._mailbox_handle.multicast_ptr or 0)
+            multicast = self._mailbox_buffer.multicast_ptr
             if not multicast or multicast % 16:
                 raise RuntimeError("NVLink multicast mapping is unavailable")
             self._multicast = multicast
