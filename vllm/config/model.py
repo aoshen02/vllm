@@ -381,8 +381,10 @@ class ModelConfig:
     """Parameter-name globs to preserve across level-2 sleep.
     Use target globs for frozen Engram table weights and scales omitted by the
     trainer (e.g. ``*.engram.embed_tokens.weight*``).
-    Use ``draft.<name>`` for draft-private parameters, or ``draft.*`` for all.
-    The sender must omit these parameters; loaders must preserve their storage."""
+    Use ``draft.<name>`` for draft-private parameters, or ``draft.*`` for all;
+    without it, level-2 sleep loses the speculative-decoding drafter's weights.
+    Retained values are restored at weights wake-up, before any update, so an
+    update that also sends them wins; loaders must preserve their storage."""
     sleep_mode_backend: str = "cumem"
     """Mechanism used to free and restore GPU state for sleep mode. ``"cumem"``
     (default) uses the built-in ``CuMemAllocator`` and is behavior-compatible

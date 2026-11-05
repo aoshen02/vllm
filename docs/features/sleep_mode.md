@@ -57,6 +57,16 @@ llm.collective_rpc("reload_weights")
 llm.wake_up(tags=["kv_cache"])
 ```
 
+!!! warning "Speculative decoding"
+    Level-2 sleep also discards the draft model's weights, and `reload_weights`
+    reloads only the target model. Without
+    `--sleep-preserve-parameter-names 'draft.*'` (see
+    [Retaining frozen weights](#retaining-frozen-weights-during-rlhf-updates)),
+    the drafter proposes garbage after wake-up: outputs stay correct, but no
+    draft tokens are accepted (`Mean acceptance length: 1.00`) and decoding
+    falls to roughly the no-speculation speed. vLLM logs a warning at sleep
+    time when this happens.
+
 #### RLHF weight updates
 
 During RLHF training, vLLM allows you to selectively wake up only the model weights or the KV cache using the tags argument in wake_up(). This fine-grained control is especially useful when updating model weights: by waking up just the weights (e.g., llm.wake_up(tags=["weights"])), you avoid allocating memory for the KV cache until after the weight update is complete. This approach helps prevent GPU out-of-memory (OOM) errors, particularly with large models, by minimizing peak memory usage during weight synchronization and update operations.
@@ -92,9 +102,10 @@ Level-2 sleep backs up selected GPU parameters to pageable CPU memory; weights
 wake-up restores them in place and releases the backups. CPU parameters need no
 copy. Allow enough host memory for backups. Level-1 behavior is unchanged.
 
-The trainer must omit these parameters from updates, and reload/post-processing
-must preserve their values and storage (including avoiding replacement with meta
-tensors). This option does not filter updates.
+Weights wake-up restores the retained values before any update, so an update
+that also sends them wins; the trainer can omit them to save the transfer.
+Reload/post-processing must preserve their storage (including avoiding
+replacement with meta tensors). This option does not filter updates.
 
 For frozen Engram tables omitted by the trainer, select the target table weights
 and scales. For example, DeepSeek V4.1 uses these runtime parameter names:
@@ -108,7 +119,9 @@ CPU-offloaded tables remain on CPU without an extra backup copy. Engram's
 [inference-time CPU offload](engram.md#cpu-offload) is configured separately;
 this option preserves the frozen tables across level-2 sleep and weight updates.
 
-To retain a frozen drafter while updating only target weights, use `draft.*`:
+To keep the drafter across level-2 sleep (a frozen drafter while updating only
+target weights, or a server restored from a level-2 snapshot followed by
+`reload_weights`), use `draft.*`:
 
 ```bash
 VLLM_SERVER_DEV_MODE=1 vllm serve Qwen/Qwen3.8-27B --enable-sleep-mode \

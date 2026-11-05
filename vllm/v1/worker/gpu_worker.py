@@ -308,13 +308,9 @@ class Worker(WorkerBase):
         return parameters
 
     def _save_sleep_parameters(self, model: nn.Module) -> None:
-        patterns = self.model_config.sleep_preserve_parameter_names
-        if not patterns:
-            self._sleep_saved_parameters = {}
-            return
         parameters = self._get_sleep_parameters(model)
         names: set[str] = set()
-        for pattern in patterns:
+        for pattern in self.model_config.sleep_preserve_parameter_names:
             matches = fnmatch_filter(parameters, pattern)
             if not matches and pattern != "draft.*":
                 raise ValueError(f"No parameter matches sleep retention: {pattern}")
@@ -324,6 +320,18 @@ class Worker(WorkerBase):
             for name, param in parameters.items()
             if name in names and not param.is_cpu
         }
+        if any(
+            name.startswith("draft.") and name not in names and not param.is_cpu
+            for name, param in parameters.items()
+        ):
+            logger.warning_once(
+                "Level-2 sleep discards the speculative-decoding draft model's "
+                "weights, and reload_weights() reloads only the target model: "
+                "after wake-up the drafter proposes garbage and no draft tokens "
+                "are accepted (outputs stay correct, decoding slows down) unless "
+                "the drafter is updated too. Pass "
+                "--sleep-preserve-parameter-names 'draft.*' to keep it."
+            )
 
     @torch.no_grad()
     def _restore_sleep_parameters(self, model: nn.Module) -> None:
