@@ -34,6 +34,7 @@ from vllm.model_executor.model_loader.reload.layerwise import (
 from vllm.model_executor.model_loader.utils import process_weights_after_loading
 from vllm.model_executor.utils import get_live_param
 from vllm.utils.math_utils import cdiv
+from vllm.utils.torch_utils import set_default_torch_dtype
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="FP8 linear kernels need a GPU"
@@ -203,7 +204,8 @@ class _IndexerModel(torch.nn.Module):
         self.indexer.process_weights_after_loading = lambda: (
             fuse_indexer_wk_weights_proj(self.indexer)
         )
-        with _DEVICE:
+        # the model's dtype, as model construction sets it
+        with set_default_torch_dtype(torch.bfloat16), _DEVICE:
             init_indexer_wk_weights_proj(
                 self.indexer, _HIDDEN, quant_config, "layers.0.indexer"
             )
