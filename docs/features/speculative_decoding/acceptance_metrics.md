@@ -98,3 +98,8 @@ all-`n == 1` workloads):
 | `num_spec_steps` | `vllm:spec_decode_num_drafts_total` |
 | `num_draft_tokens` | `vllm:spec_decode_num_draft_tokens_total` |
 | `num_accepted_draft_tokens` | `vllm:spec_decode_num_accepted_tokens_total` |
+
+!!! note "After level-2 sleep"
+    A mean acceptance length of 1.00 after a level-2 sleep and wake-up usually
+    means the drafter's weights were discarded; see
+    [Sleep mode](README.md#sleep-mode).

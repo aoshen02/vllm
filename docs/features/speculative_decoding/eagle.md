@@ -65,3 +65,8 @@ A variety of EAGLE draft models are available on the Hugging Face hub:
 
 !!! warning
     If you are using `vllm<0.7.0`, please use [this script](https://gist.github.com/abhigoyal1997/1e7a4109ccb7704fbc67f625e86b2d6d) to convert the speculative model and specify `"model": "path/to/modified/eagle/model"` in `speculative_config`.
+
+!!! note "After level-2 sleep"
+    A mean acceptance length of 1.00 after a level-2 sleep and wake-up usually
+    means the drafter's weights were discarded; see
+    [Sleep mode](README.md#sleep-mode).

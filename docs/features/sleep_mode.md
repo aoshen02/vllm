@@ -61,7 +61,7 @@ llm.wake_up(tags=["kv_cache"])
     Level-2 sleep also discards the draft model's weights, and `reload_weights`
     reloads only the target model. Without
     `--sleep-preserve-parameter-names 'draft.*'` (see
-    [Retaining frozen weights](#retaining-frozen-weights-during-rlhf-updates)),
+    [Retaining frozen weights](#retaining-frozen-weights-engram-tables-speculative-drafter-across-level-2-sleep)),
     the drafter proposes garbage after wake-up: outputs stay correct, but no
     draft tokens are accepted (`Mean acceptance length: 1.00`) and decoding
     falls to roughly the no-speculation speed. vLLM logs a warning at sleep
@@ -84,7 +84,10 @@ llm.wake_up(tags=["weights"])
 llm.wake_up(tags=["kv_cache"])
 ```
 
-#### Retaining frozen weights during RLHF updates
+With speculative decoding, also pass `--sleep-preserve-parameter-names 'draft.*'`
+unless the update sends the drafter's weights too.
+
+#### Retaining frozen weights (Engram tables, speculative drafter) across level-2 sleep
 
 Set `sleep_preserve_parameter_names` (CLI: `--sleep-preserve-parameter-names`)
 to runtime parameter-name glob patterns for weights that stay frozen during
@@ -232,6 +235,10 @@ curl -X POST 'http://localhost:8000/collective_rpc' -H 'Content-Type: applicatio
 # Reallocate KV cache
 curl -X POST 'http://localhost:8000/wake_up?tags=kv_cache'
 ```
+
+With speculative decoding, start the server with
+`--sleep-preserve-parameter-names 'draft.*'`, or the drafter loses its weights
+(see the warning under [Python API](#python-api)).
 
 To release only KV cache memory, wait for the level 0 pause to complete before calling the release endpoint. The same resident-memory and backend requirements as the Python API apply.
 
