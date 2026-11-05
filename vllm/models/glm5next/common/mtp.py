@@ -24,10 +24,7 @@ from vllm.model_executor.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from vllm.model_executor.models.deepseek_mtp import SharedHead
-from vllm.model_executor.models.deepseek_v2 import (
-    DeepseekV2MixtureOfExperts,
-    _indexer_checkpoint_name,
-)
+from vllm.model_executor.models.deepseek_v2 import DeepseekV2MixtureOfExperts
 from vllm.model_executor.models.utils import (
     extract_layer_index,
     get_fused_shared_expert_layers,
@@ -302,8 +299,6 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
             ("gate_up_proj", "up_proj", 1),
             ("fused_qkv_a_proj", "q_a_proj", 0),
             ("fused_qkv_a_proj", "kv_a_proj_with_mqa", 1),
-            ("wk_weights_proj", "wk", 0),
-            ("wk_weights_proj", "weights_proj", 1),
         ]
         fused_shared_expert_layers = self.fused_shared_expert_layers
         num_fused_shared = _num_fused_shared_experts(
@@ -348,7 +343,6 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
             ):
                 name = _fused_shared_expert_name(name, self.config.n_routed_experts)
 
-            name = _indexer_checkpoint_name(name)
             name, loaded_weight = _mla_proj_checkpoint_tensor(
                 name, loaded_weight, params_dict, self.config, kv_a_pad_size
             )

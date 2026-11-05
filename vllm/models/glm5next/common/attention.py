@@ -17,17 +17,18 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import LayerNorm, RMSNorm
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
-    MergedColumnParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
 )
 from vllm.model_executor.layers.mla import MLAModules, MultiHeadLatentAttentionWrapper
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
-from vllm.model_executor.layers.quantization.fp8_dequant import Fp8DequantConfig
+from vllm.model_executor.layers.quantization.fp8 import dequantized_fp8_config
 from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding, get_rope
 from vllm.model_executor.models.deepseek_v2 import (
     DeepSeekV2FusedQkvAProjLinear,
     DeepseekV32IndexerCache,
+    fuse_indexer_wk_weights_proj,
+    init_indexer_wk_weights_proj,
     yarn_get_mscale,
 )
 from vllm.model_executor.utils import maybe_disable_graph_partition, refill_derived
@@ -234,17 +235,10 @@ class Indexer(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.wq_b",
         )
-        # Fused wk + weights_proj: single GEMM producing [head_dim + n_head].
-        # It runs in BF16; FP8 checkpoint rows are dequantized after loading.
-        self.wk_weights_proj = MergedColumnParallelLinear(
-            hidden_size,
-            [self.head_dim, self.n_head],
-            bias=False,
-            quant_config=Fp8DequantConfig.for_checkpoint(
-                vllm_config.quant_config, any_scale_layout=True
-            ),
-            disable_tp=True,
-            prefix=f"{prefix}.wk_weights_proj",
+        # wk + weights_proj run as one BF16 GEMM (wk_weights_proj); unlike the
+        # rest of the indexer, wk may be block-FP8 in the checkpoint
+        init_indexer_wk_weights_proj(
+            self, hidden_size, dequantized_fp8_config(vllm_config.quant_config), prefix
         )
         self.k_norm = LayerNorm(self.head_dim, eps=1e-6, dtype=torch.float32)
         self.softmax_scale = self.head_dim**-0.5
@@ -298,8 +292,9 @@ class Indexer(nn.Module):
         )
 
     def process_weights_after_loading(self) -> None:
-        """Build the fp32 head-gate projection from the loaded weights; reloads
-        refill it in place."""
+        """Build the fused wk + weights_proj weight and the fp32 head-gate
+        projection from the loaded weights; reloads refill them in place."""
+        fuse_indexer_wk_weights_proj(self)
         wp = (
             self.wk_weights_proj.weight.data[self.head_dim :, :]
             .t()
@@ -433,9 +428,9 @@ class Glm5NextMLAAttention(nn.Module):
         # otherwise default to hidden_size (used in Eagle3 Deepseek with MLA)
         proj_input_size = input_size if input_size is not None else self.hidden_size
 
-        # The model runs these projections in BF16; an FP8 checkpoint stores
-        # them as block-FP8, dequantized after loading.
-        proj_quant_config = quant_config or Fp8DequantConfig.for_checkpoint(
+        # The model runs these projections in BF16; a block-FP8 checkpoint
+        # stores them in FP8, dequantized after loading.
+        proj_quant_config = quant_config or dequantized_fp8_config(
             vllm_config.quant_config
         )
 

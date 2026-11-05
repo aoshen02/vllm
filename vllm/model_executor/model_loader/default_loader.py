@@ -550,9 +550,6 @@ class DefaultModelLoader(BaseModelLoader):
                         #   fall back to defaults when a checkpoint has none;
                         # - empty placeholders hold no data, e.g. the qzeros
                         #   moe_wna16 registers for symmetric GPTQ;
-                        # - parameters marked optional_in_checkpoint, e.g. the
-                        #   scale of a block-FP8 weight that runs in BF16, which
-                        #   a checkpoint storing the weight in BF16 lacks;
                         # - _CONFIG_BUILT_PARAMS come from the quantization config.
                         # Unquantized models, where this check runs by default,
                         # keep the module-wide exemption.
@@ -560,7 +557,6 @@ class DefaultModelLoader(BaseModelLoader):
                             quantized
                             and not has_online_quant
                             and not isinstance(quant_method, BaseKVCacheMethod)
-                            and not getattr(param, "optional_in_checkpoint", False)
                             and param.numel() > 0
                             and param_name.rsplit(".", 1)[-1]
                             not in _CONFIG_BUILT_PARAMS

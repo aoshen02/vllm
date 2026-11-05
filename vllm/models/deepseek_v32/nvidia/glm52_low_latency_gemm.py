@@ -29,9 +29,7 @@ from vllm.model_executor.layers.linear import (
     UnquantizedLinearMethod,
 )
 from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
-from vllm.model_executor.layers.quantization.fp8_dequant import (
-    Fp8DequantLinearMethod,
-)
+from vllm.model_executor.layers.quantization.fp8 import Fp8DequantLinearMethod
 from vllm.platforms import current_platform
 
 Backend = Literal["cute", "dsv3_fused_a"]
@@ -455,7 +453,11 @@ def enable_glm52_low_latency_gemm(
         if type(method) not in (UnquantizedLinearMethod, Fp8DequantLinearMethod):
             continue
         weight = getattr(child, "weight", None)
-        if weight is None or weight.dim() != 2 or weight.dtype != torch.bfloat16:
+        if weight is None or weight.dim() != 2:
+            continue
+        # orig_dtype: the runtime dtype of a weight Fp8DequantLinearMethod
+        # loads in FP8 and dequantizes after loading
+        if getattr(child, "orig_dtype", weight.dtype) != torch.bfloat16:
             continue
         spec = table.get(tuple(weight.shape))
         if spec is None:

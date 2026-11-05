@@ -35,7 +35,6 @@ from .deepseek_v2 import (
     DeepseekV2DecoderLayer,
     DeepseekV2MixtureOfExperts,
     DeepseekV2MoE,
-    _indexer_checkpoint_name,
 )
 from .interfaces import SupportsPP
 from .utils import (
@@ -309,13 +308,6 @@ class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts, SupportsPP):
             ("fused_qkv_a_proj", "kv_a_proj_with_mqa", 1),
         ]
 
-        # Fused indexer wk + weights_proj (shard 0 = wk, shard 1 = weights_proj)
-        indexer_fused_mapping = [
-            ("wk_weights_proj", "wk", 0),
-            ("wk_weights_proj", "weights_proj", 1),
-        ]
-        stacked_params_mapping.extend(indexer_fused_mapping)
-
         fused_shared_expert_layers = self.fused_shared_expert_layers
         expert_params_mapping = fused_moe_make_expert_params_mapping(
             self,
@@ -351,8 +343,6 @@ class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts, SupportsPP):
                 and extract_layer_index(name) in fused_shared_expert_layers
             )
             name = self._rewrite_spec_layer_name(spec_layer, name)
-
-            name = _indexer_checkpoint_name(name)
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 # Skip non-stacked layers and experts (experts handled below).

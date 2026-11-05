@@ -27,7 +27,6 @@ from vllm.model_executor.models.deepseek_v2 import (
     DeepseekV2ForCausalLM,
     DeepseekV2MLP,
     DeepseekV2MoE,
-    _indexer_checkpoint_name,
     get_spec_layer_idx_from_weight_name,
 )
 from vllm.model_executor.models.utils import (
@@ -333,15 +332,13 @@ class DeepseekV32Model(torch.nn.Module):
         return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        # DSA-only: MLA (fused_qkv_a_proj) + the fused indexer wk/weights_proj +
-        # routed experts. No MHA (qkv_proj) or ROCm shared-expert-fusion paths.
+        # DSA-only: MLA (fused_qkv_a_proj) + routed experts. No MHA (qkv_proj)
+        # or ROCm shared-expert-fusion paths.
         stacked_params_mapping = [
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
             ("fused_qkv_a_proj", "q_a_proj", 0),
             ("fused_qkv_a_proj", "kv_a_proj_with_mqa", 1),
-            ("wk_weights_proj", "wk", 0),
-            ("wk_weights_proj", "weights_proj", 1),
         ]
         expert_params_mapping = fused_moe_make_expert_params_mapping(
             self,
@@ -360,7 +357,6 @@ class DeepseekV32Model(torch.nn.Module):
             # MTP / nextn layers are loaded by the MTP model, not here.
             if get_spec_layer_idx_from_weight_name(self.config, name) is not None:
                 continue
-            name = _indexer_checkpoint_name(name)
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:

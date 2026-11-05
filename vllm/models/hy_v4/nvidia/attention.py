@@ -35,14 +35,17 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
-from vllm.model_executor.layers.quantization.fp8_dequant import Fp8DequantConfig
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     per_token_group_quant_fp8,
 )
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.sparse_attn_indexer import SparseAttnIndexer
 from vllm.model_executor.model_loader.weight_utils import make_attention_sink
-from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
+from vllm.model_executor.models.deepseek_v2 import (
+    DeepseekV32IndexerCache,
+    fuse_indexer_wk_weights_proj,
+    init_indexer_wk_weights_proj,
+)
 from vllm.model_executor.models.utils import compute_skip_topk_layers
 from vllm.platforms import current_platform
 from vllm.v1.attention.backend import AttentionBackend, AttentionType
@@ -118,18 +121,8 @@ class Indexer(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.wq_b",
         )
-        # Fused wk + weights_proj: single GEMM producing [head_dim + n_head].
-        # It runs in BF16; FP8 checkpoint rows are dequantized after loading.
-        self.wk_weights_proj = MergedColumnParallelLinear(
-            hidden_size,
-            [self.head_dim, self.n_head],
-            bias=False,
-            quant_config=Fp8DequantConfig.for_checkpoint(
-                vllm_config.quant_config, any_scale_layout=True
-            ),
-            disable_tp=True,
-            prefix=f"{prefix}.wk_weights_proj",
-        )
+        # wk + weights_proj run as one BF16 GEMM (wk_weights_proj)
+        init_indexer_wk_weights_proj(self, hidden_size, quant_config, prefix)
         self.k_norm = LayerNorm(self.head_dim, eps=1e-6, dtype=torch.float32)
         self.softmax_scale = self.head_dim**-0.5
 
@@ -162,6 +155,9 @@ class Indexer(nn.Module):
             self.max_total_seq_len,
             self.topk_indices_buffer,
         )
+
+    def process_weights_after_loading(self) -> None:
+        fuse_indexer_wk_weights_proj(self)
 
     def forward(
         self,

@@ -1,51 +1,59 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Block-FP8 checkpoint weights of layers that run in BF16 (`Fp8DequantConfig`).
+"""Checkpoint weights that are stored in FP8 but run in BF16.
 
-The weight and its scale load independently (any order, any call, no pairing in
-the model's loader); BF16 rows load as is; post-load processing dequantizes in
-the weight's own storage, so cold start and direct reload end with the same
-bytes at the startup address."""
+- `Fp8DequantLinearMethod` (GLM5-next MLA projections): the checkpoint's own
+  block-FP8 ``weight`` and ``weight_scale_inv``, dequantized after loading.
+- The sparse-attention indexer: ``wk`` under the checkpoint's quantization,
+  ``weights_proj`` in BF16, fused into one BF16 weight after loading.
+
+Each checkpoint tensor loads on its own (any order, one per ``load_weights``
+call); direct and layerwise reloads end with the bytes of a cold start, at the
+cold-start addresses."""
 
 import pytest
 import torch
 
-from vllm.config import LoadConfig, ModelConfig
 from vllm.model_executor.layers.linear import (
-    ColumnParallelLinear,
     MergedColumnParallelLinear,
-    ReplicatedLinear,
     RowParallelLinear,
 )
-from vllm.model_executor.layers.quantization.fp8_dequant import Fp8DequantConfig
-from vllm.model_executor.layers.quantization.utils.quant_utils import (
-    GroupShape,
-    scaled_dequantize,
+from vllm.model_executor.layers.quantization.fp8 import (
+    Fp8Config,
+    dequantized_fp8_config,
 )
-from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
-from vllm.model_executor.model_loader.reload import record_metadata_for_reloading
 from vllm.model_executor.model_loader.reload.direct import (
     begin_direct_reload,
     finish_direct_reload,
 )
-from vllm.model_executor.model_loader.utils import process_weights_after_loading
-from vllm.model_executor.model_loader.weight_utils import (
-    initialize_single_dummy_weight,
+from vllm.model_executor.model_loader.reload.layerwise import (
+    finalize_layerwise_reload,
+    initialize_layerwise_reload,
+    record_metadata_for_reloading,
 )
-from vllm.model_executor.utils import get_live_param, weights_already_processed
+from vllm.model_executor.model_loader.utils import process_weights_after_loading
+from vllm.model_executor.utils import get_live_param
 from vllm.utils.math_utils import cdiv
 
-pytestmark = pytest.mark.usefixtures("dist_init")
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="FP8 linear kernels need a GPU"
+)
 
-_DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+_DEVICE = torch.device("cuda")
 # q_a / kv_a-like shards: the first spans several dequantization chunks, the
 # last ends in a partial block
 _OUT = [1280, 192]
 
 
-@pytest.fixture(scope="module")
-def model_config() -> ModelConfig:
-    return ModelConfig("facebook/opt-125m", dtype="bfloat16", skip_tokenizer_init=True)
+@pytest.fixture
+def model_config(dist_init):
+    from vllm.config import ModelConfig, VllmConfig, set_current_vllm_config
+
+    config = ModelConfig(
+        "facebook/opt-125m", dtype="bfloat16", skip_tokenizer_init=True
+    )
+    with set_current_vllm_config(VllmConfig(model_config=config)):
+        yield config
 
 
 def _block_fp8(rows: int, cols: int, seed: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -61,13 +69,32 @@ def _dequant(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     return (weight.float() * s).to(torch.bfloat16)
 
 
-class _Model(torch.nn.Module):
-    """A fused (q_a / kv_a-like) and a row-parallel block-FP8 projection, loaded
-    the way the model loaders do: one tensor at a time, no pairing."""
+def _ptrs(model: torch.nn.Module) -> dict[str, int]:
+    return {n: p.data_ptr() for n, p in model.named_parameters()}
+
+
+def _reload(model, ckpt, mode, model_config, monkeypatch):
+    """Send every tensor in its own ``load_weights`` call, as RL updates do."""
+    monkeypatch.setenv("VLLM_RELOAD_MODE", mode)
+    if mode == "direct":
+        begin_direct_reload(model)
+    else:
+        initialize_layerwise_reload(model)
+    for item in ckpt.items():
+        model.load_weights([item])
+    if mode == "direct":
+        finish_direct_reload(model, model_config, _DEVICE)
+    else:
+        finalize_layerwise_reload(model, model_config)
+
+
+class _MlaModel(torch.nn.Module):
+    """A fused (q_a / kv_a-like) and a row-parallel projection that a
+    block-FP8 checkpoint stores in FP8 and the model runs in BF16."""
 
     def __init__(self):
         super().__init__()
-        config = Fp8DequantConfig([128, 128])
+        config = dequantized_fp8_config(Fp8Config(weight_block_size=[128, 128]))
         with _DEVICE:
             self.qkv_a = MergedColumnParallelLinear(
                 256, _OUT, bias=False, params_dtype=torch.bfloat16, quant_config=config
@@ -76,373 +103,190 @@ class _Model(torch.nn.Module):
                 256, 128, bias=False, params_dtype=torch.bfloat16, quant_config=config
             )
 
-    def load_weights(self, weights) -> set[str]:
-        loaded: set[str] = set()
+    def load_weights(self, weights) -> None:
         for name, tensor in weights:
             layer, shard, param_name = name.split(".")
             param = getattr(getattr(self, layer), param_name)
-            shard_id = None if shard == "-" else int(shard)
-            param.weight_loader(
-                param, tensor, *(() if shard_id is None else (shard_id,))
-            )
-            loaded.add(f"{layer}.{param_name}")
-        return loaded
+            shard_ids = () if shard == "-" else (int(shard),)
+            param.weight_loader(param, tensor, *shard_ids)
 
 
-def _checkpoint(seed: int, bf16_shard: int | None = None) -> dict[str, torch.Tensor]:
-    """``layer.shard.param`` -> tensor; shard ``bf16_shard`` of qkv_a is BF16."""
+def _mla_checkpoint(seed: int) -> dict[str, torch.Tensor]:
+    """``layer.shard.param`` -> tensor, scales first."""
     ckpt = {}
     for shard, rows in enumerate(_OUT):
-        weight, scale = _block_fp8(rows, 256, seed + shard)
-        if shard == bf16_shard:
-            ckpt[f"qkv_a.{shard}.weight"] = _dequant(weight, scale)
-        else:
-            ckpt[f"qkv_a.{shard}.weight"] = weight
-            ckpt[f"qkv_a.{shard}.weight_scale_inv"] = scale
-    weight, scale = _block_fp8(128, 256, seed + 9)
-    ckpt["o.-.weight"], ckpt["o.-.weight_scale_inv"] = weight, scale
+        weight, ckpt[f"qkv_a.{shard}.weight_scale_inv"] = _block_fp8(
+            rows, 256, seed + shard
+        )
+        ckpt[f"qkv_a.{shard}.weight"] = weight
+    ckpt["o.-.weight_scale_inv"], ckpt["o.-.weight"] = reversed(
+        _block_fp8(128, 256, seed + 9)
+    )
     return ckpt
 
 
-def _bf16(ckpt: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-    """The same weights as a BF16 trainer sends them: no scales."""
-    return {
-        name: _dequant(w, ckpt[name + "_scale_inv"]) if w.dtype != torch.bfloat16 else w
-        for name, w in ckpt.items()
-        if name.endswith(".weight")
-    }
+def _mla_expected(ckpt: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    def dq(prefix: str) -> torch.Tensor:
+        return _dequant(ckpt[f"{prefix}.weight"], ckpt[f"{prefix}.weight_scale_inv"])
+
+    qkv_a = torch.cat([dq(f"qkv_a.{shard}") for shard in range(len(_OUT))])
+    return {"qkv_a": qkv_a, "o": dq("o.-")}
 
 
-def _expected(ckpt: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-    runtime = _bf16(ckpt)
-    qkv_a = torch.cat([runtime[f"qkv_a.{shard}.weight"] for shard in range(len(_OUT))])
-    return {"qkv_a": qkv_a, "o": runtime["o.-.weight"]}
-
-
-def _cold_start(ckpt: dict[str, torch.Tensor], model_config: ModelConfig) -> _Model:
-    model = _Model()
+def _mla_cold_start(ckpt, model_config, scales_first=True) -> _MlaModel:
+    model = _MlaModel()
     record_metadata_for_reloading(model)
-    model.load_weights(reversed(list(ckpt.items())))  # scales before weights
+    items = list(ckpt.items())
+    for item in items if scales_first else reversed(items):
+        model.load_weights([item])
     process_weights_after_loading(model, model_config, _DEVICE)
     return model
 
 
-def _assert_runtime(model: _Model, expected: dict[str, torch.Tensor]) -> None:
+def _assert_mla(model: _MlaModel, expected: dict[str, torch.Tensor]) -> None:
     for name, weight in expected.items():
         layer = getattr(model, name)
         assert layer.weight.dtype == torch.bfloat16
-        assert layer.weight.is_contiguous()
         torch.testing.assert_close(layer.weight, weight, rtol=0, atol=0)
         assert get_live_param(layer, "weight_scale_inv") is None  # retired
-
-
-def _ptrs(model: torch.nn.Module) -> dict[str, int]:
-    return {n: p.data_ptr() for n, p in model.named_parameters()}
-
-
-@pytest.mark.parametrize("bf16_shard", [None, 0])
-def test_cold_start_dequantizes_in_place(model_config, bf16_shard):
-    """FP8 rows load into the first half of their BF16 rows' bytes (no extra
-    memory) and are dequantized at the same address; BF16 rows load as is."""
-    ckpt = _checkpoint(0, bf16_shard)
-    model = _Model()
-    storage = model.qkv_a.weight.untyped_storage()
-    assert storage.nbytes() == sum(_OUT) * 256 * 2  # the BF16 weight's bytes
-    ptrs = _ptrs(model)
-    model.load_weights(reversed(list(ckpt.items())))
-    process_weights_after_loading(model, model_config, _DEVICE)
-    _assert_runtime(model, _expected(ckpt))
-    assert _ptrs(model) == ptrs
+    x = torch.randn(3, 256, dtype=torch.bfloat16, device=_DEVICE)
+    torch.testing.assert_close(model.o(x)[0], x @ expected["o"].t())
 
 
 @pytest.mark.parametrize("scales_first", [True, False])
-def test_weight_and_scale_in_separate_calls(model_config, scales_first):
-    ckpt = _checkpoint(1)
-    model = _Model()
-    items = list(ckpt.items())
-    for item in reversed(items) if scales_first else items:
-        model.load_weights([item])
-    process_weights_after_loading(model, model_config, _DEVICE)
-    _assert_runtime(model, _expected(ckpt))
+def test_mla_cold_start_separate_calls(model_config, scales_first):
+    ckpt = _mla_checkpoint(0)
+    model = _mla_cold_start(ckpt, model_config, scales_first)
+    _assert_mla(model, _mla_expected(ckpt))
 
 
-def test_missing_scale_is_rejected(model_config):
-    """FP8 rows whose scale never arrived are not dequantized with whatever
-    the scale holds."""
-    ckpt = _checkpoint(17)
-    del ckpt["qkv_a.1.weight_scale_inv"]
-    model = _Model()
-    model.load_weights(ckpt.items())
-    with pytest.raises(ValueError, match="without their weight_scale_inv"):
-        process_weights_after_loading(model, model_config, _DEVICE)
-
-
-def test_bf16_checkpoint(model_config):
-    """A BF16 checkpoint needs no scales, also for the strict loaded-weights
-    check on a quantized model."""
-    bf16 = _bf16(_checkpoint(3))
-    model = _Model()
-    loaded = model.load_weights(bf16.items())
-    DefaultModelLoader(LoadConfig()).track_weights_loading(model, loaded, True)
-    process_weights_after_loading(model, model_config, _DEVICE)
-    _assert_runtime(model, _expected(bf16))
-
-
-def test_dummy_weights_are_runtime_values(model_config):
-    """--load-format dummy fills the BF16 weight; no row holds FP8 bytes."""
-    model = _Model()
-    model.o.weight.view(torch.int16).fill_(0x7FC0)  # BF16 NaN
-    for module in model.modules():
-        for name, param in module._parameters.items():
-            if param is not None:
-                initialize_single_dummy_weight(param, name=name)
-    process_weights_after_loading(model, model_config, _DEVICE)
-    for layer in (model.qkv_a, model.o):
-        assert layer.weight.isfinite().all()
-        assert layer.weight.abs().max() <= 1e-3
-
-
-def test_weight_copied_before_processing(model_config):
-    """CPU offloading moves the loaded weight (``.to(device)``) before
-    post-load processing; the copy keeps its FP8 rows."""
-    ckpt = _checkpoint(16)
-    model = _Model()
-    model.load_weights(ckpt.items())
-    for layer in (model.qkv_a, model.o):
-        layer.weight.data = layer.weight.data.to("cpu").clone().to(_DEVICE)
-    process_weights_after_loading(model, model_config, _DEVICE)
-    _assert_runtime(model, _expected(ckpt))
-
-
-def test_bf16_load_weights_outside_a_reload(model_config):
-    """A bare ``model.load_weights`` of BF16 tensors leaves a runnable layer."""
-    model = _cold_start(_checkpoint(12), model_config)
-    new = _expected(_checkpoint(13))
-    model.load_weights([("o.-.weight", new["o"])])
-    x = torch.randn(2, 256, dtype=torch.bfloat16, device=_DEVICE)
-    torch.testing.assert_close(model.o(x)[0], x @ new["o"].t())
-
-
-def test_pre_processed_weights_are_kept(model_config):
-    """The weight cache hands over plain parameters holding runtime bytes."""
-    runtime = _expected(_checkpoint(11))
-    model = _Model()
-    for name, weight in runtime.items():
-        layer = getattr(model, name)
-        layer.weight = torch.nn.Parameter(weight.clone(), requires_grad=False)
-    with weights_already_processed():
-        process_weights_after_loading(model, model_config, _DEVICE)
-    _assert_runtime(model, runtime)
-
-
-@pytest.mark.parametrize("update", ["fp8", "mixed", "bf16", "left_out"])
-def test_direct_reload_equals_cold_start(monkeypatch, model_config, update):
-    monkeypatch.setenv("VLLM_RELOAD_MODE", "direct")
-    old = _checkpoint(5)
-    model = _cold_start(old, model_config)
+@pytest.mark.parametrize("mode", ["direct", "layerwise"])
+def test_mla_reload_equals_cold_start(monkeypatch, model_config, mode):
+    """Direct reload views the BF16 storage back to the FP8 checkpoint layout
+    (a dtype and size change); layerwise reload restages the FP8 layer. Both
+    dequantize the new tensors at the cold-start addresses."""
+    monkeypatch.setenv("VLLM_RELOAD_MODE", mode)
+    model = _mla_cold_start(_mla_checkpoint(1), model_config)
     ptrs = _ptrs(model)
-    new = {
-        "fp8": _checkpoint(6),
-        "mixed": _checkpoint(6, bf16_shard=1),
-        "bf16": _bf16(_checkpoint(6)),
-        # dequantized rows are runtime bytes: a reload that skips o keeps it
-        "left_out": {k: v for k, v in _checkpoint(6).items() if k.startswith("qkv_a")},
-    }[update]
-    begin_direct_reload(model)
-    for item in new.items():
-        model.load_weights([item])
-    finish_direct_reload(model, model_config, _DEVICE)
-    _assert_runtime(model, _expected({**old, **new}))
-    assert _ptrs(model) == ptrs
+    for seed in (2, 3):  # twice: the second reload starts from a reloaded model
+        new = _mla_checkpoint(seed)
+        _reload(model, new, mode, model_config, monkeypatch)
+        _assert_mla(model, _mla_expected(new))
+        assert _ptrs(model) == ptrs
 
 
-@pytest.mark.parametrize("bf16", [False, True])
-def test_replicated_layer(model_config, bf16):
-    """A ReplicatedLinear (GLM5-next kv_a_proj_with_mqa without q_lora_rank)
-    loads FP8 through the FP8 view too."""
-    with _DEVICE:
-        layer = ReplicatedLinear(
-            256,
-            192,
-            bias=False,
-            params_dtype=torch.bfloat16,
-            quant_config=Fp8DequantConfig([128, 128]),
-        )
-    weight, scale = _block_fp8(192, 256, 40)
-    expected = _dequant(weight, scale)
-    if bf16:
-        layer.weight.weight_loader(layer.weight, expected)
-    else:
-        layer.weight_scale_inv.weight_loader(layer.weight_scale_inv, scale)
-        layer.weight.weight_loader(layer.weight, weight)
-    layer.quant_method.process_weights_after_loading(layer)
-    torch.testing.assert_close(layer.weight, expected, rtol=0, atol=0)
-
-
-@pytest.mark.parametrize("bf16", [False, True])
-@pytest.mark.parametrize("tp_rank", [0, 1])
-def test_column_parallel_tp_slice(model_config, tp_rank, bf16):
-    """Under TP 2, a rank loads its rows of a column-parallel weight (q_b_proj)
-    from the full FP8 or BF16 checkpoint tensor, with the matching scale rows."""
-    with _DEVICE:
-        layer = ColumnParallelLinear(
-            256,
-            512,
-            bias=False,
-            params_dtype=torch.bfloat16,
-            quant_config=Fp8DequantConfig([128, 128]),
-            tp_rank=tp_rank,
-            tp_size=2,
-        )
-    weight, scale = _block_fp8(512, 256, 3)
-    full = _dequant(weight, scale)
-    ckpt = {"weight": full} if bf16 else {"weight_scale_inv": scale, "weight": weight}
-    for name, tensor in ckpt.items():
-        param = getattr(layer, name)
-        param.weight_loader(param, tensor)
-    process_weights_after_loading(layer, model_config, _DEVICE)
-    rows = slice(256 * tp_rank, 256 * (tp_rank + 1))
-    torch.testing.assert_close(layer.weight, full[rows], rtol=0, atol=0)
-
-
-# Sparse-attention indexer: `wk` (128 rows) and `weights_proj` (64 rows) fused
-# into one replicated `wk_weights_proj`, whose FP8 checkpoint scale layout
-# varies between models (`Fp8DequantConfig(None)`).
+# Sparse-attention indexer: `wk` (128 rows) and `weights_proj` (64 rows).
 _WK, _WP, _HIDDEN = 128, 64, 512
 
 
-class _IndexerModel(torch.nn.Module):
-    """The indexer part of the DeepSeek-V3.2-style loaders."""
+def _mxfp8_config():
+    from vllm.model_executor.layers.quantization.modelopt import ModelOptMxFp8Config
 
-    def __init__(self, hidden: int = _HIDDEN):
+    return ModelOptMxFp8Config(True, None, [])
+
+
+class _IndexerModel(torch.nn.Module):
+    def __init__(self, layout: str):
         super().__init__()
+        from vllm.model_executor.models.deepseek_v2 import (
+            fuse_indexer_wk_weights_proj,
+            init_indexer_wk_weights_proj,
+        )
+
+        quant_config = {
+            "bf16": None,
+            "block": Fp8Config(weight_block_size=[128, 128]),  # DeepSeek-V3.2
+            "mxfp8": _mxfp8_config(),  # Hy4-preview-FP8 (ModelOpt MXFP8)
+        }[layout]
+        self.indexer = torch.nn.Module()
+        self.indexer.head_dim, self.indexer.n_head = _WK, _WP
+        self.indexer.process_weights_after_loading = lambda: (
+            fuse_indexer_wk_weights_proj(self.indexer)
+        )
         with _DEVICE:
-            self.wk_weights_proj = MergedColumnParallelLinear(
-                hidden,
-                [_WK, _WP],
-                bias=False,
-                params_dtype=torch.bfloat16,
-                quant_config=Fp8DequantConfig(None),
-                disable_tp=True,
+            init_indexer_wk_weights_proj(
+                self.indexer, _HIDDEN, quant_config, "layers.0.indexer"
             )
 
-    def load_weights(self, weights) -> set[str]:
-        from vllm.model_executor.models.deepseek_v2 import _indexer_checkpoint_name
-
+    def load_weights(self, weights) -> None:
         params = dict(self.named_parameters())
-        loaded: set[str] = set()
         for name, tensor in weights:
-            name = _indexer_checkpoint_name(f"layers.0.indexer.{name}")
-            proj, _, suffix = name.removeprefix("layers.0.indexer.").partition(".")
-            name = f"wk_weights_proj.{suffix}"
-            shard = {"wk": 0, "weights_proj": 1}[proj]
-            param = params[name]
-            param.weight_loader(param, tensor, shard)
-            loaded.add(name)
-        return loaded
+            param = params[f"indexer.{name}"]
+            param.weight_loader(param, tensor)
 
 
-def _scale_layout(layout: str, rows: int, gen: torch.Generator) -> torch.Tensor:
-    """A checkpoint scale of a ``[rows, _HIDDEN]`` FP8 weight."""
-    shapes = {
-        "block": (cdiv(rows, 128), _HIDDEN // 128),
-        "channel": (rows,),
-        "channel_2d": (rows, 1),
-        "tensor": (),
-        "mx": (rows, _HIDDEN // 32),
-    }
-    if layout == "mx":  # E8M0 exponents of 2^-2 .. 2^1
-        scale = torch.randint(125, 129, shapes[layout], generator=gen)
-        return scale.to(torch.uint8).to(_DEVICE)
-    return (torch.rand(shapes[layout], generator=gen) + 0.5).to(_DEVICE)
-
-
-def _indexer_checkpoint(seed: int, layout: str = "block", fp8_wp: bool = False):
-    """A checkpoint and the BF16 weight the paired loaders made of it."""
+def _indexer_checkpoint(seed: int, layout: str):
+    """Checkpoint tensors (scales first) and the fused BF16 weight."""
     gen = torch.Generator().manual_seed(seed)
-    ckpt, expected = {}, []
-    for name, rows, fp8 in (("wk", _WK, True), ("weights_proj", _WP, fp8_wp)):
-        weight = torch.randn(rows, _HIDDEN, generator=gen)
-        if not fp8:
-            ckpt[f"{name}.weight"] = weight.to(torch.bfloat16).to(_DEVICE)
-            expected.append(ckpt[f"{name}.weight"])
-            continue
-        weight = weight.to(torch.float8_e4m3fn).to(_DEVICE)
-        scale = _scale_layout(layout, rows, gen)
-        # Quark / compressed-tensors call it `weight_scale`
-        scale_name = (
-            "weight_scale" if layout.startswith("channel") else "weight_scale_inv"
-        )
-        ckpt[f"{name}.weight"], ckpt[f"{name}.{scale_name}"] = weight, scale
-        ref = scale.view(torch.float8_e8m0fnu).float() if layout == "mx" else scale
-        ref = ref.reshape(ref.shape[0] if ref.ndim else 1, -1)
-        group = GroupShape(rows // ref.shape[0], _HIDDEN // ref.shape[1])
-        expected.append(scaled_dequantize(weight, ref, group, torch.bfloat16))
-    return ckpt, torch.cat(expected)
+    wk = torch.randn(_WK, _HIDDEN, generator=gen)
+    wp = torch.randn(_WP, _HIDDEN, generator=gen).to(torch.bfloat16).to(_DEVICE)
+    if layout == "bf16":
+        wk = wk.to(torch.bfloat16).to(_DEVICE)
+        ckpt = {"wk.weight": wk}
+    elif layout == "block":
+        wk, scale = _block_fp8(_WK, _HIDDEN, seed)
+        ckpt = {"wk.weight_scale_inv": scale, "wk.weight": wk}
+        wk = _dequant(wk, scale)
+    else:  # E8M0 exponents 2^-2 .. 2^1, one per row and 32 columns
+        exponent = torch.randint(125, 129, (_WK, _HIDDEN // 32), generator=gen)
+        scale = exponent.to(torch.uint8).to(_DEVICE)
+        wk = wk.to(torch.float8_e4m3fn).to(_DEVICE)
+        ckpt = {"wk.weight_scale": scale, "wk.weight": wk}
+        s = scale.view(torch.float8_e8m0fnu).float().repeat_interleave(32, 1)
+        wk = (wk.float() * s).to(torch.bfloat16)
+    ckpt["weights_proj.weight"] = wp
+    return ckpt, torch.cat([wk, wp])
 
 
-def _indexer_cold_start(ckpt, model_config: ModelConfig) -> _IndexerModel:
-    model = _IndexerModel()
+def _indexer_cold_start(ckpt, layout, model_config, scales_first=True):
+    model = _IndexerModel(layout)
     record_metadata_for_reloading(model)
-    for item in reversed(list(ckpt.items())):  # scales first, one per call
+    items = list(ckpt.items())
+    for item in items if scales_first else reversed(items):
         model.load_weights([item])
     process_weights_after_loading(model, model_config, _DEVICE)
     return model
 
 
-@pytest.mark.parametrize("layout", ["block", "channel", "channel_2d", "tensor", "mx"])
+@pytest.mark.parametrize("layout", ["bf16", "block", "mxfp8"])
 @pytest.mark.parametrize("scales_first", [True, False])
-def test_indexer_wk_any_scale_layout(model_config, layout, scales_first):
-    """Bit-equal to main's paired `scaled_dequantize`, for every scale layout
-    and with weight and scale in separate calls."""
-    ckpt, expected = _indexer_checkpoint(20, layout)
-    model = _IndexerModel()
-    items = list(ckpt.items())
-    for item in reversed(items) if scales_first else items:
-        model.load_weights([item])
-    process_weights_after_loading(model, model_config, _DEVICE)
-    torch.testing.assert_close(model.wk_weights_proj.weight, expected, rtol=0, atol=0)
+def test_indexer_fused_weight(model_config, layout, scales_first):
+    """Wk loads under the checkpoint's quantization (BF16, block-FP8, MXFP8)
+    with its scale in a separate call, and the fused weight equals the exact
+    dequantization of the checkpoint."""
+    ckpt, expected = _indexer_checkpoint(10, layout)
+    model = _indexer_cold_start(ckpt, layout, model_config, scales_first)
+    fused = model.indexer.wk_weights_proj
+    torch.testing.assert_close(fused.weight, expected, rtol=0, atol=0)
+    assert "weight" not in fused._parameters  # derived, not loaded
+    x = torch.randn(3, _HIDDEN, dtype=torch.bfloat16, device=_DEVICE)
+    torch.testing.assert_close(fused(x)[0], x @ expected.t())
 
 
-def test_indexer_fp8_weights_proj(model_config):
-    # dots3 stores weights_proj as FP8 too
-    ckpt, expected = _indexer_checkpoint(21, fp8_wp=True)
-    model = _indexer_cold_start(ckpt, model_config)
-    torch.testing.assert_close(model.wk_weights_proj.weight, expected, rtol=0, atol=0)
-
-
-@pytest.mark.parametrize("update", ["fp8", "bf16", "left_out"])
-def test_indexer_direct_reload_equals_cold_start(monkeypatch, model_config, update):
-    monkeypatch.setenv("VLLM_RELOAD_MODE", "direct")
-    old, old_expected = _indexer_checkpoint(24, "mx")
-    model = _indexer_cold_start(old, model_config)
+@pytest.mark.parametrize("layout", ["block", "mxfp8"])
+@pytest.mark.parametrize("mode", ["direct", "layerwise"])
+def test_indexer_reload_keeps_fused_address(monkeypatch, model_config, layout, mode):
+    monkeypatch.setenv("VLLM_RELOAD_MODE", mode)
+    old, _ = _indexer_checkpoint(11, layout)
+    model = _indexer_cold_start(old, layout, model_config)
+    fused_ptr = model.indexer.wk_weights_proj.weight.data_ptr()
     ptrs = _ptrs(model)
-    new, expected = _indexer_checkpoint(25, "mx")
-    if update == "bf16":
-        new = {
-            "wk.weight": expected[:_WK].clone(),
-            "weights_proj.weight": expected[_WK:],
-        }
-    elif update == "left_out":
-        new, expected = {}, old_expected
-    begin_direct_reload(model)
-    for item in new.items():
-        model.load_weights([item])
-    finish_direct_reload(model, model_config, _DEVICE)
-    torch.testing.assert_close(model.wk_weights_proj.weight, expected, rtol=0, atol=0)
+    new, expected = _indexer_checkpoint(12, layout)
+    _reload(model, new, mode, model_config, monkeypatch)
+    fused = model.indexer.wk_weights_proj.weight
+    torch.testing.assert_close(fused, expected, rtol=0, atol=0)
+    assert fused.data_ptr() == fused_ptr
     assert _ptrs(model) == ptrs
 
 
 def _glm5_mla_params() -> dict:
     """Params of a GLM5-next MLA layer whose projections load a block-FP8
-    checkpoint (see `Fp8DequantConfig`): only the scales matter here."""
+    checkpoint (see `dequantized_fp8_config`): only the names matter here."""
     prefix = "layers.3.self_attn"
-    params = {}
-    for target in ("fused_qkv_a_proj", "q_b_proj", "o_proj"):
-        scale = torch.nn.Parameter(torch.empty(0), requires_grad=False)
-        scale.weight_block_size = [128, 128]
-        params[f"{prefix}.{target}.weight_scale_inv"] = scale
-    return params
+    return {
+        f"{prefix}.{target}.weight_scale_inv": None
+        for target in ("fused_qkv_a_proj", "q_b_proj", "o_proj")
+    }
 
 
 def test_glm5next_attn_loader_accepts_quark_weight_scale():

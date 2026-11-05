@@ -73,9 +73,12 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mla import MLAModules, MultiHeadLatentAttentionWrapper
 from vllm.model_executor.layers.quantization import QuantizationConfig
-from vllm.model_executor.layers.quantization.fp8_dequant import Fp8DequantConfig
+from vllm.model_executor.layers.quantization.fp8 import dequantized_fp8_config
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     per_token_group_quant_fp8,
+)
+from vllm.model_executor.layers.quantization.utils.quant_utils import (
+    get_and_maybe_dequant_weights,
 )
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.sparse_attn_indexer import (
@@ -96,6 +99,7 @@ from vllm.model_executor.models.utils import (
     get_fused_shared_expert_layers,
     sequence_parallel_chunk,
 )
+from vllm.model_executor.utils import refill_derived
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.utils.torch_utils import direct_register_custom_op
@@ -703,18 +707,7 @@ class Indexer(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.wq_b",
         )
-        # Fused wk + weights_proj: single GEMM producing [head_dim + n_head].
-        # It runs in BF16; FP8 checkpoint rows are dequantized after loading.
-        self.wk_weights_proj = MergedColumnParallelLinear(
-            hidden_size,
-            [self.head_dim, self.n_head],
-            bias=False,
-            quant_config=Fp8DequantConfig.for_checkpoint(
-                vllm_config.quant_config, any_scale_layout=True
-            ),
-            disable_tp=True,
-            prefix=f"{prefix}.wk_weights_proj",
-        )
+        init_indexer_wk_weights_proj(self, hidden_size, quant_config, prefix)
         self.k_norm = LayerNorm(self.head_dim, eps=1e-6, dtype=torch.float32)
         self.softmax_scale = self.head_dim**-0.5
 
@@ -757,6 +750,9 @@ class Indexer(nn.Module):
             and self.rope_dim == 64
             and self.scale_fmt is not None
         )
+
+    def process_weights_after_loading(self) -> None:
+        fuse_indexer_wk_weights_proj(self)
 
     def forward(
         self, hidden_states: torch.Tensor, qr: torch.Tensor, positions, rotary_emb
@@ -852,16 +848,48 @@ class Indexer(nn.Module):
         return self.indexer_op(hidden_states, q_fp8, k, weights)
 
 
-def _indexer_checkpoint_name(name: str) -> str:
-    """Quark and compressed-tensors name an FP8 indexer scale ``weight_scale``;
-    the fused ``wk_weights_proj`` loads it as ``weight_scale_inv``. (HY-V4's
-    weights mapper renames ``weights_proj`` to ``wk_weights_proj`` first.)"""
-    if name.endswith(".weight_scale") and any(
-        f".indexer.{proj}." in name
-        for proj in ("wk", "weights_proj", "wk_weights_proj")
-    ):
-        return f"{name}_inv"
-    return name
+def init_indexer_wk_weights_proj(
+    indexer: nn.Module,
+    hidden_size: int,
+    quant_config: QuantizationConfig | None,
+    prefix: str,
+) -> None:
+    """Build the indexer's checkpoint layers ``wk`` (quantized as the checkpoint
+    stores it) and ``weights_proj`` (BF16), and ``wk_weights_proj``, the BF16
+    linear that runs both as one GEMM. Its weight is not a parameter: it is
+    derived from theirs after every load (`fuse_indexer_wk_weights_proj`)."""
+    indexer.wk = ReplicatedLinear(
+        hidden_size,
+        indexer.head_dim,
+        bias=False,
+        quant_config=dequantized_fp8_config(quant_config) or quant_config,
+        prefix=f"{prefix}.wk",
+    )
+    indexer.weights_proj = ReplicatedLinear(
+        hidden_size, indexer.n_head, bias=False, prefix=f"{prefix}.weights_proj"
+    )
+    fused = MergedColumnParallelLinear(
+        hidden_size,
+        [indexer.head_dim, indexer.n_head],
+        bias=False,
+        disable_tp=True,
+        prefix=f"{prefix}.wk_weights_proj",
+    )
+    weight = fused.weight.data
+    del fused.weight
+    fused.weight = weight  # a plain attribute: loaders and reloads skip it
+    indexer.wk_weights_proj = fused
+
+
+def fuse_indexer_wk_weights_proj(indexer: nn.Module) -> None:
+    """Refill the fused BF16 ``wk_weights_proj`` weight from the loaded ``wk``
+    and ``weights_proj``, in place so captured CUDA graphs keep its address."""
+    dtype = indexer.wk_weights_proj.weight.dtype
+    parts = [
+        get_and_maybe_dequant_weights(layer, out_dtype=dtype)
+        for layer in (indexer.wk, indexer.weights_proj)
+    ]
+    refill_derived(indexer.wk_weights_proj, "weight", torch.cat(parts))
 
 
 def _min_latency_fused_qkv_a_proj_impl(
@@ -1557,13 +1585,6 @@ class DeepseekV2Model(nn.Module):
             ("qkv_proj", "k_proj", "k"),
             ("qkv_proj", "v_proj", "v"),
         ]
-        # Fused indexer wk + weights_proj (shard 0 = wk, shard 1 = weights_proj)
-        indexer_fused_mapping = [
-            ("wk_weights_proj", "wk", 0),
-            ("wk_weights_proj", "weights_proj", 1),
-        ]
-        stacked_params_mapping.extend(indexer_fused_mapping)
-
         if self.use_mha:
             stacked_params_mapping.extend(mha_params_mapping)
         else:
@@ -1608,8 +1629,6 @@ class DeepseekV2Model(nn.Module):
                 and bool(rocm_aiter_ops.is_fusion_moe_shared_experts_enabled())
                 and extract_layer_index(name) in self.fused_shared_expert_layers
             )
-
-            name = _indexer_checkpoint_name(name)
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 # Skip non-stacked layers and experts (experts handled below).

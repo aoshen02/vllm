@@ -29,7 +29,6 @@ from vllm.model_executor.models.deepseek_v2 import (
     DeepseekV2ForCausalLM,
     DeepseekV2MLP,
     DeepseekV2MoE,
-    _indexer_checkpoint_name,
     get_spec_layer_idx_from_weight_name,
 )
 from vllm.model_executor.models.utils import (
@@ -254,8 +253,6 @@ class DeepseekV32Model(torch.nn.Module):
             ("gate_up_proj", "up_proj", 1),
             ("fused_qkv_a_proj", "q_a_proj", 0),
             ("fused_qkv_a_proj", "kv_a_proj_with_mqa", 1),
-            ("wk_weights_proj", "wk", 0),
-            ("wk_weights_proj", "weights_proj", 1),
         ]
         expert_params_mapping = fused_moe_make_expert_params_mapping(
             self,
@@ -281,7 +278,6 @@ class DeepseekV32Model(torch.nn.Module):
                 and bool(rocm_aiter_ops.is_fusion_moe_shared_experts_enabled())
                 and extract_layer_index(name) in self.fused_shared_expert_layers
             )
-            name = _indexer_checkpoint_name(name)
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:

@@ -56,10 +56,7 @@ from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
 )
-from vllm.model_executor.models.deepseek_v2 import (
-    _get_moe_router_dtype,
-    _indexer_checkpoint_name,
-)
+from vllm.model_executor.models.deepseek_v2 import _get_moe_router_dtype
 from vllm.model_executor.models.glm4_1v import (
     Glm4vDummyInputsBuilder,
     Glm4vForConditionalGeneration,
@@ -867,9 +864,6 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
             # MLA: fuse q_a_proj and kv_a_proj_with_mqa
             (".fused_qkv_a_proj", ".q_a_proj", 0),
             (".fused_qkv_a_proj", ".kv_a_proj_with_mqa", 1),
-            # Indexer: fuse wk and weights_proj
-            (".wk_weights_proj", ".wk", 0),
-            (".wk_weights_proj", ".weights_proj", 1),
             # KDA: merge q, k, v, b, f_a, g_a projections into one GEMM
             (".in_proj_qkvbfg_a", ".q_proj", 0),
             (".in_proj_qkvbfg_a", ".k_proj", 1),
@@ -940,8 +934,6 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
                 and extract_layer_index(name) in self.fused_shared_expert_layers
             ):
                 name = _fused_shared_expert_name(name, self.config.n_routed_experts)
-
-            name = _indexer_checkpoint_name(name)
 
             name, loaded_weight = _mla_proj_checkpoint_tensor(
                 name, loaded_weight, params_dict, self.config, kv_a_pad_size
@@ -1367,7 +1359,7 @@ def _mla_proj_checkpoint_tensor(
     scale_name = f"{prefix}.{_FP8_ATTN_PROJS[suffix]}.weight_scale_inv"
     if scale_name not in params_dict:  # no q_lora_rank: kv_a is not fused
         scale_name = f"{prefix}{suffix}weight_scale_inv"
-    is_fp8_proj = scale_name in params_dict  # see `Fp8DequantConfig`
+    is_fp8_proj = scale_name in params_dict  # see `dequantized_fp8_config`
     if is_fp8_proj and name.endswith(".weight_scale"):
         name = f"{name}_inv"
     if kv_a_pad_size > 0 and suffix == ".kv_a_proj_with_mqa.":
@@ -1375,7 +1367,7 @@ def _mla_proj_checkpoint_tensor(
             pad = tensor.new_zeros(kv_a_pad_size, *tensor.shape[1:])
             tensor = torch.cat([tensor, pad])
         elif is_fp8_proj and name.endswith(".weight_scale_inv"):
-            block_n = params_dict[scale_name].weight_block_size[0]
+            block_n = cdiv(config.kv_lora_rank, tensor.shape[0])
             rows = cdiv(config.kv_lora_rank + kv_a_pad_size, block_n)
             pad = tensor.new_ones(rows - tensor.shape[0], *tensor.shape[1:])
             tensor = torch.cat([tensor, pad])
