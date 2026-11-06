@@ -4,7 +4,7 @@
 import json
 from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
@@ -103,6 +103,22 @@ def test_sleep_preservation_allows_empty_draft_but_rejects_target_typo(
     worker.model_config.sleep_preserve_parameter_names = ["missing"]
     with pytest.raises(ValueError, match="No parameter matches sleep retention"):
         worker._save_sleep_parameters(target)
+
+
+@pytest.mark.parametrize("patterns", [[], ["draft.*"]], ids=["unset", "draft"])
+def test_sleep_warns_when_draft_weights_are_discarded(monkeypatch, patterns):
+    target = torch.nn.Linear(2, 2, bias=False)
+    draft = torch.nn.Module()
+    draft.private = torch.nn.Linear(2, 2, bias=False, device="meta")
+    worker = object.__new__(gpu_worker.Worker)
+    worker.get_draft_model = lambda: draft  # type: ignore[method-assign]
+    worker.model_config = SimpleNamespace(sleep_preserve_parameter_names=patterns)
+    warn = Mock()
+    monkeypatch.setattr(gpu_worker.logger, "warning_once", warn)
+    # a meta draft parameter stands in for GPU storage; only the warning matters
+    monkeypatch.setattr(torch.Tensor, "to", lambda self, *a, **k: self)
+    worker._save_sleep_parameters(target)
+    assert warn.called == (not patterns)
 
 
 def test_load_model_preserves_compiled_graphs_at_runtime(monkeypatch):

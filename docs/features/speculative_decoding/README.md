@@ -262,6 +262,14 @@ vllm serve <target-model> \
   are populated by vLLM and are not intended to be set by users.
 - `use_heterogeneous_vocab` currently supports greedy draft sampling only. Probabilistic acceptance (temperature > 0 draft sampling) is not yet supported and will be added in a future release.
 
+## Sleep mode
+
+Level-2 [sleep](../sleep_mode.md) discards the draft model's weights, and
+`reload_weights` reloads only the target model. Start the server with
+`--sleep-preserve-parameter-names 'draft.*'` to keep the drafter; otherwise
+acceptance drops to zero after wake-up (`Mean acceptance length: 1.00`) while
+outputs stay correct.
+
 ## Lossless guarantees of Speculative Decoding
 
 In vLLM, speculative decoding aims to enhance inference efficiency while maintaining accuracy. This section addresses the lossless guarantees of

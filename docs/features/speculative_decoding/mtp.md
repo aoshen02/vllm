@@ -83,3 +83,8 @@ vllm serve XiaomiMiMo/MiMo-7B-Base \
   per lm_head weight, e.g. 0.6 or 0.35 GiB for a 248k x 2560 head; it is
   counted in the model weights, so with `--kv-cache-memory-bytes` leave room
   for it.
+
+!!! note "After level-2 sleep"
+    A mean acceptance length of 1.00 after a level-2 sleep and wake-up usually
+    means the drafter's weights were discarded; see
+    [Sleep mode](README.md#sleep-mode).
