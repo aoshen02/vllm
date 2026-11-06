@@ -560,8 +560,6 @@ class DefaultModelLoader(BaseModelLoader):
             "Loading weights took %.2f seconds",
             self.counter_after_loading_weights - self.counter_before_loading_weights,
         )
-        if hasattr(model, "finish_checkpoint_load"):
-            model.finish_checkpoint_load(loaded_weights)
         if loaded_weights is not None:
             _check_draft_layers_loaded(model, model_config, loaded_weights)
         # We only enable strict check for non-quantized models
