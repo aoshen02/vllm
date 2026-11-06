@@ -142,9 +142,20 @@ def _check_delivered(model: torch.nn.Module, model_config: ModelConfig | None) -
     if not metas:
         return
     try:
-        # Names the loader skips (a target's MTP layers, tied heads) need no update.
-        traced = trace_loads(model, metas, Targets(model))
-        missing = sorted(n for n in metas if n in traced.copies or n in traced.reasons)
+        # Not needed: names the loader skips (a target's MTP layers, tied heads) or
+        # writes only to a tensor shared from another model (a draft's target head).
+        targets = Targets(model)
+        traced = trace_loads(model, metas, targets)
+        missing = sorted(
+            name
+            for name in metas
+            if name in traced.reasons
+            or any(
+                copy.storage not in targets.by_storage
+                or _owned(model, targets.by_storage[copy.storage].real)
+                for copy in traced.copies.get(name, ())
+            )
+        )
     except RuntimeError:
         missing = sorted(metas)  # untraceable loader: every missing name counts
     if missing:

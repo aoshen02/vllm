@@ -342,6 +342,34 @@ class TestCompleteness:
         model = _tracked({**_checkpoint(), **_SkippingModel.SKIPPED})
         _reload(model, _checkpoint(1.01))
 
+    def test_name_writing_only_a_shared_tensor_needs_no_update(self):
+        class Draft(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.own = torch.nn.Parameter(torch.zeros(2), False)
+                self.head = torch.nn.Parameter(torch.zeros(8, 4), False)
+
+            def load_weights(self, weights):
+                params = dict(self.named_parameters())
+                for name, weight in weights:
+                    default_weight_loader(params[name], weight)
+
+        source = _tracked(_checkpoint())
+        with _DEVICE:
+            draft = Draft()
+        track_delivered_names(draft)
+        draft.load_weights([("own", torch.ones(2)), ("head", torch.ones(8, 4))])
+        process_weights_after_loading(draft, _MODEL_CONFIG, _DEVICE)
+        draft.head = source.attn.kv_b.weight  # shared after the draft's cold start
+
+        begin_direct_reload(draft)
+        draft.load_weights([("own", torch.ones(2))])
+        finish_direct_reload(draft, _MODEL_CONFIG, _DEVICE)
+
+        begin_direct_reload(draft)
+        with pytest.raises(ValueError, match="own"):
+            finish_direct_reload(draft, _MODEL_CONFIG, _DEVICE)
+
     @pytest.mark.parametrize(
         "globs,is_draft,raises",
         [
