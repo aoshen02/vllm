@@ -434,6 +434,25 @@ The base class provides:
     its `drain_pending()` joins both queues and syncs both streams before
     `finalize_layerwise_reload` runs.
 
+#### Session rules and failures
+
+**If an update fails: no rollback; call `start_weight_update` again and resend the whole update.** Any exception in `update_weights` ends the session: chunks loaded so far stay in the model, layerwise reload is not finalized, `weight_version` is not committed, and a later `finish_weight_update` raises. Keep generation paused until the retry finishes. If `finish_weight_update` itself raises, the session stays open and a new start raises until finish succeeds.
+
+Bracket a chunked push in one session so layerwise reload and post-load processing (re-quantization, fusing) run once, at finish. Over HTTP: `POST /start_weight_update` (no body; `is_checkpoint_format` from older examples is not a weight-transfer argument, only `reload_weights` takes it), `POST /update_weights` once per chunk, then `POST /finish_weight_update` with optional `{"weight_version": "..."}`. Offline:
+
+```python
+llm.start_weight_update()
+llm.update_weights({"update_info": chunk})  # once per chunk
+llm.finish_weight_update(weight_version="step-42")
+```
+
+| Call | Raises `RuntimeError` when | Message |
+| ---- | -------------------------- | ------- |
+| `update_weights` | no active session (no implicit start) | `start_weight_update must be called before update_weights.` |
+| `start_weight_update` | a session is already active | `start_weight_update called while a weight update is already active. Call finish_weight_update first.` |
+| `finish_weight_update` | no active session | `finish_weight_update called without a matching start_weight_update.` |
+| `shutdown_weight_transfer_engine` | a session is active | `Cannot release a trainer connection during a weight update` |
+
 ### Request Classes
 
 The API-level request classes provide backend-agnostic serialization using plain dictionaries.
