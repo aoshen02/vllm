@@ -10,7 +10,7 @@ However, this overlap introduces a complication: weights must be updated in the 
 
 ## The Pause and Resume API
 
-To safely update weights while the inference engine is running, vLLM provides `pause_generation` and `resume_generation` methods. These let the trainer coordinate a clean window for weight synchronization without losing in-flight work.
+To safely update weights while the inference engine is running, vLLM provides `pause_generation` and `resume_generation` methods (HTTP: `POST /pause`, `POST /resume`). These let the trainer coordinate a clean window for weight synchronization without losing in-flight work.
 
 ### pause_generation
 
@@ -35,7 +35,7 @@ request racing the pause call itself may instead be treated as in-flight, and
 input to an already-open streaming-input session is still accepted. Other pauses,
 such as `sleep`, keep queueing new requests.
 
-The `clear_cache` parameter controls whether to clear the KV cache and prefix cache after pausing.
+`clear_cache` (default `True`; marked deprecated but still honored in every mode, including `"keep"`) resets the prefix, KV connector, multimodal and encoder caches when the pause completes. Requests added while paused are queued until resume.
 
 ### resume_generation
 
@@ -43,20 +43,23 @@ The `clear_cache` parameter controls whether to clear the KV cache and prefix ca
 await engine.resume_generation()
 ```
 
-Resumes the scheduler after a pause. Any requests frozen with `mode="keep"` will continue generating.
+Resumes the scheduler after a pause. Any requests frozen with `mode="keep"` will continue generating; `await engine.is_paused()` returns the state. Call it only after `pause_generation` returns: with DP on an MoE model, resuming while a pause is in flight raises `RuntimeError` (HTTP 500).
 
 ### HTTP Endpoints
 
 With `VLLM_SERVER_DEV_MODE=1`, the vLLM HTTP server exposes the same functionality via:
 
-- `POST /pause?mode=keep` - Pause generation
+- `POST /pause?mode=abort|wait|keep&clear_cache=true|false` - Pause generation (default `mode=abort`); returns `{"status": "paused"}`
 - `POST /resume` - Resume generation
-- `POST /abort_requests` - Abort in-flight requests without pausing the scheduler (send `{}` to abort all, or `{"request_ids": [...]}`)
+- `GET /is_paused` - Returns `{"is_paused": true|false}`
+- `POST /abort_requests` - Abort in-flight requests without pausing the scheduler (send `{}` to abort all, or `{"request_ids": [...]}`); returns `{"status": "aborted", "aborted": <count>}`
+    - IDs are the `X-Request-Id` (or body `request_id`) you sent plus the endpoint prefix: `chatcmpl-<id>` (chat), `cmpl-<id>-<i>` (prompt `i` of completions).
+    - `--enable-scale-out`/`--tokens-only` also expose `POST /inference/v1/abort_requests` (no dev mode, `--api-key`, `request_ids` required); see [Aborting requests](../serving/online_serving/token_in_token_out.md#aborting-requests).
 - `POST /update_weight_version` - Set the `weight_version` label without changing weights (send `{"new_version": "v8"}`)
 - `GET /weight_info` - Return the latest committed `weight_version`
 
 !!! note "Data Parallelism"
-    When using data parallelism with vLLM's **internal load balancer** (i.e. `data_parallel_backend="ray"`), pause and resume are handled automatically across all DP ranks -- a single call is sufficient. When using an **external load balancer** (i.e. multiple independent vLLM instances behind a proxy), you must send pause and resume requests to **every** engine instance individually before and after the weight update, and set the weight version on every instance too.
+    With the **internal load balancer** (one `vllm serve --data-parallel-size N`, `mp` or `ray` backend), a single pause/resume call reaches every DP rank (MoE ranks also agree on the pause via all-reduce). With an **external** (`--data-parallel-external-lb`, `--data-parallel-rank`, or instances behind a proxy) or **hybrid** (`--data-parallel-hybrid-lb`) load balancer, each server controls only its own ranks: send pause, resume and the weight version to **every** server.
 
 ## Typical Async RL Flow
 
@@ -68,7 +71,7 @@ A typical async RL loop with weight syncing looks like this:
 4. Resume generation -- in-flight requests continue with the new weights
 5. Repeat
 
-The key insight is that requests paused with `mode="keep"` will produce tokens from the **old** weights before the pause and tokens from the **new** weights after resume. The `clear_cache` parameter controls whether the KV cache is invalidated during the pause. When `clear_cache=True`, previously cached key-value entries are discarded, so all tokens generated after resume will be computed entirely with the new weights. When `clear_cache=False`, existing KV cache entries are retained, meaning some tokens in context may still reflect the old weights (stale KV cache).
+The key insight is that requests paused with `mode="keep"` will produce tokens from the **old** weights before the pause and tokens from the **new** weights after resume. With `clear_cache=True` (default), frozen requests are preempted and re-prefilled with the new weights on resume (a recompute); with `clear_cache=False`, their pre-pause KV cache is kept and stays stale. Either way, tokens sampled before the pause are old-policy; see [weight versions](#weight-versions-in-outputs).
 
 ## Weight Versions in Outputs
 
