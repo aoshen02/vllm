@@ -137,10 +137,18 @@ llm.wake_up(tags=["kv_cache"])  # Reallocate KV cache and resume scheduling.
 #### Offloading CUDA graph memory
 
 By default, CUDA graph memory stays on the GPU while asleep. With
-`sleep_mode_offload_cudagraph=True` (off by default), CUDA graphs are captured
-into a cuMem pool that sleep backs up to CPU memory at both levels and any wake
-restores in place, so graphs are replayed, not recaptured. It needs the default
-`cumem` backend, CUDA or ROCm, and CUDA graphs; otherwise it has no effect.
+`--sleep-mode-offload-cudagraph` (`sleep_mode_offload_cudagraph=True`, off by
+default), CUDA graphs are captured into a cuMem pool that sleep backs up to CPU
+memory at levels 1 and 2 and any wake restores in place, so graphs are replayed,
+not recaptured. It takes effect only when all of these hold:
+
+- `--enable-sleep-mode` is set;
+- the sleep mode backend is the default `cumem`;
+- CUDA graphs are on (`cudagraph_mode` is not `NONE`, so not with `--enforce-eager`);
+- the platform is CUDA or ROCm.
+
+Otherwise the flag is a silent no-op: no error or warning is raised, and CUDA
+graph memory stays on the GPU while asleep.
 
 ```python
 llm = LLM("Qwen/Qwen3-8B", enable_sleep_mode=True, sleep_mode_offload_cudagraph=True)
@@ -157,11 +165,21 @@ outside PyTorch pools stay resident.
 #### Releasing NCCL communicator memory
 
 By default, NCCL communicators keep their GPU buffers while asleep. With
-`enable_nccl_comm_suspend=True` (off by default, experimental), sleep releases
-them with `ncclCommSuspend` and wake restores them with `ncclCommResume`. The
-communicators keep their topology, so they are not re-created. It needs NCCL
-2.29.7 or newer; with an older library, a warning is logged and the memory stays
-on the GPU.
+`--enable-nccl-comm-suspend` (`enable_nccl_comm_suspend=True`, off by default,
+experimental), sleep releases them with `ncclCommSuspend` and wake restores them
+with `ncclCommResume`. The communicators keep their topology, so they are not
+re-created. Scope and requirements:
+
+- It needs NCCL 2.29.7 or newer. With an older NCCL/RCCL library, a warning is
+  logged and the memory stays on the GPU (no error).
+- It applies only at sleep level 1 or 2. Level 0 only pauses scheduling and does
+  not touch communicators.
+- It covers only vLLM's own parallel-group communicators (TP, PP, DP, EP, ...).
+  With a world size of 1 there are none. The NCCL communicator created by
+  `init_weight_transfer_engine` for RL weight sync is not suspended and keeps its
+  buffers. To free that memory, release it with `shutdown_weight_transfer_engine`
+  (`POST /shutdown_weight_transfer_engine` online) and initialize it again before
+  the next weight update.
 
 ```python
 llm = LLM("Qwen/Qwen3-8B", enable_sleep_mode=True, enable_nccl_comm_suspend=True)
