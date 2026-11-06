@@ -380,7 +380,8 @@ class ModelConfig:
     sleep_preserve_parameter_names: list[str] = field(default_factory=list)
     """Parameter-name globs to preserve across level-2 sleep.
     Use target globs for frozen Engram table weights and scales omitted by the
-    trainer (e.g. ``*.engram.embed_tokens.weight*``).
+    trainer (e.g. ``*.engram.embed*``). A direct weight update may leave out the
+    checkpoint names these match, so they must fit both name forms.
     Use ``draft.<name>`` for draft-private parameters, or ``draft.*`` for all.
     The sender must omit these parameters; loaders must preserve their storage."""
     sleep_mode_backend: str = "cumem"

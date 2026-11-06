@@ -32,7 +32,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.utils import storage_view
 
 from .bake import Copy, Targets, Traced, trace_loads
-from .direct import direct_reload_active, direct_reload_enabled
+from .direct import direct_reload_active, direct_reload_enabled, record_delivered
 from .geometry import (
     Box,
     Fallback,
@@ -119,13 +119,10 @@ def plan_loads(model: torch.nn.Module, metadata: "Iterable[ParamMeta]") -> LoadP
         if meta.name in metas:
             raise ValueError(f"load plan: {meta.name!r} is declared twice")
         metas[meta.name] = meta
-    # TODO(#54477 F2): refuse when a name of the required set (cold-start
-    # checkpoint names minus `is_unused_checkpoint_weight` and
-    # VLLM_DIRECT_RELOAD_EXCLUDE_REGEX) is missing from `metas`.
-
     t0 = time.perf_counter()
     targets = Targets(model)
     traced = trace_loads(model, metas, targets)
+    model._delivered_names.clear()  # a trace delivers nothing
     if traced.lonely:
         lonely = traced.lonely
         raise RuntimeError(
@@ -157,6 +154,7 @@ def load_planned(
     and ``finish_reload``."""
     fallbacks = []
     for name, full in weights:
+        record_delivered(model, name, full.dtype, full.shape)
         dest = plan.get_dest(name)
         if dest is None:
             fallbacks.append((name, full))

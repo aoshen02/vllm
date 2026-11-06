@@ -9,17 +9,18 @@ which must keep addresses (captured CUDA graphs) and refill derived tensors.
 Between ``begin`` and a successful ``finish`` the model must not run; there is
 no rollback, the next full update repairs it.
 
-Delivery contract (not checked here): an update delivers every checkpoint
-tensor of each module whose PWAL changes its layout or is not idempotent, and
-of every ``padding_fill_params()`` parameter, which ``begin`` zero-fills whole.
+Delivery contract: an update delivers, by checkpoint name, every tensor cold
+start fed to ``load_weights`` and the loader writes; ``finish`` raises otherwise,
+before PWAL. ``sleep_preserve_parameter_names`` globs exempt checkpoint names.
 """
 
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
+from fnmatch import fnmatch
 
 import torch
 
 import vllm.envs as envs
-from vllm.config import ModelConfig
+from vllm.config import ModelConfig, get_current_vllm_config_or_none
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
 from vllm.model_executor.utils import (
@@ -36,6 +37,8 @@ __all__ = [
     "finish_direct_reload",
     "loadable_tensors",
     "record_checkpoint_layout",
+    "record_delivered",
+    "track_delivered_names",
 ]
 
 
@@ -83,6 +86,73 @@ def loadable_tensors(model: torch.nn.Module) -> Iterator[tuple[str, torch.Tensor
                 continue
             seen.add(id(tensor))
             yield (f"{module_name}.{name}" if module_name else name), tensor
+
+
+def record_delivered(
+    model: torch.nn.Module, name: str, dtype: torch.dtype, shape: Iterable[int]
+) -> None:
+    """Record a checkpoint tensor; engines call it when they bypass ``load_weights``."""
+    model._delivered_names[name] = dtype, tuple(shape)
+
+
+def track_delivered_names(model: torch.nn.Module) -> None:
+    """In direct mode, record every checkpoint name fed to ``model.load_weights``."""
+    load_weights = getattr(model, "load_weights", None)
+    if load_weights is None or not direct_reload_enabled():
+        return
+    model._delivered_names = {}
+
+    def tracked(weights: Iterable[tuple[str, torch.Tensor]], *args, **kwargs):
+        def fed() -> Iterator[tuple[str, torch.Tensor]]:
+            for name, tensor in weights:
+                record_delivered(model, name, tensor.dtype, tensor.shape)
+                yield name, tensor
+
+        return load_weights(fed(), *args, **kwargs)
+
+    model.load_weights = tracked
+
+
+def _exempt_globs(model_config: ModelConfig | None) -> list[str]:
+    """``sleep_preserve_parameter_names`` for this model (``draft.`` for a draft)."""
+    vllm_config = get_current_vllm_config_or_none()
+    target = vllm_config.model_config if vllm_config else None
+    if target is None:
+        return []
+    globs = target.sleep_preserve_parameter_names
+    if model_config is target:
+        return [g for g in globs if not g.startswith("draft.")]
+    return [g.removeprefix("draft.") for g in globs if g.startswith("draft.")]
+
+
+def _check_delivered(model: torch.nn.Module, model_config: ModelConfig | None) -> None:
+    """Raise, naming them, if the update left out names cold start's loader wrote."""
+    # Local imports: bake imports this module.
+    from vllm.distributed.weight_transfer.base import ParamMeta
+
+    from .bake import Targets, trace_loads
+
+    delivered = model.__dict__.get("_delivered_names", {})
+    globs = _exempt_globs(model_config)
+    metas = {
+        name: ParamMeta(name, dtype, shape)
+        for name, (dtype, shape) in getattr(model, "_ckpt_names", {}).items()
+        if name not in delivered and not any(fnmatch(name, g) for g in globs)
+    }
+    if not metas:
+        return
+    try:
+        # Names the loader skips (a target's MTP layers, tied heads) need no update.
+        traced = trace_loads(model, metas, Targets(model))
+        missing = sorted(n for n in metas if n in traced.copies or n in traced.reasons)
+    except RuntimeError:
+        missing = sorted(metas)  # untraceable loader: every missing name counts
+    if missing:
+        raise ValueError(
+            f"direct reload: the update did not deliver {len(missing)} checkpoint "
+            f"tensors its cold start loaded: {missing[:16]}. Send them, or exempt "
+            "frozen ones with sleep_preserve_parameter_names."
+        )
 
 
 def _check_supported_modules(model: torch.nn.Module) -> None:
@@ -137,6 +207,7 @@ def record_checkpoint_layout(model: torch.nn.Module) -> None:
         if hasattr(module, "padding_fill_params")
         for name in module.padding_fill_params()
     ]
+    model._ckpt_names = model.__dict__.get("_delivered_names", {})  # empty: dummy
     # every name, aliases included: post-load processing may replace either
     model._ckpt_param_names = frozenset(
         name
@@ -216,6 +287,7 @@ def begin_direct_reload(model: torch.nn.Module) -> None:
 
     # nothing above modified the model
     model._direct_reload_begun = True  # one finish per begin
+    model._delivered_names = {}
     for t, view in views:
         t.data = view  # no zeroing: the full sync rewrites the checkpoint region
     for _, t in loadable_tensors(model):
@@ -238,7 +310,7 @@ def begin_direct_reload(model: torch.nn.Module) -> None:
 def finish_direct_reload(
     model: torch.nn.Module, model_config: ModelConfig, device: torch.device
 ) -> None:
-    """Rerun cold-start post-load processing."""
+    """Check the update was complete, then rerun cold-start post-load processing."""
     from vllm.model_executor.model_loader.utils import process_weights_after_loading
 
     if not model.__dict__.pop("_direct_reload_begun", False):
@@ -247,6 +319,7 @@ def finish_direct_reload(
         raise RuntimeError(
             "direct reload: finish without a begin; start a new full update"
         )
+    _check_delivered(model, model_config)
     if device.type != "cpu":
         torch.accelerator.synchronize()  # engines may write on other streams
 
@@ -258,3 +331,5 @@ def finish_direct_reload(
             module.__dict__.pop("_already_called_process_weights_after_loading", None)
 
     process_weights_after_loading(model, model_config, device)
+    if not model._ckpt_names:  # a dummy start: the first full update is the baseline
+        model._ckpt_names = model._delivered_names
