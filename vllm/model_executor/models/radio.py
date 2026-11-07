@@ -497,6 +497,10 @@ class RadioParallelAttention(InternParallelAttention):
 class RadioVisionEncoderLayer(InternVisionEncoderLayer):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, attn_cls=RadioParallelAttention, **kwargs)
+        for name in ("ls1", "ls2"):
+            scale = getattr(self, name).detach()
+            delattr(self, name)
+            self.register_buffer(name, scale)
 
     def forward(
         self,

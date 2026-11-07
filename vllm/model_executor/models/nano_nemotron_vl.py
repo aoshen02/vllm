@@ -1668,8 +1668,12 @@ class NemotronH_Nano_VL_V2(
                     assert param_name in vision_norm_params, (
                         f"Unexpected vision LayerNorm weight: {name}"
                     )
+                    param = vision_norm_params[param_name]
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
                     with torch.no_grad():
-                        default_weight_loader(vision_norm_params[param_name], w)
+                        weight_loader(param, w)
 
         # Fully drain the generator so every mm tensor is buffered, even if
         # the LLM loader stops iterating early.
@@ -1682,8 +1686,9 @@ class NemotronH_Nano_VL_V2(
             for trimmed_name, w in adapter_weights:
                 # Load vision-language adapter weights directly
                 param = adapter_dict[trimmed_name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 with torch.no_grad():
-                    default_weight_loader(param, w)
+                    weight_loader(param, w)
             self.vision_model.load_weights(vision_weights)
             if self.sound_encoder is not None and len(sound_weights) > 0:
                 self.sound_encoder.load_weights(sound_weights)

@@ -875,7 +875,7 @@ class RadioMBartPrefixForCausalLM(nn.Module, SupportsMultiModal, SupportsEagle3)
         radio_source_names = {name for name, _ in radio_weights}
         synthetic_layerscales = {
             name: param
-            for name, param in self.encoder.model_encoder.named_parameters()
+            for name, param in self.encoder.model_encoder.named_buffers()
             if name.endswith((".ls1", ".ls2")) and name not in radio_loaded
         }
         if synthetic_layerscales:
