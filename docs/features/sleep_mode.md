@@ -104,8 +104,9 @@ training. It covers two use cases:
 - **Frozen draft weights:** retain draft-private parameters when the trainer
   updates only the target model.
 
-Target patterns match
-`model.named_parameters()`; checkpoint names and `requires_grad` are not used.
+Target patterns match `model.named_parameters()`. With
+`VLLM_RELOAD_MODE=direct` they also match the checkpoint names an update may leave
+out, so a pattern for a renamed tensor has to fit both names.
 
 Level-2 sleep backs up selected GPU parameters to CPU memory; weights wake-up
 restores them in place. CPU parameters need no copy. Allow enough host memory
@@ -116,11 +117,13 @@ must preserve their values and storage (including avoiding replacement with meta
 tensors). This option does not filter updates.
 
 For frozen Engram tables omitted by the trainer, select the target table weights
-and scales. For example, DeepSeek V4.1 uses these runtime parameter names:
+and scales. For example, for DeepSeek V4.1 this pattern matches the checkpoint's
+`engram.embed.*` and the runtime `engram.embed_tokens.*`, but not `engram.wkv`,
+which must be sent:
 
 ```bash
 VLLM_SERVER_DEV_MODE=1 vllm serve deepseek-ai/DeepSeek-V4.1-Flash --enable-sleep-mode \
-    --sleep-preserve-parameter-names '*.engram.embed_tokens.weight*'
+    --sleep-preserve-parameter-names '*.engram.embed*'
 ```
 
 CPU-offloaded tables remain on CPU without an extra backup copy. Engram's

@@ -785,6 +785,43 @@ class TestWireTypes:
         assert reshard_order == ["pair.weight", "direct", "pair.scale"]
         assert stream.synchronize.call_count == 2
 
+    def test_direct_mode_records_in_place_writes_and_always_reloads(self, monkeypatch):
+        calls = []
+        reload = "vllm.model_executor.model_loader.reload"
+        monkeypatch.setattr(f"{reload}.start_reload", lambda _: calls.append("start"))
+        monkeypatch.setattr(
+            f"{reload}.finish_reload", lambda *_: calls.append("finish")
+        )
+        monkeypatch.setattr(f"{reload}.direct.direct_reload_enabled", lambda: True)
+        monkeypatch.setattr(torch.cuda, "current_stream", Mock)
+        model = torch.nn.Module()
+        model._direct_reload_begun = True
+        model._delivered_names = {}
+        engine = object.__new__(M2NWeightTransferEngine)
+        engine._handle = object()
+        engine.model_update_group = object()
+        engine.device = torch.device("cpu")
+        engine.model = model
+        engine.model_config = None
+        engine._uses_load_weights = False
+        engine._index = {"direct": 0}
+        engine._metas = [
+            M2NParamMeta(
+                "direct", torch.float32, (1,), M2NLayout(M2NMesh((1, 1), 0), REPLICATED)
+            )
+        ]
+        engine._parameter_destinations = [
+            M2NDestination("direct", REPLICATED, torch.zeros(1))
+        ]
+        engine._reshard = Mock()
+
+        engine.start_weight_update()
+        engine.receive_weights(M2NWeightTransferUpdateInfo(names=["direct"]))
+        engine.finish_weight_update()
+
+        assert calls == ["start", "finish"]
+        assert model._delivered_names == {"direct": (torch.float32, (1,))}
+
     def test_trainer_rank_must_be_a_trainer_rank(self):
         """A trainer rank must fall within the trainer portion of the group."""
         with pytest.raises(ValueError, match="num_trainer_ranks"):

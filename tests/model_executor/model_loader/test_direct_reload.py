@@ -23,15 +23,25 @@ import pytest
 import torch
 
 from vllm.config import VllmConfig
+from vllm.distributed.weight_transfer.base import ParamMeta
 from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
 from vllm.model_executor.layers.quantization.online.base import OnlineQuantizationConfig
 from vllm.model_executor.layers.quantization.online.fp8 import (
     Fp8PerTensorOnlineLinearMethod,
 )
-from vllm.model_executor.model_loader.reload import finish_reload, start_reload
+from vllm.model_executor.model_loader.reload import (
+    direct as direct_module,
+)
+from vllm.model_executor.model_loader.reload import (
+    finish_reload,
+    load_planned,
+    plan_loads,
+    start_reload,
+)
 from vllm.model_executor.model_loader.reload.direct import (
     begin_direct_reload,
     finish_direct_reload,
+    track_delivered_names,
 )
 from vllm.model_executor.model_loader.utils import process_weights_after_loading
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
@@ -283,6 +293,131 @@ class TestUnsent:
         _assert_same(after, before, names=["attn.kv_b.weight"], addresses=True)
         expected = dict(new, **{"attn.kv_b.weight": old["attn.kv_b.weight"]})
         _assert_same(after, _state(_cold_start(expected)))
+
+
+class _SkippingModel(_ToyModel):
+    """A loader that skips what a trainer never sends."""
+
+    SKIPPED = {
+        "mtp.0.weight": torch.ones(1),
+        "layers.0.rotary_emb.inv_freq": torch.ones(1),
+    }
+
+    def load_weights(self, weights):
+        return super().load_weights(
+            (name, weight) for name, weight in weights if name not in self.SKIPPED
+        )
+
+
+def _tracked(weights: dict | None = None) -> _SkippingModel:
+    with _DEVICE:
+        model = _SkippingModel()
+    track_delivered_names(model)
+    if weights is not None:  # None: a dummy start
+        model.load_weights(weights.items())
+    process_weights_after_loading(model, _MODEL_CONFIG, _DEVICE)
+    return model
+
+
+class TestCompleteness:
+    def test_partial_update_raises_before_post_load_then_full_succeeds(self):
+        new = _checkpoint(1.01)
+        model = _tracked(_checkpoint())
+        runs = _runs(model)
+        partial = {n: t for n, t in new.items() if n != "proj.weight"}
+        with pytest.raises(ValueError, match=r"deliver 1 .*'proj\.weight'"):
+            _reload(model, partial)
+        assert _runs(model) == runs
+        _reload(model, new)
+        _assert_same(_state(model), _state(_cold_start(new)))
+
+    def test_update_split_across_load_weights_calls(self):
+        model = _tracked(_checkpoint())
+        begin_direct_reload(model)
+        for item in _checkpoint(1.01).items():
+            model.load_weights([item])
+        finish_direct_reload(model, _MODEL_CONFIG, _DEVICE)
+
+    def test_names_the_loader_skips_need_no_update(self):
+        model = _tracked({**_checkpoint(), **_SkippingModel.SKIPPED})
+        _reload(model, _checkpoint(1.01))
+
+    def test_name_writing_only_a_shared_tensor_needs_no_update(self):
+        class Draft(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.own = torch.nn.Parameter(torch.zeros(2), False)
+                self.head = torch.nn.Parameter(torch.zeros(8, 4), False)
+
+            def load_weights(self, weights):
+                params = dict(self.named_parameters())
+                for name, weight in weights:
+                    default_weight_loader(params[name], weight)
+
+        source = _tracked(_checkpoint())
+        with _DEVICE:
+            draft = Draft()
+        track_delivered_names(draft)
+        draft.load_weights([("own", torch.ones(2)), ("head", torch.ones(8, 4))])
+        process_weights_after_loading(draft, _MODEL_CONFIG, _DEVICE)
+        draft.head = source.attn.kv_b.weight  # shared after the draft's cold start
+
+        begin_direct_reload(draft)
+        draft.load_weights([("own", torch.ones(2))])
+        finish_direct_reload(draft, _MODEL_CONFIG, _DEVICE)
+
+        begin_direct_reload(draft)
+        with pytest.raises(ValueError, match="own"):
+            finish_direct_reload(draft, _MODEL_CONFIG, _DEVICE)
+
+    @pytest.mark.parametrize(
+        "globs,is_draft,raises",
+        [
+            (["attn.kv_b.*"], False, False),
+            (["*.engram.*"], False, True),
+            (["attn.kv_b.*"], True, True),
+            (["draft.attn.kv_b.*"], True, False),
+            (["draft.attn.kv_b.*"], False, True),
+        ],
+        ids=["target", "no-match", "target-glob-on-draft", "draft", "draft-on-target"],
+    )
+    def test_exempt_globs(self, monkeypatch, globs, is_draft, raises):
+        target = SimpleNamespace(
+            **vars(_MODEL_CONFIG), sleep_preserve_parameter_names=globs
+        )
+        monkeypatch.setattr(
+            direct_module,
+            "get_current_vllm_config_or_none",
+            lambda: SimpleNamespace(model_config=target),
+        )
+        config = _MODEL_CONFIG if is_draft else target
+        model = _tracked(_checkpoint())
+        partial = {n: t for n, t in _checkpoint().items() if n != "attn.kv_b.weight"}
+        begin_direct_reload(model)
+        model.load_weights(partial.items())
+        if raises:
+            with pytest.raises(ValueError, match="attn.kv_b.weight"):
+                finish_direct_reload(model, config, _DEVICE)
+        else:
+            finish_direct_reload(model, config, _DEVICE)
+
+    def test_dummy_start_first_update_is_the_baseline(self):
+        model = _tracked()
+        new = _checkpoint(1.01)
+        _reload(model, new)
+        with pytest.raises(ValueError, match="pad.weight"):
+            _reload(model, {n: t for n, t in new.items() if n != "pad.weight"})
+
+    def test_plan_trace_delivers_nothing_and_planned_writes_count(self):
+        new = _checkpoint(1.01)
+        model = _tracked(_checkpoint())
+        begin_direct_reload(model)
+        metas = [ParamMeta(n, t.dtype, tuple(t.shape)) for n, t in new.items()]
+        plan = plan_loads(model, metas)
+        assert not model._delivered_names
+        load_planned(model, plan, new.items())
+        finish_direct_reload(model, _MODEL_CONFIG, _DEVICE)
+        _assert_same(_state(model), _state(_cold_start(new)))
 
 
 class TestRefusals:

@@ -440,22 +440,28 @@ class M2NWeightTransferEngine(
             not destination.direct for destination in self._parameter_destinations
         )
 
+    def _reloads(self) -> bool:
+        from vllm.model_executor.model_loader.reload.direct import (
+            direct_reload_enabled,
+        )
+
+        return self._uses_load_weights or direct_reload_enabled()
+
     def start_weight_update(self) -> None:
-        """Begin reloading, but only if some parameter needs it.
+        """Begin reloading if some parameter needs it, and always in direct mode.
 
         Directly-resharded parameters are written in place and never go through
-        `load_weights`, so a plan with no fallback entries has nothing to
-        reload.
+        `load_weights`; a direct reload still has to check and post-process them.
         """
-        if not self._uses_load_weights:
+        if not self._reloads():
             return
         from vllm.model_executor.model_loader.reload import start_reload
 
         start_reload(self.model)
 
     def finish_weight_update(self) -> None:
-        """Finish reloading when the plan uses fallback entries."""
-        if not self._uses_load_weights:
+        """Finish what `start_weight_update` began."""
+        if not self._reloads():
             return
         from vllm.model_executor.model_loader.reload import finish_reload
 
@@ -483,6 +489,11 @@ class M2NWeightTransferEngine(
                 )
             requested.append((name, index))
 
+        from vllm.model_executor.model_loader.reload.direct import (
+            direct_reload_active,
+            record_delivered,
+        )
+
         stream = torch.cuda.current_stream()
 
         # Reshard lazily so one `load_weights` invocation sees the complete
@@ -493,6 +504,8 @@ class M2NWeightTransferEngine(
                 meta = self._metas[index]
                 destination = self._parameter_destinations[index]
                 buffer = destination.tensor
+                if buffer is not None and direct_reload_active(self.model):
+                    record_delivered(self.model, name, meta.dtype, meta.shape)
                 if buffer is None:
                     buffer = torch.empty(
                         meta.shape, dtype=meta.dtype, device=self.device
