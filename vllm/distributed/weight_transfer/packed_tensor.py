@@ -179,8 +179,12 @@ def _split_for_wire(
     post_iter_func: Callable[[tuple[str, torch.Tensor]], torch.Tensor],
     limit: int,
 ) -> Iterator[tuple[str, torch.Tensor]]:
+    big = 2 * limit
     for item in iterator:
         tensor = post_iter_func(item)
+        if tensor.nbytes <= big:  # the common case: no split, skip the math
+            yield item[0], tensor
+            continue
         segs = wire_segments(tuple(tensor.shape), tensor.dtype, limit)
         if segs is None:
             yield item[0], tensor

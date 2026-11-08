@@ -39,7 +39,6 @@ from vllm.distributed.weight_transfer.packed_tensor import (
     DEFAULT_PACKED_BUFFER_SIZE_BYTES,
     DEFAULT_PACKED_NUM_BUFFERS,
     packed_nccl_broadcast_consumer,
-    packed_nccl_broadcast_producer,
 )
 
 # NCCLWeightTransferInitInfo is re-exported here for convenience; its canonical
@@ -969,17 +968,10 @@ class NCCLTrainerWeightTransferEngine(TrainerWeightTransferEngine[NCCLTrainerIni
             self._discard(meta, src)
             return
         assert self.source is not None
-        pairs = self._checked_iter(self.source, meta)
         if self.packed:
-            packed_nccl_broadcast_producer(
-                iterator=pairs,
-                group=self.model_update_group,
-                src=src,
-                post_iter_func=lambda item: item[1],
-                buffer_size_bytes=self.packed_buffer_size_bytes,
-                num_buffers=self.packed_num_buffers,
-            )
+            self._produce(meta, meta, self.model_update_group, src)
         else:
+            pairs = self._checked_iter(self.source, meta)
             stream = torch.cuda.current_stream()
             for _name, tensor in pairs:
                 # NCCL sends `numel` elements straight from `data_ptr()`, so a
@@ -988,6 +980,113 @@ class NCCLTrainerWeightTransferEngine(TrainerWeightTransferEngine[NCCLTrainerIni
                 # enqueued. (The packed path linearizes in `pack_tensors`.)
                 send = tensor if tensor.is_contiguous() else tensor.contiguous()
                 self.model_update_group.broadcast(send, src=src, stream=stream)
+
+    def _produce(
+        self,
+        metas: list[ParamMeta],
+        sub: list[ParamMeta],
+        group: "PyNcclCommunicator",
+        src: int,
+    ) -> None:
+        """Broadcast ``sub`` (in ``metas`` order; this rank owns ``metas``)
+        packed exactly as ``pack_tensors`` and ``wire_segments`` split it, so
+        any consumer decodes it unchanged. The chunking and each tensor's
+        typed view into a reused slot buffer are built once; a chunk is then
+        one ``_foreach_copy_`` and one broadcast (no per-tensor Python ops,
+        which cost more than the wire on models with many small tensors)."""
+        from vllm.distributed.weight_transfer.packed_tensor import (
+            _get_streams,
+            wire_segments,
+        )
+
+        limit = self.packed_buffer_size_bytes
+        nbuf = self.packed_num_buffers
+        cache = self.__dict__.setdefault("_produce_layouts", {})
+        key = (
+            id(group),
+            src,
+            len(sub),
+            sub[0].name if sub else "",
+            sub[-1].name if sub else "",
+        )
+        layout = cache.get(key)
+        if layout is None:
+            chunks: list[list[tuple]] = [[]]
+            sizes: list[int] = []
+            size = 0
+            for idx, m in enumerate(sub):
+                nbytes = math.prod(m.shape) * m.dtype.itemsize
+                segs = wire_segments(list(m.shape), m.dtype, limit)
+                row = nbytes // m.shape[0] if segs else 0
+                pieces = (
+                    [(None, list(m.shape), nbytes)]
+                    if segs is None
+                    else [
+                        ((r0, r1), [r1 - r0, *m.shape[1:]], (r1 - r0) * row)
+                        for r0, r1 in segs
+                    ]
+                )
+                for rng, shape, n in pieces:
+                    chunks[-1].append((idx, rng, shape, m.dtype, size, n))
+                    size += n
+                    if size > limit:
+                        sizes.append(size)
+                        chunks.append([])
+                        size = 0
+            if chunks[-1]:
+                sizes.append(size)
+            else:
+                chunks.pop()
+            bufs = self.__dict__.get("_produce_bufs")
+            need = max(sizes, default=0)
+            if bufs is None or len(bufs) != nbuf or bufs[0].numel() < need:
+                device = group.device
+                bufs = self._produce_bufs = [
+                    torch.empty(need, dtype=torch.uint8, device=device)
+                    for _ in range(nbuf)
+                ]
+                cache.clear()  # views into the old buffers
+            views = [
+                [
+                    bufs[k % nbuf][off : off + n].view(dtype).view(shape)
+                    for _, _, shape, dtype, off, n in entries
+                ]
+                for k, entries in enumerate(chunks)
+            ]
+            layout = cache[key] = (chunks, sizes, views)
+        chunks, sizes, views = layout
+        bufs = self._produce_bufs
+        keep = {m.name for m in sub} if len(sub) != len(metas) else None
+        assert self.source is not None
+        pairs = (
+            t
+            for name, t in self._checked_iter(self.source, metas)
+            if keep is None or name in keep
+        )
+        streams = _get_streams(torch.accelerator.current_device_index(), nbuf)
+        done: list = [None] * nbuf
+        held: list = [None] * nbuf  # sources stay alive until copied
+        cur_idx, cur = -1, torch.empty(0)
+        for k, entries in enumerate(chunks):
+            slot = k % nbuf
+            if done[slot] is not None:
+                done[slot].synchronize()
+            srcs = []
+            for idx, rng, _, _, _, _ in entries:
+                if idx != cur_idx:
+                    cur_idx, cur = idx, next(pairs)
+                srcs.append(cur if rng is None else cur[rng[0] : rng[1]])
+            with torch.cuda.stream(streams[slot]):
+                torch._foreach_copy_(views[k], srcs)
+                group.broadcast(bufs[slot][: sizes[k]], src=src)
+                ev = torch.Event()
+                ev.record(streams[slot])
+            done[slot] = ev
+            held[slot] = srcs
+        for stream in streams:
+            stream.synchronize()
+        for _ in pairs:  # run the source to its end (it checks the count)
+            pass
 
     def _discard(self, meta: list[ParamMeta], src: int) -> None:
         """Receive another broadcaster's parameters and drop them."""
