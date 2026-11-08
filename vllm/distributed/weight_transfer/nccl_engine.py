@@ -539,20 +539,20 @@ class NCCLWeightTransferEngine(
                     del weight
 
     def _setup_stages(self) -> None:
-        """Worker side of `_stage_handshake`: needs the plan (built at the
-        first update), which knows exactly what this rank writes."""
+        """Worker side of `_stage_handshake`: needs the plan (built by the
+        first `start_weight_update`), which knows exactly what this rank writes."""
         from vllm.distributed.parallel_state import get_pp_group
-        from vllm.model_executor.model_loader.reload.plan import _copies
 
         group = self.model_update_group
         assert group is not None and self._plan is not None
         assert self._plan_manifest is not None
-        copies = _copies(self._plan)
         names = list(self._plan_manifest)
         row = torch.zeros(1 + len(names), dtype=torch.int32)
         row[0] = get_pp_group().rank_in_group
         # a fallback (None) may write anything here: count it as needed
-        row[1:] = torch.tensor([copies.get(n) != () for n in names], dtype=torch.int32)
+        row[1:] = torch.tensor(
+            [self._plan.dests.get(n) != () for n in names], dtype=torch.int32
+        )
         stages = _stage_handshake(group, row.to(group.device), self.rank_offset)
         mine = [i for i, st in enumerate(stages) if st["comm"] is not None]
         assert len(mine) == 1, mine
@@ -763,12 +763,11 @@ class NCCLTrainerWeightTransferEngine(TrainerWeightTransferEngine[NCCLTrainerIni
         # Metadata the worker already holds; an unchanged round sends none.
         self._sent_meta: list[ParamMeta] | None = None
         # PP-stage groups: opt in by setting `stage_groups` (needs
-        # `use_load_plan`); formed at the second update, once the workers
-        # have their plan.
+        # `use_load_plan`); formed at the first update, once its start has
+        # built the workers' plan.
         self.stage_groups = False
         self._stages: list[dict] | None = None
         self._stage_split: tuple | None = None  # rounds and tail per slices
-        self._sends = 0
         # With `use_load_plan`: the metadata the workers plan from, sent at init.
         self._plan_manifest: Manifest | None = None
 
@@ -918,8 +917,7 @@ class NCCLTrainerWeightTransferEngine(TrainerWeightTransferEngine[NCCLTrainerIni
         reuse = self.is_sender and meta == self._sent_meta
         if self.is_sender:
             self.client.start_weight_update()
-        self._sends += 1
-        if self.stage_groups and self._stages is None and self._sends >= 2:
+        if self.stage_groups and self._stages is None:
             self._setup_stages(meta, group_ranks)
         if self._stages:
             self._send_stages(group_ranks, slices)
