@@ -387,6 +387,7 @@ class NCCLWeightTransferEngine(
                 f"got {src!r}."
             )
         key = (self.model, src)
+        reused = not update_info.names
         if update_info.names:
             self._last_update_info[key] = update_info
         else:
@@ -398,7 +399,8 @@ class NCCLWeightTransferEngine(
         from vllm.model_executor.model_loader.reload import load_planned
 
         plan = self._plan if self.model is self._default_model else None
-        if plan is not None:
+        if plan is not None and not reused:
+            # reused metadata was checked when it first came
             assert self._plan_manifest is not None
             _check_manifest(
                 self._plan_manifest,
