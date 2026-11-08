@@ -257,24 +257,50 @@ def _dest(targets: Targets, write: Write, dtype: torch.dtype) -> torch.Tensor:
 def _overlaps(traced: Traced, targets: Targets) -> dict[str, str]:
     """Names whose writes share a byte with another write: direct writes land
     in any order, so these go through ``load_weights`` in arrival order."""
-    runs: dict[int, list[tuple[int, int, str]]] = defaultdict(list)
+    # Sweep each storage by the byte span each copy covers; only copies whose
+    # spans intersect can share a byte, and only those are expanded into runs.
+    spans: dict[int, list[tuple[int, int, int, str, Copy]]] = defaultdict(list)
     for name, copies in traced.copies.items():
         for c in copies:
             if c.storage in targets.by_storage and 0 not in c.shape:
-                spans = byte_runs(c.byte_offset, c.shape, c.stride, c.dtype.itemsize)
-                runs[c.storage] += [(a, b, name) for a, b in spans]
+                size = c.dtype.itemsize
+                end = (
+                    c.byte_offset
+                    + (sum((n - 1) * s for n, s in zip(c.shape, c.stride)) + 1) * size
+                )
+                spans[c.storage].append(
+                    (c.byte_offset, end, len(spans[c.storage]), name, c)
+                )
     reasons: dict[str, str] = {}
-    for named in runs.values():
-        named.sort()
-        active: list[tuple[int, str]] = []  # heap of (stop, name)
-        for start, stop, name in named:
+    for items in spans.values():
+        items.sort()
+        active: list[tuple[int, int, str, Copy]] = []  # heap of (stop, id, name, copy)
+        for start, stop, i, name, c in items:
             while active and active[0][0] <= start:
                 heapq.heappop(active)
-            for _, other in active:
-                reasons.setdefault(name, f"writes overlap with {other!r}")
-                reasons.setdefault(other, f"writes overlap with {name!r}")
-            heapq.heappush(active, (stop, name))
+            for _, _, other, oc in active:
+                if _runs_intersect(c, oc):
+                    reasons.setdefault(name, f"writes overlap with {other!r}")
+                    reasons.setdefault(other, f"writes overlap with {name!r}")
+            heapq.heappush(active, (stop, i, name, c))
     return reasons
+
+
+def _runs_intersect(a: Copy, b: Copy) -> bool:
+    """Whether two copies into one storage write a common byte."""
+    ra = byte_runs(a.byte_offset, a.shape, a.stride, a.dtype.itemsize)
+    rb = byte_runs(b.byte_offset, b.shape, b.stride, b.dtype.itemsize)
+    ra.sort()
+    rb.sort()
+    i = j = 0
+    while i < len(ra) and j < len(rb):
+        if ra[i][0] < rb[j][1] and rb[j][0] < ra[i][1]:
+            return True
+        if ra[i][1] <= rb[j][1]:
+            i += 1
+        else:
+            j += 1
+    return False
 
 
 def _nbytes(entry: Entry) -> int:
