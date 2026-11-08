@@ -461,6 +461,8 @@ class NCCLWeightTransferEngine(
         layout = cache.get(src)
         if layout is not None and layout["names"] == update_info.names:
             return layout
+        from vllm.distributed.weight_transfer.packed_tensor import wire_segments
+
         chunks: list[list[tuple]] = [[]]
         size = 0
         sizes = []
@@ -468,13 +470,23 @@ class NCCLWeightTransferEngine(
             update_info.names, update_info.dtype_names, update_info.shapes
         ):
             dtype = getattr(torch, dtype_name)
-            n = math.prod(shape) * dtype.itemsize
-            chunks[-1].append((name, list(shape), dtype, size, n))
-            size += n
-            if size > self.packed_buffer_size_bytes:
-                sizes.append(size)
-                chunks.append([])
-                size = 0
+            segs = wire_segments(shape, dtype, self.packed_buffer_size_bytes)
+            pieces = (
+                [(list(shape), None)]
+                if segs is None
+                else [
+                    ([r1 - r0, *shape[1:]], (r0, r1, list(shape), len(segs)))
+                    for r0, r1 in segs
+                ]
+            )
+            for piece_shape, seg in pieces:
+                n = math.prod(piece_shape) * dtype.itemsize
+                chunks[-1].append((name, piece_shape, dtype, size, n, seg))
+                size += n
+                if size > self.packed_buffer_size_bytes:
+                    sizes.append(size)
+                    chunks.append([])
+                    size = 0
         if chunks[-1]:
             sizes.append(size)
         else:
@@ -523,6 +535,24 @@ class NCCLWeightTransferEngine(
             srcs.append(part)
             roles.append(role)
 
+        def split_ops(ops, r0: int, r1: int, view: torch.Tensor):
+            """The writes of rows [r0, r1) of a tensor sent in pieces, or None
+            when some write does not map dim 0 to dim 0 (assemble it)."""
+            pairs = []
+            for index, dst in ops:
+                if [s.stop - s.start for s in index] != list(dst.shape):
+                    return None
+                a, b = index[0].start, index[0].stop
+                lo, hi = max(a, r0), min(b, r1)
+                if lo < hi:
+                    pairs.append(
+                        (
+                            dst[lo - a : hi - a],
+                            view[(slice(lo - r0, hi - r0), *index[1:])],
+                        )
+                    )
+            return pairs
+
         for i, chunk in enumerate(chunks):
             buf = huge if oversize[i] else buffers[i % nbuf]
             dsts: list[torch.Tensor] = []
@@ -530,14 +560,24 @@ class NCCLWeightTransferEngine(
             slow: list = []
             fallbacks: list = []
             unaligned: list = []
+            assemble: list = []
             roles: list[str] = []
-            for name, shape, dtype, off, n in chunk:
+            for name, shape, dtype, off, n, seg in chunk:
                 role = index_of.sub(".#", name)  # read by add()
                 ops = copies[name]
                 try:
                     full = buf[off : off + n].view(dtype).view(shape)
                 except RuntimeError:
                     full = None  # packed at an offset this dtype cannot view
+                if seg is not None:
+                    pairs = None
+                    if full is not None and ops is not None:
+                        pairs = split_ops(ops, seg[0], seg[1], full)
+                    if pairs is None:
+                        assemble.append((name, off, n, dtype, seg, ops))
+                    for dst, part in pairs or ():
+                        add(dst, part, dsts, srcs)
+                    continue
                 if full is None:
                     # realign it at each receive
                     unaligned.append((name, off, n, dtype, shape, ops))
@@ -565,6 +605,7 @@ class NCCLWeightTransferEngine(
                     unaligned,
                     oversize[i],
                     fb_bytes,
+                    assemble,
                 )
             )
         layout = {
@@ -599,6 +640,7 @@ class NCCLWeightTransferEngine(
         assert group is not None
         deferred: list[tuple[str, torch.Tensor]] = []
         huge_done: torch.Event | None = None
+        assembling: dict[str, list] = {}
         for i, (
             buf,
             dsts,
@@ -608,6 +650,7 @@ class NCCLWeightTransferEngine(
             unaligned,
             oversize,
             fb_bytes,
+            assemble,
         ) in enumerate(layout["chunks"]):
             s = i % nbuf
             done = slot_done[s]
@@ -643,6 +686,27 @@ class NCCLWeightTransferEngine(
                         deferred.append((name, full))
                     for index, dst in ops or ():
                         dst.copy_(full[index].reshape(dst.shape))
+                for name, off, n, dtype, (r0, r1, full_shape, count), ops in assemble:
+                    # a split tensor whose writes need it whole: join it
+                    state = assembling.get(name)
+                    if state is None:
+                        whole = torch.empty(full_shape, dtype=dtype, device=self.device)
+                        state = assembling[name] = [whole, 0]
+                    row = n // (r1 - r0)
+                    state[0].view(-1).view(torch.uint8)[r0 * row : r1 * row].copy_(
+                        buf[off : off + n]
+                    )
+                    state[1] += 1
+                    if state[1] < count:
+                        continue
+                    whole = assembling.pop(name)[0]
+                    if ops is None:
+                        if deferred:
+                            self.model.load_weights(deferred)
+                            deferred = []
+                        self.model.load_weights([(name, whole)])
+                    for index, dst in ops or ():
+                        dst.copy_(whole[index].reshape(dst.shape))
                 prev = torch.Event()
                 prev.record(streams[s])
                 slot_done[s] = prev

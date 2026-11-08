@@ -143,6 +143,59 @@ def pack_tensors(
 # ── NCCL packed broadcast ──────────────────────────────────────────────
 
 
+def wire_segments(
+    shape: list[int] | tuple[int, ...], dtype: torch.dtype, limit: int
+) -> list[tuple[int, int]] | None:
+    """Row ranges of dim 0 a tensor travels as, or ``None`` to send it whole.
+
+    A tensor larger than one packed buffer is split along dim 0 (e.g. one
+    expert stack per layer) so no side needs a buffer of its size. Producer
+    and consumers derive the same split from the metadata alone."""
+    nbytes = math.prod(shape) * dtype.itemsize
+    # only far-oversize tensors: one slightly over the buffer still goes whole
+    if nbytes <= 2 * limit or len(shape) == 0 or shape[0] < 2:
+        return None
+    row = nbytes // shape[0]
+    if row > limit:
+        return None
+    rows = limit // row
+    return [(r, min(r + rows, shape[0])) for r in range(0, shape[0], rows)]
+
+
+def _second(item: tuple[str, torch.Tensor]) -> torch.Tensor:
+    return item[1]
+
+
+def _split_for_wire(
+    iterator: Iterator[tuple[str, torch.Tensor]],
+    post_iter_func: Callable[[tuple[str, torch.Tensor]], torch.Tensor],
+    limit: int,
+) -> Iterator[tuple[str, torch.Tensor]]:
+    for item in iterator:
+        tensor = post_iter_func(item)
+        segs = wire_segments(tuple(tensor.shape), tensor.dtype, limit)
+        if segs is None:
+            yield item[0], tensor
+        else:
+            for r0, r1 in segs:
+                yield item[0], tensor[r0:r1]
+
+
+def _split_meta(
+    iterator: Iterator[tuple[str, tuple[list[int], torch.dtype]]],
+    limit: int,
+    pending: dict[str, list],
+) -> Iterator[tuple[str, tuple[list[int], torch.dtype]]]:
+    for name, (shape, dtype) in iterator:
+        segs = wire_segments(shape, dtype, limit)
+        if segs is None:
+            yield name, (shape, dtype)
+            continue
+        pending[name] = [len(segs), []]
+        for r0, r1 in segs:
+            yield name, ([r1 - r0, *shape[1:]], dtype)
+
+
 def packed_nccl_broadcast_producer(
     iterator: Iterator[tuple[str, torch.Tensor]],
     group: Any,
@@ -165,6 +218,8 @@ def packed_nccl_broadcast_producer(
                     Both producer and consumer must use the same value.
 
     """
+    iterator = _split_for_wire(iterator, post_iter_func, buffer_size_bytes)
+    post_iter_func = _second
     streams = _get_streams(torch.accelerator.current_device_index(), num_buffers)
     # Keep references to in-flight chunks so their packed_tensors
     # aren't freed while an async broadcast is still reading them.
@@ -219,6 +274,27 @@ def packed_nccl_broadcast_consumer(
 
     """
     target_packed_tensor_size = buffer_size_bytes
+    # Tensors split on the wire (see wire_segments) are joined again before
+    # post_unpack_func sees them.
+    pending: dict[str, list] = {}
+    iterator = _split_meta(iterator, buffer_size_bytes, pending)
+    load = post_unpack_func
+
+    def joined(weights: list[tuple[str, torch.Tensor]]) -> None:
+        out = []
+        for name, t in weights:
+            entry = pending.get(name)
+            if entry is None:
+                out.append((name, t))
+                continue
+            entry[1].append(t.clone())  # the receive buffer is reused
+            if len(entry[1]) == entry[0]:
+                out.append((name, torch.cat(entry[1])))
+                del pending[name]
+        if out:
+            load(out)
+
+    post_unpack_func = joined
 
     streams = _get_streams(torch.accelerator.current_device_index(), num_buffers)
     buffer_idx = 0
