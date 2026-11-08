@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """NCCL-based (dense) weight transfer engine."""
 
+import math
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
@@ -651,15 +652,28 @@ class NCCLTrainerWeightTransferEngine(TrainerWeightTransferEngine[NCCLTrainerIni
         assert self.model_update_group is not None
         device = self.model_update_group.device
         if self.packed:
-            packed_nccl_broadcast_consumer(
-                iterator=((m.name, (list(m.shape), m.dtype)) for m in meta),
-                group=self.model_update_group,
-                src=src,
-                post_unpack_func=lambda weights: None,
-                buffer_size_bytes=self.packed_buffer_size_bytes,
-                num_buffers=self.packed_num_buffers,
-                device=device,
-            )
+            # Nothing is kept, so skip the per-tensor unpack: receive each
+            # packed chunk (split as pack_tensors splits) into one buffer.
+            # A rank that lags here stalls the whole broadcast ring.
+            key = (src, len(meta))
+            cached: dict = self.__dict__.setdefault("_discard_sizes", {})
+            sizes = cached.get(key)
+            if sizes is None:
+                sizes, size = [], 0
+                limit = self.packed_buffer_size_bytes
+                for m in meta:
+                    size += math.prod(m.shape) * m.dtype.itemsize
+                    if size > limit:
+                        sizes.append(size)
+                        size = 0
+                if size:
+                    sizes.append(size)
+                cached[key] = sizes
+            buf = torch.empty(max(sizes, default=0), dtype=torch.uint8, device=device)
+            stream = torch.cuda.current_stream()
+            for n in sizes:
+                self.model_update_group.broadcast(buf[:n], src=src, stream=stream)
+            stream.synchronize()
         else:
             stream = torch.cuda.current_stream()
             for m in meta:
