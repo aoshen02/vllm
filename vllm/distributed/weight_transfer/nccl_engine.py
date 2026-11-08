@@ -473,8 +473,6 @@ class NCCLWeightTransferEngine(
 
         import regex as re
 
-        from vllm.model_executor.model_loader.reload.plan import _copies
-
         nbuf = self.packed_num_buffers
         cache = self.__dict__.setdefault("_layouts", {})
         layout = cache.get(src)
@@ -489,7 +487,6 @@ class NCCLWeightTransferEngine(
         wire = chunk_layout(zip(shapes, dtypes), self.packed_buffer_size_bytes)
         need = max(wire.sizes, default=0)
         bufs = slot_buffers(nbuf, need)
-        copies = _copies(plan)
         index_of = re.compile(r"\.\d+(?=\.|$)")
         chunks = []
         for k, pieces in enumerate(wire.chunks):
@@ -502,7 +499,12 @@ class NCCLWeightTransferEngine(
             for piece, view in zip(pieces, wire.views(k, bufs[k % nbuf])):
                 index, rows, dtype = piece[0], piece[1], piece[3]
                 name = names[index]
-                ops = copies[name]
+                dest = plan.get_dest(name)
+                ops = (
+                    None
+                    if dest is None
+                    else [(tuple(slice(*b) for b in box), t) for box, t in dest]
+                )
                 pairs = None if ops is None else _pairs(ops, rows, view)
                 if view.dtype != dtype or (rows is not None and pairs is None):
                     pending.append((piece, view, name, ops))
