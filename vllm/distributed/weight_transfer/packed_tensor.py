@@ -50,9 +50,17 @@ def unpack_tensor(
     unpacked_tensors = packed_tensor.split(tensor_sizes)
 
     return [
-        (name, tensor.contiguous().view(dtype).view(shape))
+        (name, _aligned(tensor, dtype).view(dtype).view(shape))
         for name, shape, dtype, tensor in zip(names, shapes, dtypes, unpacked_tensors)
     ]
+
+
+def _aligned(t: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    """``t`` (bytes), copied when it starts at an offset ``dtype`` cannot view:
+    tensors are packed back to back, so an odd-sized one shifts the next."""
+    if t.storage_offset() % dtype.itemsize:
+        return t.clone()
+    return t.contiguous()
 
 
 @dataclass
