@@ -1237,6 +1237,9 @@ class NCCLTrainerWeightTransferEngine(TrainerWeightTransferEngine[NCCLTrainerIni
         if not src:
             # Keep single-broadcaster payloads readable by older servers.
             del payload["src"]
+        for unused in ("stage_setup", "stages", "tail"):  # stage-group fields
+            if not payload[unused]:
+                del payload[unused]
         # update_weights (workers receive) must run concurrently with the
         # trainer-side broadcast — both rendezvous inside the same NCCL calls.
         exe = ThreadPoolExecutor(max_workers=1)
