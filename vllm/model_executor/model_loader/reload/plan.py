@@ -216,7 +216,7 @@ def _write(
     src = copy.src
     if src._geom is None:
         raise Fallback(src._lost or "not a view of the checkpoint tensor")
-    if src.dtype != copy.dtype:
+    if src.dtype != copy.dtype and not _same_bits(src.dtype, copy.dtype):
         raise Fallback(
             f"casts {src.dtype} to {copy.dtype} at copy_ "
             f"(send it as {copy.dtype} to make it direct)"
@@ -242,6 +242,18 @@ def _write(
     box, dst_shape, dst_stride = box_and_region(shape, geom.storage_offset(), dims)
     return Write(
         box, target.module, target.tensor, Region(rel // size, dst_shape, dst_stride)
+    )
+
+
+def _same_bits(a: torch.dtype, b: torch.dtype) -> bool:
+    """Integer casts between equal widths keep every bit (two's complement)."""
+    return (
+        a.itemsize == b.itemsize
+        and not a.is_floating_point
+        and not b.is_floating_point
+        and not a.is_complex
+        and not b.is_complex
+        and torch.bool not in (a, b)
     )
 
 
