@@ -298,23 +298,18 @@ def _chunks(
     if layout is not None:
         bufs = slot_buffers(num_buffers, max(layout.sizes, default=0))
         bound = layout.__dict__.get("_bound")
-        if bound is None or bound[0] is not bufs[0]:
-            bound = (
-                bufs[0],
-                [
-                    layout.views(k, bufs[k % num_buffers])
-                    for k in range(len(layout.sizes))
-                ],
-            )
-            layout.__dict__["_bound"] = bound
+        if bound is None:
+            bound = layout.__dict__["_bound"] = [
+                layout.views(k, bufs[k % num_buffers]) for k in range(len(layout.sizes))
+            ]
         index, tensor = -1, torch.empty(0)
         for k, pieces in enumerate(layout.chunks):
             srcs = []
-            for piece, view in zip(pieces, bound[1][k]):
+            for piece, view in zip(pieces, bound[k]):
                 if piece[0] != index:
                     index, tensor = piece[0], next(tensors)
                 srcs.append(_source(piece, tensor, view))
-            yield bufs[k % num_buffers][: layout.sizes[k]], bound[1][k], srcs
+            yield bufs[k % num_buffers][: layout.sizes[k]], bound[k], srcs
         return
     stash: dict[int, torch.Tensor] = {}
 
@@ -349,16 +344,17 @@ _SLOTS: dict[tuple[int, int], list[torch.Tensor]] = {}
 def slot_buffers(num_buffers: int, nbytes: int) -> list[torch.Tensor]:
     """This device's reused packed buffers, at least ``nbytes`` each. Shared by
     every transfer on the device, so memory is one set of buffers however many
-    senders there are; ``release_slot_buffers`` frees the memory between
-    updates (views stay valid, the storage regrows on the next use)."""
+    senders there are. They grow in place and ``release_slot_buffers`` frees
+    their memory between updates: views of them stay valid either way."""
     key = (torch.accelerator.current_device_index(), num_buffers)
-    bufs = _SLOTS.get(key)
-    if bufs is None or bufs[0].numel() < nbytes:
-        bufs = _SLOTS[key] = [
-            torch.empty(nbytes, dtype=torch.uint8, device="cuda")
-            for _ in range(num_buffers)
+    if key not in _SLOTS:
+        _SLOTS[key] = [
+            torch.empty(0, dtype=torch.uint8, device="cuda") for _ in range(num_buffers)
         ]
+    bufs = _SLOTS[key]
     for buf in bufs:
+        if buf.numel() < nbytes:
+            buf.resize_(nbytes)
         if buf.untyped_storage().nbytes() != buf.numel():
             buf.untyped_storage().resize_(buf.numel())
     return bufs
