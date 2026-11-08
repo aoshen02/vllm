@@ -216,15 +216,17 @@ def _write(
     src = copy.src
     if src._geom is None:
         raise Fallback(src._lost or "not a view of the checkpoint tensor")
-    if src.dtype != copy.dtype and not _same_bits(src.dtype, copy.dtype):
-        raise Fallback(
-            f"casts {src.dtype} to {copy.dtype} at copy_ "
-            f"(send it as {copy.dtype} to make it direct)"
-        )
+    # A cast is the loader's own elementwise copy_ conversion: replay it
+    # into a destination viewed in its dtype.
+    cast = (
+        copy.dtype
+        if src.dtype != copy.dtype and not _same_bits(src.dtype, copy.dtype)
+        else None
+    )
     target = targets.by_storage.get(copy.storage)
     if target is None:
         raise Fallback("copies into a tensor that is not a checkpoint tensor")
-    size = dtype.itemsize
+    size = (cast or dtype).itemsize
     rel = copy.byte_offset - target.byte_offset
     if rel % size or target.byte_offset % size:
         raise Fallback("copies into a destination viewed with another element size")
@@ -241,7 +243,11 @@ def _write(
     dims = list(zip(copy.shape, geom.stride(), copy.stride))
     box, dst_shape, dst_stride = box_and_region(shape, geom.storage_offset(), dims)
     return Write(
-        box, target.module, target.tensor, Region(rel // size, dst_shape, dst_stride)
+        box,
+        target.module,
+        target.tensor,
+        Region(rel // size, dst_shape, dst_stride),
+        cast,
     )
 
 
@@ -259,6 +265,7 @@ def _same_bits(a: torch.dtype, b: torch.dtype) -> bool:
 
 def _dest(targets: Targets, write: Write, dtype: torch.dtype) -> torch.Tensor:
     """The live tensor of ``write``, in the checkpoint dtype."""
+    dtype = write.dtype or dtype
     target = targets.by_name[(write.module, write.tensor)]
     r = write.dst
     offset = target.byte_offset // dtype.itemsize + r.offset
