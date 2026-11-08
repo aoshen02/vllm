@@ -571,11 +571,7 @@ class NCCLWeightTransferEngine(
         nbuf = self.packed_num_buffers
         cache = self.__dict__.setdefault("_layouts", {})
         layout = cache.get((id(group), src))
-        if (
-            layout is not None
-            and layout["names"] == update_info.names
-            and layout["bufs"][0] is slot_buffers(nbuf, layout["need"])[0]
-        ):
+        if layout is not None and layout["names"] == update_info.names:
             return layout
         names, shapes = update_info.names, update_info.shapes
         dtypes = [getattr(torch, d) for d in update_info.dtype_names]
@@ -638,7 +634,6 @@ class NCCLWeightTransferEngine(
             "names": list(names),
             "shapes": shapes,
             "chunks": chunks,
-            "bufs": bufs,
             "need": need,
         }
         # These views live as long as the engine: keep the collector from
