@@ -1542,6 +1542,18 @@ def convert_gpt_oss_weight_to_mxfp4_moe_kernel_format(
         )
 
 
+def _gather_rows(t: torch.Tensor, index: torch.Tensor) -> torch.Tensor:
+    """``t[:, index]`` for a byte tensor [E, N, K], moving whole rows in the
+    widest word that divides K (a byte-wise gather is far below bandwidth)."""
+    for word in (torch.int64, torch.int32, torch.int16):
+        if t.shape[-1] % word.itemsize == 0:
+            try:
+                return t.view(word)[:, index].view(torch.uint8)
+            except RuntimeError:
+                break  # not viewable (offset or stride); gather bytes
+    return t[:, index].contiguous()
+
+
 def convert_weight_to_mxfp4_moe_kernel_format(
     mxfp4_backend: Mxfp4MoeBackend,
     layer: torch.nn.Module,
@@ -1673,17 +1685,10 @@ def convert_weight_to_mxfp4_moe_kernel_format(
         # Swap w1/w3 and interleave to match TRTLLM SwiGLU convention.
         # Standard loading gives contiguous [w1/gate, w3/up].
         # TRTLLM kernel expects interleaved [w3_0, w1_0, w3_1, w1_1, ...].
-        w1_weight = w13_weight[:, :intermediate_size, :]
-        w3_weight = w13_weight[:, intermediate_size:, :]
-        w13_weight = torch.stack([w3_weight, w1_weight], dim=2).reshape(
-            w13_weight.shape
-        )
-
-        w1_scale = w13_weight_scale[:, :intermediate_size, :]
-        w3_scale = w13_weight_scale[:, intermediate_size:, :]
-        w13_weight_scale = torch.stack([w3_scale, w1_scale], dim=2).reshape(
-            w13_weight_scale.shape
-        )
+        # Interleaved row 2i is w3 row i (loaded row I + i), row 2i + 1 is w1
+        # row i; folded into the shuffle below so each tensor is gathered once.
+        rows = torch.arange(intermediate_size, device=w13_weight.device)
+        interleave = torch.stack([rows + intermediate_size, rows], dim=1).reshape(-1)
 
         if w13_bias is not None:
             b1 = w13_bias[:, :intermediate_size]
@@ -1701,7 +1706,7 @@ def convert_weight_to_mxfp4_moe_kernel_format(
             w13_weight[0].view(torch.uint8),
             epilogue_tile_m,
         ).to(w13_weight.device)
-        w13_weight = w13_weight.view(torch.uint8)[:, w13_perm].contiguous()
+        w13_weight = _gather_rows(w13_weight.view(torch.uint8), interleave[w13_perm])
 
         # w13 scale permute + interleave
         w13_sf_perm = get_w2_permute_indices_with_cache(
@@ -1710,7 +1715,9 @@ def convert_weight_to_mxfp4_moe_kernel_format(
             epilogue_tile_m,
             num_elts_per_sf=16,
         ).to(w13_weight_scale.device)
-        w13_s = w13_weight_scale.view(torch.uint8)[:, w13_sf_perm].contiguous()
+        w13_s = _gather_rows(
+            w13_weight_scale.view(torch.uint8), interleave[w13_sf_perm]
+        )
         E, N_s, K_s = w13_s.shape
         w13_weight_scale = (
             nvfp4_block_scale_interleave(w13_s.reshape(E * N_s, K_s))
@@ -1724,7 +1731,7 @@ def convert_weight_to_mxfp4_moe_kernel_format(
             w2_weight[0].view(torch.uint8),
             epilogue_tile_m,
         ).to(w2_weight.device)
-        w2_weight = w2_weight.view(torch.uint8)[:, w2_perm].contiguous()
+        w2_weight = _gather_rows(w2_weight.view(torch.uint8), w2_perm)
 
         # w2 scale permute + interleave
         w2_sf_perm = get_w2_permute_indices_with_cache(
@@ -1733,7 +1740,7 @@ def convert_weight_to_mxfp4_moe_kernel_format(
             epilogue_tile_m,
             num_elts_per_sf=16,
         ).to(w2_weight_scale.device)
-        w2_s = w2_weight_scale.view(torch.uint8)[:, w2_sf_perm].contiguous()
+        w2_s = _gather_rows(w2_weight_scale.view(torch.uint8), w2_sf_perm)
         E2, N2_s, K2_s = w2_s.shape
         w2_weight_scale = (
             nvfp4_block_scale_interleave(w2_s.reshape(E2 * N2_s, K2_s))
