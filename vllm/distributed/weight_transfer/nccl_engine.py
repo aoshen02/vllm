@@ -111,6 +111,13 @@ class NCCLWeightTransferUpdateInfo(WeightTransferUpdateInfo):
     dtype_names: list[str] = field(default_factory=list)
     shapes: list[list[int]] = field(default_factory=list)
     src: int = 0
+    # PP-stage groups (see `_stage_handshake`): `stage_setup` runs the
+    # handshake; `stages` carries one round, an entry per stage (None: that
+    # stage receives nothing this round), each a dict of the fields above.
+    stage_setup: bool = False
+    stages: list[dict | None] | None = None
+    # with `stages`: main-group turns after every stage's rounds
+    tail: list[dict] | None = None
 
     def __post_init__(self):
         """Validate that all lists have the same length."""
@@ -227,6 +234,59 @@ def _coalesce(
                 out_s.append(s0)
             i = j + 1
     return out_d, out_s
+
+
+def _stage_handshake(
+    group: "PyNcclCommunicator",
+    row: torch.Tensor,
+    n_trainer: int,
+    owner_flags=None,
+) -> list[dict]:
+    """Form one sub-communicator per pipeline stage, so stages receive only
+    their own weights, in parallel.
+
+    Every group rank contributes ``row``: its PP rank (-1 on trainer ranks)
+    followed by a 0/1 mask over the planned names of what it needs. Each stage
+    needs the union of its workers' masks. Group rank 0 (a trainer rank) calls
+    ``owner_flags(need)`` for which trainer ranks own a name some stage needs;
+    a stage's group is those trainer ranks plus its workers, so a trainer rank
+    joins only the rings it sends or must relay on."""
+    from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
+
+    world = group.world_size
+    out = torch.empty(world * row.numel(), dtype=row.dtype, device=group.device)
+    group.all_gather(out, row)
+    rows = out.view(world, -1).cpu()
+    pp = rows[n_trainer:, 0].tolist()
+    stages = sorted(set(pp))
+    workers = [[n_trainer + i for i, r in enumerate(pp) if r == c] for c in stages]
+    need = [rows[ranks, 1:].bool().any(0) for ranks in workers]
+    flags = torch.zeros(len(stages) * n_trainer, dtype=torch.int32, device=group.device)
+    if group.rank == 0:
+        flags.copy_(owner_flags(need).flatten())
+    group.broadcast(flags, src=0)
+    flags = flags.view(len(stages), n_trainer).cpu()
+    out_stages = []
+    for c, ranks in enumerate(workers):
+        members = [b for b in range(n_trainer) if flags[c, b]] + ranks
+        uid = torch.zeros(128, dtype=torch.uint8, device=group.device)
+        if group.rank == members[0]:
+            raw = bytes(group.nccl.ncclGetUniqueId().internal)
+            uid.copy_(torch.frombuffer(bytearray(raw), dtype=torch.uint8))
+        group.broadcast(uid, src=members[0])
+        out_stages.append(
+            {"members": members, "need": need[c], "uid": bytes(uid.cpu().tolist())}
+        )
+    for st in out_stages:  # in stage order on every rank: no init cycle
+        st["comm"] = None
+        if group.rank in st["members"]:
+            st["comm"] = PyNcclCommunicator.from_unique_id_bytes(
+                st["uid"],
+                rank=st["members"].index(group.rank),
+                world_size=len(st["members"]),
+                device=group.device,
+            )
+    return out_stages
 
 
 class NCCLWeightTransferEngine(
@@ -379,13 +439,33 @@ class NCCLWeightTransferEngine(
                 "NCCL weight transfer not initialized. "
                 "Call init_transfer_engine() first."
             )
+        if update_info.stage_setup:
+            self._setup_stages()
+            return
+        group = self.model_update_group
+        tag: tuple = ()
+        if update_info.stages is not None:
+            stage, group = self._stage
+            sub = update_info.stages[stage]
+            if isinstance(sub, list):  # this stage's rounds, back to back
+                for one in sub:
+                    stages: list = [None] * len(update_info.stages)
+                    stages[stage] = one
+                    self.receive_weights(NCCLWeightTransferUpdateInfo(stages=stages))
+                for info in update_info.tail or ():
+                    self.receive_weights(NCCLWeightTransferUpdateInfo(**info))
+                return
+            if not sub:
+                return  # this stage receives nothing this round
+            update_info = NCCLWeightTransferUpdateInfo(**sub)
+            tag = ("stage",)
         src = update_info.src
-        if not 0 <= src < self.rank_offset:
+        if not tag and not 0 <= src < self.rank_offset:
             raise ValueError(
                 f"NCCL update src must be a sender rank in [0, {self.rank_offset}), "
                 f"got {src!r}."
             )
-        key = (self.model, src)
+        key = (self.model, *tag, src)
         if update_info.names:
             self._last_update_info[key] = update_info
         else:
@@ -414,7 +494,9 @@ class NCCLWeightTransferEngine(
         )
         with disable_mtp_completeness_check():
             if self.packed and plan is not None:
-                self._receive_planned(update_info, src, plan)
+                self._receive_planned(update_info, src, plan, group, (*tag, src))
+            elif tag:
+                raise RuntimeError("PP-stage groups need a load plan")
             elif self.packed:
                 # Build iterator of (name, (shape, dtype)) from update_info
                 def state_dict_info_iterator():
@@ -446,8 +528,32 @@ class NCCLWeightTransferEngine(
                     load_weights([(name, weight)])
                     del weight
 
+    def _setup_stages(self) -> None:
+        """Worker side of `_stage_handshake`: needs the plan (built at the
+        first update), which knows exactly what this rank writes."""
+        from vllm.distributed.parallel_state import get_pp_group
+        from vllm.model_executor.model_loader.reload.plan import _copies
+
+        group = self.model_update_group
+        assert group is not None and self._plan is not None
+        assert self._plan_manifest is not None
+        copies = _copies(self._plan)
+        names = list(self._plan_manifest)
+        row = torch.zeros(1 + len(names), dtype=torch.int32)
+        row[0] = get_pp_group().rank_in_group
+        # a fallback (None) may write anything here: count it as needed
+        row[1:] = torch.tensor([copies.get(n) != () for n in names], dtype=torch.int32)
+        stages = _stage_handshake(group, row.to(group.device), self.rank_offset)
+        mine = [i for i, st in enumerate(stages) if st["comm"] is not None]
+        assert len(mine) == 1, mine
+        self._stage = (mine[0], stages[mine[0]]["comm"])
+
     def _planned_layout(
-        self, update_info: NCCLWeightTransferUpdateInfo, src: int, plan
+        self,
+        update_info: NCCLWeightTransferUpdateInfo,
+        src: int,
+        plan,
+        cache_key: object = None,
     ):
         """Receive buffers and, per packed chunk, the views copied into the
         model: built once for a manifest, so an update runs no per-tensor
@@ -458,7 +564,8 @@ class NCCLWeightTransferEngine(
         from vllm.model_executor.model_loader.reload.plan import _copies
 
         cache = self.__dict__.setdefault("_layouts", {})
-        layout = cache.get(src)
+        cache_key = src if cache_key is None else cache_key
+        layout = cache.get(cache_key)
         if layout is not None and layout["names"] == update_info.names:
             return layout
         from vllm.distributed.weight_transfer.packed_tensor import wire_segments
@@ -613,7 +720,7 @@ class NCCLWeightTransferEngine(
             "chunks": built,
             "buffers": [*buffers, huge],
         }
-        cache[src] = layout
+        cache[cache_key] = layout
         # These views live as long as the engine: keep the collector from
         # rescanning ~1e5 of them mid-transfer (full collections cost ~0.3 s).
         gc.collect()
@@ -621,13 +728,18 @@ class NCCLWeightTransferEngine(
         return layout
 
     def _receive_planned(
-        self, update_info: NCCLWeightTransferUpdateInfo, src: int, plan
+        self,
+        update_info: NCCLWeightTransferUpdateInfo,
+        src: int,
+        plan,
+        group: "PyNcclCommunicator | None" = None,
+        cache_key: object = None,
     ) -> None:
         """Packed receive into fixed buffers, then one batched copy per chunk;
         fallback names still go through ``load_weights`` in arrival order."""
         from vllm.distributed.weight_transfer.packed_tensor import _get_streams
 
-        layout = self._planned_layout(update_info, src, plan)
+        layout = self._planned_layout(update_info, src, plan, cache_key)
         for buf in layout["buffers"]:  # released at the previous finish
             storage = buf.untyped_storage()
             if storage.nbytes() != buf.nbytes:
@@ -636,7 +748,7 @@ class NCCLWeightTransferEngine(
         streams = _get_streams(torch.accelerator.current_device_index(), nbuf)
         slot_done: list[torch.Event | None] = [None] * nbuf
         prev: torch.Event | None = None
-        group = self.model_update_group
+        group = group or self.model_update_group
         assert group is not None
         deferred: list[tuple[str, torch.Tensor]] = []
         huge_done: torch.Event | None = None
@@ -760,6 +872,12 @@ class NCCLTrainerWeightTransferEngine(TrainerWeightTransferEngine[NCCLTrainerIni
         self._group_rank = 0
         # Metadata the worker already holds; an unchanged round sends none.
         self._sent_meta: list[ParamMeta] | None = None
+        # PP-stage groups: opt in by setting `stage_groups` (needs
+        # `use_load_plan`); formed at the second update, once workers have
+        # their plan.
+        self.stage_groups = False
+        self._stages: list[dict] | None = None
+        self._sends = 0
         # With `use_load_plan`: the metadata the workers plan from, sent at init.
         self._plan_manifest: Manifest | None = None
 
@@ -909,16 +1027,199 @@ class NCCLTrainerWeightTransferEngine(TrainerWeightTransferEngine[NCCLTrainerIni
         reuse = self.is_sender and meta == self._sent_meta
         if self.is_sender:
             self.client.start_weight_update()
-        for broadcaster, metas in slices:
-            src = group_ranks.index(broadcaster)
-            if self.is_sender:
-                self._send_update(metas, src, reuse)
-            else:
-                self._broadcast(metas, src)
+        self._sends += 1
+        if self.stage_groups and self._stages is None and self._sends >= 2:
+            self._setup_stages(meta, group_ranks)
+        if self._stages:
+            self._send_stages(group_ranks, slices)
+        else:
+            for broadcaster, metas in slices:
+                src = group_ranks.index(broadcaster)
+                if self.is_sender:
+                    self._send_update(metas, src, reuse)
+                else:
+                    self._broadcast(metas, src)
         if self.is_sender:
             self.client.finish_weight_update()
             self._sent_meta = meta
         self._post_send_sync()
+
+    def _setup_stages(self, meta: list[ParamMeta], group_ranks: list[int]) -> None:
+        """Trainer side of `_stage_handshake`; rank 0 triggers the workers'
+        side with an `update_weights` RPC that runs concurrently."""
+        group = self.model_update_group
+        assert group is not None and self._plan_manifest is not None
+        names = list(self._plan_manifest)
+        owner = {
+            m.name: group_ranks.index(0 if m.owners is None else m.owners[0])
+            for m in meta
+        }
+
+        size = {m.name: math.prod(m.shape) * m.dtype.itemsize for m in meta}
+
+        def owner_flags(need: list[torch.Tensor]) -> torch.Tensor:
+            # Each trainer rank joins one stage's ring only: the one it sends
+            # the most bytes to (a rank on two rings halves both). What it
+            # owns for other stages goes in a final turn on the main group.
+            nbytes = torch.zeros(len(need), len(group_ranks), dtype=torch.float64)
+            for c, mask in enumerate(need):
+                for i in mask.nonzero().flatten().tolist():
+                    if names[i] in owner:
+                        nbytes[c, owner[names[i]]] += size[names[i]]
+            flags = torch.zeros(len(need), len(group_ranks), dtype=torch.int32)
+            for b in range(len(group_ranks)):
+                if nbytes[:, b].sum() > 0:
+                    flags[int(nbytes[:, b].argmax()), b] = 1
+            return flags.to(group.device)
+
+        row = torch.zeros(1 + len(names), dtype=torch.int32, device=group.device)
+        row[0] = -1
+        exe = ThreadPoolExecutor(max_workers=1)
+        try:
+            future = (
+                exe.submit(self.client.update_weights, {"stage_setup": True})
+                if self.is_sender
+                else None
+            )
+            stages = _stage_handshake(group, row, len(group_ranks), owner_flags)
+            if future is not None:
+                future.result()
+        finally:
+            exe.shutdown(wait=False)
+        for st in stages:
+            st["need"] = {names[i] for i in st["need"].nonzero().flatten().tolist()}
+        self._stages = stages
+
+    def _send_stages(
+        self, group_ranks: list[int], slices: list[tuple[int, list[ParamMeta]]]
+    ) -> None:
+        """One RPC per round; in round j, every stage's j-th owner broadcasts
+        that stage's part of its slice on the stage's group, all stages at
+        once (threads: each rank joins each of its groups' broadcasts)."""
+        assert self._stages is not None
+        me = self._group_rank
+        device = self.model_update_group.device if self.model_update_group else None
+        cached = self.__dict__.get("_stage_rounds")
+        if cached is not None and cached[0] == [
+            (b, len(metas), metas[0].name if metas else "") for b, metas in slices
+        ]:
+            rounds, tail = cached[1], cached[2]
+        else:
+            rounds, tail = self._stage_split(group_ranks, slices)
+            self._stage_rounds = (
+                [
+                    (b, len(metas), metas[0].name if metas else "")
+                    for b, metas in slices
+                ],
+                rounds,
+                tail,
+            )
+        sent = self.__dict__.setdefault("_stage_sent", {})
+        self._send_stage_rounds(rounds, tail, sent, me, device)
+
+    def _stage_split(self, group_ranks, slices):
+        """Per stage, (owner, slice, part) in owner order, and the part of
+        each slice owned for a stage whose ring the owner is not on."""
+        assert self._stages is not None
+        rounds: list[list] = [[] for _ in self._stages]
+        tail = []  # what a rank owns for a stage whose ring it is not on
+        for broadcaster, metas in slices:
+            b = group_ranks.index(broadcaster)
+            home = [c for c, st in enumerate(self._stages) if b in st["members"]]
+            if not home:
+                continue
+            st = self._stages[home[0]]
+            sub = [m for m in metas if m.name in st["need"]]
+            if sub:
+                rounds[home[0]].append((b, metas, sub))
+            rest = [
+                m
+                for m in metas
+                if any(
+                    m.name in other["need"]
+                    for c, other in enumerate(self._stages)
+                    if c != home[0]
+                )
+            ]
+            if rest:
+                tail.append((b, metas, rest))
+        return rounds, tail
+
+    def _send_stage_rounds(self, rounds, tail, sent, me, device) -> None:
+        """One RPC carries every stage's rounds and the tail; each stage runs
+        its rounds back to back, then every rank joins the tail turns."""
+        assert self._stages is not None
+        payload: list = []
+        mine: list = []
+        for c, (st, entries) in enumerate(zip(self._stages, rounds)):
+            infos = []
+            for j, (b, metas, sub) in enumerate(entries):
+                src = st["members"].index(b)
+                if sent.get((c, j)) is sub:
+                    infos.append({"src": src})
+                else:
+                    infos.append(
+                        {
+                            "names": [m.name for m in sub],
+                            "dtype_names": [_dtype_name(m.dtype) for m in sub],
+                            "shapes": [list(m.shape) for m in sub],
+                            "src": src,
+                        }
+                    )
+                    sent[(c, j)] = sub
+                if st["comm"] is not None:
+                    mine.append((st["comm"], src, metas, sub, me == b))
+            payload.append(infos or None)
+        errors: list[BaseException] = []
+
+        def run(comm, src, metas, sub, own) -> None:
+            try:
+                if own:
+                    self._produce(metas, sub, comm, src)
+                else:
+                    self._discard(sub, src, comm)
+                torch.accelerator.current_stream().synchronize()
+            except BaseException as e:  # surfaced after the stage
+                errors.append(e)
+
+        tail_infos = []
+        for b, metas, rest in tail:
+            if sent.get(("tail", b)) is rest:
+                tail_infos.append({"src": b})
+            else:
+                tail_infos.append(
+                    {
+                        "names": [m.name for m in rest],
+                        "dtype_names": [_dtype_name(m.dtype) for m in rest],
+                        "shapes": [list(m.shape) for m in rest],
+                        "src": b,
+                    }
+                )
+                sent[("tail", b)] = rest
+        group = self.model_update_group
+        assert group is not None
+        exe = ThreadPoolExecutor(max_workers=1)
+        try:
+            future = (
+                exe.submit(
+                    self.client.update_weights,
+                    {"stages": payload, "tail": tail_infos},
+                )
+                if self.is_sender
+                else None
+            )
+            for task in mine:  # a rank sits on one stage's ring: in order
+                run(*task)
+                if errors:
+                    raise errors[0]
+            for b, metas, rest in tail:  # the stragglers, on the main group
+                run(group, b, metas, rest, me == b)
+                if errors:
+                    raise errors[0]
+            if future is not None:
+                future.result()
+        finally:
+            exe.shutdown(wait=False)
 
     def _send_update(self, meta: list[ParamMeta], src: int, reuse: bool) -> None:
         """Rank 0's part of one broadcaster's turn: run its `update_weights`
@@ -1088,15 +1389,21 @@ class NCCLTrainerWeightTransferEngine(TrainerWeightTransferEngine[NCCLTrainerIni
         for _ in pairs:  # run the source to its end (it checks the count)
             pass
 
-    def _discard(self, meta: list[ParamMeta], src: int) -> None:
+    def _discard(
+        self,
+        meta: list[ParamMeta],
+        src: int,
+        group: "PyNcclCommunicator | None" = None,
+    ) -> None:
         """Receive another broadcaster's parameters and drop them."""
-        assert self.model_update_group is not None
-        device = self.model_update_group.device
+        group = group or self.model_update_group
+        assert group is not None
+        device = group.device
         if self.packed:
             # Nothing is kept, so skip the per-tensor unpack: receive each
             # packed chunk (split as the producer splits) into one buffer.
             # A rank that lags here stalls the whole broadcast ring.
-            key = (src, len(meta))
+            key = (id(group), src, len(meta))
             cached: dict = self.__dict__.setdefault("_discard_sizes", {})
             sizes = cached.get(key)
             if sizes is None:
@@ -1123,13 +1430,13 @@ class NCCLTrainerWeightTransferEngine(TrainerWeightTransferEngine[NCCLTrainerIni
             buf = torch.empty(max(sizes, default=0), dtype=torch.uint8, device=device)
             stream = torch.cuda.current_stream()
             for n in sizes:
-                self.model_update_group.broadcast(buf[:n], src=src, stream=stream)
+                group.broadcast(buf[:n], src=src, stream=stream)
             stream.synchronize()
         else:
             stream = torch.cuda.current_stream()
             for m in meta:
                 weight = torch.empty(m.shape, dtype=m.dtype, device=device)
-                self.model_update_group.broadcast(weight, src=src, stream=stream)
+                group.broadcast(weight, src=src, stream=stream)
 
     @staticmethod
     def _checked_iter(
