@@ -407,7 +407,6 @@ def _single(loader, shape=(4,), dtype=BF16, param_shape=None):
         (lambda p, w: p.copy_(w * 2), "applies"),
         (lambda p, w: p.copy_(w.to(torch.float32).to(BF16)), "applies"),
         (lambda p, w: p.copy_(w if bool(w.sum() > 0) else -w), "reads tensor values"),
-        (lambda p, w: p.__setitem__(slice(None), w), "without Tensor.copy_"),
         (lambda p, w: p.copy_(w).mul_(2), "reads the destination"),  # composed
         (lambda p, w: p.copy_(w.expand(2, 4)[0]), "applies"),
         (lambda p, w: torch.add(w, 0, out=p), "without Tensor.copy_ (add.out)"),
@@ -417,7 +416,6 @@ def _single(loader, shape=(4,), dtype=BF16, param_shape=None):
         "arith",
         "cast-roundtrip",
         "value-read",
-        "setitem",
         "composed",
         "expand",
         "out",
@@ -429,6 +427,14 @@ def test_fallbacks(loader, reason):
     _, plan = _check_plan_equals_cold_start(make, shapes)
     assert plan.get_dest("layer.weight") is None
     assert reason in (plan.entries["layer.weight"].reason or "")
+
+
+def test_setitem_is_direct():
+    """``param[...] = weight`` writes like ``param.copy_(weight)``."""
+    make, shapes = _single(lambda p, w: p.__setitem__(slice(None), w))
+    _, plan = _check_plan_equals_cold_start(make, shapes)
+    ((box, _),) = plan.get_dest("layer.weight")
+    assert box == ((0, 4),)
 
 
 def test_noop_to_and_constant_fill_stay_direct():
