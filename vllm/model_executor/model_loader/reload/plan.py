@@ -155,16 +155,43 @@ def load_planned(
     boxes into its destinations, skip names this rank needs nothing of, and
     pass fallbacks to ``model.load_weights``. Call between ``start_reload``
     and ``finish_reload``."""
+    copies = _copies(plan)
     fallbacks = []
+    dsts: list[torch.Tensor] = []
+    srcs: list[torch.Tensor] = []
     for name, full in weights:
-        dest = plan.get_dest(name)
-        if dest is None:
+        ops = copies[name]
+        if ops is None:
             fallbacks.append((name, full))
-        for box, tensor in dest or ():
-            part = full[tuple(slice(start, stop) for start, stop in box)]
-            tensor.copy_(part.reshape(tensor.shape))
+            continue
+        for index, tensor in ops:
+            dsts.append(tensor)
+            srcs.append(full[index].reshape(tensor.shape))
+    if dsts:
+        # One dispatch for all of this call's copies instead of one per tensor.
+        torch._foreach_copy_(dsts, srcs)
     if fallbacks:
         model.load_weights(fallbacks)
+
+
+def _copies(
+    plan: LoadPlan,
+) -> dict[str, tuple[tuple[tuple[slice, ...], torch.Tensor], ...] | None]:
+    """Per name: (index into the full tensor, destination) pairs, or ``None``
+    for a fallback. Built once per plan."""
+    copies = plan.__dict__.get("_copies")
+    if copies is None:
+        copies = {
+            name: None
+            if e.writes is None
+            else tuple(
+                (tuple(slice(start, stop) for start, stop in box), tensor)
+                for box, tensor in plan.dests.get(name, ())
+            )
+            for name, e in plan.entries.items()
+        }
+        object.__setattr__(plan, "_copies", copies)
+    return copies
 
 
 def check_plannable(model: torch.nn.Module) -> None:
