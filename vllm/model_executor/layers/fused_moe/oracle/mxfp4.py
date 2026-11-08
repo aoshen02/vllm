@@ -1011,121 +1011,44 @@ def convert_gpt_oss_weight_to_mxfp4_moe_kernel_format(
         w13_bias = w13_bias.data.to(torch.float32)
         w2_bias = w2_bias.data.to(torch.float32)
 
-        # Swap w1 and w3 as the definition of swiglu is different in trtllm-gen
-        def swap_every_two_rows(x, axis=-1):
-            shape = x.shape
-            if axis < 0:
-                axis = len(shape) + axis
-            new_shape = list(shape)
-            new_shape[axis] = shape[axis] // 2
-            new_shape.insert(axis + 1, 2)
-            x = x.reshape(*new_shape)
-            x = x.flip(axis + 1)
-            new_shape = list(shape)
-            return x.reshape(*new_shape)
-
-        w13_weight_scale = swap_every_two_rows(w13_weight_scale, -2)
-        w13_weight = swap_every_two_rows(w13_weight, -2)
-        w13_bias = swap_every_two_rows(w13_bias, -1)
-
-        # Shuffle weights and scaling factors for transposed mma output
-        gemm1_weights_shuffled = []
-        gemm1_scales_shuffled = []
-        gemm2_weights_shuffled = []
-        gemm2_scales_shuffled = []
-        gemm1_bias_shuffled = []
-        gemm2_bias_shuffled = []
+        # trtllm-gen's swiglu takes w3 before w1: swap every two rows of w13,
+        # then shuffle for transposed mma output. Every expert has the same
+        # shape, so one index (swap folded in) gathers all experts at once.
+        dev = w13_weight.device
         epilogue_tile_m = 128
-        for i in range(num_experts):
-            # w13 weight
-            permute_indices = get_w2_permute_indices_with_cache(
-                _cache_permute_indices,
-                w13_weight[i].view(torch.uint8),
-                epilogue_tile_m,
-            )
-            gemm1_weights_shuffled.append(
-                w13_weight[i]
-                .view(torch.uint8)[permute_indices.to(w13_weight.device)]
-                .contiguous()
-            )
-            # w13 scale
-            permute_sf_indices = get_w2_permute_indices_with_cache(
-                _cache_permute_indices,
-                w13_weight_scale[i].view(torch.uint8),
-                epilogue_tile_m,
-                num_elts_per_sf=16,
-            )
-            gemm1_scales_shuffled.append(
-                nvfp4_block_scale_interleave(
-                    w13_weight_scale[i]
-                    .view(torch.uint8)[permute_sf_indices.to(w13_weight_scale.device)]
-                    .contiguous()
-                )
-            )
-            # w13 bias
-            permute_bias_indices = get_w2_permute_indices_with_cache(
-                _cache_permute_indices,
-                w13_bias[i].clone().reshape(-1, 1),
-                epilogue_tile_m,
-            )
-            gemm1_bias_shuffled.append(
-                w13_bias[i]
-                .clone()
-                .reshape(-1, 1)[permute_bias_indices.to(w13_bias.device)]
-                .contiguous()
-            )
-            # w2 weight
-            permute_indices = get_w2_permute_indices_with_cache(
-                _cache_permute_indices,
-                w2_weight[i].view(torch.uint8),
-                epilogue_tile_m,
-            )
-            gemm2_weights_shuffled.append(
-                w2_weight[i]
-                .view(torch.uint8)[permute_indices.to(w2_weight.device)]
-                .contiguous()
-            )
-            # w2 scale
-            permute_sf_indices = get_w2_permute_indices_with_cache(
-                _cache_permute_indices,
-                w2_weight_scale[i].view(torch.uint8),
-                epilogue_tile_m,
-                num_elts_per_sf=16,
-            )
-            gemm2_scales_shuffled.append(
-                nvfp4_block_scale_interleave(
-                    w2_weight_scale[i]
-                    .view(torch.uint8)[permute_sf_indices.to(w2_weight_scale.device)]
-                    .contiguous()
-                )
-            )
-            # w2 bias
-            permute_indices = get_w2_permute_indices_with_cache(
-                _cache_permute_indices,
-                w2_bias[i].clone().reshape(-1, 1),
-                epilogue_tile_m,
-            )
-            gemm2_bias_shuffled.append(
-                w2_bias[i]
-                .clone()
-                .reshape(-1, 1)[permute_indices.to(w2_bias.device)]
-                .contiguous()
-            )
+        rows = 2 * intermediate_size
+        swap = torch.arange(rows, device=dev) ^ 1
 
-        w13_weight = torch.stack(gemm1_weights_shuffled)
+        def perm(t: torch.Tensor, **kw) -> torch.Tensor:
+            return get_w2_permute_indices_with_cache(
+                _cache_permute_indices, t, epilogue_tile_m, **kw
+            ).to(dev)
+
+        w13_perm = swap[perm(w13_weight[0].view(torch.uint8))]
+        w13_sf_perm = swap[
+            perm(w13_weight_scale[0].view(torch.uint8), num_elts_per_sf=16)
+        ]
+        w13_b_perm = swap[perm(w13_bias[0].reshape(-1, 1)).reshape(-1)]
+        w2_perm = perm(w2_weight[0].view(torch.uint8))
+        w2_sf_perm = perm(w2_weight_scale[0].view(torch.uint8), num_elts_per_sf=16)
+        w2_b_perm = perm(w2_bias[0].reshape(-1, 1)).reshape(-1)
+
+        w13_weight = _gather_rows(w13_weight.view(torch.uint8), w13_perm)
+        w2_weight = _gather_rows(w2_weight.view(torch.uint8), w2_perm)
+        w13_s = _gather_rows(w13_weight_scale.view(torch.uint8), w13_sf_perm)
+        w2_s = _gather_rows(w2_weight_scale.view(torch.uint8), w2_sf_perm)
         w13_weight_scale = (
-            torch.stack(gemm1_scales_shuffled)
+            torch.stack([nvfp4_block_scale_interleave(s) for s in w13_s])
             .reshape(num_experts, 2 * intermediate_size, hidden_size // sf_block_size)
             .view(torch.float8_e4m3fn)
         )
-        w2_weight = torch.stack(gemm2_weights_shuffled)
         w2_weight_scale = (
-            torch.stack(gemm2_scales_shuffled)
+            torch.stack([nvfp4_block_scale_interleave(s) for s in w2_s])
             .reshape(num_experts, hidden_size, intermediate_size // sf_block_size)
             .view(torch.float8_e4m3fn)
         )
-        w13_bias = torch.stack(gemm1_bias_shuffled).reshape(num_experts, -1)
-        w2_bias = torch.stack(gemm2_bias_shuffled).reshape(num_experts, -1)
+        w13_bias = w13_bias[:, w13_b_perm].contiguous()
+        w2_bias = w2_bias[:, w2_b_perm].contiguous()
 
         return (
             w13_weight,
