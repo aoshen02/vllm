@@ -39,9 +39,6 @@ use crate::middleware;
 use crate::routes::openai::utils::types::{ErrorDetail, ErrorResponse};
 use crate::state::AppState;
 
-const SCALE_OUT_DISABLED_MESSAGE: &str =
-    "Scale-out endpoints are disabled. Restart vllm serve with --enable-scale-out to enable them.";
-
 /// Scale-out routes that Python registers together with
 /// `/inference/v1/generate` but the Rust frontend does not implement yet.
 const UNIMPLEMENTED_SCALE_OUT_ROUTES: &[&str] = &[
@@ -53,20 +50,6 @@ const UNIMPLEMENTED_SCALE_OUT_ROUTES: &[&str] = &[
     "/v1/chat/completions/derender",
     "/v1/completions/derender",
 ];
-
-async fn disabled_scale_out() -> (StatusCode, Json<ErrorResponse>) {
-    (
-        StatusCode::FORBIDDEN,
-        Json(ErrorResponse {
-            error: ErrorDetail {
-                message: SCALE_OUT_DISABLED_MESSAGE.to_string(),
-                error_type: "PermissionDeniedError".to_string(),
-                param: None,
-                code: StatusCode::FORBIDDEN.as_u16(),
-            },
-        }),
-    )
-}
 
 /// Placeholder for a route the Python frontend registers but the Rust frontend
 /// does not implement yet. Returning 501 instead of 404 tells clients that the
@@ -178,11 +161,7 @@ fn build_router_with_gates(state: Arc<AppState>, gates: RouteGates) -> Router {
             router = router.route(path, post(not_supported));
         }
     } else {
-        info!("{SCALE_OUT_DISABLED_MESSAGE}");
-        router = router.route("/inference/v1/generate", post(disabled_scale_out));
-        for path in UNIMPLEMENTED_SCALE_OUT_ROUTES {
-            router = router.route(path, post(disabled_scale_out));
-        }
+        info!("scale-out endpoints are disabled; pass --enable-scale-out to enable them");
     }
 
     if gates.cohere_api {
