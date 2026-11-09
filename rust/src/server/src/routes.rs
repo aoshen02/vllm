@@ -161,7 +161,10 @@ fn build_router_with_gates(state: Arc<AppState>, gates: RouteGates) -> Router {
             router = router.route(path, post(not_supported));
         }
     } else {
-        info!("scale-out endpoints are disabled; pass --enable-scale-out to enable them");
+        info!(
+            "scale-out endpoints are disabled; pass --enable-scale-out or set \
+             VLLM_SERVER_DEV_MODE=1 to enable them"
+        );
     }
 
     if gates.cohere_api {

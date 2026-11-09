@@ -90,7 +90,8 @@ def register_scale_out_api_routers(
     enabled = dedicated_mode or getattr(args, "enable_scale_out", False)
     if not enabled:
         logger.info(
-            "Scale-out endpoints are disabled. Set --enable-scale-out to enable them."
+            "Scale-out endpoints are disabled. Set --enable-scale-out or "
+            "VLLM_SERVER_DEV_MODE=1 to enable them."
         )
         return
 
