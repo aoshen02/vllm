@@ -28,6 +28,7 @@ from vllm.distributed.aux_output_connector.routed_experts import (
 )
 from vllm.distributed.aux_output_connector.session_objects import (
     SessionObjectWriter,
+    record_weight_version,
 )
 from vllm.distributed.aux_output_connector.store import (
     BackgroundBlockObjectStore,
@@ -55,6 +56,7 @@ class _WorkerRequestState:
     aux_output_keys: list[str] = field(default_factory=list)
     block_hash_hexes: list[str] = field(default_factory=list)
     session: str | None = None
+    weight_versions: list[tuple[int, str]] = field(default_factory=list)
     pending_blocks: list[tuple[int, np.ndarray]] = field(default_factory=list)
     capture_cursor: int | None = None
     scheduled_cursor: int = 0
@@ -74,6 +76,7 @@ class PendingAuxOutput:
     query_start_loc: np.ndarray
     # GPU snapshot taken on the main stream.
     routed_experts_gpu: torch.Tensor
+    weight_version: str = "default"
     # Filled by enqueue_cpu_copy on the output copy stream.
     routed_experts: np.ndarray | None = None
     num_sampled: np.ndarray | None = None
@@ -207,6 +210,7 @@ class AuxOutputWorkerConnector:
             token_starts=input_batch.num_computed_tokens_np,
             query_start_loc=query_start_loc,
             routed_experts_gpu=self._capturer.snapshot_routing_data(num_rows),
+            weight_version=self._step_metadata.weight_version,
         )
         with self._lock:
             assert len(self._pending_outputs) < self._max_concurrent_batches, (
@@ -299,6 +303,10 @@ class AuxOutputWorkerConnector:
                     "auxiliary output capture has an unbacked token gap"
                 )
                 capture_start = capture_cursor
+            if state.session is not None:
+                record_weight_version(
+                    state.weight_versions, capture_start, pending.weight_version
+                )
 
             emit_start = state.emit_cursor
             # Complete blocks without keys remain pending until a hash update.
@@ -375,6 +383,7 @@ class AuxOutputWorkerConnector:
                         state.session,
                         state.block_hash_hexes,
                         ready,
+                        state.weight_versions,
                     )
         if ready_batches or retain_keys or release_keys:
             publish_routed_experts(

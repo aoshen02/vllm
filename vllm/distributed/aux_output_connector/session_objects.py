@@ -19,17 +19,38 @@ from vllm.distributed.aux_output_connector.objects import encode_aux_object
 ROUTED_EXPERTS_FIELD = "routed_experts"
 
 
-def aux_object_key(key_prefix: str, session: str, block_hash_hex: str) -> str:
-    """Key of the object that ends with the hash block `block_hash_hex`."""
-    return f"{key_prefix}/{session}/{block_hash_hex}"
+def aux_object_key(
+    key_prefix: str, session: str, block_hash_hex: str, weight_version: str
+) -> str:
+    """Key of the object that ends with the hash block `block_hash_hex` and
+    whose last row was computed with weights `weight_version`."""
+    return f"{key_prefix}/{session}/{block_hash_hex}@{weight_version}"
+
+
+def record_weight_version(
+    versions: list[tuple[int, str]], start: int, weight_version: str
+) -> None:
+    """Record that positions from `start` on are computed with `weight_version`."""
+    while versions and versions[-1][0] >= start:
+        versions.pop()
+    if not versions or versions[-1][1] != weight_version:
+        versions.append((start, weight_version))
+
+
+def weight_version_at(versions: Sequence[tuple[int, str]], position: int) -> str:
+    """Weight version that computed `position`."""
+    for start, weight_version in reversed(versions):
+        if start <= position:
+            return weight_version
+    raise ValueError(f"no weight version recorded for position {position}")
 
 
 class SessionObjectWriter:
     """Assemble full objects from hash blocks and write them in the background.
 
     An object holds `object_size` positions and is named by the hash of its
-    last hash block within its session. Each object is written once per
-    session; a failed write fails every later call.
+    last hash block and the weight version of its last row within its
+    session. Each key is written once; a failed write fails every later call.
     """
 
     def __init__(
@@ -85,11 +106,13 @@ class SessionObjectWriter:
         session: str,
         block_hash_hexes: Sequence[str],
         blocks: Sequence[tuple[int, np.ndarray]],
+        weight_versions: Sequence[tuple[int, str]],
     ) -> None:
         """Stage computed hash blocks; write the objects they complete.
 
-        `blocks` are `(start, rows)` pairs of full hash blocks and
-        `block_hash_hexes` are the request's hash-block hashes so far.
+        `blocks` are `(start, rows)` pairs of full hash blocks,
+        `block_hash_hexes` are the request's hash-block hashes so far and
+        `weight_versions` are `(start, version)` runs of its positions.
         """
         self.check()
         staged = self._staged.setdefault(request_id, {})
@@ -104,7 +127,12 @@ class SessionObjectWriter:
                 continue
             del staged[index]
             last = (index + 1) * self._pieces_per_object - 1
-            key = aux_object_key(self._key_prefix, session, block_hash_hexes[last])
+            key = aux_object_key(
+                self._key_prefix,
+                session,
+                block_hash_hexes[last],
+                weight_version_at(weight_versions, (index + 1) * self.object_size - 1),
+            )
             if key in written:
                 continue
             written.add(key)

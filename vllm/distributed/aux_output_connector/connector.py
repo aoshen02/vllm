@@ -13,7 +13,11 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
-from vllm.distributed.aux_output_connector.session_objects import aux_object_key
+from vllm.distributed.aux_output_connector.session_objects import (
+    aux_object_key,
+    record_weight_version,
+    weight_version_at,
+)
 from vllm.v1.core.kv_cache_utils import maybe_convert_block_hash
 
 if TYPE_CHECKING:
@@ -69,6 +73,7 @@ class AuxOutputConnectorMetadata:
     released_block_hashes: PackedBlockHashes | None = None
     sessions: dict[str, str] | None = None
     released_sessions: tuple[str, ...] = ()
+    weight_version: str = "default"
 
 
 @dataclass
@@ -118,7 +123,12 @@ class AuxOutputSchedulerConnector:
         self._released_hashes: list[bytes] = []
         self._object_size = self._block_size if object_store else None
         self._key_prefix = key_prefix
-        self._published: dict[str, set[bytes]] = {}
+        self._weight_version = "default"
+        # Weight version of each object a session published, and of the
+        # latest commit of each object by any session.
+        self._published: dict[str, dict[bytes, str]] = {}
+        self._commit_versions: dict[bytes, str] = {}
+        self._weight_versions: dict[str, list[tuple[int, str]]] = {}
         self._session_idle_timeout_s = session_idle_timeout_s
         self._session_requests: Counter[str] = Counter()
         self._session_last_used: dict[str, float] = {}
@@ -141,6 +151,12 @@ class AuxOutputSchedulerConnector:
                 if (session := self._session(request)) is not None:
                     sessions[request_id] = session
                     self._session_requests[session] += 1
+            if self._session(request) is not None:
+                record_weight_version(
+                    self._weight_versions.setdefault(request_id, []),
+                    request.num_computed_tokens,
+                    self._weight_version,
+                )
             packed = self._take_new_hashes(
                 request, request.num_computed_tokens + num_tokens
             )
@@ -175,6 +191,7 @@ class AuxOutputSchedulerConnector:
             self._pack_hashes(self._released_hashes),
             sessions or None,
             self._forget_idle_sessions(),
+            self._weight_version,
         )
         self._retained_hashes, self._released_hashes = [], []
         return metadata
@@ -207,7 +224,18 @@ class AuxOutputSchedulerConnector:
             del self._session_last_used[session]
             del self._session_requests[session]
             self._published.pop(session, None)
+        if idle:
+            live = set(chain.from_iterable(self._published.values()))
+            self._commit_versions = {
+                object_hash: weight_version
+                for object_hash, weight_version in self._commit_versions.items()
+                if object_hash in live
+            }
         return idle
+
+    def set_weight_version(self, weight_version: str) -> None:
+        """Set the weight version of later steps; call while no step runs."""
+        self._weight_version = weight_version
 
     def _session(self, request: Request) -> str | None:
         if self._object_size is None or request.sampling_params is None:
@@ -223,10 +251,13 @@ class AuxOutputSchedulerConnector:
     def max_cache_hit(self, request: Request) -> int:
         if (session := self._session(request)) is not None:
             assert self._object_size is not None
-            published = self._published.get(session, set())
+            published = self._published.get(session, {})
             num_objects = 0
             for object_hash in self._object_hashes(request.block_hashes):
-                if object_hash not in published:
+                if (
+                    object_hash not in published
+                    or published[object_hash] != self._commit_versions[object_hash]
+                ):
                     break
                 num_objects += 1
             last = (request.num_tokens - 1) // self._object_size
@@ -316,11 +347,23 @@ class AuxOutputSchedulerConnector:
         assert request_output.token_start == tail_start + len(tail), (
             "auxiliary output rows of a session request are not contiguous"
         )
+        weight_versions = self._weight_versions[request_id]
+        first_object = max(
+            (tail_start + len(tail)) // self._object_size,
+            -(-weight_versions[0][0] // self._object_size),
+        )
         tail = np.concatenate((tail, rows))
         num_objects = (tail_start + len(tail)) // self._object_size
-        self._published.setdefault(session, set()).update(
-            islice(self._object_hashes(request.block_hashes), num_objects)
-        )
+        published = self._published.setdefault(session, {})
+        object_hashes = self._object_hashes(request.block_hashes)
+        for index, object_hash in enumerate(
+            islice(object_hashes, first_object, num_objects), first_object
+        ):
+            weight_version = weight_version_at(
+                weight_versions, (index + 1) * self._object_size - 1
+            )
+            published[object_hash] = weight_version
+            self._commit_versions[object_hash] = weight_version
         boundary = token_end // self._object_size * self._object_size
         if boundary > tail_start:
             tail = tail[boundary - tail_start :]
@@ -335,9 +378,12 @@ class AuxOutputSchedulerConnector:
             return None
         assert self._object_size is not None
         tail_start, _ = self._tails.pop(request.request_id)
+        published = self._published[session]
         object_hashes = self._object_hashes(request.block_hashes)
         return [
-            aux_object_key(self._key_prefix, session, object_hash.hex())
+            aux_object_key(
+                self._key_prefix, session, object_hash.hex(), published[object_hash]
+            )
             for object_hash in islice(object_hashes, tail_start // self._object_size)
         ]
 
@@ -346,6 +392,7 @@ class AuxOutputSchedulerConnector:
         request_id = request.request_id
         self._loading.pop(request_id, None)
         self._computed_starts.pop(request_id, None)
+        self._weight_versions.pop(request_id, None)
         if (session := self._session(request)) is not None:
             if request.is_finished():
                 self._tails.pop(request_id, None)

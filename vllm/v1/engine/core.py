@@ -1265,6 +1265,9 @@ class EngineCore:
 
     def set_weight_version(self, weight_version: str) -> None:
         self._weight_version = weight_version
+        connector = getattr(self.scheduler, "aux_output_connector", None)
+        if connector is not None:
+            connector.set_weight_version(weight_version)
 
     def get_weight_version(self) -> str:
         """Return the latest committed weight version."""
