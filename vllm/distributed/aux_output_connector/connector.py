@@ -137,7 +137,7 @@ class AuxOutputSchedulerConnector:
         self._session_last_used: dict[str, float] = {}
         self._next_session_sweep = 0.0
         self._tails: dict[str, tuple[int, np.ndarray]] = {}
-        self._field_tails: dict[str, dict[str, tuple[int, np.ndarray]]] = {}
+        self._field_tails: dict[str, dict[str, list[tuple[int, np.ndarray]]]] = {}
 
     def build_connector_meta(
         self,
@@ -372,19 +372,21 @@ class AuxOutputSchedulerConnector:
         tails = self._field_tails.setdefault(request_id, {})
         for name, (start, field_rows) in request_output.fields.items():
             field_rows = field_rows[: max(token_end - start, 0)]
-            previous = tails.get(name)
-            if previous is not None and previous[0] + len(previous[1]) == start:
-                start = previous[0]
-                field_rows = np.concatenate((previous[1], field_rows))
+            chunks = tails.get(name)
+            if chunks and chunks[-1][0] + len(chunks[-1][1]) == start:
+                chunks.append((start, field_rows))
             else:
                 assert start <= boundary, (
                     f"{name} rows of request {request_id} skip positions "
                     f"before {start} past the last object boundary {boundary}"
                 )
-            tails[name] = (start, field_rows)
-        for name, (start, field_rows) in tails.items():
+                tails[name] = [(start, field_rows)]
+        for chunks in tails.values():
+            while len(chunks) > 1 and chunks[1][0] <= boundary:
+                chunks.pop(0)
+            start, field_rows = chunks[0]
             if boundary > start:
-                tails[name] = (boundary, field_rows[boundary - start :])
+                chunks[0] = (boundary, field_rows[boundary - start :])
         if boundary > tail_start:
             tail = tail[boundary - tail_start :]
             tail_start = boundary
@@ -399,11 +401,14 @@ class AuxOutputSchedulerConnector:
         assert self._object_size is not None
         token_end = request.num_tokens - 1
         boundary = token_end // self._object_size * self._object_size
-        for name, (start, rows) in tails.items():
-            assert start == boundary and start + len(rows) == token_end, (
+        fields = {}
+        for name, chunks in tails.items():
+            rows = np.concatenate([field_rows for _, field_rows in chunks])
+            assert chunks[0][0] == boundary and boundary + len(rows) == token_end, (
                 f"{name} rows do not cover the request's tail"
             )
-        return {name: rows for name, (_, rows) in tails.items()}
+            fields[name] = rows
+        return fields
 
     def take_object_keys(self, request: Request) -> list[str] | None:
         """Keys of a finished session request's objects before its tail."""

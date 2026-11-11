@@ -632,6 +632,51 @@ def test_session_field_tail_is_empty_when_the_last_object_is_written():
     assert len(output.aux_fields["indexer_topk"]) == 0
 
 
+def test_session_field_tail_is_copied_once(monkeypatch):
+    scheduler = create_scheduler(enable_prefix_caching=True)
+    scheduler.aux_output_connector = AuxOutputSchedulerConnector(
+        scheduler.kv_cache_manager, object_store=True, key_prefix="job"
+    )
+    (request,) = create_requests(num_requests=1, num_tokens=2, max_tokens=14)
+    request.sampling_params = request.sampling_params.clone()
+    request.sampling_params.aux_session = "s"
+    scheduler.add_request(request)
+    indexer = np.arange(16 * 2, dtype=np.int32).reshape(16, 1, 2)
+    copied_rows = []
+    concatenate = np.concatenate
+
+    def counting_concatenate(arrays, *args, **kwargs):
+        arrays = list(arrays)
+        if arrays[0].dtype == indexer.dtype:
+            copied_rows.append(sum(len(array) for array in arrays))
+        return concatenate(arrays, *args, **kwargs)
+
+    monkeypatch.setattr(np, "concatenate", counting_concatenate)
+    steps = [(0, 2)] + [(start, start + 1) for start in range(2, 15)]
+    for start, end in steps:
+        scheduler_output = scheduler.schedule()
+        outputs = scheduler.update_from_output(
+            scheduler_output,
+            ModelRunnerOutput(
+                req_ids=[request.request_id],
+                sampled_token_ids=[[0]],
+                logprobs=None,
+                prompt_logprobs_dict={},
+                pooler_output=[],
+                aux_output_connector_output={
+                    request.request_id: AuxRequestOutput(
+                        start,
+                        np.zeros((end - start, 1, 1), dtype=np.uint8),
+                        {"indexer_topk": (start, indexer[start:end])},
+                    )
+                },
+            ),
+        )
+    output = outputs[request.client_index].outputs[0]
+    assert output.aux_fields["indexer_topk"].tolist() == indexer[:15].tolist()
+    assert sum(copied_rows) == 15
+
+
 def test_session_field_rows_with_a_gap_past_the_boundary_are_rejected():
     scheduler = create_scheduler(enable_prefix_caching=True)
     scheduler.aux_output_connector = AuxOutputSchedulerConnector(
