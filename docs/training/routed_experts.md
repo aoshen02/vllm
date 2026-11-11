@@ -83,7 +83,7 @@ Returning every row inline costs one copy per turn through the engine output pat
 - The engine writes one immutable object per KV cache block, the prefix-cache hit granularity, named `<key_prefix>/<aux_session>/<hash of the object's last hash block>`. An object is written once per session.
 - The finished response lists in `aux_output_keys` the keys of the objects covering rows `[0, B)`, where `B` is the last block boundary at or below `num_tokens - 1`, and returns rows `[B, num_tokens - 1)` in `routed_experts`. Every turn lists the full key list, so the caller replaces what it holds from the first key that differs.
 - Read the rows with `vllm.distributed.aux_output_connector.objects.read_aux_rows(store, keys, "routed_experts", tail)`, which waits for objects that are still being written.
-- A session request's prefix-cache hit covers only objects this session has published, so every listed key exists. Requests without `aux_session` keep the inline behavior.
+- A session request's prefix-cache hit covers only objects this session has published, so every listed key exists. An object counts as published once its rows have been committed by the worker; rows of an aborted step that never completed are not, so a later request recomputes those positions. Requests without `aux_session` keep the inline behavior.
 
 Objects stay in the store until the caller removes them:
 
