@@ -466,6 +466,49 @@ def test_idle_sessions_are_forgotten(monkeypatch, idle_s, expected_hit, released
     )
 
 
+@pytest.mark.parametrize(
+    "rows_received,expected_hit",
+    [(True, 80), (False, 0)],
+    ids=["committed", "aborted-in-flight"],
+)
+def test_sessions_publish_only_committed_objects(rows_received, expected_hit):
+    scheduler = create_scheduler(enable_prefix_caching=True)
+    scheduler.aux_output_connector = AuxOutputSchedulerConnector(
+        scheduler.kv_cache_manager, object_store=True, key_prefix="job"
+    )
+    first, second = create_requests(
+        num_requests=2, num_tokens=86, max_tokens=8, same_prompt=True
+    )
+    for request in (first, second):
+        request.sampling_params = request.sampling_params.clone()
+        request.sampling_params.aux_session = "s"
+    scheduler.add_request(first)
+    scheduler_output = scheduler.schedule()
+    if rows_received:
+        scheduler.update_from_output(
+            scheduler_output,
+            ModelRunnerOutput(
+                req_ids=[first.request_id],
+                sampled_token_ids=[[0]],
+                logprobs=None,
+                prompt_logprobs_dict={},
+                pooler_output=[],
+                aux_output_connector_output={
+                    first.request_id: AuxRequestOutput(
+                        0, np.zeros((86, 1, 1), dtype=np.uint8)
+                    )
+                },
+            ),
+        )
+    scheduler.finish_requests(first.request_id, RequestStatus.FINISHED_ABORTED)
+
+    scheduler.add_request(second)
+    scheduler_output = scheduler.schedule()
+    assert scheduler_output.num_scheduled_tokens[second.request_id] == (
+        86 - expected_hit
+    )
+
+
 def test_routed_experts_hashes_follow_scheduled_tokens():
     scheduler = create_scheduler(enable_prefix_caching=True, max_num_batched_tokens=64)
     scheduler.aux_output_connector = AuxOutputSchedulerConnector(

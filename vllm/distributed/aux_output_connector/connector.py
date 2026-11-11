@@ -307,7 +307,7 @@ class AuxOutputSchedulerConnector:
             f"output_end={request_output.token_start + len(request_output.rows)}"
         )
         rows = request_output.rows[:local_end]
-        if self._session(request) is None:
+        if (session := self._session(request)) is None:
             return rows
         assert self._object_size is not None
         tail_start, tail = self._tails.get(
@@ -317,6 +317,10 @@ class AuxOutputSchedulerConnector:
             "auxiliary output rows of a session request are not contiguous"
         )
         tail = np.concatenate((tail, rows))
+        num_objects = (tail_start + len(tail)) // self._object_size
+        self._published.setdefault(session, set()).update(
+            islice(self._object_hashes(request.block_hashes), num_objects)
+        )
         boundary = token_end // self._object_size * self._object_size
         if boundary > tail_start:
             tail = tail[boundary - tail_start :]
@@ -343,11 +347,6 @@ class AuxOutputSchedulerConnector:
         self._loading.pop(request_id, None)
         self._computed_starts.pop(request_id, None)
         if (session := self._session(request)) is not None:
-            assert self._object_size is not None
-            num_objects = request.num_computed_tokens // self._object_size
-            self._published.setdefault(session, set()).update(
-                islice(self._object_hashes(request.block_hashes), num_objects)
-            )
             if request.is_finished():
                 self._tails.pop(request_id, None)
             if request_id in self._sent_hash_counts:
