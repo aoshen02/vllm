@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from threading import Lock
 from typing import TYPE_CHECKING, Any
@@ -29,6 +29,8 @@ from vllm.distributed.aux_output_connector.routed_experts import (
 from vllm.distributed.aux_output_connector.session_objects import (
     HIDDEN_STATES_FIELD,
     INDEXER_TOPK_FIELD,
+    TOPK_LOGPROBS_FIELD,
+    TOPK_TOKEN_IDS_FIELD,
     SessionObjectWriter,
     record_weight_version,
 )
@@ -114,6 +116,7 @@ class AuxOutputWorkerConnector:
     _object_writer: SessionObjectWriter | None = None
     _indexer: IndexerTopkCapturer | None = None
     _return_hidden_states = False
+    _topk_logprobs = 0
 
     def __init__(
         self,
@@ -152,6 +155,7 @@ class AuxOutputWorkerConnector:
         self._return_hidden_states = (
             vllm_config.aux_output_config.enable_return_hidden_states
         )
+        self._topk_logprobs = vllm_config.aux_output_config.return_topk_logprobs
         self._vllm_config = vllm_config
         self._store: BackgroundBlockObjectStore | None = None
         self._buffer: RoutedExpertsBuffer | None = None
@@ -224,19 +228,35 @@ class AuxOutputWorkerConnector:
             )
 
     def prepare_output(
-        self, input_batch: InputBatch, hidden_states: torch.Tensor | None = None
+        self,
+        input_batch: InputBatch,
+        hidden_states: torch.Tensor | None = None,
+        logits_fn: Callable[[torch.Tensor], torch.Tensor | None] | None = None,
     ) -> PendingAuxOutput | None:
         """Snapshot one step's auxiliary tensors for asynchronous CPU transfer.
 
-        `hidden_states` are the step's LM-head inputs, one row per query token.
+        `hidden_states` are the step's LM-head inputs, one row per query token,
+        and `logits_fn` computes logits from them. Call on every rank: the
+        top-k logprobs need the logits collective.
         """
-        if self._buffer is None or self._step_metadata is None:
+        if self._step_metadata is None or (
+            self._buffer is None and not self._topk_logprobs
+        ):
             return None
-
         request_ids = list(input_batch.req_ids)
         query_start_loc = input_batch.query_start_loc_np[: len(request_ids) + 1]
         num_rows = int(query_start_loc[-1])
+        topk = None
+        if self._topk_logprobs and hidden_states is not None and logits_fn is not None:
+            topk = compute_topk_logprobs(
+                hidden_states[:num_rows], logits_fn, self._topk_logprobs
+            )
+        if self._buffer is None:
+            return None
+
         fields_gpu: dict[str, torch.Tensor] = {}
+        if topk is not None:
+            fields_gpu[TOPK_TOKEN_IDS_FIELD], fields_gpu[TOPK_LOGPROBS_FIELD] = topk
         if self._indexer is not None:
             fields_gpu[INDEXER_TOPK_FIELD] = self._indexer.snapshot(num_rows)
         if self._return_hidden_states and hidden_states is not None:
@@ -559,6 +579,27 @@ class AuxOutputWorkerConnector:
                     self._store.close()
                 finally:
                     self._store = None
+
+
+def compute_topk_logprobs(
+    hidden_states: torch.Tensor,
+    logits_fn: Callable[[torch.Tensor], torch.Tensor | None],
+    k: int,
+    chunk_size: int = 1024,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Top-k next-token ids (int32) and log-probabilities (float32) of every
+    row, or None on ranks that do not receive the logits."""
+    token_ids, logprobs = [], []
+    for start in range(0, len(hidden_states), chunk_size):
+        logits = logits_fn(hidden_states[start : start + chunk_size])
+        if logits is None:
+            continue
+        values, indices = torch.log_softmax(logits.float(), dim=-1).topk(k, dim=-1)
+        token_ids.append(indices.to(torch.int32))
+        logprobs.append(values)
+    if not token_ids:
+        return None
+    return torch.cat(token_ids), torch.cat(logprobs)
 
 
 def get_aux_output_connector(

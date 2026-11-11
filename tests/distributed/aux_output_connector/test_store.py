@@ -32,6 +32,7 @@ from vllm.distributed.aux_output_connector.store import (
 )
 from vllm.distributed.aux_output_connector.worker import (
     AuxOutputWorkerConnector,
+    compute_topk_logprobs,
 )
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
 from vllm.v1.outputs import ModelRunnerOutput
@@ -288,6 +289,30 @@ def test_worker_snapshots_hidden_states_of_query_rows(dtype):
     rows = torch.from_numpy(pending.fields["hidden_states"]).view(dtype)
     assert rows.shape == (1, 4) and bool(rows.ne(0).all())
     worker.close()
+
+
+@pytest.mark.parametrize(
+    "gathered", [True, False], ids=["logits-rank", "non-logits-rank"]
+)
+def test_topk_logprobs_are_computed_in_chunks(gathered):
+    hidden_states = torch.randn(5, 3)
+    weight = torch.randn(7, 3)
+    calls = []
+
+    def logits_fn(rows):
+        calls.append(len(rows))
+        return rows @ weight.T if gathered else None
+
+    topk = compute_topk_logprobs(hidden_states, logits_fn, 2, chunk_size=2)
+    assert calls == [2, 2, 1]
+    if not gathered:
+        assert topk is None
+        return
+    token_ids, logprobs = topk
+    expected = torch.log_softmax(hidden_states @ weight.T, dim=-1).topk(2, dim=-1)
+    assert token_ids.dtype == torch.int32
+    assert token_ids.tolist() == expected.indices.tolist()
+    torch.testing.assert_close(logprobs, expected.values)
 
 
 def test_next_step_does_not_consume_pending_output(monkeypatch):
