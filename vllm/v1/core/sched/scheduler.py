@@ -469,6 +469,8 @@ class Scheduler(SchedulerInterface):
                 bytes_per_token=get_routed_experts_bytes_per_token(
                     vllm_config.model_config
                 ),
+                object_store=vllm_config.aux_output_config.object_store is not None,
+                key_prefix=vllm_config.aux_output_config.object_key_prefix,
             )
             if vllm_config.aux_output_config.enabled
             else None
@@ -2453,6 +2455,7 @@ class Scheduler(SchedulerInterface):
                 stopped = True
 
             routed_experts = None
+            aux_output_keys = None
             should_emit_output = bool(
                 new_token_ids or pooler_output is not None or stopped
             )
@@ -2460,6 +2463,10 @@ class Scheduler(SchedulerInterface):
                 routed_experts = self.aux_output_connector.take_output(
                     request, model_runner_output.aux_output_connector_output
                 )
+                if stopped:
+                    aux_output_keys = self.aux_output_connector.take_object_keys(
+                        request
+                    )
             if should_emit_output:
                 prefill_stats = request.take_prefill_stats()
                 if prefill_stats is not None:
@@ -2551,6 +2558,7 @@ class Scheduler(SchedulerInterface):
                         routed_experts=routed_experts,
                         num_nans_in_logits=request.num_nans_in_logits,
                         watermarking=watermarking,
+                        aux_output_keys=aux_output_keys,
                     )
                 )
             else:

@@ -75,3 +75,14 @@ Use it when weights change between turns and the prompt is recomputed (for examp
 Replay applies only to positions the request computes. Positions served from the prefix cache keep the routing that computed their KV, and their returned rows are those cached rows, not the replayed ones; the returned rows always describe the KV that later tokens read. The KV and rows a replaying request computes are cached like any other, so a later request with the same prefix and salt, replaying or not, reuses them. Give requests whose cached routing must not be shared different cache salts.
 
 Supported for non-monolithic MoE kernels with softmax, sigmoid or sqrtsoftplus routers, without fused shared experts and without data parallelism.
+
+## Delivering rows through a shared object store
+
+Returning every row inline costs one copy per turn through the engine output path. With `--aux-output-config '{"enable_return_routed_experts": true, "object_store": {"backend": "mooncake", "key_prefix": "<job>"}}'` (the Mooncake client is configured by `MOONCAKE_CONFIG_PATH`, as for the Mooncake KV connector), a request that sets `SamplingParams(aux_session=...)` gets its rows through the store instead:
+
+- The engine writes one immutable object per KV cache block, the prefix-cache hit granularity, named `<key_prefix>/<aux_session>/<hash of the object's last hash block>`. An object is written once per session.
+- The finished response lists in `aux_output_keys` the keys of the objects covering rows `[0, B)`, where `B` is the last block boundary at or below `num_tokens - 1`, and returns rows `[B, num_tokens - 1)` in `routed_experts`. Every turn lists the full key list, so the caller replaces what it holds from the first key that differs.
+- Read the rows with `vllm.distributed.aux_output_connector.objects.read_aux_rows(store, keys, "routed_experts", tail)`, which waits for objects that are still being written.
+- A session request's prefix-cache hit covers only objects this session has published, so every listed key exists. Requests without `aux_session` keep the inline behavior.
+
+Objects stay in the store until the caller removes them by key.

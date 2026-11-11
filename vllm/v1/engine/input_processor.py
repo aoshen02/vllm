@@ -453,6 +453,14 @@ class InputProcessor:
                     parameter="routed_experts_prompt_start",
                     value=sampling_params.routed_experts_prompt_start,
                 )
+            if (
+                sampling_params.aux_session is not None
+                and self.vllm_config.aux_output_config.object_store is None
+            ):
+                raise VLLMValidationError(
+                    "aux_session requires AuxOutputConfig.object_store.",
+                    parameter="aux_session",
+                )
             routed_experts_replay = sampling_params.routed_experts_replay
             sampling_params.routed_experts_replay = None
             if routed_experts_replay is not None:

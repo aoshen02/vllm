@@ -456,6 +456,12 @@ class SamplingParams(
     with weights recomputed from the current router logits. Positions served
     from the prefix cache keep the routing that computed them. Requires
     `AuxOutputConfig.enable_routed_experts_replay`."""
+    aux_session: str | None = None
+    """Session of a multi-turn rollout whose routed experts are delivered
+    through `AuxOutputConfig.object_store`. The response lists the keys of
+    the objects that cover rows `[0, B)` in `aux_output_keys` and returns rows
+    `[B, num_tokens - 1)` in `routed_experts`. Prefix-cache hits are limited to
+    objects this session has published."""
     trace_decode_token_ids: list[int] | None = None
     """If provided, forces the engine to emit this predetermined sequence of
     token IDs during decoding instead of sampling randomly. Real logprobs are
@@ -499,6 +505,7 @@ class SamplingParams(
         logprob_token_ids: list[int] | None = None,
         routed_experts_prompt_start: int = 0,
         routed_experts_replay: Any = None,
+        aux_session: str | None = None,
         # Debugging / RL-specific parameters.
         trace_decode_token_ids: list[int] | None = None,
     ) -> "SamplingParams":
@@ -568,6 +575,7 @@ class SamplingParams(
             repetition_detection=repetition_detection,
             routed_experts_prompt_start=routed_experts_prompt_start,
             routed_experts_replay=routed_experts_replay,
+            aux_session=aux_session,
             trace_decode_token_ids=trace_decode_token_ids,
         )
 

@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Configuration for execution auxiliary outputs."""
 
-from typing import Self
+from typing import Any, Self
 
 from pydantic import Field, model_validator
 
@@ -27,6 +27,33 @@ class AuxOutputConfig:
     can hold are retained after their request finishes; a hit on a block whose
     rows were released is recomputed."""
 
+    object_store: dict[str, Any] | None = None
+    """Deliver the routed experts of requests that set
+    `SamplingParams.aux_session` through a shared object store: the response
+    lists the keys of the objects that cover its rows, one object per KV cache
+    block, followed by the rows past the last full block. Keys: `backend`
+    (`"mooncake"`, configured by `MOONCAKE_CONFIG_PATH`, or `"local"` for a
+    single process) and `key_prefix` (default `"vllm-aux"`), which should be
+    unique per job."""
+
+    @property
+    def object_key_prefix(self) -> str:
+        """Prefix of every shared object key."""
+        return (self.object_store or {}).get("key_prefix", "vllm-aux")
+
+    @model_validator(mode="after")
+    def _check_object_store(self) -> Self:
+        if self.object_store is None:
+            return self
+        if not self.enable_return_routed_experts:
+            raise ValueError("object_store requires enable_return_routed_experts.")
+        if self.object_store.get("backend") not in ("mooncake", "local"):
+            raise ValueError(
+                "object_store backend must be 'mooncake' or 'local', got "
+                f"{self.object_store.get('backend')!r}."
+            )
+        return self
+
     @model_validator(mode="after")
     def _check_replay(self) -> Self:
         if self.enable_routed_experts_replay and not self.enable_return_routed_experts:
@@ -46,5 +73,6 @@ class AuxOutputConfig:
         """
         ignored_factors = {
             "max_bytes",
+            "object_store",
         }
         return get_compile_factors(self, ignored_factors)
