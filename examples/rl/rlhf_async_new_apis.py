@@ -10,10 +10,11 @@ vLLM AsyncLLMEngine occupies another GPU for inference.
 
 Batch invariance is enabled so that generation output is deterministic
 regardless of how many requests are batched together. This is required
-for the validation phase to succeed. Batch invariance currently requires
-NVIDIA GPUs with compute capability 9.0 or higher:
-  - H-series: H100, H200
-  - B-series: B100, B200
+for the validation phase to succeed. Batch invariance requires NVIDIA GPUs
+with compute capability 8.0 or higher (A100, H100, B200, ...); this example
+enables it on NVIDIA only. The trainer actor calls init_batch_invariance() so
+that its NCCL settings match the vLLM workers. See
+docs/features/batch_invariance.md.
 
 The example performs the following steps:
 * Load the training model (Qwen3-1.7B) on one GPU via a Ray actor.
