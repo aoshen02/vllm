@@ -56,6 +56,75 @@ Four modes are supported: `raw_logprobs` (default), `processed_logprobs`, `raw_l
 Raw means the values before applying any logit processors, like bad words.
 Processed means the values after applying all processors, including temperature and top_k/top_p.
 
+#### Full-vocabulary logprobs
+
+To get the logprob of every vocabulary token at each step (for example for KL
+or entropy terms in RL training), request `logprobs=-1` and start the engine
+with `--max-logprobs -1`.
+
+- `--max-logprobs` (default `20`) caps every request. `-1` means "no cap"
+  (the vocabulary size). Without it, `logprobs=-1` fails with
+  `Requested sample logprobs of <vocab_size>, which is greater than max allowed: 20`.
+- `--logprobs-mode` selects which distribution is returned. It is engine-wide,
+  not per request. `raw_logprobs` (default) is the model's log-softmax before
+  any logits processors, penalties, temperature, or top-k/top-p.
+  `processed_logprobs` is the distribution the sampler draws from: after
+  penalties, temperature, and top-k/top-p. Tokens filtered out by top-k/top-p
+  get `-inf`. `raw_logits` and `processed_logits` return logits instead.
+- For `prompt_logprobs=-1`, raw and processed modes return the same values.
+
+Offline (`LLM`):
+
+```python
+from vllm import LLM, SamplingParams
+
+llm = LLM(model, max_logprobs=-1, logprobs_mode="processed_logprobs")
+params = SamplingParams(temperature=1.0, logprobs=-1, flat_logprobs=True)
+out = llm.generate(prompts, params)[0].outputs[0]
+lp = out.logprobs  # FlatLogprobs: flat token_ids / logprobs / ranks lists
+for pos in range(len(out.token_ids)):
+    s, e = lp.start_indices[pos], lp.end_indices[pos]
+    ids, vals = lp.token_ids[s:e], lp.logprobs[s:e]
+```
+
+Online (OpenAI-compatible server):
+
+```bash
+vllm serve <model> --max-logprobs -1 --logprobs-mode processed_logprobs
+```
+
+- Chat Completions: `"logprobs": true, "top_logprobs": -1`.
+- Completions: `"logprobs": -1`.
+- `prompt_logprobs` (`-1` or `> 0`) is rejected when `stream=true`.
+
+Output layout per position: entry 0 is the sampled token, followed by all
+`vocab_size` tokens sorted by rank (so the sampled token appears twice in
+`FlatLogprobs`, once in the default dict form). The values are not in
+vocabulary order; scatter them by `token_ids` if you need a dense vector.
+
+Overhead and limitations:
+
+- There is no tensor or zero-copy output path. Each step sorts the full
+  vocabulary (top-k with `k = vocab_size`), copies `vocab_size + 1` floats and
+  ids per token to the CPU, and converts them to Python lists. Expect high CPU
+  and memory cost for long outputs and large vocabularies.
+- `SamplingParams(flat_logprobs=True)` returns `FlatLogprobs` instead of
+  `list[dict[int, Logprob]]`, which cuts Python object and GC overhead
+  significantly. It is only available in the Python API, not as an OpenAI
+  request field.
+- `SamplingParams(detokenize=False)` (or `--skip-tokenizer-init`) skips
+  decoding a string for every vocabulary token at every step.
+- `processed_logprobs` / `processed_logits` disable the FlashInfer (CUDA) and
+  aiter (ROCm) top-k/top-p samplers, falling back to the PyTorch-native
+  sampler. With the V1 model runner this applies to every request, not only
+  those that ask for logprobs; the V2 model runner skips the fused sampler
+  only for batches that return logprobs.
+- `--max-logprobs -1` cannot be combined with
+  `--enable-batch-sharded-sampling` (startup `ValueError`).
+- If you only need a few known tokens, `logprob_token_ids` (Chat and
+  Completions request field, or `SamplingParams.logprob_token_ids`) gathers
+  just those ids and is much cheaper than full-vocabulary logprobs.
+
 #### Prompt Logprobs with Prefix Caching
 
 While V1 supports passing prompt logprobs with prefix caching enabled, it no longer caches the logprobs.
