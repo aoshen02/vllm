@@ -241,7 +241,7 @@ class RequestState:
         # Routed experts accumulation (prompt + sample chunks)
         self.routed_experts_chunks: list[np.ndarray] = []
         self.aux_output_keys: list[str] | None = None
-        self.aux_fields: dict[str, np.ndarray] | None = None
+        self.aux_field_chunks: dict[str, list[np.ndarray]] = {}
         self.sampling_mask_chunks: list[SamplingMaskLists] = []
         # (weight version, first output-token index) for each span.
         self.weight_version_starts: list[tuple[str, int]] = []
@@ -525,7 +525,14 @@ class RequestState:
             token_ids=token_ids,
             routed_experts=routed_experts,
             aux_output_keys=self.aux_output_keys if finished else None,
-            aux_fields=self.aux_fields if finished else None,
+            aux_fields=(
+                {
+                    name: np.concatenate(chunks, axis=0)
+                    for name, chunks in self.aux_field_chunks.items()
+                }
+                if finished and self.aux_field_chunks
+                else None
+            ),
             sampling_mask=sampling_mask,
             logprobs=logprobs,
             cumulative_logprob=self.logprobs_processor.cumulative_logprob,
@@ -795,8 +802,8 @@ class OutputProcessor:
                 )
             if engine_core_output.aux_output_keys is not None:
                 req_state.aux_output_keys = engine_core_output.aux_output_keys
-            if engine_core_output.aux_fields is not None:
-                req_state.aux_fields = engine_core_output.aux_fields
+            for name, rows in (engine_core_output.aux_fields or {}).items():
+                req_state.aux_field_chunks.setdefault(name, []).append(rows)
 
             if req_state.is_prefilling:
                 if engine_core_output.prefill_stats is not None:
@@ -924,6 +931,8 @@ class OutputProcessor:
             )
         if output.routed_experts is not None:
             req_state.routed_experts_chunks[-1] = output.routed_experts[:-num_dropped]
+        for name, rows in (output.aux_fields or {}).items():
+            req_state.aux_field_chunks[name][-1] = rows[:-num_dropped]
 
     def _finish_request(self, req_state: RequestState) -> None:
         req_id = req_state.request_id

@@ -23,19 +23,20 @@ class AuxOutputConfig:
 
     enable_return_indexer_topk: bool = False
     """Capture the sparse-attention indexer's top-k positions of every
-    indexer layer and deliver them with the routed experts of session
-    requests (`SamplingParams.aux_session`). Requires `object_store`."""
+    indexer layer. Delivered inline in `CompletionOutput.aux_fields`, or
+    through `object_store` for session requests when it is set."""
 
     enable_return_hidden_states: bool = False
     """Deliver the final hidden states (the input of the LM head) of every
-    computed position with the routed experts of session requests
-    (`SamplingParams.aux_session`). Requires `object_store`."""
+    computed position. Delivered inline in `CompletionOutput.aux_fields`, or
+    through `object_store` for session requests when it is set."""
 
     return_topk_logprobs: int = Field(default=0, ge=0)
     """Deliver the top-k token ids and log-probabilities of the next token at
-    every computed position with the routed experts of session requests
-    (`SamplingParams.aux_session`); 0 disables. Prefix-cache hits keep the
-    rows of the request that computed them. Requires `object_store`."""
+    every computed position; 0 disables. Delivered inline in
+    `CompletionOutput.aux_fields`, or through `object_store` for session
+    requests when it is set, where prefix-cache hits keep the rows of the
+    request that computed them."""
 
     max_bytes: int | None = Field(default=None, gt=0)
     """Capacity of the row cache that serves prefix-cache and KV offload hits,
@@ -65,13 +66,6 @@ class AuxOutputConfig:
     @model_validator(mode="after")
     def _check_object_store(self) -> Self:
         if self.object_store is None:
-            for name in (
-                "enable_return_indexer_topk",
-                "enable_return_hidden_states",
-                "return_topk_logprobs",
-            ):
-                if getattr(self, name):
-                    raise ValueError(f"{name} requires object_store.")
             return self
         if not (
             self.enable_return_routed_experts
@@ -98,7 +92,13 @@ class AuxOutputConfig:
     @property
     def enabled(self) -> bool:
         """Whether any execution auxiliary output is enabled."""
-        return self.enable_return_routed_experts or self.object_store is not None
+        return (
+            self.enable_return_routed_experts
+            or self.enable_return_indexer_topk
+            or self.enable_return_hidden_states
+            or bool(self.return_topk_logprobs)
+            or self.object_store is not None
+        )
 
     def compile_factors(self) -> CompileFactors:
         """WARNING: Whenever a new field is added to this config, add it to

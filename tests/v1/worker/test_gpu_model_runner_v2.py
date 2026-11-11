@@ -131,6 +131,7 @@ def test_profile_run_creates_aux_output_connector_before_forward(
             enable_return_indexer_topk=False,
             enable_return_hidden_states=False,
             return_topk_logprobs=0,
+            object_store=None,
         ),
         max_concurrent_batches=1,
         scheduler_config=SimpleNamespace(max_num_batched_tokens=8),

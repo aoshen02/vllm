@@ -632,6 +632,36 @@ def test_session_field_tail_is_empty_when_the_last_object_is_written():
     assert len(output.aux_fields["indexer_topk"]) == 0
 
 
+def test_requests_without_session_return_inline_fields():
+    scheduler = create_scheduler(enable_prefix_caching=True)
+    scheduler.aux_output_connector = AuxOutputSchedulerConnector(
+        scheduler.kv_cache_manager
+    )
+    (request,) = create_requests(num_requests=1, num_tokens=10, max_tokens=1)
+    scheduler.add_request(request)
+    scheduler_output = scheduler.schedule()
+    hidden = np.arange(11, dtype=np.float32).reshape(11, 1)
+    outputs = scheduler.update_from_output(
+        scheduler_output,
+        ModelRunnerOutput(
+            req_ids=[request.request_id],
+            sampled_token_ids=[[0]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+            aux_output_connector_output={
+                request.request_id: AuxRequestOutput(
+                    0,
+                    np.zeros((10, 1, 1), dtype=np.uint8),
+                    {"hidden_states": (0, hidden)},
+                )
+            },
+        ),
+    )
+    output = outputs[request.client_index].outputs[0]
+    assert output.aux_fields["hidden_states"].tolist() == hidden[:10].tolist()
+
+
 def test_session_field_tail_is_copied_once(monkeypatch):
     scheduler = create_scheduler(enable_prefix_caching=True)
     scheduler.aux_output_connector = AuxOutputSchedulerConnector(

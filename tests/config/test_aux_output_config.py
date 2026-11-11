@@ -120,6 +120,20 @@ def test_object_store_without_routed_experts(kwargs, error):
     assert config.enabled and not config.enable_return_routed_experts
 
 
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"return_topk_logprobs": 2},
+        {"enable_return_hidden_states": True},
+        {"enable_return_indexer_topk": True},
+    ],
+    ids=["topk-logprobs", "hidden-states", "indexer-topk"],
+)
+def test_outputs_without_object_store_are_inline(kwargs):
+    config = AuxOutputConfig(**kwargs)
+    assert config.enabled and config.object_store is None
+
+
 def test_dense_model_without_routed_experts_is_accepted():
     config = _config(is_moe=False)
     config.aux_output_config = AuxOutputConfig(

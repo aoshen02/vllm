@@ -70,6 +70,7 @@ class _WorkerRequestState:
     scheduled_cursor: int = 0
     emit_cursor: int = 0
     pending_outputs: int = 0
+    inline_fields: dict[str, list[tuple[int, np.ndarray]]] = field(default_factory=dict)
     # Terminal event received; teardown waits for in-flight step outputs.
     finished: bool = False
 
@@ -117,6 +118,7 @@ class AuxOutputWorkerConnector:
     _indexer: IndexerTopkCapturer | None = None
     _return_hidden_states = False
     _topk_logprobs = 0
+    _inline_fields = False
 
     def __init__(
         self,
@@ -162,6 +164,7 @@ class AuxOutputWorkerConnector:
             vllm_config.aux_output_config.enable_return_hidden_states
         )
         self._topk_logprobs = vllm_config.aux_output_config.return_topk_logprobs
+        self._inline_fields = vllm_config.aux_output_config.object_store is None
         self._session_request_ids: set[str] = set()
         self._session_generation = 0
         self._vllm_config = vllm_config
@@ -257,7 +260,13 @@ class AuxOutputWorkerConnector:
         num_rows = int(query_start_loc[-1])
         topk = None
         if self._topk_logprobs and hidden_states is not None and logits_fn is not None:
-            rows = session_rows(request_ids, query_start_loc, self._session_request_ids)
+            rows = (
+                np.arange(num_rows)
+                if self._inline_fields
+                else session_rows(
+                    request_ids, query_start_loc, self._session_request_ids
+                )
+            )
             if len(rows):
                 topk = compute_topk_logprobs(
                     hidden_states, logits_fn, self._topk_logprobs, rows, num_rows
@@ -388,6 +397,16 @@ class AuxOutputWorkerConnector:
                             capture_start,
                             field_rows[start : end - rejected],
                         )
+            elif self._inline_fields:
+                first = max(capture_start, state.emit_cursor)
+                for name, field_rows in pending.fields.items():
+                    new_rows = field_rows[start : end - rejected][
+                        first - capture_start :
+                    ]
+                    if len(new_rows):
+                        state.inline_fields.setdefault(name, []).append(
+                            (first, new_rows)
+                        )
 
             emit_start = state.emit_cursor
             # Complete blocks without keys remain pending until a hash update.
@@ -448,6 +467,15 @@ class AuxOutputWorkerConnector:
                     )
                     if staged is not None:
                         output.fields[name] = staged
+        if self._inline_fields:
+            for request_id, output in outputs.items():
+                state = self._requests[request_id]
+                for name, chunks in state.inline_fields.items():
+                    output.fields[name] = (
+                        chunks[0][0],
+                        np.concatenate([rows for _, rows in chunks]),
+                    )
+                state.inline_fields.clear()
         return outputs
 
     def _publish_blocks(
