@@ -18,6 +18,7 @@ from vllm.distributed.aux_output_connector.objects import encode_aux_object
 
 ROUTED_EXPERTS_FIELD = "routed_experts"
 INDEXER_TOPK_FIELD = "indexer_topk"
+HIDDEN_STATES_FIELD = "hidden_states"
 
 
 def aux_object_key(

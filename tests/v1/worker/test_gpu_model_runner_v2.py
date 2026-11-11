@@ -128,6 +128,7 @@ def test_profile_run_creates_aux_output_connector_before_forward(
             enabled=enabled,
             enable_routed_experts_replay=False,
             enable_return_indexer_topk=False,
+            enable_return_hidden_states=False,
         ),
         max_concurrent_batches=1,
         scheduler_config=SimpleNamespace(max_num_batched_tokens=8),

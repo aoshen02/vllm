@@ -266,6 +266,30 @@ def test_worker_skips_aux_outputs_for_internal_warmup_step():
     worker.close()
 
 
+@pytest.mark.parametrize(
+    "dtype", [torch.bfloat16, torch.float32], ids=["bfloat16", "float32"]
+)
+def test_worker_snapshots_hidden_states_of_query_rows(dtype):
+    worker = _make_worker(1)
+    worker._return_hidden_states = True
+    worker.begin_step(
+        _metadata(0, [_request_metadata("request", 0, 1, 0, [])], {}).metadata
+    )
+    worker._capturer = Mock()
+    worker._capturer.snapshot_routing_data.return_value = torch.ones(
+        (1, *_SHAPE), dtype=torch.uint8
+    )
+    hidden_states = torch.randn(3, 4).to(dtype)
+    pending = worker.prepare_output(
+        _input_batch(["request"], np.array([0]), np.array([0, 1])), hidden_states
+    )
+    hidden_states.zero_()
+    pending.enqueue_cpu_copy(np.array([1]), np.array([0]))
+    rows = torch.from_numpy(pending.fields["hidden_states"]).view(dtype)
+    assert rows.shape == (1, 4) and bool(rows.ne(0).all())
+    worker.close()
+
+
 def test_next_step_does_not_consume_pending_output(monkeypatch):
     """begin_step must not wait for or consume an unconsumed step output."""
     event = Mock()

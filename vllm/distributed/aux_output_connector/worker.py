@@ -27,6 +27,7 @@ from vllm.distributed.aux_output_connector.routed_experts import (
     routed_experts_keys,
 )
 from vllm.distributed.aux_output_connector.session_objects import (
+    HIDDEN_STATES_FIELD,
     INDEXER_TOPK_FIELD,
     SessionObjectWriter,
     record_weight_version,
@@ -112,6 +113,7 @@ class AuxOutputWorkerConnector:
 
     _object_writer: SessionObjectWriter | None = None
     _indexer: IndexerTopkCapturer | None = None
+    _return_hidden_states = False
 
     def __init__(
         self,
@@ -147,6 +149,9 @@ class AuxOutputWorkerConnector:
                     "enable_return_indexer_topk requires a model with "
                     "sparse-attention indexer layers."
                 )
+        self._return_hidden_states = (
+            vllm_config.aux_output_config.enable_return_hidden_states
+        )
         self._vllm_config = vllm_config
         self._store: BackgroundBlockObjectStore | None = None
         self._buffer: RoutedExpertsBuffer | None = None
@@ -218,14 +223,28 @@ class AuxOutputWorkerConnector:
                 max_pending_batches=2 * vllm_config.scheduler_config.max_num_seqs,
             )
 
-    def prepare_output(self, input_batch: InputBatch) -> PendingAuxOutput | None:
-        """Snapshot one step's R3 tensor for asynchronous CPU transfer."""
+    def prepare_output(
+        self, input_batch: InputBatch, hidden_states: torch.Tensor | None = None
+    ) -> PendingAuxOutput | None:
+        """Snapshot one step's auxiliary tensors for asynchronous CPU transfer.
+
+        `hidden_states` are the step's LM-head inputs, one row per query token.
+        """
         if self._buffer is None or self._step_metadata is None:
             return None
 
         request_ids = list(input_batch.req_ids)
         query_start_loc = input_batch.query_start_loc_np[: len(request_ids) + 1]
         num_rows = int(query_start_loc[-1])
+        fields_gpu: dict[str, torch.Tensor] = {}
+        if self._indexer is not None:
+            fields_gpu[INDEXER_TOPK_FIELD] = self._indexer.snapshot(num_rows)
+        if self._return_hidden_states and hidden_states is not None:
+            rows = hidden_states[:num_rows]
+            # NumPy has no bfloat16: keep the bit patterns.
+            if rows.dtype == torch.bfloat16:
+                rows = rows.view(torch.int16)
+            fields_gpu[HIDDEN_STATES_FIELD] = rows.clone()
         pending_output = PendingAuxOutput(
             connector=self,
             request_ids=request_ids,
@@ -233,11 +252,7 @@ class AuxOutputWorkerConnector:
             query_start_loc=query_start_loc,
             routed_experts_gpu=self._capturer.snapshot_routing_data(num_rows),
             weight_version=self._step_metadata.weight_version,
-            fields_gpu=(
-                {INDEXER_TOPK_FIELD: self._indexer.snapshot(num_rows)}
-                if self._indexer is not None
-                else {}
-            ),
+            fields_gpu=fields_gpu,
         )
         with self._lock:
             assert len(self._pending_outputs) < self._max_concurrent_batches, (
