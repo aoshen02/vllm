@@ -2326,7 +2326,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         pending_aux_output = None
         if self.aux_output_connector is not None:
-            pending_aux_output = self.aux_output_connector.prepare_output(input_batch)
+            pending_aux_output = self.aux_output_connector.prepare_output(
+                input_batch, hidden_states
+            )
 
         # Start async output copy here so that it can overlap with speculator proposal.
         async_output = AsyncOutput(
