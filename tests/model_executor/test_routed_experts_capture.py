@@ -836,7 +836,7 @@ def test_aux_output_worker_connector_default_capacity(monkeypatch):
 
     config = SimpleNamespace(
         aux_output_config=SimpleNamespace(
-            max_bytes=None, enable_routed_experts_replay=False
+            max_bytes=None, enable_routed_experts_replay=False, object_store=None
         ),
         kv_transfer_config=None,
         cache_config=SimpleNamespace(enable_prefix_caching=True),

@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
+from vllm.distributed.aux_output_connector.session_objects import aux_object_key
 from vllm.v1.core.kv_cache_utils import maybe_convert_block_hash
 
 if TYPE_CHECKING:
@@ -65,6 +66,7 @@ class AuxOutputConnectorMetadata:
     finished_requests: tuple[str, ...]
     retained_block_hashes: PackedBlockHashes | None = None
     released_block_hashes: PackedBlockHashes | None = None
+    sessions: dict[str, str] | None = None
 
 
 @dataclass
@@ -82,6 +84,8 @@ class AuxOutputSchedulerConnector:
         kv_connector: KVConnectorBase_V1 | None = None,
         max_bytes: int | None = None,
         bytes_per_token: int = 0,
+        object_store: bool = False,
+        key_prefix: str = "",
     ) -> None:
         # Number of hashes already sent to the worker for each active request.
         self._sent_hash_counts: dict[str, int] = {}
@@ -109,6 +113,10 @@ class AuxOutputSchedulerConnector:
         )
         self._retained_hashes: list[bytes] = []
         self._released_hashes: list[bytes] = []
+        self._object_size = self._block_size if object_store else None
+        self._key_prefix = key_prefix
+        self._published: dict[str, set[bytes]] = {}
+        self._tails: dict[str, tuple[int, np.ndarray]] = {}
 
     def build_connector_meta(
         self,
@@ -118,9 +126,13 @@ class AuxOutputSchedulerConnector:
         """Build one step's incremental worker metadata."""
         scheduled_requests: dict[str, int] = {}
         block_hashes_by_request: dict[str, PackedBlockHashes] = {}
+        sessions: dict[str, str] = {}
         for request_id, num_tokens in scheduler_output.num_scheduled_tokens.items():
-            self._sent_hash_counts.setdefault(request_id, 0)
             request = requests[request_id]
+            if request_id not in self._sent_hash_counts:
+                self._sent_hash_counts[request_id] = 0
+                if (session := self._session(request)) is not None:
+                    sessions[request_id] = session
             packed = self._take_new_hashes(
                 request, request.num_computed_tokens + num_tokens
             )
@@ -153,6 +165,7 @@ class AuxOutputSchedulerConnector:
             finished_requests,
             self._pack_hashes(self._retained_hashes),
             self._pack_hashes(self._released_hashes),
+            sessions or None,
         )
         self._retained_hashes, self._released_hashes = [], []
         return metadata
@@ -170,7 +183,28 @@ class AuxOutputSchedulerConnector:
             ),
         )
 
+    def _session(self, request: Request) -> str | None:
+        if self._object_size is None or request.sampling_params is None:
+            return None
+        return request.sampling_params.aux_session
+
+    def _object_hashes(self, hashes: Sequence[BlockHash]) -> Iterator[bytes]:
+        assert self._object_size is not None
+        step = self._object_size // self._hash_block_size
+        for end in range(step, len(hashes) + 1, step):
+            yield bytes(hashes[end - 1])
+
     def max_cache_hit(self, request: Request) -> int:
+        if (session := self._session(request)) is not None:
+            assert self._object_size is not None
+            published = self._published.get(session, set())
+            num_objects = 0
+            for object_hash in self._object_hashes(request.block_hashes):
+                if object_hash not in published:
+                    break
+                num_objects += 1
+            last = (request.num_tokens - 1) // self._object_size
+            return min(num_objects, last) * self._object_size
         num_blocks = 0
         for block, keys in self._kv_blocks(request.block_hashes):
             if block in self._kv_cached:
@@ -246,13 +280,50 @@ class AuxOutputSchedulerConnector:
             f"output_start={request_output.token_start}, "
             f"output_end={request_output.token_start + len(request_output.rows)}"
         )
-        return request_output.rows[:local_end]
+        rows = request_output.rows[:local_end]
+        if self._session(request) is None:
+            return rows
+        assert self._object_size is not None
+        tail_start, tail = self._tails.get(
+            request_id, (request_output.token_start, rows[:0])
+        )
+        assert request_output.token_start == tail_start + len(tail), (
+            "auxiliary output rows of a session request are not contiguous"
+        )
+        tail = np.concatenate((tail, rows))
+        boundary = token_end // self._object_size * self._object_size
+        if boundary > tail_start:
+            tail = tail[boundary - tail_start :]
+            tail_start = boundary
+        self._tails[request_id] = (tail_start, tail)
+        return tail if request.is_finished() else None
+
+    def take_object_keys(self, request: Request) -> list[str] | None:
+        """Keys of a finished session request's objects before its tail."""
+        session = self._session(request)
+        if session is None or request.request_id not in self._tails:
+            return None
+        assert self._object_size is not None
+        tail_start, _ = self._tails.pop(request.request_id)
+        object_hashes = self._object_hashes(request.block_hashes)
+        return [
+            aux_object_key(self._key_prefix, session, object_hash.hex())
+            for object_hash in islice(object_hashes, tail_start // self._object_size)
+        ]
 
     def request_finished(self, request: Request) -> None:
         """Queue a request's terminal event and final block hashes."""
         request_id = request.request_id
         self._loading.pop(request_id, None)
         self._computed_starts.pop(request_id, None)
+        if (session := self._session(request)) is not None:
+            assert self._object_size is not None
+            num_objects = request.num_computed_tokens // self._object_size
+            self._published.setdefault(session, set()).update(
+                islice(self._object_hashes(request.block_hashes), num_objects)
+            )
+            if request.is_finished():
+                self._tails.pop(request_id, None)
         num_blocks = request.num_computed_tokens // self._block_size
         for block, keys in islice(self._kv_blocks(request.block_hashes), num_blocks):
             if block not in self._kv_cached and self._gpu_cached(keys[-1]):

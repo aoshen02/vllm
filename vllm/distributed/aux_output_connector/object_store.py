@@ -144,3 +144,12 @@ class MooncakeAuxObjectStore(AuxObjectStore):
 
     def close(self) -> None:
         self._store.close()
+
+
+def create_aux_object_store(config: dict[str, Any]) -> AuxObjectStore:
+    """Create the store named by `config["backend"]`."""
+    if config["backend"] == "mooncake":
+        return MooncakeAuxObjectStore.create()
+    if config["backend"] == "local":
+        return LocalAuxObjectStore()
+    raise ValueError(f"Unknown auxiliary-output store backend {config['backend']!r}")

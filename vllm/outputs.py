@@ -90,6 +90,7 @@ class CompletionOutput:
     cumulative_logprob: float | None
     logprobs: SampleLogprobs | None
     routed_experts: np.ndarray | None = None  # [seq_len,layer_num,topk]
+    aux_output_keys: list[str] | None = None
     finish_reason: str | None = None
     stop_reason: int | str | None = None
     lora_request: LoRARequest | None = None
@@ -243,6 +244,8 @@ class RequestOutput:
                         # aggregation with earlier chunks that have no R3.
                         if next_completion.routed_experts is not None:
                             completion.routed_experts = next_completion.routed_experts
+                        if next_completion.aux_output_keys is not None:
+                            completion.aux_output_keys = next_completion.aux_output_keys
                         # Like finish_reason, spans come only with the terminal output.
                         completion.weight_versions = next_completion.weight_versions
                         completion.finish_reason = next_completion.finish_reason

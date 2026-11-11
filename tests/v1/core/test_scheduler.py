@@ -366,6 +366,55 @@ def test_routed_experts_start_at_first_recomputed_position(
     assert output.routed_experts[:, 0, 0].tolist() == list(range(expected_start, 80))
 
 
+@pytest.mark.parametrize(
+    "second_session,expected_hit",
+    [("s", 80), ("t", 0)],
+    ids=["same-session", "other-session"],
+)
+def test_session_requests_return_object_keys_and_hit_published_objects(
+    second_session, expected_hit
+):
+    scheduler = create_scheduler(enable_prefix_caching=True)
+    scheduler.aux_output_connector = AuxOutputSchedulerConnector(
+        scheduler.kv_cache_manager,
+        object_store=True,
+        key_prefix="job",
+    )
+    first, second = create_requests(
+        num_requests=2, num_tokens=86, max_tokens=1, same_prompt=True
+    )
+    first.sampling_params = first.sampling_params.clone()
+    first.sampling_params.aux_session = "s"
+    second.sampling_params.aux_session = second_session
+    scheduler.add_request(first)
+    scheduler_output = scheduler.schedule()
+    metadata = scheduler_output.aux_output_connector_metadata
+    assert metadata.sessions == {first.request_id: "s"}
+    rows = np.arange(86, dtype=np.uint8).reshape(-1, 1, 1)
+    outputs = scheduler.update_from_output(
+        scheduler_output,
+        ModelRunnerOutput(
+            req_ids=[first.request_id],
+            sampled_token_ids=[[0]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+            aux_output_connector_output={first.request_id: AuxRequestOutput(0, rows)},
+        ),
+    )
+
+    output = outputs[first.client_index].outputs[0]
+    hashes = [block_hash.hex() for block_hash in first.block_hashes]
+    assert output.aux_output_keys == [f"job/s/{h}" for h in hashes[:5]]
+    assert output.routed_experts[:, 0, 0].tolist() == list(range(80, 86))
+
+    scheduler.add_request(second)
+    scheduler_output = scheduler.schedule()
+    assert scheduler_output.num_scheduled_tokens[second.request_id] == (
+        86 - expected_hit
+    )
+
+
 def test_routed_experts_hashes_follow_scheduled_tokens():
     scheduler = create_scheduler(enable_prefix_caching=True, max_num_batched_tokens=64)
     scheduler.aux_output_connector = AuxOutputSchedulerConnector(
