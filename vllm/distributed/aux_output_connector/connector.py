@@ -61,6 +61,7 @@ class AuxOutputSchedulerConnector:
     ) -> None:
         # Number of hashes already sent to the worker for each active request.
         self._sent_hash_counts: dict[str, int] = {}
+        self._computed_starts: dict[str, int] = {}
         # Terminal events are delivered with the next connector metadata.
         self._finished_requests: dict[str, PackedBlockHashes | None] = {}
         self._generation = 0
@@ -97,15 +98,7 @@ class AuxOutputSchedulerConnector:
             if packed is not None:
                 block_hashes_by_request[request_id] = packed
             self._loading.pop(request_id, None)
-            assert request.sampling_params is not None
-            # A P/D prefiller may cut the prompt short of the requested start.
-            scheduled_requests[request_id] = max(
-                min(
-                    request.sampling_params.routed_experts_prompt_start,
-                    request.num_prompt_tokens,
-                ),
-                0 if request.num_output_tokens == 0 else request.num_tokens - 1,
-            )
+            scheduled_requests[request_id] = self._get_request_start(request)
         # A settled token can complete a hash block after the next async schedule
         # was built. Send a hash-only update if the request was not rescheduled.
         if len(self._sent_hash_counts) != len(scheduled_requests):
@@ -134,6 +127,19 @@ class AuxOutputSchedulerConnector:
         )
         self._retained_hashes, self._released_hashes = [], []
         return metadata
+
+    def _get_request_start(self, request: Request) -> int:
+        if request.num_output_tokens:
+            return request.num_tokens - 1
+        assert request.sampling_params is not None
+        # A P/D prefiller may cut the prompt short of the requested start.
+        return min(
+            request.sampling_params.routed_experts_prompt_start,
+            request.num_prompt_tokens,
+            self._computed_starts.setdefault(
+                request.request_id, request.num_computed_tokens
+            ),
+        )
 
     def max_cache_hit(self, request: Request) -> int:
         num_blocks = 0
@@ -217,6 +223,7 @@ class AuxOutputSchedulerConnector:
         """Queue a request's terminal event and final block hashes."""
         request_id = request.request_id
         self._loading.pop(request_id, None)
+        self._computed_starts.pop(request_id, None)
         num_blocks = request.num_computed_tokens // self._block_size
         for block, keys in islice(self._kv_blocks(request.block_hashes), num_blocks):
             if block not in self._kv_cached and self._gpu_cached(keys[-1]):
@@ -253,6 +260,7 @@ class AuxOutputSchedulerConnector:
         """Start a new auxiliary output namespace after a prefix-cache reset."""
         # The worker drops temporary state on generation changes; resend hashes.
         self._sent_hash_counts.clear()
+        self._computed_starts.clear()
         self._finished_requests.clear()
         self._generation += 1
         self._released_hashes.extend(chain.from_iterable(self._kv_cached.values()))

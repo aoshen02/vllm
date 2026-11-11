@@ -315,41 +315,54 @@ def test_add_requests():
         assert len(scheduler.waiting) == i + 1
 
 
-@pytest.mark.parametrize("max_tokens", [1, 2])
-def test_routed_experts_prompt_start_at_prompt_end(max_tokens):
-    """A prompt-end offset should return empty routing data, not crash."""
-    scheduler = create_scheduler()
-    (request,) = create_requests(num_requests=1, max_tokens=max_tokens)
-    request.sampling_params.routed_experts_prompt_start = request.num_prompt_tokens
+@pytest.mark.parametrize(
+    "cached,prompt_start,expected_start",
+    [
+        (False, 50, 0),
+        (False, 80, 0),
+        (True, 80, 64),
+        (True, 32, 32),
+    ],
+    ids=["miss", "miss-start-at-prompt-end", "hit-before-start", "hit-after-start"],
+)
+def test_routed_experts_start_at_first_recomputed_position(
+    cached, prompt_start, expected_start
+):
+    scheduler = create_scheduler(enable_prefix_caching=True)
     scheduler.aux_output_connector = AuxOutputSchedulerConnector(
         scheduler.kv_cache_manager
     )
-    scheduler.add_request(request)
+    first, second = create_requests(
+        num_requests=2, num_tokens=80, max_tokens=1, same_prompt=True
+    )
+    if cached:
+        scheduler.add_request(first)
+        scheduler.schedule()
+        scheduler.finish_requests(first.request_id, RequestStatus.FINISHED_ABORTED)
+    second.sampling_params.routed_experts_prompt_start = prompt_start
+    scheduler.add_request(second)
     scheduler_output = scheduler.schedule()
     assert scheduler_output.aux_output_connector_metadata.requests == {
-        request.request_id: request.num_prompt_tokens
+        second.request_id: expected_start
     }
 
+    rows = np.arange(expected_start, 80, dtype=np.uint8).reshape(-1, 1, 1)
     outputs = scheduler.update_from_output(
         scheduler_output,
         ModelRunnerOutput(
-            req_ids=[request.request_id],
+            req_ids=[second.request_id],
             sampled_token_ids=[[0]],
             logprobs=None,
             prompt_logprobs_dict={},
             pooler_output=[],
             aux_output_connector_output={
-                request.request_id: AuxRequestOutput(
-                    request.num_prompt_tokens,
-                    np.empty((0, 1, 1), dtype=np.uint8),
-                )
+                second.request_id: AuxRequestOutput(expected_start, rows)
             },
         ),
     )
 
-    output = outputs[request.client_index].outputs[0]
-    assert output.new_token_ids == [0]
-    assert output.routed_experts.shape == (0, 1, 1)
+    output = outputs[second.client_index].outputs[0]
+    assert output.routed_experts[:, 0, 0].tolist() == list(range(expected_start, 80))
 
 
 def test_routed_experts_hashes_follow_scheduled_tokens():

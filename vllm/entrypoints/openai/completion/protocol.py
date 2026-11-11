@@ -191,7 +191,10 @@ class CompletionRequest(OpenAIBaseModel):
     routed_experts_prompt_start: int = Field(
         default=0,
         ge=0,
-        description="Skip the first N prompt tokens from returned routed-expert data.",
+        description=(
+            "Skip up to the first N prompt tokens from returned routed-expert "
+            "data; positions this request recomputes are always returned."
+        ),
     )
     return_token_offsets: bool | None = Field(
         default=False,

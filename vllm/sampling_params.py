@@ -441,11 +441,13 @@ class SamplingParams(
 
     # Debugging / RL-specific parameters. Not intended for production serving.
     routed_experts_prompt_start: int = 0
-    """When enable_return_routed_experts is active, skip the first
+    """When enable_return_routed_experts is active, skip up to the first
     routed_experts_prompt_start prompt tokens from the returned routing
     data. In multi-turn agent scenarios, set this to the length of the
     already-returned prefix to avoid duplicating routing for prompt tokens
-    covered by earlier turns. Default 0 returns routing for all prompt
+    covered by earlier turns. Positions this request recomputes instead of
+    reading from the KV cache are always returned, so the rows start at
+    num_tokens - 1 - len(rows). Default 0 returns routing for all prompt
     tokens."""
     trace_decode_token_ids: list[int] | None = None
     """If provided, forces the engine to emit this predetermined sequence of
