@@ -126,3 +126,10 @@ class TestSessionObjectWriter:
         writer.add_rows("r", "indexer_topk", 0, np.zeros((5, 1, 2), dtype=np.int32))
         with pytest.raises(AssertionError, match="incomplete"):
             writer.add_blocks("r", "s", HASHES, [_block(0), _block(4)], VERSIONS)
+
+    def test_reading_rows_that_were_not_staged_is_rejected(self):
+        writer = _writer(CountingStore())
+        writer.add_rows("r", "indexer_topk", 0, np.zeros((3, 1, 2), dtype=np.int32))
+        writer.add_rows("r", "indexer_topk", 5, np.zeros((7, 1, 2), dtype=np.int32))
+        with pytest.raises(AssertionError, match="were not staged"):
+            writer.read_rows("r", "indexer_topk", 0, 12)

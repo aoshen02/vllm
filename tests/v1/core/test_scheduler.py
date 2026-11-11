@@ -632,6 +632,37 @@ def test_session_field_tail_is_empty_when_the_last_object_is_written():
     assert len(output.aux_fields["indexer_topk"]) == 0
 
 
+def test_session_field_rows_with_a_gap_past_the_boundary_are_rejected():
+    scheduler = create_scheduler(enable_prefix_caching=True)
+    scheduler.aux_output_connector = AuxOutputSchedulerConnector(
+        scheduler.kv_cache_manager, object_store=True, key_prefix="job"
+    )
+    (request,) = create_requests(num_requests=1, num_tokens=86, max_tokens=1)
+    request.sampling_params = request.sampling_params.clone()
+    request.sampling_params.aux_session = "s"
+    scheduler.add_request(request)
+    scheduler_output = scheduler.schedule()
+    indexer = np.zeros((3, 1, 2), dtype=np.int32)
+    with pytest.raises(AssertionError, match="skip positions before 83"):
+        scheduler.update_from_output(
+            scheduler_output,
+            ModelRunnerOutput(
+                req_ids=[request.request_id],
+                sampled_token_ids=[[0]],
+                logprobs=None,
+                prompt_logprobs_dict={},
+                pooler_output=[],
+                aux_output_connector_output={
+                    request.request_id: AuxRequestOutput(
+                        0,
+                        np.zeros((86, 1, 1), dtype=np.uint8),
+                        {"indexer_topk": (83, indexer)},
+                    )
+                },
+            ),
+        )
+
+
 def test_routed_experts_hashes_follow_scheduled_tokens():
     scheduler = create_scheduler(enable_prefix_caching=True, max_num_batched_tokens=64)
     scheduler.aux_output_connector = AuxOutputSchedulerConnector(
