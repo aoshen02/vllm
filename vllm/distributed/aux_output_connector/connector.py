@@ -376,6 +376,11 @@ class AuxOutputSchedulerConnector:
             if previous is not None and previous[0] + len(previous[1]) == start:
                 start = previous[0]
                 field_rows = np.concatenate((previous[1], field_rows))
+            else:
+                assert start <= boundary, (
+                    f"{name} rows of request {request_id} skip positions "
+                    f"before {start} past the last object boundary {boundary}"
+                )
             tails[name] = (start, field_rows)
         for name, (start, field_rows) in tails.items():
             if boundary > start:

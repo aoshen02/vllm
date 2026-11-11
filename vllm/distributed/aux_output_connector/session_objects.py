@@ -196,14 +196,15 @@ class SessionObjectWriter:
         chunks = []
         for index in range(first // self.object_size, -(-end // self.object_size)):
             object_start = index * self.object_size
-            chunks.append(
-                objects[index][0][
-                    max(first, object_start) - object_start : min(
-                        end, object_start + self.object_size
-                    )
-                    - object_start
-                ]
-            )
+            lo = max(first, object_start) - object_start
+            hi = min(end, object_start + self.object_size) - object_start
+            field_rows, written_mask = objects.get(index, (None, None))
+            if field_rows is None or not written_mask[lo:hi].all():
+                raise AssertionError(
+                    f"{field} rows [{object_start + lo}, {object_start + hi}) of "
+                    f"request {request_id} were not staged"
+                )
+            chunks.append(field_rows[lo:hi])
         return first, np.concatenate(chunks)
 
     def discard(self, request_id: str) -> None:
