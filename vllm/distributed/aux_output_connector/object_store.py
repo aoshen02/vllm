@@ -9,6 +9,8 @@ from collections.abc import Sequence
 from threading import Lock
 from typing import TYPE_CHECKING, Any
 
+import regex as re
+
 if TYPE_CHECKING:
     from vllm.distributed.mooncake_store import MooncakeStoreConfig
 
@@ -41,6 +43,10 @@ class AuxObjectStore(ABC):
     def remove(self, keys: Sequence[str]) -> None:
         """Remove the objects that exist."""
 
+    @abstractmethod
+    def remove_prefix(self, prefix: str) -> int:
+        """Remove every object whose key starts with `prefix`; return how many."""
+
     def close(self) -> None:
         """Release the client's resources."""
         return None
@@ -72,6 +78,13 @@ class LocalAuxObjectStore(AuxObjectStore):
         with self._lock:
             for key in keys:
                 self._objects.pop(key, None)
+
+    def remove_prefix(self, prefix: str) -> int:
+        with self._lock:
+            keys = [key for key in self._objects if key.startswith(prefix)]
+            for key in keys:
+                del self._objects[key]
+            return len(keys)
 
 
 class MooncakeAuxObjectStore(AuxObjectStore):
@@ -141,6 +154,14 @@ class MooncakeAuxObjectStore(AuxObjectStore):
     def remove(self, keys: Sequence[str]) -> None:
         if keys:
             self._store.batch_remove(list(keys), True)
+
+    def remove_prefix(self, prefix: str) -> int:
+        removed = self._store.remove_by_regex("^" + re.escape(prefix), True)
+        if removed < 0:
+            raise AuxObjectStoreError(
+                f"Mooncake failed to remove objects under {prefix!r}: {removed}"
+            )
+        return removed
 
     def close(self) -> None:
         self._store.close()

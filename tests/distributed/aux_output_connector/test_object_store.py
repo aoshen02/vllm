@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import re
 import sys
 from types import SimpleNamespace
 
@@ -45,6 +46,13 @@ class FakeMooncake:
         assert force
         return [0 if self.objects.pop(key, None) is not None else -704 for key in keys]
 
+    def remove_by_regex(self, pattern, force):
+        assert force
+        keys = [key for key in self.objects if re.match(pattern, key)]
+        for key in keys:
+            del self.objects[key]
+        return len(keys)
+
     def close(self):
         pass
 
@@ -74,6 +82,12 @@ class TestAuxObjectStore:
         assert store.exists(["a", "b", "c"]) == [False, True, False]
         store.put_batch(["a"], [b"new"])
         assert store.get("a") == b"new"
+
+    def test_remove_prefix(self, store):
+        keys = ["job/s/a", "job/s/b", "job/t/a", "job/s.x/a", "other/job/s/a"]
+        store.put_batch(keys, [b"v"] * len(keys))
+        assert store.remove_prefix("job/s/") == 2
+        assert store.exists(keys) == [False, False, True, True, True]
 
 
 class TestMooncakeAuxObjectStore:

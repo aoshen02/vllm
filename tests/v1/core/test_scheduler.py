@@ -415,6 +415,57 @@ def test_session_requests_return_object_keys_and_hit_published_objects(
     )
 
 
+@pytest.mark.parametrize(
+    "idle_s,expected_hit,released",
+    [(10.0, 80, ()), (100.0, 0, ("s",))],
+    ids=["recent", "idle"],
+)
+def test_idle_sessions_are_forgotten(monkeypatch, idle_s, expected_hit, released):
+    from vllm.distributed.aux_output_connector import connector as aux_connector
+
+    now = [1000.0]
+    monkeypatch.setattr(aux_connector.time, "monotonic", lambda: now[0])
+    scheduler = create_scheduler(enable_prefix_caching=True)
+    scheduler.aux_output_connector = AuxOutputSchedulerConnector(
+        scheduler.kv_cache_manager,
+        object_store=True,
+        key_prefix="job",
+        session_idle_timeout_s=60.0,
+    )
+    first, second = create_requests(
+        num_requests=2, num_tokens=86, max_tokens=1, same_prompt=True
+    )
+    for request in (first, second):
+        request.sampling_params = request.sampling_params.clone()
+        request.sampling_params.aux_session = "s"
+    scheduler.add_request(first)
+    scheduler_output = scheduler.schedule()
+    scheduler.update_from_output(
+        scheduler_output,
+        ModelRunnerOutput(
+            req_ids=[first.request_id],
+            sampled_token_ids=[[0]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+            aux_output_connector_output={
+                first.request_id: AuxRequestOutput(
+                    0, np.zeros((86, 1, 1), dtype=np.uint8)
+                )
+            },
+        ),
+    )
+
+    now[0] += idle_s
+    metadata = scheduler.schedule().aux_output_connector_metadata
+    assert metadata.released_sessions == released
+    scheduler.add_request(second)
+    scheduler_output = scheduler.schedule()
+    assert scheduler_output.num_scheduled_tokens[second.request_id] == (
+        86 - expected_hit
+    )
+
+
 def test_routed_experts_hashes_follow_scheduled_tokens():
     scheduler = create_scheduler(enable_prefix_caching=True, max_num_batched_tokens=64)
     scheduler.aux_output_connector = AuxOutputSchedulerConnector(

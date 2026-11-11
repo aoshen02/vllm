@@ -471,6 +471,9 @@ class Scheduler(SchedulerInterface):
                 ),
                 object_store=vllm_config.aux_output_config.object_store is not None,
                 key_prefix=vllm_config.aux_output_config.object_key_prefix,
+                session_idle_timeout_s=(
+                    vllm_config.aux_output_config.session_idle_timeout_s
+                ),
             )
             if vllm_config.aux_output_config.enabled
             else None
