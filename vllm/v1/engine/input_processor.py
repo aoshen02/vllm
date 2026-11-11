@@ -7,9 +7,7 @@ from typing import Any, Literal
 
 import vllm.envs as envs
 from vllm.config import VllmConfig
-from vllm.distributed.aux_output_connector.connector import (
-    check_routed_experts_replay,
-)
+from vllm.distributed.aux_output_connector.connector import validate_aux_request
 from vllm.exceptions import VLLMValidationError
 from vllm.inputs import (
     EngineInput,
@@ -453,34 +451,9 @@ class InputProcessor:
                     parameter="routed_experts_prompt_start",
                     value=sampling_params.routed_experts_prompt_start,
                 )
-            if (
-                sampling_params.aux_session is not None
-                and self.vllm_config.aux_output_config.object_store is None
-            ):
-                raise VLLMValidationError(
-                    "aux_session requires AuxOutputConfig.object_store.",
-                    parameter="aux_session",
-                )
-            routed_experts_replay = sampling_params.routed_experts_replay
-            sampling_params.routed_experts_replay = None
-            if routed_experts_replay is not None:
-                if not self.vllm_config.aux_output_config.enable_routed_experts_replay:
-                    raise VLLMValidationError(
-                        "routed_experts_replay requires "
-                        "AuxOutputConfig.enable_routed_experts_replay.",
-                        parameter="routed_experts_replay",
-                    )
-                model_config = self.vllm_config.model_config
-                num_layers = model_config.get_total_num_hidden_layers()
-                num_experts_per_tok = model_config.get_num_experts_per_tok()
-                reason = check_routed_experts_replay(
-                    routed_experts_replay, prompt_len, (num_layers, num_experts_per_tok)
-                )
-                if reason is not None:
-                    raise VLLMValidationError(
-                        f"routed_experts_replay {reason}.",
-                        parameter="routed_experts_replay",
-                    )
+            routed_experts_replay = validate_aux_request(
+                self.vllm_config, sampling_params, prompt_len
+            )
             start = sampling_params.prompt_logprob_start or 0
             if start and start >= prompt_len - 1:
                 raise VLLMValidationError(

@@ -10,7 +10,9 @@ import torch
 import vllm.model_executor.layers.fused_moe.routed_experts_replay as replay_module
 from vllm.distributed.aux_output_connector.connector import (
     check_routed_experts_replay,
+    validate_aux_request,
 )
+from vllm.exceptions import VLLMValidationError
 from vllm.model_executor.layers.fused_moe.routed_experts_replay import (
     RoutedExpertsReplay,
     replay_topk_weights,
@@ -24,6 +26,7 @@ from vllm.model_executor.layers.fused_moe.router.fused_topk_router import (
 from vllm.model_executor.layers.fused_moe.router.grouped_topk_router import (
     GroupedTopKRouter,
 )
+from vllm.sampling_params import SamplingParams
 
 requires_cuda = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="fused routers need CUDA"
@@ -79,6 +82,49 @@ def _routers():
             e_score_correction_bias=bias,
         ),
     ]
+
+
+def _aux_vllm_config(object_store=None, replay=False):
+    return SimpleNamespace(
+        aux_output_config=SimpleNamespace(
+            object_store=object_store, enable_routed_experts_replay=replay
+        ),
+        model_config=SimpleNamespace(
+            get_total_num_hidden_layers=lambda: 2, get_num_experts_per_tok=lambda: 4
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    "config_kwargs,params_kwargs,error",
+    [
+        ({}, {"aux_session": "s"}, "aux_session requires"),
+        ({"object_store": {"backend": "local"}}, {"aux_session": "s"}, None),
+        ({}, {"routed_experts_replay": np.zeros((2, 2, 4), np.uint8)}, "requires"),
+        (
+            {"replay": True},
+            {"routed_experts_replay": np.zeros((2, 2, 2), np.uint8)},
+            "must have shape",
+        ),
+        (
+            {"replay": True},
+            {"routed_experts_replay": np.zeros((2, 2, 4), np.uint8)},
+            None,
+        ),
+    ],
+    ids=["session-no-store", "session", "replay-disabled", "replay-shape", "replay"],
+)
+def test_validate_aux_request(config_kwargs, params_kwargs, error):
+    params = SamplingParams(**params_kwargs)
+    config = _aux_vllm_config(**config_kwargs)
+    if error is not None:
+        with pytest.raises(VLLMValidationError, match=error):
+            validate_aux_request(config, params, prompt_len=3)
+        return
+    rows = validate_aux_request(config, params, prompt_len=3)
+    assert params.routed_experts_replay is None
+    replay = params_kwargs.get("routed_experts_replay")
+    assert rows is replay
 
 
 @requires_cuda

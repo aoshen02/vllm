@@ -9,10 +9,7 @@ from typing import Any
 
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import KVEventsConfig, VllmConfig
-from vllm.distributed.aux_output_connector.connector import (
-    AuxOutputSchedulerConnector,
-    get_routed_experts_bytes_per_token,
-)
+from vllm.distributed.aux_output_connector.connector import AuxOutputSchedulerConnector
 from vllm.distributed.ec_transfer.ec_connector.base import (
     ECConnectorBase,
     ECConnectorMetadata,
@@ -462,23 +459,8 @@ class Scheduler(SchedulerInterface):
             self.perf_metrics = ModelMetrics(vllm_config)
 
         self.aux_output_connector = (
-            AuxOutputSchedulerConnector(
-                self.kv_cache_manager,
-                self.connector,
-                max_bytes=vllm_config.aux_output_config.max_bytes,
-                bytes_per_token=(
-                    get_routed_experts_bytes_per_token(vllm_config.model_config)
-                    if vllm_config.aux_output_config.enable_return_routed_experts
-                    else 0
-                ),
-                object_store=vllm_config.aux_output_config.object_store is not None,
-                key_prefix=vllm_config.aux_output_config.object_key_prefix,
-                session_idle_timeout_s=(
-                    vllm_config.aux_output_config.session_idle_timeout_s
-                ),
-                return_routed_experts=(
-                    vllm_config.aux_output_config.enable_return_routed_experts
-                ),
+            AuxOutputSchedulerConnector.from_config(
+                self.kv_cache_manager, self.connector, vllm_config
             )
             if vllm_config.aux_output_config.enabled
             else None
@@ -2462,25 +2444,18 @@ class Scheduler(SchedulerInterface):
                 request.resumable = False
                 stopped = True
 
-            routed_experts = None
-            aux_output_keys = None
-            aux_fields = None
+            routed_experts = aux_output_keys = aux_fields = None
             should_emit_output = bool(
                 new_token_ids or pooler_output is not None or stopped
             )
             if self.aux_output_connector is not None and should_emit_output:
-                routed_experts = self.aux_output_connector.take_output(
-                    request, model_runner_output.aux_output_connector_output
+                routed_experts, aux_output_keys, aux_fields = (
+                    self.aux_output_connector.take_outputs(
+                        request,
+                        model_runner_output.aux_output_connector_output,
+                        stopped,
+                    )
                 )
-                if stopped:
-                    aux_output_keys = self.aux_output_connector.take_object_keys(
-                        request
-                    )
-                    aux_fields = self.aux_output_connector.take_aux_fields(request)
-                if aux_fields is None:
-                    aux_fields = self.aux_output_connector.take_inline_fields(
-                        request, model_runner_output.aux_output_connector_output
-                    )
             if should_emit_output:
                 prefill_stats = request.take_prefill_stats()
                 if prefill_stats is not None:
