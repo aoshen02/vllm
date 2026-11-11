@@ -213,6 +213,44 @@ def _make_worker(
     return worker
 
 
+@pytest.mark.parametrize(
+    "emit_start,steps,expected",
+    [
+        (0, [(0, 4, 0), (4, 2, 1), (6, 1, 1)], [None, (0, 6), (6, 7)]),
+        (5, [(0, 6, 1)], [(5, 6)]),
+    ],
+    ids=["chunked-prefill", "after-preemption"],
+)
+def test_inline_fields_cover_each_computed_position_once(emit_start, steps, expected):
+    worker = _make_worker(1)
+    worker._inline_fields = True
+    worker._return_hidden_states = True
+    for (token_start, num_tokens, sampled), want in zip(steps, expected):
+        worker._capturer = Mock()
+        worker._capturer.snapshot_routing_data.return_value = torch.from_numpy(
+            np.zeros((num_tokens, *_SHAPE), dtype=_DTYPE)
+        )
+        worker.begin_step(
+            _metadata(
+                0, [_request_metadata("r", token_start, num_tokens, emit_start, [])], {}
+            ).metadata
+        )
+        hidden = torch.arange(token_start, token_start + num_tokens).float()
+        pending = worker.prepare_output(
+            _input_batch(["r"], np.array([token_start]), np.array([0, num_tokens])),
+            hidden.reshape(-1, 1),
+        )
+        pending.enqueue_cpu_copy(np.array([sampled]), np.array([0]))
+        output = worker.process_output(pending)
+        if want is None:
+            assert "r" not in output
+            continue
+        start, rows = output["r"].fields["hidden_states"]
+        assert start == want[0]
+        assert rows.ravel().tolist() == list(range(*want))
+    worker.close()
+
+
 def test_worker_rejects_metadata_generation_rollback():
     worker = _make_worker(1)
     _begin_step(worker, _metadata(1, [], {}))

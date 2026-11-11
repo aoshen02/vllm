@@ -790,6 +790,7 @@ def test_aux_output_worker_connector_binds_capture_on_non_output_rank(monkeypatc
             enable_return_indexer_topk=False,
             enable_return_hidden_states=False,
             return_topk_logprobs=0,
+            object_store=None,
         ),
         kv_transfer_config=None,
         max_concurrent_batches=2,

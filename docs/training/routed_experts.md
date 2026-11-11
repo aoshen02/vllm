@@ -58,6 +58,16 @@ import numpy as np
 experts = np.load(io.BytesIO(base64.b64decode(choice["routed_experts"])))
 ```
 
+## Other outputs
+
+`enable_return_indexer_topk`, `enable_return_hidden_states` and `return_topk_logprobs` (formats under [Delivering rows through a shared object store](#delivering-rows-through-a-shared-object-store)) work without routed experts and on dense models (the indexer needs a sparse-attention model). Without `object_store`, every request returns them in `CompletionOutput.aux_fields` (offline API), one array per field, filled when the request finishes:
+
+- Rows cover the positions this request computed, up to the last sampled token, which has no row: `start = num_tokens - 1 - len(rows)`.
+- Positions served from the prefix cache have no rows, because these outputs are not cached. Use a session and `object_store` to keep them across turns.
+- `top-k logprobs` add one LM-head pass over every prefill token of every request.
+
+With `object_store`, only session requests get them, through the store.
+
 ## `routed_experts_prompt_start`
 
 Per-request, default `0`: drops up to the first N prompt-token rows (e.g. routing already received in earlier turns). Must be `0 <= value <= prompt_len`, else HTTP 400. Pass it top-level on `/v1/*completions`, inside `sampling_params` on `/inference/v1/generate`, or as `SamplingParams(routed_experts_prompt_start=...)`.

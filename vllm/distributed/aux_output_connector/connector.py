@@ -397,6 +397,24 @@ class AuxOutputSchedulerConnector:
             return None
         return tail
 
+    def take_inline_fields(
+        self,
+        request: Request,
+        output: dict[str, AuxRequestOutput] | None,
+    ) -> dict[str, np.ndarray] | None:
+        """Rows of the other fields a request without a session computed
+        in this output, up to its last accepted token."""
+        if self._session(request) is not None or not output:
+            return None
+        request_output = output.get(request.request_id)
+        if request_output is None or not request_output.fields:
+            return None
+        token_end = request.num_tokens - 1
+        return {
+            name: rows[: max(token_end - start, 0)]
+            for name, (start, rows) in request_output.fields.items()
+        }
+
     def take_aux_fields(self, request: Request) -> dict[str, np.ndarray] | None:
         """Rows of the other fields of a finished session request's tail."""
         tails = self._field_tails.pop(request.request_id, None)

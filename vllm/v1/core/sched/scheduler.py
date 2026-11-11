@@ -2477,6 +2477,10 @@ class Scheduler(SchedulerInterface):
                         request
                     )
                     aux_fields = self.aux_output_connector.take_aux_fields(request)
+                if aux_fields is None:
+                    aux_fields = self.aux_output_connector.take_inline_fields(
+                        request, model_runner_output.aux_output_connector_output
+                    )
             if should_emit_output:
                 prefill_stats = request.take_prefill_stats()
                 if prefill_stats is not None:
