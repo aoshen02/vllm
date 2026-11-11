@@ -141,6 +141,7 @@ class EngineCoreOutput(
     error: RequestError | None = None
     watermarking: bool | None = None
     aux_output_keys: list[str] | None = None
+    aux_fields: object | None = None
 
 
 class ExtendedEngineCoreOutput(EngineCoreOutput):
@@ -300,6 +301,13 @@ outputs = EngineCoreOutputs(
             error=RequestError("engine_paused", "Generation is paused.", True),
             watermarking=True,
             aux_output_keys=["job/s/ab"],
+            aux_fields={
+                "indexer_topk": [
+                    np.arange(4, dtype=np.int32).reshape(2, 1, 2).dtype.str,
+                    [2, 1, 2],
+                    msgspec.msgpack.Ext(3, np.arange(4, dtype=np.int32).tobytes()),
+                ]
+            },
             routed_experts=[
                 np.arange(4, dtype=np.uint8).reshape(2, 1, 2).dtype.str,
                 [2, 1, 2],

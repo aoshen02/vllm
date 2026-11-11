@@ -2459,6 +2459,7 @@ class Scheduler(SchedulerInterface):
 
             routed_experts = None
             aux_output_keys = None
+            aux_fields = None
             should_emit_output = bool(
                 new_token_ids or pooler_output is not None or stopped
             )
@@ -2470,6 +2471,7 @@ class Scheduler(SchedulerInterface):
                     aux_output_keys = self.aux_output_connector.take_object_keys(
                         request
                     )
+                    aux_fields = self.aux_output_connector.take_aux_fields(request)
             if should_emit_output:
                 prefill_stats = request.take_prefill_stats()
                 if prefill_stats is not None:
@@ -2562,6 +2564,7 @@ class Scheduler(SchedulerInterface):
                         num_nans_in_logits=request.num_nans_in_logits,
                         watermarking=watermarking,
                         aux_output_keys=aux_output_keys,
+                        aux_fields=aux_fields,
                     )
                 )
             else:
