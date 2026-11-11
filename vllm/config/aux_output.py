@@ -31,6 +31,12 @@ class AuxOutputConfig:
     computed position with the routed experts of session requests
     (`SamplingParams.aux_session`). Requires `object_store`."""
 
+    return_topk_logprobs: int = Field(default=0, ge=0)
+    """Deliver the top-k token ids and log-probabilities of the next token at
+    every computed position with the routed experts of session requests
+    (`SamplingParams.aux_session`); 0 disables. Prefix-cache hits keep the
+    rows of the request that computed them. Requires `object_store`."""
+
     max_bytes: int | None = Field(default=None, gt=0)
     """Capacity of the row cache that serves prefix-cache and KV offload hits,
     or `None` to derive it from the KV cache capacity. Rows of the blocks it
@@ -58,7 +64,11 @@ class AuxOutputConfig:
     @model_validator(mode="after")
     def _check_object_store(self) -> Self:
         if self.object_store is None:
-            for name in ("enable_return_indexer_topk", "enable_return_hidden_states"):
+            for name in (
+                "enable_return_indexer_topk",
+                "enable_return_hidden_states",
+                "return_topk_logprobs",
+            ):
                 if getattr(self, name):
                     raise ValueError(f"{name} requires object_store.")
             return self
@@ -91,6 +101,7 @@ class AuxOutputConfig:
         ignored_factors = {
             "max_bytes",
             "object_store",
+            "return_topk_logprobs",
             "session_idle_timeout_s",
         }
         return get_compile_factors(self, ignored_factors)
