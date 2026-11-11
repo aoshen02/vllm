@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -158,6 +158,10 @@ pub struct EngineCoreOutput {
     /// when `AuxOutputConfig.object_store` is set.
     #[serde(default)]
     pub aux_output_keys: Option<Vec<String>>,
+    /// Rows of the other auxiliary fields (e.g. `indexer_topk`) of a
+    /// finished session request's tail.
+    #[serde(default)]
+    pub aux_fields: Option<BTreeMap<String, WireNdArray>>,
 }
 
 /// A request-level error that does not mark the engine as unhealthy.
@@ -241,6 +245,11 @@ impl EngineCoreOutput {
             value
                 .resolve_aux_frame(frames)
                 .map_err(|message| ext_value_decode!("routed_experts: {message}"))?;
+        }
+        for (name, value) in self.aux_fields.iter_mut().flatten() {
+            value
+                .resolve_aux_frame(frames)
+                .map_err(|message| ext_value_decode!("aux_fields[{name}]: {message}"))?;
         }
         Ok(())
     }
@@ -552,7 +561,7 @@ mod tests {
         };
         let fields = crate::protocol::decode_value(&encode_msgpack(&output).unwrap()).unwrap();
         assert_eq!(
-            fields.as_array().unwrap().last(),
+            fields.as_array().unwrap().iter().rev().nth(1),
             Some(&OpaqueValue::Array(
                 keys.iter().map(|key| key.as_str().into()).collect()
             ))
@@ -629,6 +638,7 @@ mod tests {
                             error: None,
                             watermarking: None,
                             aux_output_keys: None,
+                            aux_fields: None,
                         },
                     ],
                     scheduler_stats: None,

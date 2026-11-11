@@ -17,6 +17,7 @@ from vllm.distributed.aux_output_connector.object_store import (
 from vllm.distributed.aux_output_connector.objects import encode_aux_object
 
 ROUTED_EXPERTS_FIELD = "routed_experts"
+INDEXER_TOPK_FIELD = "indexer_topk"
 
 
 def aux_object_key(
@@ -73,6 +74,8 @@ class SessionObjectWriter:
         self._hash_block_size = hash_block_size
         self._pieces_per_object = object_size // hash_block_size
         self._staged: dict[str, dict[int, dict[int, np.ndarray]]] = {}
+        # Request -> field -> object index -> (rows, positions written).
+        self._rows: dict[str, dict[str, dict[int, tuple[np.ndarray, np.ndarray]]]] = {}
         self._written: dict[str, set[str]] = {}
         self._queue: queue.Queue[tuple[list[str], list[bytes]] | None] = queue.Queue(
             maxsize=max_pending_batches
@@ -126,6 +129,19 @@ class SessionObjectWriter:
             if len(pieces) < self._pieces_per_object:
                 continue
             del staged[index]
+            fields = {
+                ROUTED_EXPERTS_FIELD: np.concatenate(
+                    [pieces[i] for i in range(self._pieces_per_object)]
+                )
+            }
+            for field, objects in self._rows.get(request_id, {}).items():
+                field_rows, written_mask = objects.pop(index, (None, None))
+                if field_rows is None or not written_mask.all():
+                    raise AssertionError(
+                        f"{field} rows of object {index} of request {request_id} "
+                        "are incomplete"
+                    )
+                fields[field] = field_rows
             last = (index + 1) * self._pieces_per_object - 1
             key = aux_object_key(
                 self._key_prefix,
@@ -137,20 +153,59 @@ class SessionObjectWriter:
                 continue
             written.add(key)
             keys.append(key)
-            values.append(
-                encode_aux_object(
-                    {
-                        ROUTED_EXPERTS_FIELD: np.concatenate(
-                            [pieces[i] for i in range(self._pieces_per_object)]
-                        )
-                    }
-                )
-            )
+            values.append(encode_aux_object(fields))
         if keys:
             self._queue.put((keys, values))
 
+    def add_rows(
+        self, request_id: str, field: str, start: int, rows: np.ndarray
+    ) -> None:
+        """Stage rows of another field for positions from `start` on; each
+        object the request completes later carries them."""
+        objects = self._rows.setdefault(request_id, {}).setdefault(field, {})
+        end = start + len(rows)
+        for index in range(start // self.object_size, -(-end // self.object_size)):
+            object_start = index * self.object_size
+            if index not in objects:
+                objects[index] = (
+                    np.empty((self.object_size, *rows.shape[1:]), dtype=rows.dtype),
+                    np.zeros(self.object_size, dtype=bool),
+                )
+            field_rows, written_mask = objects[index]
+            lo = max(start, object_start)
+            hi = min(end, object_start + self.object_size)
+            field_rows[lo - object_start : hi - object_start] = rows[
+                lo - start : hi - start
+            ]
+            written_mask[lo - object_start : hi - object_start] = True
+
+    def read_rows(
+        self, request_id: str, field: str, start: int, end: int
+    ) -> tuple[int, np.ndarray] | None:
+        """Staged rows of `field` up to `end`, from `start` or the first
+        position not yet in a completed object, whichever is later."""
+        objects = self._rows.get(request_id, {}).get(field)
+        if not objects:
+            return None
+        first = max(start, min(objects) * self.object_size)
+        if first >= end:
+            return None
+        chunks = []
+        for index in range(first // self.object_size, -(-end // self.object_size)):
+            object_start = index * self.object_size
+            chunks.append(
+                objects[index][0][
+                    max(first, object_start) - object_start : min(
+                        end, object_start + self.object_size
+                    )
+                    - object_start
+                ]
+            )
+        return first, np.concatenate(chunks)
+
     def discard(self, request_id: str) -> None:
         self._staged.pop(request_id, None)
+        self._rows.pop(request_id, None)
 
     def forget_session(self, session: str) -> None:
         """Drop what was written for `session`; later blocks are written again."""

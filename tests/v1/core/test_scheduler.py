@@ -563,6 +563,75 @@ def test_session_objects_follow_weight_version(recompute_session, expected_hit):
     assert scheduler_output.num_scheduled_tokens[last.request_id] == (86 - expected_hit)
 
 
+@pytest.mark.parametrize(
+    "indexer_start", [0, 80], ids=["from-prompt-start", "from-boundary"]
+)
+def test_session_requests_return_indexer_tail(indexer_start):
+    scheduler = create_scheduler(enable_prefix_caching=True)
+    scheduler.aux_output_connector = AuxOutputSchedulerConnector(
+        scheduler.kv_cache_manager, object_store=True, key_prefix="job"
+    )
+    (request,) = create_requests(num_requests=1, num_tokens=86, max_tokens=1)
+    request.sampling_params = request.sampling_params.clone()
+    request.sampling_params.aux_session = "s"
+    scheduler.add_request(request)
+    scheduler_output = scheduler.schedule()
+    indexer = np.arange(87 * 2, dtype=np.int32).reshape(87, 1, 2)
+    outputs = scheduler.update_from_output(
+        scheduler_output,
+        ModelRunnerOutput(
+            req_ids=[request.request_id],
+            sampled_token_ids=[[0]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+            aux_output_connector_output={
+                request.request_id: AuxRequestOutput(
+                    0,
+                    np.zeros((86, 1, 1), dtype=np.uint8),
+                    {"indexer_topk": (indexer_start, indexer[indexer_start:])},
+                )
+            },
+        ),
+    )
+    output = outputs[request.client_index].outputs[0]
+    assert output.aux_fields["indexer_topk"].tolist() == indexer[80:86].tolist()
+
+
+def test_session_field_tail_is_empty_when_the_last_object_is_written():
+    scheduler = create_scheduler(enable_prefix_caching=True)
+    scheduler.aux_output_connector = AuxOutputSchedulerConnector(
+        scheduler.kv_cache_manager, object_store=True, key_prefix="job"
+    )
+    (request,) = create_requests(num_requests=1, num_tokens=79, max_tokens=2)
+    request.sampling_params = request.sampling_params.clone()
+    request.sampling_params.aux_session = "s"
+    scheduler.add_request(request)
+    indexer = np.arange(80 * 2, dtype=np.int32).reshape(80, 1, 2)
+    steps = [
+        AuxRequestOutput(
+            0, np.zeros((79, 1, 1), dtype=np.uint8), {"indexer_topk": (0, indexer[:79])}
+        ),
+        AuxRequestOutput(79, np.zeros((1, 1, 1), dtype=np.uint8)),
+    ]
+    for aux_output in steps:
+        scheduler_output = scheduler.schedule()
+        outputs = scheduler.update_from_output(
+            scheduler_output,
+            ModelRunnerOutput(
+                req_ids=[request.request_id],
+                sampled_token_ids=[[0]],
+                logprobs=None,
+                prompt_logprobs_dict={},
+                pooler_output=[],
+                aux_output_connector_output={request.request_id: aux_output},
+            ),
+        )
+    output = outputs[request.client_index].outputs[0]
+    assert len(output.routed_experts) == 0
+    assert len(output.aux_fields["indexer_topk"]) == 0
+
+
 def test_routed_experts_hashes_follow_scheduled_tokens():
     scheduler = create_scheduler(enable_prefix_caching=True, max_num_batched_tokens=64)
     scheduler.aux_output_connector = AuxOutputSchedulerConnector(

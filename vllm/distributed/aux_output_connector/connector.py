@@ -7,7 +7,7 @@ from __future__ import annotations
 import time
 from collections import Counter, OrderedDict
 from collections.abc import Iterator, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from itertools import chain, islice
 from typing import TYPE_CHECKING
 
@@ -80,6 +80,9 @@ class AuxOutputConnectorMetadata:
 class AuxRequestOutput:
     token_start: int
     rows: np.ndarray
+    # (start, rows) of each other field of a session request, from the first
+    # position not yet in a written object.
+    fields: dict[str, tuple[int, np.ndarray]] = field(default_factory=dict)
 
 
 class AuxOutputSchedulerConnector:
@@ -134,6 +137,7 @@ class AuxOutputSchedulerConnector:
         self._session_last_used: dict[str, float] = {}
         self._next_session_sweep = 0.0
         self._tails: dict[str, tuple[int, np.ndarray]] = {}
+        self._field_tails: dict[str, dict[str, tuple[int, np.ndarray]]] = {}
 
     def build_connector_meta(
         self,
@@ -365,11 +369,36 @@ class AuxOutputSchedulerConnector:
             published[object_hash] = weight_version
             self._commit_versions[object_hash] = weight_version
         boundary = token_end // self._object_size * self._object_size
+        tails = self._field_tails.setdefault(request_id, {})
+        for name, (start, field_rows) in request_output.fields.items():
+            field_rows = field_rows[: max(token_end - start, 0)]
+            previous = tails.get(name)
+            if previous is not None and previous[0] + len(previous[1]) == start:
+                start = previous[0]
+                field_rows = np.concatenate((previous[1], field_rows))
+            tails[name] = (start, field_rows)
+        for name, (start, field_rows) in tails.items():
+            if boundary > start:
+                tails[name] = (boundary, field_rows[boundary - start :])
         if boundary > tail_start:
             tail = tail[boundary - tail_start :]
             tail_start = boundary
         self._tails[request_id] = (tail_start, tail)
         return tail if request.is_finished() else None
+
+    def take_aux_fields(self, request: Request) -> dict[str, np.ndarray] | None:
+        """Rows of the other fields of a finished session request's tail."""
+        tails = self._field_tails.pop(request.request_id, None)
+        if not tails:
+            return None
+        assert self._object_size is not None
+        token_end = request.num_tokens - 1
+        boundary = token_end // self._object_size * self._object_size
+        for name, (start, rows) in tails.items():
+            assert start == boundary and start + len(rows) == token_end, (
+                f"{name} rows do not cover the request's tail"
+            )
+        return {name: rows for name, (_, rows) in tails.items()}
 
     def take_object_keys(self, request: Request) -> list[str] | None:
         """Keys of a finished session request's objects before its tail."""
@@ -396,6 +425,7 @@ class AuxOutputSchedulerConnector:
         if (session := self._session(request)) is not None:
             if request.is_finished():
                 self._tails.pop(request_id, None)
+                self._field_tails.pop(request_id, None)
             if request_id in self._sent_hash_counts:
                 self._session_requests[session] -= 1
             self._session_last_used[session] = time.monotonic()

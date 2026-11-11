@@ -105,3 +105,24 @@ class TestSessionObjectWriter:
         writer.add_blocks("c", "s", HASHES, blocks[:2], [(0, "v4")])
         writer.flush()
         assert store.writes == [["job/s/h1@v2", "job/s/h3@v3"], ["job/s/h1@v4"]]
+
+    def test_objects_carry_staged_rows_of_other_fields(self):
+        store = CountingStore()
+        writer = _writer(store)
+        rows = np.arange(24, dtype=np.int32).reshape(12, 1, 2)
+        writer.add_rows("r", "indexer_topk", 0, rows[:5])
+        writer.add_rows("r", "indexer_topk", 5, rows[5:])
+        start, staged = writer.read_rows("r", "indexer_topk", 3, 12)
+        assert start == 3 and staged.tolist() == rows[3:].tolist()
+        writer.add_blocks("r", "s", HASHES, [_block(0), _block(4)], VERSIONS)
+        writer.flush()
+        stored = read_aux_rows(store, ["job/s/h1@v"], "indexer_topk")
+        assert stored.tolist() == rows[:8].tolist()
+        start, staged = writer.read_rows("r", "indexer_topk", 3, 12)
+        assert start == 8 and staged.tolist() == rows[8:].tolist()
+
+    def test_object_with_incomplete_field_rows_is_rejected(self):
+        writer = _writer(CountingStore())
+        writer.add_rows("r", "indexer_topk", 0, np.zeros((5, 1, 2), dtype=np.int32))
+        with pytest.raises(AssertionError, match="incomplete"):
+            writer.add_blocks("r", "s", HASHES, [_block(0), _block(4)], VERSIONS)

@@ -27,6 +27,7 @@ from vllm.distributed.aux_output_connector.routed_experts import (
     routed_experts_keys,
 )
 from vllm.distributed.aux_output_connector.session_objects import (
+    INDEXER_TOPK_FIELD,
     SessionObjectWriter,
     record_weight_version,
 )
@@ -42,6 +43,10 @@ from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
 from vllm.model_executor.layers.fused_moe.routed_experts_replay import (
     RoutedExpertsReplay,
     bind_routed_experts_replay,
+)
+from vllm.model_executor.layers.indexer_topk_capturer import (
+    IndexerTopkCapturer,
+    bind_indexer_topk_capturer,
 )
 from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes
 
@@ -77,8 +82,10 @@ class PendingAuxOutput:
     # GPU snapshot taken on the main stream.
     routed_experts_gpu: torch.Tensor
     weight_version: str = "default"
+    fields_gpu: dict[str, torch.Tensor] = field(default_factory=dict)
     # Filled by enqueue_cpu_copy on the output copy stream.
     routed_experts: np.ndarray | None = None
+    fields: dict[str, np.ndarray] = field(default_factory=dict)
     num_sampled: np.ndarray | None = None
     num_rejected: np.ndarray | None = None
 
@@ -91,6 +98,10 @@ class PendingAuxOutput:
         self.routed_experts = self.routed_experts_gpu.to(
             "cpu", non_blocking=True
         ).numpy()
+        self.fields = {
+            name: rows.to("cpu", non_blocking=True).numpy()
+            for name, rows in self.fields_gpu.items()
+        }
 
     def process_output(self) -> dict[str, AuxRequestOutput]:
         return self.connector.process_output(self)
@@ -100,6 +111,7 @@ class AuxOutputWorkerConnector:
     """Own capture, request tails, and backend resources on the output worker."""
 
     _object_writer: SessionObjectWriter | None = None
+    _indexer: IndexerTopkCapturer | None = None
 
     def __init__(
         self,
@@ -125,6 +137,16 @@ class AuxOutputWorkerConnector:
                 capturer.device_buffer.device,
             )
             bind_routed_experts_replay(model, self._replay)
+        self._indexer: IndexerTopkCapturer | None = None
+        if vllm_config.aux_output_config.enable_return_indexer_topk:
+            self._indexer = bind_indexer_topk_capturer(
+                model, max_num_batched_tokens, capturer.device_buffer.device
+            )
+            if self._indexer is None:
+                raise ValueError(
+                    "enable_return_indexer_topk requires a model with "
+                    "sparse-attention indexer layers."
+                )
         self._vllm_config = vllm_config
         self._store: BackgroundBlockObjectStore | None = None
         self._buffer: RoutedExpertsBuffer | None = None
@@ -211,6 +233,11 @@ class AuxOutputWorkerConnector:
             query_start_loc=query_start_loc,
             routed_experts_gpu=self._capturer.snapshot_routing_data(num_rows),
             weight_version=self._step_metadata.weight_version,
+            fields_gpu=(
+                {INDEXER_TOPK_FIELD: self._indexer.snapshot(num_rows)}
+                if self._indexer is not None
+                else {}
+            ),
         )
         with self._lock:
             assert len(self._pending_outputs) < self._max_concurrent_batches, (
@@ -307,6 +334,14 @@ class AuxOutputWorkerConnector:
                 record_weight_version(
                     state.weight_versions, capture_start, pending.weight_version
                 )
+                if self._object_writer is not None:
+                    for name, field_rows in pending.fields.items():
+                        self._object_writer.add_rows(
+                            request_id,
+                            name,
+                            capture_start,
+                            field_rows[start : end - rejected],
+                        )
 
             emit_start = state.emit_cursor
             # Complete blocks without keys remain pending until a hash update.
@@ -354,6 +389,19 @@ class AuxOutputWorkerConnector:
                 )
             outputs[request_id] = AuxRequestOutput(emit_start, rows)
             state.emit_cursor = token_end
+        if pending.fields and self._object_writer is not None:
+            for request_id, output in outputs.items():
+                if self._requests[request_id].session is None:
+                    continue
+                for name in pending.fields:
+                    staged = self._object_writer.read_rows(
+                        request_id,
+                        name,
+                        output.token_start,
+                        output.token_start + len(output.rows),
+                    )
+                    if staged is not None:
+                        output.fields[name] = staged
         return outputs
 
     def _publish_blocks(

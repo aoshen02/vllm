@@ -318,6 +318,10 @@ class EngineCoreOutput(
     # Appended last for array_like compatibility.
     aux_output_keys: list[str] | None = None
 
+    # Rows of the other auxiliary fields (e.g. indexer_topk) of a finished
+    # session request's tail. Appended last for array_like compatibility.
+    aux_fields: dict[str, np.ndarray] | None = None
+
     @property
     def finished(self) -> bool:
         return self.finish_reason is not None

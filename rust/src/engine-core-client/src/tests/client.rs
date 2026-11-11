@@ -4004,6 +4004,24 @@ fn python_msgpack_fixtures_match_rust_encoding_and_record_nixl_metrics() {
                                 "job/s/ab",
                             ],
                         ),
+                        aux_fields: Some(
+                            {
+                                "indexer_topk": WireArray {
+                                    dtype: NumpyDtype {
+                                        scalar: I32,
+                                        endianness: Little,
+                                    },
+                                    shape: [
+                                        2,
+                                        1,
+                                        2,
+                                    ],
+                                    data: RawView(
+                                        b"\0\0\0\0\x01\0\0\0\x02\0\0\0\x03\0\0\0",
+                                    ),
+                                },
+                            },
+                        ),
                     },
                 ],
                 scheduler_stats: None,

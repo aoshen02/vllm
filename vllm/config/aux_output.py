@@ -21,6 +21,11 @@ class AuxOutputConfig:
     (`SamplingParams.routed_experts_replay`). Requires
     `enable_return_routed_experts`."""
 
+    enable_return_indexer_topk: bool = False
+    """Capture the sparse-attention indexer's top-k positions of every
+    indexer layer and deliver them with the routed experts of session
+    requests (`SamplingParams.aux_session`). Requires `object_store`."""
+
     max_bytes: int | None = Field(default=None, gt=0)
     """Capacity of the row cache that serves prefix-cache and KV offload hits,
     or `None` to derive it from the KV cache capacity. Rows of the blocks it
@@ -48,6 +53,8 @@ class AuxOutputConfig:
     @model_validator(mode="after")
     def _check_object_store(self) -> Self:
         if self.object_store is None:
+            if self.enable_return_indexer_topk:
+                raise ValueError("enable_return_indexer_topk requires object_store.")
             return self
         if not self.enable_return_routed_experts:
             raise ValueError("object_store requires enable_return_routed_experts.")
