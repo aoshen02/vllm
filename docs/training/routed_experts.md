@@ -20,7 +20,7 @@ Rejected at startup: adaptive speculative verification, PP > 1, DCP/PCP > 1, and
 
 ### How it works: aux output connector
 
-Routing is stored by the aux output connector (`vllm/distributed/aux_output_connector/`, configured via `--aux-output-config`), keyed by KV block hash and shared with prefix caching, which is why prefix caching is required. `max_bytes` is its host-memory LRU capacity (default: derived from KV cache capacity). If a prefix-cache hit needs evicted rows, the worker raises `BlockObjectStoreError`; increase `max_bytes`.
+Routing is stored by the aux output connector (`vllm/distributed/aux_output_connector/`, configured via `--aux-output-config`), keyed by KV block hash and shared with prefix caching, which is why prefix caching is required. `max_bytes` is its host-memory LRU capacity (default: derived from KV cache capacity): the engine retains the rows of as many finished blocks as fit, and a prefix-cache or KV offload hit on a block whose rows were released is recomputed instead. With a KV offload tier, size `max_bytes` for 1.5-2x the tier's block count; a smaller row cache releases rows the tier still has KV for and loses those hits. In bytes, one KV block of rows takes `block_size × num_hidden_layers × num_experts_per_tok × (1 if num_experts <= 256 else 2)` bytes, so `max_bytes ≈ 1.5–2 × tier blocks × bytes per block`.
 
 ### Backend row restoration
 

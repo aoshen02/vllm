@@ -15,8 +15,10 @@ class AuxOutputConfig:
     """Capture and return routed-experts auxiliary outputs."""
 
     max_bytes: int | None = Field(default=None, gt=0)
-    """Initial capacity, or `None` to derive it from the KV cache capacity.
-    Grows when every object is referenced."""
+    """Capacity of the row cache that serves prefix-cache and KV offload hits,
+    or `None` to derive it from the KV cache capacity. Rows of the blocks it
+    can hold are retained after their request finishes; a hit on a block whose
+    rows were released is recomputed."""
 
     @property
     def enabled(self) -> bool:
