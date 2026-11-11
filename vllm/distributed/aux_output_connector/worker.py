@@ -32,6 +32,10 @@ from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
     RoutedExpertsCapturer,
     bind_routed_experts_capturer,
 )
+from vllm.model_executor.layers.fused_moe.routed_experts_replay import (
+    RoutedExpertsReplay,
+    bind_routed_experts_replay,
+)
 from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes
 
 if TYPE_CHECKING:
@@ -95,6 +99,18 @@ class AuxOutputWorkerConnector:
         )
         bind_routed_experts_capturer(model, capturer)
         self._capturer = capturer
+        self._replay: RoutedExpertsReplay | None = None
+        if vllm_config.aux_output_config.enable_routed_experts_replay:
+            if vllm_config.parallel_config.data_parallel_size > 1:
+                raise ValueError(
+                    "Routed-experts replay does not support data parallelism."
+                )
+            self._replay = RoutedExpertsReplay(
+                max_num_batched_tokens,
+                capturer.shape_per_token,
+                capturer.device_buffer.device,
+            )
+            bind_routed_experts_replay(model, self._replay)
         self._vllm_config = vllm_config
         self._store: BackgroundBlockObjectStore | None = None
         self._buffer: RoutedExpertsBuffer | None = None
@@ -107,6 +123,23 @@ class AuxOutputWorkerConnector:
         self._pending_outputs: list[PendingAuxOutput] = []
         self._lock = Lock()
         self._max_concurrent_batches = vllm_config.max_concurrent_batches
+
+    def add_replay(self, request_id: str, rows: np.ndarray) -> None:
+        if self._replay is None:
+            raise ValueError("Routed-experts replay is not enabled.")
+        self._replay.add_request(request_id, rows)
+
+    def remove_replay(self, request_id: str) -> None:
+        if self._replay is not None:
+            self._replay.remove_request(request_id)
+
+    def prepare_replay(self, input_batch: InputBatch) -> None:
+        if self._replay is not None:
+            self._replay.prepare(
+                input_batch.req_ids,
+                input_batch.num_computed_tokens_np,
+                input_batch.query_start_loc_np,
+            )
 
     def initialize_output_storage(self, kv_cache_config: KVCacheConfig) -> None:
         """Create the output data plane once the KV cache layout is resolved."""

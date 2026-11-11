@@ -32,6 +32,19 @@ def get_routed_experts_bytes_per_token(model_config: ModelConfig) -> int:
     )
 
 
+def check_routed_experts_replay(
+    rows: np.ndarray, prompt_len: int, shape_per_token: tuple[int, int]
+) -> str | None:
+    """Return why `rows` cannot replay a prompt of `prompt_len` tokens."""
+    if not isinstance(rows, np.ndarray) or rows.dtype.kind not in "iu":
+        return "must be an integer array"
+    if rows.ndim != 3 or tuple(rows.shape[1:]) != shape_per_token:
+        return f"must have shape (num_rows, {shape_per_token[0]}, {shape_per_token[1]})"
+    if len(rows) > prompt_len:
+        return f"has {len(rows)} rows, more than the prompt length {prompt_len}"
+    return None
+
+
 @dataclass
 class PackedBlockHashes:
     """Contiguous, self-contained block hashes for scheduler-worker IPC."""

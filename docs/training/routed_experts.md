@@ -65,3 +65,13 @@ Per-request, default `0`: drops up to the first N prompt-token rows (e.g. routin
 The rows start at `start = min(routed_experts_prompt_start, first recomputed position)`. A prefix-cache hit can end before `routed_experts_prompt_start`, for example when part of the previous turn was evicted, when the hit stops at the cache-hit granularity, or when the cache salt changed with a weight update. The positions from the hit onward are then computed again, and their new rows are returned, because the rows received earlier for them may describe another computation. Derive `start` from the row count and replace the held rows from `start` on.
 
 Example: [examples/rl/routed_experts_e2e.py](../../examples/rl/routed_experts_e2e.py).
+
+## Replaying recorded routing
+
+With `--aux-output-config '{"enable_return_routed_experts": true, "enable_routed_experts_replay": true}'`, a request can pass `SamplingParams(routed_experts_replay=rows)`: the routed experts recorded for prompt positions `[0, len(rows))`, shaped like the returned rows. When prefill computes those positions, every MoE layer takes the given experts instead of selecting them, and their weights are recomputed from the current router logits with the router's scoring function. The returned rows for those positions are the replayed ones.
+
+Use it when weights change between turns and the prompt is recomputed (for example with a cache salt per weight version): earlier turns keep the routing they were sampled with, so a trainer replaying the returned rows sees the same experts.
+
+Replay applies only to positions the request computes. Positions served from the prefix cache keep the routing that computed their KV, and their returned rows are those cached rows, not the replayed ones; the returned rows always describe the KV that later tokens read. The KV and rows a replaying request computes are cached like any other, so a later request with the same prefix and salt, replaying or not, reuses them. Give requests whose cached routing must not be shared different cache salts.
+
+Supported for non-monolithic MoE kernels with softmax, sigmoid or sqrtsoftplus routers, without fused shared experts and without data parallelism.

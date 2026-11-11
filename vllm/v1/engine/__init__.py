@@ -225,6 +225,8 @@ class EngineCoreRequest(
     # PrefixHashConfig, including any extra keys (LoRA, multimodal, cache salt).
     block_hashes: list[bytes] | None = None
 
+    routed_experts_replay: np.ndarray | None = None
+
     @property
     def params(self) -> SamplingParams | PoolingParams:
         """Return the processed params (sampling or pooling)."""

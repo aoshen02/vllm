@@ -53,6 +53,7 @@ class NewRequestData:
     prompt_is_token_ids: list[bool] | None = None
     # DeepSeek-V4.1 only: SWA bounded replay; see Request.replay_start.
     replay_start: int = 0
+    routed_experts_replay: "np.ndarray | None" = None
 
     @classmethod
     def from_request(
@@ -79,6 +80,7 @@ class NewRequestData:
             prompt_is_token_ids=request.prompt_is_token_ids,
             prefill_token_ids=prefill_token_ids,
             replay_start=request.replay_start,
+            routed_experts_replay=request.routed_experts_replay,
         )
 
     def __setstate__(self, state: dict) -> None:

@@ -1244,6 +1244,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # so the model_state can still look up the slot index.
         self.model_state.remove_request(req_id)
         self.draft_tokens_handler.discard(req_id)
+        if self.aux_output_connector is not None:
+            self.aux_output_connector.remove_replay(req_id)
         req_idx = self.req_states.remove_request(req_id)
         if req_idx is None:
             return False
@@ -1328,6 +1330,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 req_index, new_req_data.block_ids, overwrite=True
             )
             self.lora_state.add_request(req_id, req_index, new_req_data.lora_request)
+            if new_req_data.routed_experts_replay is not None:
+                assert self.aux_output_connector is not None
+                self.aux_output_connector.add_replay(
+                    req_id, new_req_data.routed_experts_replay
+                )
 
             if self.is_last_pp_rank and new_req_data.sampling_params is not None:
                 assert self.sampler is not None
@@ -1930,6 +1937,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             input_batch = self.prepare_inputs(
                 scheduler_output, batch_req_state, batch_desc, num_active_loras
             )
+            if self.aux_output_connector is not None:
+                self.aux_output_connector.prepare_replay(input_batch)
             block_tables, slot_mappings = self.prepare_attn(input_batch)
             # Mamba prefix-cache pre-copy: migrate recurrent state across block
             # boundaries before the forward. Runs only on real batches, and

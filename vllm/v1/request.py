@@ -84,8 +84,10 @@ class Request:
         abort_immediately: bool = False,
         kv_hints: KvHintsEnvelope | None = None,
         block_hashes: list["BlockHash"] | None = None,
+        routed_experts_replay: np.ndarray | None = None,
     ) -> None:
         self.request_id = request_id
+        self.routed_experts_replay = routed_experts_replay
         self.client_index = client_index
         self.priority = priority
         self.sampling_params = sampling_params
@@ -282,6 +284,7 @@ class Request:
             reasoning_parser_kwargs=request.reasoning_parser_kwargs,
             abort_immediately=request.abort_immediately,
             block_hashes=block_hashes,
+            routed_experts_replay=request.routed_experts_replay,
         )
 
     def append_output_token_ids(
