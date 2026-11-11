@@ -99,6 +99,35 @@ llm = LLM("Qwen/Qwen3-0.6B")
 llm.collective_rpc("reload_weights", kwargs={"weights_iterator": weights_iterator})
 ```
 
+### Start with `load_format="dummy"`, Load Real Weights Later
+
+To skip reading the checkpoint at startup (e.g. the trainer pushes weights right after launch), start with `load_format="dummy"` (`--load-format dummy`). Parameters are randomly initialized, so outputs are gibberish until real weights are loaded. CUDA graphs are still captured at startup and are **not** recaptured on reload: `reload_weights` and weight-transfer updates copy into the existing parameter storage. See [skip_loading_weights_in_engine_init.py](../../examples/rl/skip_loading_weights_in_engine_init.py).
+
+- **Weights pushed by a trainer**: nothing else is needed. Use the [weight transfer](weight_transfer/README.md) API; checkpoint-format backends run layerwise reloading inside `start_weight_update`/`finish_weight_update`.
+- **Weights from disk**: `reload_weights` with no `weights_iterator` uses the current `load_config`, and the dummy loader cannot read checkpoints and raises `NotImplementedError`. Switch the loader with the `update_config` RPC first:
+
+```python
+from vllm import LLM
+
+llm = LLM("Qwen/Qwen3-0.6B", load_format="dummy")
+
+# switch the loader from `dummy` to `auto` (the default) before reading from disk
+llm.collective_rpc("update_config", args=({"load_config": {"load_format": "auto"}},))
+llm.collective_rpc("reload_weights")  # or kwargs={"weights_path": ...}
+```
+
+`update_config` only accepts `load_config` and `model_config` overrides; other keys raise `ValueError`. Unknown fields also raise `ValueError`.
+
+`reload_weights` arguments:
+
+| Argument | Default | Meaning |
+| - | - | - |
+| `weights_iterator` | `None` | `(name, tensor)` pairs to load. If `None`, weights are read from disk with the current `load_config` |
+| `weights_path` | `None` | Checkpoint to read when no iterator is given. If `None`, the original model path is used |
+| `is_checkpoint_format` | `True` | `True`: weights use checkpoint names and layout (as in the HF checkpoint: unfused, unsharded); they go through `model.load_weights` and layerwise processing (fusing, sharding, quantization). `False`: weights are already in kernel format (fused, sharded for this rank, repacked/quantized) and are `copy_`-ed directly into the vLLM parameter of the same name. Disk reloads must use `True` (vLLM logs a warning otherwise) |
+
+After reloading, the worker resets LoRA state and the encoder and multimodal caches.
+
 ### Low Level `layerwise` API
 
 [layerwise.py](../../vllm/model_executor/model_loader/reload/layerwise.py) Implements the following functions to execute its lifecycle:
@@ -142,5 +171,5 @@ For this reason, users must take care as to the order of weights when they are r
 Users will see a warning like the one below if weights are loaded out-of-order.
 
 ```console
-WARNING [layerwise.py:198] Allocating 28.5 MB of device memory to buffers to load ["QKVParallelLinear", "MergedColumnParallelLinear"] layers. This extra memory usage can be avoided by ordering weights by their parent layer when reloading.
+WARNING [layerwise.py:209] Allocating 28.5 MB of device memory to buffers to load ["QKVParallelLinear", "MergedColumnParallelLinear"] layers. This extra memory usage can be avoided by ordering weights by their parent layer when reloading.
 ```
