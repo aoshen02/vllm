@@ -97,6 +97,7 @@ class AuxOutputSchedulerConnector:
         object_store: bool = False,
         key_prefix: str = "",
         session_idle_timeout_s: float = 3600.0,
+        return_routed_experts: bool = True,
     ) -> None:
         # Number of hashes already sent to the worker for each active request.
         self._sent_hash_counts: dict[str, int] = {}
@@ -118,7 +119,7 @@ class AuxOutputSchedulerConnector:
             max_bytes
             // (self._hash_block_size * bytes_per_token)
             // (self._block_size // self._hash_block_size)
-            if max_bytes is not None
+            if max_bytes is not None and bytes_per_token
             else kv_cache_manager.kv_cache_config.num_blocks
             * (2 if kv_connector else 1)
         )
@@ -138,6 +139,7 @@ class AuxOutputSchedulerConnector:
         self._next_session_sweep = 0.0
         self._tails: dict[str, tuple[int, np.ndarray]] = {}
         self._field_tails: dict[str, dict[str, list[tuple[int, np.ndarray]]]] = {}
+        self._return_routed_experts = return_routed_experts
 
     def build_connector_meta(
         self,
@@ -343,7 +345,7 @@ class AuxOutputSchedulerConnector:
         )
         rows = request_output.rows[:local_end]
         if (session := self._session(request)) is None:
-            return rows
+            return rows if self._return_routed_experts else None
         assert self._object_size is not None
         tail_start, tail = self._tails.get(
             request_id, (request_output.token_start, rows[:0])
@@ -391,7 +393,9 @@ class AuxOutputSchedulerConnector:
             tail = tail[boundary - tail_start :]
             tail_start = boundary
         self._tails[request_id] = (tail_start, tail)
-        return tail if request.is_finished() else None
+        if not self._return_routed_experts or not request.is_finished():
+            return None
+        return tail
 
     def take_aux_fields(self, request: Request) -> dict[str, np.ndarray] | None:
         """Rows of the other fields of a finished session request's tail."""

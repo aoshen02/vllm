@@ -125,10 +125,16 @@ class AuxOutputWorkerConnector:
         model: torch.nn.Module,
     ) -> None:
         max_num_batched_tokens = vllm_config.scheduler_config.max_num_batched_tokens
-        capturer = RoutedExpertsCapturer(
-            max_num_batched_tokens=max_num_batched_tokens, vllm_config=vllm_config
+        return_routed_experts = (
+            vllm_config.aux_output_config.enable_return_routed_experts
         )
-        bind_routed_experts_capturer(model, capturer)
+        capturer = RoutedExpertsCapturer(
+            max_num_batched_tokens=max_num_batched_tokens,
+            vllm_config=vllm_config,
+            capture=return_routed_experts,
+        )
+        if return_routed_experts:
+            bind_routed_experts_capturer(model, capturer)
         self._capturer = capturer
         self._replay: RoutedExpertsReplay | None = None
         if vllm_config.aux_output_config.enable_routed_experts_replay:
@@ -227,6 +233,7 @@ class AuxOutputWorkerConnector:
                 object_size=scheduler_block_size,
                 hash_block_size=hash_block_size,
                 max_pending_batches=2 * vllm_config.scheduler_config.max_num_seqs,
+                routed_experts=aux_output_config.enable_return_routed_experts,
             )
 
     def prepare_output(

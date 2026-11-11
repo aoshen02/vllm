@@ -126,6 +126,7 @@ def test_profile_run_creates_aux_output_connector_before_forward(
     vllm_config = SimpleNamespace(
         aux_output_config=SimpleNamespace(
             enabled=enabled,
+            enable_return_routed_experts=True,
             enable_routed_experts_replay=False,
             enable_return_indexer_topk=False,
             enable_return_hidden_states=False,
@@ -136,7 +137,11 @@ def test_profile_run_creates_aux_output_connector_before_forward(
     )
 
     def allocate(**kwargs):
-        assert kwargs == {"max_num_batched_tokens": 8, "vllm_config": vllm_config}
+        assert kwargs == {
+            "max_num_batched_tokens": 8,
+            "vllm_config": vllm_config,
+            "capture": True,
+        }
         events.append("allocate")
         return capturer
 

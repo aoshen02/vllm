@@ -65,6 +65,7 @@ class SessionObjectWriter:
         object_size: int,
         hash_block_size: int,
         max_pending_batches: int,
+        routed_experts: bool = True,
     ) -> None:
         if object_size % hash_block_size:
             raise ValueError(
@@ -76,6 +77,7 @@ class SessionObjectWriter:
         self.object_size = object_size
         self._hash_block_size = hash_block_size
         self._pieces_per_object = object_size // hash_block_size
+        self._routed_experts = routed_experts
         self._staged: dict[str, dict[int, dict[int, np.ndarray]]] = {}
         # Request -> field -> object index -> (rows, positions written).
         self._rows: dict[str, dict[str, dict[int, tuple[np.ndarray, np.ndarray]]]] = {}
@@ -132,11 +134,11 @@ class SessionObjectWriter:
             if len(pieces) < self._pieces_per_object:
                 continue
             del staged[index]
-            fields = {
-                ROUTED_EXPERTS_FIELD: np.concatenate(
+            fields = {}
+            if self._routed_experts:
+                fields[ROUTED_EXPERTS_FIELD] = np.concatenate(
                     [pieces[i] for i in range(self._pieces_per_object)]
                 )
-            }
             for field, objects in self._rows.get(request_id, {}).items():
                 field_rows, written_mask = objects.pop(index, (None, None))
                 if field_rows is None or not written_mask.all():

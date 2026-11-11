@@ -8,7 +8,10 @@ from vllm.distributed.aux_output_connector.object_store import (
     AuxObjectStoreError,
     LocalAuxObjectStore,
 )
-from vllm.distributed.aux_output_connector.objects import read_aux_rows
+from vllm.distributed.aux_output_connector.objects import (
+    decode_aux_object,
+    read_aux_rows,
+)
 from vllm.distributed.aux_output_connector.session_objects import (
     SessionObjectWriter,
 )
@@ -120,6 +123,25 @@ class TestSessionObjectWriter:
         assert stored.tolist() == rows[:8].tolist()
         start, staged = writer.read_rows("r", "indexer_topk", 3, 12)
         assert start == 8 and staged.tolist() == rows[8:].tolist()
+
+    def test_objects_without_routed_experts_carry_only_other_fields(self):
+        store = CountingStore()
+        writer = SessionObjectWriter(
+            store,
+            key_prefix="job",
+            object_size=8,
+            hash_block_size=4,
+            max_pending_batches=4,
+            routed_experts=False,
+        )
+        rows = np.arange(16, dtype=np.int32).reshape(8, 1, 2)
+        writer.add_rows("r", "topk_token_ids", 0, rows)
+        empty = [(start, np.zeros((4, 0, 0), dtype=np.uint8)) for start in (0, 4)]
+        writer.add_blocks("r", "s", HASHES, empty, VERSIONS)
+        writer.flush()
+        fields = decode_aux_object(store.get("job/s/h1@v"))
+        assert list(fields) == ["topk_token_ids"]
+        assert fields["topk_token_ids"].tolist() == rows.tolist()
 
     def test_object_with_incomplete_field_rows_is_rejected(self):
         writer = _writer(CountingStore())

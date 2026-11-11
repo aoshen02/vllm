@@ -466,13 +466,18 @@ class Scheduler(SchedulerInterface):
                 self.kv_cache_manager,
                 self.connector,
                 max_bytes=vllm_config.aux_output_config.max_bytes,
-                bytes_per_token=get_routed_experts_bytes_per_token(
-                    vllm_config.model_config
+                bytes_per_token=(
+                    get_routed_experts_bytes_per_token(vllm_config.model_config)
+                    if vllm_config.aux_output_config.enable_return_routed_experts
+                    else 0
                 ),
                 object_store=vllm_config.aux_output_config.object_store is not None,
                 key_prefix=vllm_config.aux_output_config.object_key_prefix,
                 session_idle_timeout_s=(
                     vllm_config.aux_output_config.session_idle_timeout_s
+                ),
+                return_routed_experts=(
+                    vllm_config.aux_output_config.enable_return_routed_experts
                 ),
             )
             if vllm_config.aux_output_config.enabled

@@ -7,7 +7,7 @@ Each turn sends the whole conversation so far as one request with
 position through a shared object store. Prefix-cache hits keep the rows of the
 turns already scored, so each turn computes only its new tokens.
 
-Requires a MoE teacher and a running Mooncake master, for example:
+Requires a running Mooncake master, for example:
 
     mooncake_master --port=50051 &
     export MOONCAKE_CONFIG_PATH=mooncake.json  # points at 127.0.0.1:50051
@@ -65,10 +65,13 @@ def main() -> None:
     llm = LLM(
         model=args.model,
         tensor_parallel_size=args.tp,
-        kernel_config={"moe_backend": args.moe_backend} if args.moe_backend else None,
+        **(
+            {"kernel_config": {"moe_backend": args.moe_backend}}
+            if args.moe_backend
+            else {}
+        ),
         enable_prefix_caching=True,
         aux_output_config={
-            "enable_return_routed_experts": True,
             "return_topk_logprobs": args.topk,
             "object_store": {"backend": "mooncake", "key_prefix": "teacher"},
         },

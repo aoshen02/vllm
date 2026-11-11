@@ -86,7 +86,7 @@ def test_legacy_routed_experts_flag_updates_aux_output_config():
     ("kwargs", "error"),
     [
         ({"runner_type": "pooling"}, "only supports generate runners"),
-        ({"is_moe": False}, "only supports MoE models"),
+        ({"is_moe": False}, "requires a MoE model"),
         ({"enable_prefix_caching": False}, "requires prefix caching"),
         (
             {"adaptive_verification": True},
@@ -100,6 +100,32 @@ def test_legacy_routed_experts_flag_updates_aux_output_config():
 def test_aux_output_connector_rejects_unsupported_configuration(kwargs, error):
     with pytest.raises(ValueError, match=error):
         VllmConfig._verify_aux_output_compatibility(_config(**kwargs))
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "error"),
+    [
+        ({"return_topk_logprobs": 2}, None),
+        ({"enable_return_hidden_states": True}, None),
+        ({}, "requires at least one output"),
+    ],
+    ids=["topk-logprobs", "hidden-states", "no-output"],
+)
+def test_object_store_without_routed_experts(kwargs, error):
+    if error is not None:
+        with pytest.raises(ValueError, match=error):
+            AuxOutputConfig(object_store={"backend": "local"}, **kwargs)
+        return
+    config = AuxOutputConfig(object_store={"backend": "local"}, **kwargs)
+    assert config.enabled and not config.enable_return_routed_experts
+
+
+def test_dense_model_without_routed_experts_is_accepted():
+    config = _config(is_moe=False)
+    config.aux_output_config = AuxOutputConfig(
+        object_store={"backend": "local"}, return_topk_logprobs=2
+    )
+    VllmConfig._verify_aux_output_compatibility(config)
 
 
 @pytest.mark.parametrize(
