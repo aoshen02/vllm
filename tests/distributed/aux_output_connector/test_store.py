@@ -295,7 +295,7 @@ def test_worker_snapshots_hidden_states_of_query_rows(dtype):
     "gathered", [True, False], ids=["logits-rank", "non-logits-rank"]
 )
 def test_topk_logprobs_are_computed_in_chunks(gathered):
-    hidden_states = torch.randn(5, 3)
+    hidden_states = torch.randn(6, 3)
     weight = torch.randn(7, 3)
     calls = []
 
@@ -303,7 +303,8 @@ def test_topk_logprobs_are_computed_in_chunks(gathered):
         calls.append(len(rows))
         return rows @ weight.T if gathered else None
 
-    topk = compute_topk_logprobs(hidden_states, logits_fn, 2, chunk_size=2)
+    rows = np.array([0, 2, 3, 4, 5])
+    topk = compute_topk_logprobs(hidden_states, logits_fn, 2, rows, 6, chunk_size=2)
     assert calls == [2, 2, 1]
     if not gathered:
         assert topk is None
@@ -311,8 +312,39 @@ def test_topk_logprobs_are_computed_in_chunks(gathered):
     token_ids, logprobs = topk
     expected = torch.log_softmax(hidden_states @ weight.T, dim=-1).topk(2, dim=-1)
     assert token_ids.dtype == torch.int32
-    assert token_ids.tolist() == expected.indices.tolist()
-    torch.testing.assert_close(logprobs, expected.values)
+    assert token_ids[rows].tolist() == expected.indices[rows].tolist()
+    torch.testing.assert_close(logprobs[rows], expected.values[rows])
+    assert token_ids[1].tolist() == [-1, -1]
+
+
+@pytest.mark.parametrize(
+    "sessions,expected_rows",
+    [(set(), 0), ({"b"}, 3), ({"a", "b"}, 5)],
+    ids=["no-session", "one-session", "all-sessions"],
+)
+def test_topk_logprobs_cover_only_session_rows(sessions, expected_rows):
+    worker = object.__new__(AuxOutputWorkerConnector)
+    worker._buffer = None
+    worker._topk_logprobs = 2
+    worker._session_request_ids = set()
+    worker._session_generation = 0
+    worker.begin_step(
+        AuxOutputConnectorMetadata(
+            0, {}, {}, (), sessions={request: "s" for request in sessions}
+        )
+    )
+    calls = []
+
+    def logits_fn(rows):
+        calls.append(len(rows))
+        return torch.zeros(len(rows), 4)
+
+    worker.prepare_output(
+        _input_batch(["a", "b"], np.array([0, 0]), np.array([0, 2, 5])),
+        torch.randn(5, 3),
+        logits_fn,
+    )
+    assert sum(calls) == expected_rows
 
 
 def test_next_step_does_not_consume_pending_output(monkeypatch):

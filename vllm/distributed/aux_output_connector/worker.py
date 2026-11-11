@@ -156,6 +156,8 @@ class AuxOutputWorkerConnector:
             vllm_config.aux_output_config.enable_return_hidden_states
         )
         self._topk_logprobs = vllm_config.aux_output_config.return_topk_logprobs
+        self._session_request_ids: set[str] = set()
+        self._session_generation = 0
         self._vllm_config = vllm_config
         self._store: BackgroundBlockObjectStore | None = None
         self._buffer: RoutedExpertsBuffer | None = None
@@ -248,9 +250,11 @@ class AuxOutputWorkerConnector:
         num_rows = int(query_start_loc[-1])
         topk = None
         if self._topk_logprobs and hidden_states is not None and logits_fn is not None:
-            topk = compute_topk_logprobs(
-                hidden_states[:num_rows], logits_fn, self._topk_logprobs
-            )
+            rows = session_rows(request_ids, query_start_loc, self._session_request_ids)
+            if len(rows):
+                topk = compute_topk_logprobs(
+                    hidden_states, logits_fn, self._topk_logprobs, rows, num_rows
+                )
         if self._buffer is None:
             return None
 
@@ -499,6 +503,12 @@ class AuxOutputWorkerConnector:
         deferred to that step's process_output.
         """
         self._step_metadata = metadata
+        if self._topk_logprobs and metadata is not None:
+            if metadata.generation != self._session_generation:
+                self._session_request_ids.clear()
+                self._session_generation = metadata.generation
+            self._session_request_ids.update(metadata.sessions or ())
+            self._session_request_ids.difference_update(metadata.finished_requests)
         if self._buffer is None or metadata is None:
             return
         assert not metadata.requests.keys() & metadata.finished_requests, (
@@ -581,17 +591,36 @@ class AuxOutputWorkerConnector:
                     self._store = None
 
 
+def session_rows(
+    request_ids: Sequence[str],
+    query_start_loc: np.ndarray,
+    session_request_ids: set[str],
+) -> np.ndarray:
+    """Batch rows of the requests in `session_request_ids`."""
+    ranges = [
+        np.arange(query_start_loc[i], query_start_loc[i + 1])
+        for i, request_id in enumerate(request_ids)
+        if request_id in session_request_ids
+    ]
+    return np.concatenate(ranges) if ranges else np.empty(0, dtype=np.int64)
+
+
 def compute_topk_logprobs(
     hidden_states: torch.Tensor,
     logits_fn: Callable[[torch.Tensor], torch.Tensor | None],
     k: int,
+    rows: np.ndarray,
+    num_rows: int,
     chunk_size: int = 1024,
 ) -> tuple[torch.Tensor, torch.Tensor] | None:
-    """Top-k next-token ids (int32) and log-probabilities (float32) of every
-    row, or None on ranks that do not receive the logits."""
+    """Top-k next-token ids (int32) and log-probabilities (float32) of `rows`,
+    scattered into `[num_rows, k]` tensors (other rows hold -1 and -inf), or
+    None on ranks that do not receive the logits."""
+    index = torch.from_numpy(rows).to(hidden_states.device)
+    selected = hidden_states.index_select(0, index)
     token_ids, logprobs = [], []
-    for start in range(0, len(hidden_states), chunk_size):
-        logits = logits_fn(hidden_states[start : start + chunk_size])
+    for start in range(0, len(selected), chunk_size):
+        logits = logits_fn(selected[start : start + chunk_size])
         if logits is None:
             continue
         values, indices = torch.log_softmax(logits.float(), dim=-1).topk(k, dim=-1)
@@ -599,7 +628,15 @@ def compute_topk_logprobs(
         logprobs.append(values)
     if not token_ids:
         return None
-    return torch.cat(token_ids), torch.cat(logprobs)
+    all_token_ids = torch.full(
+        (num_rows, k), -1, dtype=torch.int32, device=hidden_states.device
+    )
+    all_logprobs = torch.full(
+        (num_rows, k), float("-inf"), dtype=torch.float32, device=hidden_states.device
+    )
+    all_token_ids[index] = torch.cat(token_ids)
+    all_logprobs[index] = torch.cat(logprobs)
+    return all_token_ids, all_logprobs
 
 
 def get_aux_output_connector(
