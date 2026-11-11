@@ -76,9 +76,10 @@ class RoutedExpertsCapturer:
         self,
         max_num_batched_tokens: int,
         vllm_config: VllmConfig,
+        capture: bool = True,
     ) -> None:
-        num_layers, num_experts, num_experts_per_tok = _get_routed_experts_shape(
-            vllm_config
+        num_layers, num_experts, num_experts_per_tok = (
+            _get_routed_experts_shape(vllm_config) if capture else (1, 1, 1)
         )
         self.shape_per_token = (num_layers, num_experts_per_tok)
         self.output_dtype_name = "uint8" if num_experts <= 256 else "uint16"

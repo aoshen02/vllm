@@ -1115,8 +1115,11 @@ class VllmConfig:
             return
         if self.model_config.runner_type != "generate":
             raise ValueError("AuxOutput Connector only supports generate runners.")
-        if not self.model_config.is_moe:
-            raise ValueError("AuxOutput Connector only supports MoE models.")
+        if (
+            self.aux_output_config.enable_return_routed_experts
+            and not self.model_config.is_moe
+        ):
+            raise ValueError("Routed-experts output requires a MoE model.")
         if not self.cache_config.enable_prefix_caching:
             raise ValueError("AuxOutput Connector requires prefix caching.")
         if (

@@ -807,6 +807,7 @@ def test_aux_output_worker_connector_binds_capture_on_non_output_rank(monkeypatc
     constructor.assert_called_once_with(
         max_num_batched_tokens=32,
         vllm_config=config,
+        capture=True,
     )
     bind.assert_called_once_with(model, capturer)
     connector.begin_step(Mock())
@@ -841,6 +842,7 @@ def test_aux_output_worker_connector_default_capacity(monkeypatch):
     config = SimpleNamespace(
         aux_output_config=SimpleNamespace(
             max_bytes=None,
+            enable_return_routed_experts=True,
             enable_routed_experts_replay=False,
             enable_return_indexer_topk=False,
             enable_return_hidden_states=False,

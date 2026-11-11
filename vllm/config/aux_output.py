@@ -44,13 +44,14 @@ class AuxOutputConfig:
     rows were released is recomputed."""
 
     object_store: dict[str, Any] | None = None
-    """Deliver the routed experts of requests that set
+    """Deliver the enabled outputs of requests that set
     `SamplingParams.aux_session` through a shared object store: the response
     lists the keys of the objects that cover its rows, one object per KV cache
     block, followed by the rows past the last full block. Keys: `backend`
     (`"mooncake"`, configured by `MOONCAKE_CONFIG_PATH`, or `"local"` for a
     single process) and `key_prefix` (default `"vllm-aux"`), which should be
-    unique per job."""
+    unique per job. Routed experts are optional here, so dense models can
+    deliver hidden states and top-k logprobs."""
 
     session_idle_timeout_s: float = Field(default=3600.0, gt=0)
     """Seconds after which the engine forgets a session with no running
@@ -72,8 +73,13 @@ class AuxOutputConfig:
                 if getattr(self, name):
                     raise ValueError(f"{name} requires object_store.")
             return self
-        if not self.enable_return_routed_experts:
-            raise ValueError("object_store requires enable_return_routed_experts.")
+        if not (
+            self.enable_return_routed_experts
+            or self.enable_return_indexer_topk
+            or self.enable_return_hidden_states
+            or self.return_topk_logprobs
+        ):
+            raise ValueError("object_store requires at least one output.")
         if self.object_store.get("backend") not in ("mooncake", "local"):
             raise ValueError(
                 "object_store backend must be 'mooncake' or 'local', got "
@@ -92,7 +98,7 @@ class AuxOutputConfig:
     @property
     def enabled(self) -> bool:
         """Whether any execution auxiliary output is enabled."""
-        return self.enable_return_routed_experts
+        return self.enable_return_routed_experts or self.object_store is not None
 
     def compile_factors(self) -> CompileFactors:
         """WARNING: Whenever a new field is added to this config, add it to
