@@ -2,7 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Configuration for execution auxiliary outputs."""
 
-from pydantic import Field
+from typing import Self
+
+from pydantic import Field, model_validator
 
 from vllm.config.utils import CompileFactors, config, get_compile_factors
 
@@ -14,11 +16,24 @@ class AuxOutputConfig:
     enable_return_routed_experts: bool = False
     """Capture and return routed-experts auxiliary outputs."""
 
+    enable_routed_experts_replay: bool = False
+    """Let requests replay recorded routed experts during prefill
+    (`SamplingParams.routed_experts_replay`). Requires
+    `enable_return_routed_experts`."""
+
     max_bytes: int | None = Field(default=None, gt=0)
     """Capacity of the row cache that serves prefix-cache and KV offload hits,
     or `None` to derive it from the KV cache capacity. Rows of the blocks it
     can hold are retained after their request finishes; a hit on a block whose
     rows were released is recomputed."""
+
+    @model_validator(mode="after")
+    def _check_replay(self) -> Self:
+        if self.enable_routed_experts_replay and not self.enable_return_routed_experts:
+            raise ValueError(
+                "enable_routed_experts_replay requires enable_return_routed_experts."
+            )
+        return self
 
     @property
     def enabled(self) -> bool:

@@ -166,6 +166,13 @@ class BaseRouter(FusedMoERouter):
         self.top_k = top_k
         self.global_num_experts = global_num_experts
         self.capture_fn: Callable[[torch.Tensor], None] | None = None
+        self.replay_fn: (
+            Callable[
+                [BaseRouter, torch.Tensor, torch.Tensor, torch.Tensor],
+                tuple[torch.Tensor, torch.Tensor],
+            ]
+            | None
+        ) = None
 
     def set_capture_fn(self, capture_fn: Callable[[torch.Tensor], None] | None) -> None:
         """Set a capture callback for logical routed expert IDs."""
@@ -277,6 +284,11 @@ class BaseRouter(FusedMoERouter):
         topk_weights, topk_ids = self._compute_routing(
             hidden_states, router_logits, topk_indices_dtype, input_ids=input_ids
         )
+
+        if self.replay_fn is not None:
+            topk_weights, topk_ids = self.replay_fn(
+                self, router_logits, topk_weights, topk_ids
+            )
 
         # Capture logical ids before EPLB mapping.
         if self.capture_fn is not None:

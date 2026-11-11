@@ -449,6 +449,13 @@ class SamplingParams(
     reading from the KV cache are always returned, so the rows start at
     num_tokens - 1 - len(rows). Default 0 returns routing for all prompt
     tokens."""
+    routed_experts_replay: Any = None
+    """Routed experts recorded for prompt positions `[0, len(rows))`, as an
+    integer array of shape `(num_rows, num_moe_layers, num_experts_per_tok)`.
+    Prefill takes these experts at those positions instead of selecting them,
+    with weights recomputed from the current router logits. Positions served
+    from the prefix cache keep the routing that computed them. Requires
+    `AuxOutputConfig.enable_routed_experts_replay`."""
     trace_decode_token_ids: list[int] | None = None
     """If provided, forces the engine to emit this predetermined sequence of
     token IDs during decoding instead of sampling randomly. Real logprobs are
@@ -491,6 +498,7 @@ class SamplingParams(
         repetition_detection: RepetitionDetectionParams | None = None,
         logprob_token_ids: list[int] | None = None,
         routed_experts_prompt_start: int = 0,
+        routed_experts_replay: Any = None,
         # Debugging / RL-specific parameters.
         trace_decode_token_ids: list[int] | None = None,
     ) -> "SamplingParams":
@@ -559,6 +567,7 @@ class SamplingParams(
             skip_clone=skip_clone,
             repetition_detection=repetition_detection,
             routed_experts_prompt_start=routed_experts_prompt_start,
+            routed_experts_replay=routed_experts_replay,
             trace_decode_token_ids=trace_decode_token_ids,
         )
 
