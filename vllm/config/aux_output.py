@@ -39,8 +39,9 @@ class AuxOutputConfig:
     request that computed them."""
 
     max_bytes: int | None = Field(default=None, gt=0)
-    """Capacity of the row cache that serves prefix-cache and KV offload hits,
-    or `None` to derive it from the KV cache capacity. Rows of the blocks it
+    """Capacity of the routed-experts row cache that serves prefix-cache and KV
+    offload hits, or `None` to derive it from the KV cache capacity. Requires
+    `enable_return_routed_experts`. Rows of the blocks it
     can hold are retained after their request finishes; a hit on a block whose
     rows were released is recomputed."""
 
@@ -79,6 +80,12 @@ class AuxOutputConfig:
                 "object_store backend must be 'mooncake' or 'local', got "
                 f"{self.object_store.get('backend')!r}."
             )
+        return self
+
+    @model_validator(mode="after")
+    def _check_max_bytes(self) -> Self:
+        if self.max_bytes is not None and not self.enable_return_routed_experts:
+            raise ValueError("max_bytes requires enable_return_routed_experts.")
         return self
 
     @model_validator(mode="after")

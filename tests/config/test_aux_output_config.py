@@ -195,3 +195,20 @@ def test_aux_output_guards_are_inactive_when_capture_is_disabled():
     config.aux_output_config = AuxOutputConfig()
 
     config._verify_aux_output_compatibility()
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"return_topk_logprobs": 2, "object_store": {"backend": "local"}},
+        {"enable_return_hidden_states": True},
+    ],
+    ids=["object-store", "inline"],
+)
+def test_max_bytes_requires_routed_experts(kwargs):
+    with pytest.raises(ValueError, match="max_bytes requires"):
+        AuxOutputConfig(max_bytes=1 << 20, **kwargs)
+    config = AuxOutputConfig(
+        max_bytes=1 << 20, enable_return_routed_experts=True, **kwargs
+    )
+    assert config.max_bytes == 1 << 20
