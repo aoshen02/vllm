@@ -187,9 +187,30 @@ When using the flag VLLM_SERVER_DEV_MODE=1, you enable development endpoints.
 
 ### Cache Management APIs
 
-- `/reset_prefix_cache` - Reset prefix cache (can disrupt service)
-- `/reset_mm_cache` - Reset multimodal cache (can disrupt service)
-- `/reset_encoder_cache` - Reset encoder cache (can disrupt service)
+Reset the prefix cache (KV cache), the multimodal cache and the encoder cache, e.g. after an RL weight update so that nothing computed with the old weights is reused.
+
+- `POST /reset_prefix_cache` - Reset prefix cache (can disrupt service)
+- `POST /reset_mm_cache` - Reset multimodal cache (can disrupt service)
+- `POST /reset_encoder_cache` - Reset encoder cache (can disrupt service)
+
+`/reset_prefix_cache` takes two query parameters, both default `false`:
+
+| Query parameter | Effect |
+| --------------- | ------ |
+| `reset_running_requests` | Preempt all running requests back to the waiting queue (their stale output is dropped and they are recomputed), then reset. If the reset still fails, the server returns an error (`RuntimeError`), e.g. while requests wait for remote KV transfer (P/D disaggregation). |
+| `reset_external` | Also reset the KV connector cache (e.g. offloaded or external KV) via the connector's `reset_cache()`. No-op success when no connector is configured. Called `reset_connector` in the Python API. |
+
+`/reset_prefix_cache` returns HTTP 200 with `{"success": true|false}`, also when the reset failed. Without `reset_running_requests=true` the reset fails while running requests (or in-flight async KV offload transfers) still hold blocks, logging `Failed to reset prefix cache because some blocks (N) are not freed yet`. Check `success` and retry. With data parallelism, `success` is `true` only if every DP engine reset. `/reset_mm_cache` and `/reset_encoder_cache` return an empty HTTP 200 and do not report failure.
+
+```bash
+curl -X POST "http://localhost:8000/reset_prefix_cache?reset_running_requests=true&reset_external=true"
+# {"success":true}
+curl -X POST http://localhost:8000/reset_mm_cache
+curl -X POST http://localhost:8000/reset_encoder_cache
+```
+
+!!! tip "One-call full reset after a weight update"
+    `POST /pause` with `clear_cache=true` (the default) already runs all three resets when the pause completes: prefix cache with `reset_running_requests` and the KV connector cache, then multimodal, then encoder. It returns an error instead of `{"status": "paused"}` if the reset fails. See [Async RL: pause_generation](../../training/async_rl.md#pause_generation). Weight reloads (`reload_weights`) reset the encoder and multimodal caches, but not the prefix cache.
 
 ### Weight Transfer APIs (RL Training)
 
