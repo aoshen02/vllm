@@ -15,12 +15,21 @@ import numpy as np
 from vllm.v1.core.kv_cache_utils import maybe_convert_block_hash
 
 if TYPE_CHECKING:
+    from vllm.config import ModelConfig
     from vllm.distributed.kv_events import ExternalBlockHash
     from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorBase_V1
     from vllm.v1.core.kv_cache_manager import KVCacheManager
     from vllm.v1.core.kv_cache_utils import BlockHash, KVCacheBlock
     from vllm.v1.core.sched.output import SchedulerOutput
     from vllm.v1.request import Request
+
+
+def get_routed_experts_bytes_per_token(model_config: ModelConfig) -> int:
+    return (
+        model_config.get_total_num_hidden_layers()
+        * model_config.get_num_experts_per_tok()
+        * (1 if model_config.get_num_experts() <= 256 else 2)
+    )
 
 
 @dataclass
@@ -58,6 +67,8 @@ class AuxOutputSchedulerConnector:
         self,
         kv_cache_manager: KVCacheManager,
         kv_connector: KVConnectorBase_V1 | None = None,
+        max_bytes: int | None = None,
+        bytes_per_token: int = 0,
     ) -> None:
         # Number of hashes already sent to the worker for each active request.
         self._sent_hash_counts: dict[str, int] = {}
@@ -75,8 +86,13 @@ class AuxOutputSchedulerConnector:
             OrderedDict()
         )
         self._loading: dict[str, set[ExternalBlockHash]] = {}
-        self._capacity = kv_cache_manager.kv_cache_config.num_blocks * (
-            2 if kv_connector else 1
+        self._capacity = (
+            max_bytes
+            // (self._hash_block_size * bytes_per_token)
+            // (self._block_size // self._hash_block_size)
+            if max_bytes is not None
+            else kv_cache_manager.kv_cache_config.num_blocks
+            * (2 if kv_connector else 1)
         )
         self._retained_hashes: list[bytes] = []
         self._released_hashes: list[bytes] = []

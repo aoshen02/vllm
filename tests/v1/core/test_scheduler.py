@@ -25,6 +25,7 @@ from vllm.config.watermarking import WatermarkConfig
 from vllm.distributed.aux_output_connector.connector import (
     AuxOutputSchedulerConnector,
     AuxRequestOutput,
+    get_routed_experts_bytes_per_token,
 )
 from vllm.distributed.ec_transfer.ec_connector.metrics import ECConnectorStats
 from vllm.distributed.kv_transfer.kv_connector.v1.hisparse.connector import (
@@ -469,10 +470,31 @@ def test_prefix_hit_is_capped_at_retained_auxiliary_outputs(
     assert output.num_scheduled_tokens[second.request_id] == 80 - expected_hit
 
 
-def test_evicted_blocks_release_their_auxiliary_outputs_past_capacity():
+@pytest.mark.parametrize(
+    "num_experts,expected",
+    [(256, 4 * 8), (257, 4 * 8 * 2)],
+    ids=["uint8", "uint16"],
+)
+def test_routed_experts_bytes_per_token(num_experts, expected):
+    model_config = SimpleNamespace(
+        get_total_num_hidden_layers=lambda: 4,
+        get_num_experts=lambda: num_experts,
+        get_num_experts_per_tok=lambda: 8,
+    )
+    assert get_routed_experts_bytes_per_token(model_config) == expected
+
+
+@pytest.mark.parametrize(
+    "max_bytes,num_released",
+    [(None, 3), (8 * 16 * 2, 0), (6 * 16 * 2, 2)],
+    ids=["kv", "fits", "short"],
+)
+def test_evicted_blocks_release_their_auxiliary_outputs_past_capacity(
+    max_bytes, num_released
+):
     scheduler = create_scheduler(enable_prefix_caching=True, num_blocks=5)
     scheduler.aux_output_connector = AuxOutputSchedulerConnector(
-        scheduler.kv_cache_manager
+        scheduler.kv_cache_manager, max_bytes=max_bytes, bytes_per_token=2
     )
     first, second, third = create_requests(num_requests=3, num_tokens=64)
     for request in (first, second):
@@ -484,7 +506,8 @@ def test_evicted_blocks_release_their_auxiliary_outputs_past_capacity():
     metadata = scheduler.schedule().aux_output_connector_metadata
 
     assert list(metadata.retained_block_hashes) == second.block_hashes
-    assert list(metadata.released_block_hashes) == first.block_hashes[:3]
+    released = list(metadata.released_block_hashes or ())
+    assert released == first.block_hashes[:num_released]
 
 
 @pytest.mark.parametrize(
