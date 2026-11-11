@@ -12,10 +12,11 @@ pytestmark = pytest.mark.cpu_test
 
 
 class FakeIndexer(torch.nn.Module):
-    def __init__(self, layer_id, topk=2):
+    def __init__(self, layer_id, topk=2, max_model_len=8192):
         super().__init__()
         self.layer_id = layer_id
         self.topk_tokens = topk
+        self.max_model_len = max_model_len
         self.topk_capture_fn = None
 
 
@@ -32,6 +33,23 @@ class TestIndexerTopkCapture:
             [[5, 6], [1, 2]],
             [[7, -1], [3, 4]],
         ]
+
+    @pytest.mark.parametrize(
+        "max_model_len,dtype",
+        [(32768, torch.int16), (32769, torch.int32)],
+        ids=["fits-int16", "needs-int32"],
+    )
+    def test_rows_use_the_smallest_exact_dtype(self, max_model_len, dtype):
+        model = torch.nn.Sequential(
+            FakeIndexer(0, max_model_len=max_model_len),
+            FakeIndexer(1, max_model_len=max_model_len // 2),
+        )
+        capturer = bind_indexer_topk_capturer(model, 2, "cpu")
+        last = max_model_len - 1
+        model[0].topk_capture_fn(torch.tensor([[last, -1]], dtype=torch.int32))
+        snapshot = capturer.snapshot(1)
+        assert snapshot.dtype == dtype
+        assert snapshot[0, 0].tolist() == [last, -1]
 
     @pytest.mark.parametrize(
         "layers,error",

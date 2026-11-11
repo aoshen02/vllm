@@ -16,6 +16,7 @@ from vllm.v1.worker.ubatching import dbo_current_ubatch_token_offset
 class IndexerTopkCaptureSource(Protocol):
     layer_id: int
     topk_tokens: int
+    max_model_len: int
     topk_capture_fn: Callable[[torch.Tensor], None] | None
 
 
@@ -32,6 +33,7 @@ class IndexerTopkCapturer:
         topk: int,
         max_num_batched_tokens: int,
         device: torch.device | str,
+        dtype: torch.dtype = torch.int32,
     ) -> None:
         self.layer_ids = sorted(layer_ids)
         self._slots = {layer_id: slot for slot, layer_id in enumerate(self.layer_ids)}
@@ -39,7 +41,7 @@ class IndexerTopkCapturer:
         self.device_buffer = torch.full(
             (max_num_batched_tokens, *self.shape_per_token),
             -1,
-            dtype=torch.int32,
+            dtype=dtype,
             device=device,
         )
 
@@ -67,11 +69,13 @@ def bind_indexer_topk_capturer(
     topks = {source.topk_tokens for source in sources}
     if len(topks) != 1:
         raise ValueError(f"indexer layers have different top-k sizes: {topks}")
+    max_position = max(source.max_model_len for source in sources) - 1
     capturer = IndexerTopkCapturer(
         [source.layer_id for source in sources],
         topks.pop(),
         max_num_batched_tokens,
         device,
+        torch.int16 if max_position <= torch.iinfo(torch.int16).max else torch.int32,
     )
     for source in sources:
         source.topk_capture_fn = partial(capturer.capture, source.layer_id)
