@@ -46,8 +46,8 @@ restorer; the existing buffer-write semantics are unchanged.
 | `/v1/completions`, `/v1/chat/completions` | `choices[i].routed_experts`: base64 `.npy`, **non-streaming only** |
 | `/inference/v1/generate` | `routed_experts` per choice (base64 `.npy`); with `stream: true`, on the final chunk |
 
-- **Shape:** `(num_tokens - 1 - routed_experts_prompt_start, num_moe_layers, num_experts_per_tok)`, `num_tokens` = prompt + output. The last sampled token has no row.
-- **Rows:** row `i` is position `routed_experts_prompt_start + i` of `prompt_token_ids + output_token_ids`.
+- **Shape:** `(num_tokens - 1 - start, num_moe_layers, num_experts_per_tok)`, `num_tokens` = prompt + output, `start` as described under [`routed_experts_prompt_start`](#routed_experts_prompt_start). The last sampled token has no row.
+- **Rows:** row `i` is position `start + i` of `prompt_token_ids + output_token_ids`, so `start = num_tokens - 1 - len(rows)`.
 - **dtype:** `uint8` for at most 256 experts, else `uint16`; logical expert IDs.
 - Filled only when the request finishes. `None` if the flag is off or the request aborted before any forward pass.
 
@@ -60,6 +60,8 @@ experts = np.load(io.BytesIO(base64.b64decode(choice["routed_experts"])))
 
 ## `routed_experts_prompt_start`
 
-Per-request, default `0`: drops the first N prompt-token rows (e.g. routing already received in earlier turns). Must be `0 <= value <= prompt_len`, else HTTP 400. Pass it top-level on `/v1/*completions`, inside `sampling_params` on `/inference/v1/generate`, or as `SamplingParams(routed_experts_prompt_start=...)`.
+Per-request, default `0`: drops up to the first N prompt-token rows (e.g. routing already received in earlier turns). Must be `0 <= value <= prompt_len`, else HTTP 400. Pass it top-level on `/v1/*completions`, inside `sampling_params` on `/inference/v1/generate`, or as `SamplingParams(routed_experts_prompt_start=...)`.
+
+The rows start at `start = min(routed_experts_prompt_start, first recomputed position)`. A prefix-cache hit can end before `routed_experts_prompt_start`, for example when part of the previous turn was evicted, when the hit stops at the cache-hit granularity, or when the cache salt changed with a weight update. The positions from the hit onward are then computed again, and their new rows are returned, because the rows received earlier for them may describe another computation. Derive `start` from the row count and replace the held rows from `start` on.
 
 Example: [examples/rl/routed_experts_e2e.py](../../examples/rl/routed_experts_e2e.py).
