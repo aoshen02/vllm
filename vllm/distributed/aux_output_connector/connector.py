@@ -4,7 +4,8 @@
 
 from __future__ import annotations
 
-from collections import OrderedDict
+import time
+from collections import Counter, OrderedDict
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from itertools import chain, islice
@@ -67,6 +68,7 @@ class AuxOutputConnectorMetadata:
     retained_block_hashes: PackedBlockHashes | None = None
     released_block_hashes: PackedBlockHashes | None = None
     sessions: dict[str, str] | None = None
+    released_sessions: tuple[str, ...] = ()
 
 
 @dataclass
@@ -86,6 +88,7 @@ class AuxOutputSchedulerConnector:
         bytes_per_token: int = 0,
         object_store: bool = False,
         key_prefix: str = "",
+        session_idle_timeout_s: float = 3600.0,
     ) -> None:
         # Number of hashes already sent to the worker for each active request.
         self._sent_hash_counts: dict[str, int] = {}
@@ -116,6 +119,10 @@ class AuxOutputSchedulerConnector:
         self._object_size = self._block_size if object_store else None
         self._key_prefix = key_prefix
         self._published: dict[str, set[bytes]] = {}
+        self._session_idle_timeout_s = session_idle_timeout_s
+        self._session_requests: Counter[str] = Counter()
+        self._session_last_used: dict[str, float] = {}
+        self._next_session_sweep = 0.0
         self._tails: dict[str, tuple[int, np.ndarray]] = {}
 
     def build_connector_meta(
@@ -133,6 +140,7 @@ class AuxOutputSchedulerConnector:
                 self._sent_hash_counts[request_id] = 0
                 if (session := self._session(request)) is not None:
                     sessions[request_id] = session
+                    self._session_requests[session] += 1
             packed = self._take_new_hashes(
                 request, request.num_computed_tokens + num_tokens
             )
@@ -166,6 +174,7 @@ class AuxOutputSchedulerConnector:
             self._pack_hashes(self._retained_hashes),
             self._pack_hashes(self._released_hashes),
             sessions or None,
+            self._forget_idle_sessions(),
         )
         self._retained_hashes, self._released_hashes = [], []
         return metadata
@@ -182,6 +191,23 @@ class AuxOutputSchedulerConnector:
                 request.request_id, request.num_computed_tokens
             ),
         )
+
+    def _forget_idle_sessions(self) -> tuple[str, ...]:
+        now = time.monotonic()
+        if now < self._next_session_sweep:
+            return ()
+        self._next_session_sweep = now + 1.0
+        deadline = now - self._session_idle_timeout_s
+        idle = tuple(
+            session
+            for session, last_used in self._session_last_used.items()
+            if last_used < deadline and not self._session_requests[session]
+        )
+        for session in idle:
+            del self._session_last_used[session]
+            del self._session_requests[session]
+            self._published.pop(session, None)
+        return idle
 
     def _session(self, request: Request) -> str | None:
         if self._object_size is None or request.sampling_params is None:
@@ -324,6 +350,9 @@ class AuxOutputSchedulerConnector:
             )
             if request.is_finished():
                 self._tails.pop(request_id, None)
+            if request_id in self._sent_hash_counts:
+                self._session_requests[session] -= 1
+            self._session_last_used[session] = time.monotonic()
         num_blocks = request.num_computed_tokens // self._block_size
         for block, keys in islice(self._kv_blocks(request.block_hashes), num_blocks):
             if block not in self._kv_cached and self._gpu_cached(keys[-1]):

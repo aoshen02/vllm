@@ -36,6 +36,10 @@ class AuxOutputConfig:
     single process) and `key_prefix` (default `"vllm-aux"`), which should be
     unique per job."""
 
+    session_idle_timeout_s: float = Field(default=3600.0, gt=0)
+    """Seconds after which the engine forgets a session with no running
+    request: its next request hits only objects it publishes again."""
+
     @property
     def object_key_prefix(self) -> str:
         """Prefix of every shared object key."""
@@ -74,5 +78,6 @@ class AuxOutputConfig:
         ignored_factors = {
             "max_bytes",
             "object_store",
+            "session_idle_timeout_s",
         }
         return get_compile_factors(self, ignored_factors)

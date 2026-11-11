@@ -85,3 +85,12 @@ class TestSessionObjectWriter:
             writer.flush()
         with pytest.raises(AuxObjectStoreError, match="write failed"):
             writer.add_blocks("r", "s", HASHES, [_block(8)])
+
+    def test_forgotten_session_writes_again(self):
+        store = CountingStore()
+        writer = _writer(store)
+        writer.add_blocks("a", "s", HASHES, [_block(0), _block(4)])
+        writer.forget_session("s")
+        writer.add_blocks("b", "s", HASHES, [_block(0), _block(4)])
+        writer.flush()
+        assert store.writes == [["job/s/h1"], ["job/s/h1"]]

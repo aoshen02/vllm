@@ -435,6 +435,9 @@ class AuxOutputWorkerConnector:
                 self._buffer.reset()
                 self._requests.clear()
                 self._generation = metadata.generation
+            if self._object_writer is not None:
+                for session in metadata.released_sessions:
+                    self._object_writer.forget_session(session)
             for request_id, emit_start in metadata.requests.items():
                 state = self._requests.setdefault(
                     request_id,

@@ -124,6 +124,10 @@ class SessionObjectWriter:
     def discard(self, request_id: str) -> None:
         self._staged.pop(request_id, None)
 
+    def forget_session(self, session: str) -> None:
+        """Drop what was written for `session`; later blocks are written again."""
+        self._written.pop(session, None)
+
     def flush(self) -> None:
         self._queue.join()
         self.check()

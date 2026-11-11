@@ -85,4 +85,9 @@ Returning every row inline costs one copy per turn through the engine output pat
 - Read the rows with `vllm.distributed.aux_output_connector.objects.read_aux_rows(store, keys, "routed_experts", tail)`, which waits for objects that are still being written.
 - A session request's prefix-cache hit covers only objects this session has published, so every listed key exists. Requests without `aux_session` keep the inline behavior.
 
-Objects stay in the store until the caller removes them by key.
+Objects stay in the store until the caller removes them:
+
+- After reading a session, remove the union of the keys its responses listed with `store.remove(keys)` (a forced batch remove on Mooncake). A key that is still being written may fail to remove; the job-end sweep catches it.
+- Never send another request with a released `aux_session`: the engine may still allow it to hit objects that were removed. Continue under a new session name instead, which recomputes the prefix.
+- At the end of the job, `store.remove_prefix("<key_prefix>/")` removes everything left, including objects of aborted or discarded samples.
+- The engine forgets a session that has had no running request for `session_idle_timeout_s` (default one hour); its next request then hits only objects it publishes again.
