@@ -5,7 +5,7 @@ import threading
 
 import numpy as np
 import pytest
-from safetensors.numpy import save
+from safetensors.numpy import load, save
 
 from vllm.distributed.aux_output_connector.object_store import (
     AuxObjectStoreError,
@@ -35,6 +35,20 @@ class TestAuxObjectFormat:
         for name, rows in fields.items():
             assert decoded[name].dtype == rows.dtype
             np.testing.assert_array_equal(decoded[name], rows)
+
+    @pytest.mark.parametrize(
+        "rows",
+        [
+            np.arange(24, dtype=np.int16).reshape(4, 6)[:, ::2],
+            np.array([[True], [False], [True], [True]]),
+            np.zeros((4, 0), dtype=np.float32),
+        ],
+        ids=["non-contiguous", "bool", "empty-row"],
+    )
+    def test_safetensors_reads_encoded_object(self, rows):
+        loaded = load(bytes(encode_aux_object({"a": rows, "b": np.ones((4, 3))})))
+        np.testing.assert_array_equal(loaded["a"], rows)
+        np.testing.assert_array_equal(loaded["b"], np.ones((4, 3)))
 
     def test_fields_must_cover_the_same_rows(self):
         with pytest.raises(ValueError, match="row counts"):

@@ -82,9 +82,9 @@ class SessionObjectWriter:
         # Request -> field -> object index -> (rows, positions written).
         self._rows: dict[str, dict[str, dict[int, tuple[np.ndarray, np.ndarray]]]] = {}
         self._written: dict[str, set[str]] = {}
-        self._queue: queue.Queue[tuple[list[str], list[bytes]] | None] = queue.Queue(
-            maxsize=max_pending_batches
-        )
+        self._queue: queue.Queue[
+            tuple[list[str], list[dict[str, np.ndarray]]] | None
+        ] = queue.Queue(maxsize=max_pending_batches)
         self._error: BaseException | None = None
         self._thread = threading.Thread(
             target=self._run, daemon=True, name="vllm-aux-object-writer"
@@ -95,7 +95,10 @@ class SessionObjectWriter:
         while (batch := self._queue.get()) is not None:
             try:
                 if self._error is None:
-                    self._store.put_batch(*batch)
+                    keys, objects = batch
+                    self._store.put_batch(
+                        keys, [encode_aux_object(fields) for fields in objects]
+                    )
             except BaseException as error:
                 self._error = error
             finally:
@@ -126,7 +129,7 @@ class SessionObjectWriter:
         staged = self._staged.setdefault(request_id, {})
         written = self._written.setdefault(session, set())
         keys: list[str] = []
-        values: list[bytes] = []
+        values: list[dict[str, np.ndarray]] = []
         for start, rows in blocks:
             index, offset = divmod(start, self.object_size)
             pieces = staged.setdefault(index, {})
@@ -158,7 +161,7 @@ class SessionObjectWriter:
                 continue
             written.add(key)
             keys.append(key)
-            values.append(encode_aux_object(fields))
+            values.append(fields)
         if keys:
             self._queue.put((keys, values))
 

@@ -9,7 +9,7 @@ import time
 from collections.abc import Mapping, Sequence
 
 import numpy as np
-from safetensors.numpy import load, save
+from safetensors.numpy import load
 
 from vllm.distributed.aux_output_connector.object_store import (
     AuxObjectStore,
@@ -17,10 +17,25 @@ from vllm.distributed.aux_output_connector.object_store import (
 )
 
 AUX_OBJECT_FORMAT = "vllm-aux-object-v1"
+_SAFETENSORS_DTYPES = {
+    "bool": "BOOL",
+    "uint8": "U8",
+    "int8": "I8",
+    "uint16": "U16",
+    "int16": "I16",
+    "float16": "F16",
+    "uint32": "U32",
+    "int32": "I32",
+    "float32": "F32",
+    "uint64": "U64",
+    "int64": "I64",
+    "float64": "F64",
+}
 
 
-def encode_aux_object(fields: Mapping[str, np.ndarray]) -> bytes:
-    """Serialize the rows of one block, one array per output field.
+def encode_aux_object(fields: Mapping[str, np.ndarray]) -> memoryview:
+    """Serialize the rows of one block, one array per output field, in the
+    safetensors format. The rows are copied once.
 
     Every field has one row per position of the block.
     """
@@ -29,14 +44,32 @@ def encode_aux_object(fields: Mapping[str, np.ndarray]) -> bytes:
     num_rows = {len(rows) for rows in fields.values()}
     if len(num_rows) != 1:
         raise ValueError(f"fields have different row counts {sorted(num_rows)}")
-    return save(
-        {name: np.ascontiguousarray(rows) for name, rows in fields.items()},
-        metadata={"format": AUX_OBJECT_FORMAT},
-    )
+    header: dict[str, object] = {"__metadata__": {"format": AUX_OBJECT_FORMAT}}
+    size = 0
+    for name, rows in fields.items():
+        header[name] = {
+            "dtype": _SAFETENSORS_DTYPES[rows.dtype.name],
+            "shape": list(rows.shape),
+            "data_offsets": [size, size + rows.nbytes],
+        }
+        size += rows.nbytes
+    encoded_header = json.dumps(header, separators=(",", ":")).encode()
+    encoded_header += b" " * (-len(encoded_header) % 8)
+    start = 8 + len(encoded_header)
+    data = np.empty(start + size, dtype=np.uint8)
+    data[:8] = np.frombuffer(len(encoded_header).to_bytes(8, "little"), np.uint8)
+    data[8:start] = np.frombuffer(encoded_header, np.uint8)
+    for rows in fields.values():
+        data[start : start + rows.nbytes] = (
+            np.ascontiguousarray(rows).view(np.uint8).reshape(-1)
+        )
+        start += rows.nbytes
+    return memoryview(data)
 
 
-def decode_aux_object(data: bytes) -> dict[str, np.ndarray]:
+def decode_aux_object(data: bytes | memoryview) -> dict[str, np.ndarray]:
     """Inverse of `encode_aux_object`."""
+    data = bytes(data)
     header_len = int.from_bytes(data[:8], "little")
     metadata = json.loads(data[8 : 8 + header_len]).get("__metadata__", {})
     if metadata.get("format") != AUX_OBJECT_FORMAT:
