@@ -511,8 +511,8 @@ def test_sessions_publish_only_committed_objects(rows_received, expected_hit):
 
 @pytest.mark.parametrize(
     "recompute_session,expected_hit",
-    [("s", 80), ("t", 0)],
-    ids=["same-session", "other-session"],
+    [("s", 80), ("t", 0), (None, 0)],
+    ids=["same-session", "other-session", "no-session"],
 )
 def test_session_objects_follow_weight_version(recompute_session, expected_hit):
     scheduler = create_scheduler(enable_prefix_caching=True)
@@ -554,9 +554,11 @@ def test_session_objects_follow_weight_version(recompute_session, expected_hit):
     num_scheduled, output = run(recompute)
     hashes = [block_hash.hex() for block_hash in recompute.block_hashes]
     assert num_scheduled == 86
-    assert output.aux_output_keys == [
-        f"job/{recompute_session}/{h}@v2" for h in hashes[:5]
-    ]
+    assert output.aux_output_keys == (
+        None
+        if recompute_session is None
+        else [f"job/{recompute_session}/{h}@v2" for h in hashes[:5]]
+    )
 
     scheduler.add_request(last)
     scheduler_output = scheduler.schedule()

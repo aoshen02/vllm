@@ -410,6 +410,8 @@ class AuxOutputSchedulerConnector:
         )
         rows = request_output.rows[:local_end]
         if (session := self._session(request)) is None:
+            if self._object_size is not None:
+                self._record_commits(request, request_output.token_start, token_end)
             return rows if self._return_routed_experts else None
         assert self._object_size is not None
         tail_start, tail = self._tails.get(
@@ -461,6 +463,16 @@ class AuxOutputSchedulerConnector:
         if not self._return_routed_experts or not request.is_finished():
             return None
         return tail
+
+    def _record_commits(self, request: Request, start: int, end: int) -> None:
+        assert self._object_size is not None
+        computed_start = self._computed_starts.get(request.request_id, start)
+        first = max(start // self._object_size, -(-computed_start // self._object_size))
+        for object_hash in islice(
+            self._object_hashes(request.block_hashes), first, end // self._object_size
+        ):
+            if object_hash in self._commit_versions:
+                self._commit_versions[object_hash] = self._weight_version
 
     def take_outputs(
         self,
