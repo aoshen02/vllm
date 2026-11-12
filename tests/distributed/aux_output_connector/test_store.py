@@ -329,25 +329,21 @@ def test_worker_snapshots_hidden_states_of_query_rows(dtype):
     worker.close()
 
 
-@pytest.mark.parametrize(
-    "gathered", [True, False], ids=["logits-rank", "non-logits-rank"]
-)
-def test_topk_logprobs_are_computed_in_chunks(gathered):
+def test_topk_logprobs_are_computed_in_chunks():
     hidden_states = torch.randn(6, 3)
     weight = torch.randn(7, 3)
     calls = []
 
-    def logits_fn(rows):
+    def topk_fn(rows, k):
         calls.append(len(rows))
-        return rows @ weight.T if gathered else None
+        values, ids = torch.log_softmax(rows @ weight.T, dim=-1).topk(k, dim=-1)
+        return ids, values
 
     rows = np.array([0, 2, 3, 4, 5])
-    topk = compute_topk_logprobs(hidden_states, logits_fn, 2, rows, 6, chunk_size=2)
+    token_ids, logprobs = compute_topk_logprobs(
+        hidden_states, topk_fn, 2, rows, 6, chunk_size=2
+    )
     assert calls == [2, 2, 1]
-    if not gathered:
-        assert topk is None
-        return
-    token_ids, logprobs = topk
     expected = torch.log_softmax(hidden_states @ weight.T, dim=-1).topk(2, dim=-1)
     assert token_ids.dtype == torch.int32
     assert token_ids[rows].tolist() == expected.indices[rows].tolist()
@@ -364,6 +360,13 @@ def test_topk_logprobs_cover_only_session_rows(sessions, expected_rows):
     worker = object.__new__(AuxOutputWorkerConnector)
     worker._buffer = None
     worker._topk_logprobs = 2
+    calls = []
+
+    def topk_fn(rows, k):
+        calls.append(len(rows))
+        return torch.zeros(len(rows), k, dtype=torch.int64), torch.zeros(len(rows), k)
+
+    worker._topk_fn = topk_fn
     worker._session_request_ids = set()
     worker._session_generation = 0
     worker.begin_step(
@@ -371,16 +374,9 @@ def test_topk_logprobs_cover_only_session_rows(sessions, expected_rows):
             0, {}, {}, (), sessions={request: "s" for request in sessions}
         )
     )
-    calls = []
-
-    def logits_fn(rows):
-        calls.append(len(rows))
-        return torch.zeros(len(rows), 4)
-
     worker.prepare_output(
         _input_batch(["a", "b"], np.array([0, 0]), np.array([0, 2, 5])),
         torch.randn(5, 3),
-        logits_fn,
     )
     assert sum(calls) == expected_rows
 
