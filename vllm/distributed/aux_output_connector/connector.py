@@ -18,12 +18,14 @@ from vllm.distributed.aux_output_connector.session_objects import (
     record_weight_version,
     weight_version_at,
 )
+from vllm.exceptions import VLLMValidationError
 from vllm.v1.core.kv_cache_utils import maybe_convert_block_hash
 
 if TYPE_CHECKING:
-    from vllm.config import ModelConfig
+    from vllm.config import ModelConfig, VllmConfig
     from vllm.distributed.kv_events import ExternalBlockHash
     from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorBase_V1
+    from vllm.sampling_params import SamplingParams
     from vllm.v1.core.kv_cache_manager import KVCacheManager
     from vllm.v1.core.kv_cache_utils import BlockHash, KVCacheBlock
     from vllm.v1.core.sched.output import SchedulerOutput
@@ -49,6 +51,46 @@ def check_routed_experts_replay(
     if len(rows) > prompt_len:
         return f"has {len(rows)} rows, more than the prompt length {prompt_len}"
     return None
+
+
+def validate_aux_request(
+    vllm_config: VllmConfig, sampling_params: SamplingParams, prompt_len: int
+) -> np.ndarray | None:
+    """Check the auxiliary-output parameters of a request and move its
+    `routed_experts_replay` rows out of `sampling_params`."""
+    aux_output_config = vllm_config.aux_output_config
+    if (
+        sampling_params.aux_session is not None
+        and aux_output_config.object_store is None
+    ):
+        raise VLLMValidationError(
+            "aux_session requires AuxOutputConfig.object_store.",
+            parameter="aux_session",
+        )
+    rows = sampling_params.routed_experts_replay
+    sampling_params.routed_experts_replay = None
+    if rows is None:
+        return None
+    if not aux_output_config.enable_routed_experts_replay:
+        raise VLLMValidationError(
+            "routed_experts_replay requires "
+            "AuxOutputConfig.enable_routed_experts_replay.",
+            parameter="routed_experts_replay",
+        )
+    model_config = vllm_config.model_config
+    reason = check_routed_experts_replay(
+        rows,
+        prompt_len,
+        (
+            model_config.get_total_num_hidden_layers(),
+            model_config.get_num_experts_per_tok(),
+        ),
+    )
+    if reason is not None:
+        raise VLLMValidationError(
+            f"routed_experts_replay {reason}.", parameter="routed_experts_replay"
+        )
+    return rows
 
 
 @dataclass
@@ -87,6 +129,29 @@ class AuxRequestOutput:
 
 class AuxOutputSchedulerConnector:
     """Build worker metadata without owning auxiliary output payloads or stores."""
+
+    @classmethod
+    def from_config(
+        cls,
+        kv_cache_manager: KVCacheManager,
+        kv_connector: KVConnectorBase_V1 | None,
+        vllm_config: VllmConfig,
+    ) -> AuxOutputSchedulerConnector:
+        config = vllm_config.aux_output_config
+        return cls(
+            kv_cache_manager,
+            kv_connector,
+            max_bytes=config.max_bytes,
+            bytes_per_token=(
+                get_routed_experts_bytes_per_token(vllm_config.model_config)
+                if config.enable_return_routed_experts
+                else 0
+            ),
+            object_store=config.object_store is not None,
+            key_prefix=config.object_key_prefix,
+            session_idle_timeout_s=config.session_idle_timeout_s,
+            return_routed_experts=config.enable_return_routed_experts,
+        )
 
     def __init__(
         self,
@@ -396,6 +461,23 @@ class AuxOutputSchedulerConnector:
         if not self._return_routed_experts or not request.is_finished():
             return None
         return tail
+
+    def take_outputs(
+        self,
+        request: Request,
+        output: dict[str, AuxRequestOutput] | None,
+        stopped: bool,
+    ) -> tuple[np.ndarray | None, list[str] | None, dict[str, np.ndarray] | None]:
+        """Routed experts, object keys and other fields to return with one
+        output of a request."""
+        routed_experts = self.take_output(request, output)
+        keys = fields = None
+        if stopped:
+            keys = self.take_object_keys(request)
+            fields = self.take_aux_fields(request)
+        if fields is None:
+            fields = self.take_inline_fields(request, output)
+        return routed_experts, keys, fields
 
     def take_inline_fields(
         self,
