@@ -710,6 +710,10 @@ class EngineCore:
         Overridden by the DP engine core; never throttles otherwise."""
         return False
 
+    def _after_schedule(self) -> None:
+        """Hook right after scheduler.schedule(); used by DP prefill balancing."""
+        return
+
     def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
         """Schedule, execute, and make output.
 
@@ -721,6 +725,7 @@ class EngineCore:
         if not self.scheduler.has_requests():
             return {}, False
         scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
+        self._after_schedule()
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
         with (
@@ -783,6 +788,7 @@ class EngineCore:
         deferred_scheduler_output = None
         if self.scheduler.has_requests():
             scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
+            self._after_schedule()
             with self.log_error_detail(scheduler_output):
                 exec_future = self.model_executor.execute_model(
                     scheduler_output, non_block=True
@@ -2547,6 +2553,17 @@ class DPEngineCoreProc(EngineCoreProc):
         self.prefill_schedule_interval = scheduler_config.prefill_schedule_interval
         self.dp_sync_interval = vllm_config.parallel_config.dp_sync_interval
 
+        # DP prefill token balancing (opt-in, VLLM_DP_PREFILL_BALANCE=<floor>):
+        # cap each rank's prefill tokens per step to max(floor, largest other
+        # rank's prefill), using demand that each rank publishes to the DP
+        # TCPStore after scheduling, and un-throttle off-cadence steps of idle
+        # ranks up to what the prefilling ranks run (fills their EP wait).
+        self.dpbal_floor = envs.VLLM_DP_PREFILL_BALANCE
+        self.dpbal = self.dpbal_floor > 0
+        self.dpbal_store: Any = None
+        self.dpbal_keys: list[str] = []
+        self._dpbal_last_pub: tuple[int, int] = (0, 0)
+
         # Counts forward-passes of the model so that we can synchronize
         # finished with DP peers every N steps.
         self.step_counter = 0
@@ -2592,6 +2609,98 @@ class DPEngineCoreProc(EngineCoreProc):
         self.dp_size = dp_size
         dp_group, dp_store = parallel_config.stateless_init_dp_group(return_store=True)
         self.dp_group, self.dp_store = dp_group, dp_store
+        if self.dpbal:
+            self._dpbal_init()
+
+    def _dpbal_init(self) -> None:
+        import torch.distributed as dist
+        from torch.distributed import PrefixStore
+
+        self.dpbal_store = PrefixStore("dp_prefill_balance", self.dp_store)
+        self.dpbal_keys = [str(r) for r in range(self.dp_size)]
+        # Every key exists before anyone reads (store.get blocks on a miss).
+        self.dpbal_store.set(self.dpbal_keys[self.dp_rank], "0,0")
+        dist.barrier(group=self.dp_group)
+        logger.info(
+            "DP prefill token balancing on: floor=%d (rank %d/%d)",
+            self.dpbal_floor,
+            self.dp_rank,
+            self.dp_size,
+        )
+
+    def _dpbal_publish(self, demand: int, bits: int) -> None:
+        # Skip repeated idle values to keep the store quiet when idle.
+        if demand == 0 and self._dpbal_last_pub == (0, bits):
+            return
+        self._dpbal_last_pub = (demand, bits)
+        self.dpbal_store.set(self.dpbal_keys[self.dp_rank], f"{demand},{bits}")
+
+    def _dpbal_read(self) -> list[tuple[int, int]]:
+        """(demand, bits) of every peer; bits = capacity_bound | has_decodes << 1."""
+        keys = [k for r, k in enumerate(self.dpbal_keys) if r != self.dp_rank]
+        try:
+            raw = self.dpbal_store.multi_get(keys)
+        except (AttributeError, NotImplementedError, RuntimeError):
+            raw = [self.dpbal_store.get(k) for k in keys]
+        out = []
+        for v in raw:
+            d, b = (int(x) for x in bytes(v).decode().split(","))
+            out.append((d, b))
+        return out
+
+    def _dpbal_disable(self, e: Exception) -> None:
+        logger.warning("DP prefill token balancing disabled after error: %r", e)
+        self.dpbal = False
+        self.scheduler.dp_prefill_cap = None
+        self.scheduler.dp_prefill_fill = False
+
+    def _after_schedule(self) -> None:
+        if not self.dpbal:
+            return
+        try:
+            demand, cap_bound, has_decodes = self.scheduler.dp_prefill_demand()
+            self._dpbal_publish(demand, int(cap_bound) | (int(has_decodes) << 1))
+        except Exception as e:
+            self._dpbal_disable(e)
+
+    def _dpbal_plan(self, throttle: bool) -> bool:
+        """Set this step's prefill cap on the scheduler and return the
+        (possibly lifted) throttle flag.
+
+        A rank's prefill this step is "firm" unless the cadence defers it
+        (throttled, not capacity-bound, has decodes): the same predicate as
+        defer_prefills in Scheduler.schedule, evaluated with the step counter
+        that is identical on all ranks. Peer demand is what each peer
+        published right after its previous schedule() (<= 1 step stale; its
+        arrivals since then are not seen).
+        """
+        sched = self.scheduler
+        _, own_cb, own_hd = sched.dp_prefill_demand()
+        firm: list[int] = []
+        for d, bits in self._dpbal_read():
+            deferred = throttle and not (bits & 1) and bool(bits & 2)
+            firm.append(0 if deferred else d)
+        own_firm = not (throttle and not own_cb and own_hd)
+        floor = self.dpbal_floor
+        peers_max = max(firm, default=0)
+        sched.dp_prefill_fill = False
+        sched.dp_prefill_cap = None
+        lifted = throttle
+        if own_firm:
+            # Only the largest rank is limited in effect: every other rank's
+            # demand is <= the max over its peers.
+            sched.dp_prefill_cap = max(floor, peers_max)
+        elif peers_max > 0:
+            # What the prefilling peers actually run after their own caps.
+            target = 0
+            for j, f in enumerate(firm):
+                others = max(firm[:j] + firm[j + 1 :], default=0)
+                target = max(target, min(f, max(floor, others)))
+            if target > 0:
+                sched.dp_prefill_cap = target
+                sched.dp_prefill_fill = True
+                lifted = False
+        return lifted
 
     def shutdown(self):
         super().shutdown()
@@ -2707,10 +2816,16 @@ class DPEngineCoreProc(EngineCoreProc):
         # Throttle new prefills to cadence-aligned steps for DP balancing.
         # step_counter is identical across DP ranks. On a fresh wave the
         # counter is 0, so prefills are admitted immediately after idle.
-        return (
+        throttle = (
             self.prefill_schedule_interval > 1
             and self.step_counter % self.prefill_schedule_interval != 0
         )
+        if self.dpbal:
+            try:
+                throttle = self._dpbal_plan(throttle)
+            except Exception as e:
+                self._dpbal_disable(e)
+        return throttle
 
     @fault_tolerant_wrapper
     def run_busy_loop(self):
@@ -2754,6 +2869,9 @@ class DPEngineCoreProc(EngineCoreProc):
                 # Execute a dummy pass when no ready requests ran, unless the
                 # engine is sleeping.
                 elif not self.model_executor.is_sleeping:
+                    if self.dpbal and not self.scheduler.has_requests():
+                        # Idle: publish zero demand instead of a stale backlog.
+                        self._after_schedule()
                     with self.capture_iteration_details(None) as iteration_details:
                         self.execute_dummy_batch()
                     if iteration_details is not None and not self.has_coordinator:
