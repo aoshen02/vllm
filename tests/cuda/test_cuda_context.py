@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 import torch
 
+from tests.utils import create_new_process_for_each_test
 from vllm.platforms import current_platform
 
 
@@ -198,3 +199,15 @@ def test_has_device_capability_comparisons(monkeypatch):
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA not available")
+@create_new_process_for_each_test("spawn")
+def test_arch_support_pdl_leaves_cuda_uninitialized():
+    """The API server asks for PDL support while it builds the config. The
+    query must not create a CUDA context, which would hold GPU memory for the
+    lifetime of a process that never runs kernels."""
+    capability = current_platform.get_device_capability()
+    assert capability is not None
+    assert current_platform.is_arch_support_pdl() == (capability.major >= 9)
+    assert not torch.cuda.is_initialized()
