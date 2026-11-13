@@ -124,6 +124,13 @@ def _use_fa2_native_decode() -> bool:
 
 _KVPair = tuple[torch.Tensor, torch.Tensor]
 
+# VLLM_FLASHINFER_CAKE_DECODE (opt-in): store BF16/FP16 K and V as separate
+# head slots ([B, 2*H, N, D], K heads then V heads, like NVFP4) instead of
+# packing them in the content dim ([B, H, N, 2*D]), and run trtllm-API decode
+# with FlashInfer's Cake kernel, which splits long sequences across CTAs from
+# an on-device work plan (needs the dense [H, N, D] K/V pages).
+_FI_CAKE_DECODE = envs.VLLM_FLASHINFER_CAKE_DECODE
+
 
 def _nvfp4_kv_views(
     kv_cache: torch.Tensor, num_kv_heads: int
@@ -560,6 +567,19 @@ class FlashInferBackend(AttentionBackend):
     def customize_spec(cls, spec: "AttentionSpec") -> "AttentionSpec":
         """NVFP4 stores K and V as separate per-head slots of packed fp4 data
         plus fp8 block scales."""
+        if (
+            _FI_CAKE_DECODE
+            and spec.state_content_bytes is None
+            and spec.num_head_slots is None
+            and spec.kv_quant_mode == KVQuantMode.NONE
+            and spec.dtype in (torch.bfloat16, torch.float16)
+            and spec.head_size == spec.head_size_v
+        ):
+            return replace(
+                spec,
+                num_head_slots=2 * spec.num_kv_heads,
+                state_content_bytes=spec.head_size * get_dtype_size(spec.dtype),
+            )
         if spec.state_content_bytes is not None or not spec.kv_quant_mode.is_nvfp4:
             return spec
         hs_k = nvfp4_kv_cache_full_dim(spec.head_size)
@@ -2121,14 +2141,34 @@ class FlashInferImpl(AttentionImpl):
         # Allocated eagerly to stay out of CUDA-graph capture; DCP all-gathers
         # the decode query over heads.
         self._multi_ctas_kv_counter_buffer: torch.Tensor | None = None
+        # Cake decode: only for the unquantized split-K/V cache without DCP.
+        self._decode_backend_override: str | None = None
+        if (
+            _FI_CAKE_DECODE
+            and kv_cache_dtype == "auto"
+            and self.dcp_world_size == 1
+            and head_size in (64, 128, 256)
+        ):
+            self._decode_backend_override = "cake"
+            logger.info_once("FlashInfer decode backend: cake (split K/V cache)")
         if vllm_config is not None:
             _sched = vllm_config.scheduler_config
+            _counter_bytes = get_trtllm_gen_multi_ctas_kv_counter_bytes(
+                _sched.max_num_batched_tokens or _sched.max_num_seqs,
+                num_heads * self.dcp_world_size,
+                get_device_sm_count(torch.device("cuda")),
+            )
+            if self._decode_backend_override == "cake":
+                from flashinfer.cake_fmha import cake_fmha_balanced_counter_bytes
+
+                _counter_bytes = max(
+                    _counter_bytes,
+                    cake_fmha_balanced_counter_bytes(
+                        get_device_sm_count(torch.device("cuda")), 8, head_size
+                    ),
+                )
             self._multi_ctas_kv_counter_buffer = _get_multi_ctas_kv_counter_buffer(
-                get_trtllm_gen_multi_ctas_kv_counter_bytes(
-                    _sched.max_num_batched_tokens or _sched.max_num_seqs,
-                    num_heads * self.dcp_world_size,
-                    get_device_sm_count(torch.device("cuda")),
-                ),
+                _counter_bytes,
                 torch.device("cuda"),
             )
 
@@ -2367,17 +2407,19 @@ class FlashInferImpl(AttentionImpl):
         hs = self.head_size
         nvfp4_kv_data = None
         nvfp4_kv_block_scales = None
-        if self.is_kvcache_nvfp4:
+        # VLLM_FLASHINFER_CAKE_DECODE also stores K/V as separate head groups.
+        if self.is_kvcache_nvfp4 or kv_cache.shape[1] == 2 * self.num_kv_heads:
             k_cache, v_cache = kv_cache.split(self.num_kv_heads, dim=1)
             kv_cache_tuple = (
                 canonicalize_singleton_dim_strides(k_cache.permute(*stride_order)),
                 canonicalize_singleton_dim_strides(v_cache.permute(*stride_order)),
             )
+        else:
+            kv_cache_tuple = kv_cache_permute.split(hs, dim=-1)
+        if self.is_kvcache_nvfp4:
             nvfp4_kv_data, nvfp4_kv_block_scales, _ = _nvfp4_kv_views(
                 kv_cache, self.num_kv_heads
             )
-        else:
-            kv_cache_tuple = kv_cache_permute.split(hs, dim=-1)
 
         use_dcp = self.dcp_world_size > 1
         if decode_with_xqa:
@@ -2808,7 +2850,8 @@ class FlashInferImpl(AttentionImpl):
                     o_sf_scale=self.o_sf_scale,
                     out=out,
                     kv_layout=get_flashinfer_layout_string(kv_cache_layout),
-                    backend=attn_metadata.decode.kernel.value,
+                    backend=self._decode_backend_override
+                    or attn_metadata.decode.kernel.value,
                     q_len_per_req=q_len_per_req,
                     max_q_len=max_q_len,
                     cum_seq_lens_q=q_cu_seq_lens,
@@ -2863,7 +2906,7 @@ class FlashInferImpl(AttentionImpl):
                     kv_layout=kv_layout,
                 )
                 return
-            if self.is_kvcache_nvfp4:
+            if self.is_kvcache_nvfp4 or kv_cache.shape[1] == 2 * self.num_kv_heads:
                 # (B, 2*H, N, full_dim) -> ((B, N, H, full_dim),
                 #                            (B, N, H, full_dim));
                 # K heads first, then V heads.
