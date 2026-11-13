@@ -931,6 +931,40 @@ def clear_layer_kv_caches(layers: Iterable[Any]) -> None:
                 setattr(layer, name, torch.empty(0, dtype=torch.int32))
 
 
+@triton.jit
+def _copy_storage_blocks_kernel(ptrs_ptr, idx_ptr, row_words, BLOCK: tl.constexpr):
+    # ptrs_ptr: int64 [num_storages] base addresses (16-byte aligned);
+    # idx_ptr: contiguous int64 [num_pairs, 2] = (src, dst) scheduler block ids;
+    # row_words: 16-byte words per scheduler block.
+    pair = tl.program_id(0)
+    chunk = tl.program_id(1)
+    base = tl.load(ptrs_ptr + tl.program_id(2)).to(tl.pointer_type(tl.int64))
+    src = tl.load(idx_ptr + pair * 2).to(tl.int64)
+    dst = tl.load(idx_ptr + pair * 2 + 1).to(tl.int64)
+    offs = chunk.to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < row_words
+    # Two int64 per 16-byte word.
+    w = offs[:, None] * 2 + tl.arange(0, 2)[None, :]
+    v = tl.load(base + src * row_words * 2 + w, mask=mask[:, None])
+    tl.store(base + dst * row_words * 2 + w, v, mask=mask[:, None])
+
+
+def _fast_copy_storage_blocks(
+    storages: list[tuple[int, int]], indices: torch.Tensor
+) -> None:
+    """Copy scheduler blocks indices[:, 0] -> indices[:, 1] of every raw
+    storage (base address, block bytes) with one launch per block size."""
+    by_row: dict[int, list[int]] = defaultdict(list)
+    for ptr, row_bytes in storages:
+        by_row[row_bytes].append(ptr)
+    BLOCK = 1024
+    for row_bytes, ptrs in by_row.items():
+        ptrs_t = async_tensor_h2d(np.array(ptrs, dtype=np.int64), device=indices.device)
+        row_words = row_bytes // 16
+        grid = (indices.shape[0], triton.cdiv(row_words, BLOCK), len(ptrs))
+        _copy_storage_blocks_kernel[grid](ptrs_t, indices, row_words, BLOCK=BLOCK)
+
+
 def copy_kv_cache_blocks_inplace(
     kv_caches: Iterable[torch.Tensor],
     num_blocks: int,
@@ -941,6 +975,15 @@ def copy_kv_cache_blocks_inplace(
 
     indices_np = np.array(kv_cache_block_copies, dtype=np.int64)
     indices: torch.Tensor | None = None
+    # Whole-storage copies on CUDA go through one Triton launch over 16-byte
+    # words instead of `blocks[dst] = blocks[src]` on a uint8 view (a
+    # byte-granular gather + scatter, ~0.5 TB/s). It copies pairs in parallel,
+    # so only when no destination is also a source (the gather-then-scatter
+    # below tolerates chains). Bit-identical result.
+    fast = current_platform.is_cuda() and not (
+        set(indices_np[:, 0].tolist()) & set(indices_np[:, 1].tolist())
+    )
+    fast_storages: list[tuple[int, int]] = []
     seen: set[tuple[Any, ...]] = set()
     copied_storages: set[tuple[torch.device, int]] = set()
     for cache in kv_caches:
@@ -980,6 +1023,13 @@ def copy_kv_cache_blocks_inplace(
             if storage_key in copied_storages:
                 continue
             copied_storages.add(storage_key)
+            if (
+                fast
+                and storage.data_ptr() % 16 == 0
+                and scheduler_block_stride % 16 == 0
+            ):
+                fast_storages.append((storage.data_ptr(), scheduler_block_stride))
+                continue
             blocks = torch.empty(0, dtype=torch.uint8, device=cache.device)
             blocks.set_(storage)
             blocks = blocks.view(num_blocks, -1)
@@ -988,6 +1038,9 @@ def copy_kv_cache_blocks_inplace(
             # scheduler blocks; unflatten of dim 0 is always a view.
             blocks = cache.unflatten(0, (num_blocks, kernel_blocks_per_block))
         blocks[dst] = blocks[src]
+    if fast_storages:
+        assert indices is not None
+        _fast_copy_storage_blocks(fast_storages, indices)
 
 
 def is_uniform_query_len(num_reqs: int, num_tokens: int, max_query_len: int) -> bool:
