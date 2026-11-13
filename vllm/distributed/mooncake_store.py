@@ -9,6 +9,10 @@ from typing import Any, Literal
 
 import regex as re
 
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
+
 DEFAULT_GLOBAL_SEGMENT_SIZE = 4 * 1024 * 1024 * 1024  # 4 GiB
 DEFAULT_LOCAL_BUFFER_SIZE = 4 * 1024 * 1024 * 1024  # 4 GiB
 DEFAULT_TENANT_ID = "default"
@@ -39,6 +43,13 @@ class MooncakeStoreConfig:
     # ``device_name`` of each physical GPU's store client, indexed by
     # physical GPU ID. Replaces ``device_name`` when set.
     device_name_per_gpu: list[str] | None = None
+    # Client-side SSD tier (LOCAL_DISK segment). When enabled, setup uses the
+    # dict form of ``MooncakeDistributedStore.setup`` and each rank gets its
+    # own sub-directory of ``ssd_offload_path`` (Mooncake requires one client
+    # per storage path). Capacity/eviction are set by the native client's
+    # MOONCAKE_OFFLOAD_* env vars; the master needs --enable_offload=true.
+    enable_ssd_offload: bool = False
+    ssd_offload_path: str = ""
 
     def __post_init__(self) -> None:
         if self.mode not in ("embedded", "standalone-store"):
@@ -61,6 +72,8 @@ class MooncakeStoreConfig:
             raise ValueError("embedded mode requires global_segment_size > 0")
         if self.mode == "standalone-store" and self.global_segment_size != 0:
             raise ValueError("standalone-store mode requires global_segment_size == 0")
+        if self.enable_ssd_offload and not os.path.isabs(self.ssd_offload_path):
+            raise ValueError("enable_ssd_offload requires an absolute ssd_offload_path")
 
     @staticmethod
     def from_file(file_path: str) -> "MooncakeStoreConfig":
@@ -81,6 +94,8 @@ class MooncakeStoreConfig:
             enable_offload=bool(config.get("enable_offload", False)),
             tenant_id=_normalize_tenant_id(config.get("tenant_id", DEFAULT_TENANT_ID)),
             device_name_per_gpu=config.get("device_name_per_gpu"),
+            enable_ssd_offload=bool(config.get("enable_ssd_offload", False)),
+            ssd_offload_path=config.get("ssd_offload_path", ""),
         )
 
     @staticmethod
@@ -154,10 +169,54 @@ def _device_name_for_current_gpu(config: MooncakeStoreConfig) -> str:
     return config.device_name_per_gpu[gpu]
 
 
+def _ssd_dir_for_current_rank(config: MooncakeStoreConfig) -> str:
+    """Per-GPU (or per-process) sub-directory of ssd_offload_path."""
+    try:
+        import torch
+
+        from vllm.platforms import current_platform
+
+        gpu = current_platform.visible_device_id_to_physical_device_id(
+            torch.accelerator.current_device_index()
+        )
+        rank = f"gpu{gpu}"
+    except Exception:
+        rank = f"pid{os.getpid()}"
+    path = os.path.join(config.ssd_offload_path, rank)
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def _setup_mooncake_store_ssd(
+    store: Any, config: MooncakeStoreConfig, local_hostname: str
+) -> None:
+    path = _ssd_dir_for_current_rank(config)
+    logger.info("Mooncake SSD offload: path=%s", path)
+    ret = store.setup(
+        {
+            "local_hostname": local_hostname,
+            "metadata_server": config.metadata_server,
+            "global_segment_size": config.global_segment_size,
+            "local_buffer_size": config.local_buffer_size,
+            "protocol": config.protocol,
+            "rdma_devices": _device_name_for_current_gpu(config),
+            "master_server_addr": config.master_server_address,
+            "enable_ssd_offload": True,
+            "ssd_offload_path": path,
+            "tenant_id": config.tenant_id,
+        }
+    )
+    if ret != 0:
+        raise RuntimeError("Initialize MooncakeDistributedStore (SSD) failed.")
+
+
 def setup_mooncake_store(
     store: Any, config: MooncakeStoreConfig, local_hostname: str
 ) -> None:
     """Initialize a native Store, preserving explicit tenant configuration."""
+    if config.enable_ssd_offload:
+        _setup_mooncake_store_ssd(store, config, local_hostname)
+        return
     setup_kwargs: dict[str, str] = {}
     if config.tenant_id != DEFAULT_TENANT_ID:
         setup_kwargs["tenant_id"] = config.tenant_id
