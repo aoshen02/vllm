@@ -46,6 +46,27 @@ def _validate_nccl_checkpoint(worker, suspended):
         )
 
 
+def _lock_process_memory(worker) -> bool:
+    """Keep the worker's host pages resident once touched.
+
+    On ATS systems such as Grace, the GPU reaches host memory through the CPU
+    page tables. The checkpoint image lives in the worker's own anonymous
+    memory, and page reclaim may unmap it while the engine sleeps; the first
+    restore then faults on every page (10-30 s instead of 3 s on GB300).
+    MCL_ONFAULT locks pages as they are touched, so nothing is prefaulted.
+    MCL_FUTURE makes later mappings count against RLIMIT_MEMLOCK, so lock only
+    when that limit cannot make allocations fail.
+    """
+    import ctypes
+    import resource
+
+    if resource.getrlimit(resource.RLIMIT_MEMLOCK)[0] != resource.RLIM_INFINITY:
+        return False
+    mcl_current, mcl_future, mcl_onfault = 1, 2, 4
+    libc = ctypes.CDLL(None, use_errno=True)
+    return libc.mlockall(mcl_current | mcl_future | mcl_onfault) == 0
+
+
 class CUDACheckpointExecutor(MultiprocExecutor):
     """Use dedicated workers even at TP=1 so failed restoration is terminable."""
 
@@ -53,6 +74,7 @@ class CUDACheckpointExecutor(MultiprocExecutor):
         self._checkpoint_lock = threading.RLock()
         self._checkpoint = None
         self._checkpoint_active = False
+        self._memory_locked = False
         parallel = vllm_config.parallel_config
         if sys.platform != "linux" or not current_platform.is_cuda():
             raise ValueError("CUDA checkpoint requires Linux and NVIDIA CUDA")
@@ -252,6 +274,15 @@ class CUDACheckpointExecutor(MultiprocExecutor):
         if self._checkpoint is None:
             self._checkpoint = CudaProcessCheckpoint(self._record)
         try:
+            if not self._memory_locked:
+                self._memory_locked = True
+                if not all(self.collective_rpc(_lock_process_memory, timeout=30)):
+                    logger.warning_once(
+                        "Could not lock worker memory; under host memory pressure "
+                        "the first restore after a checkpoint may be slow. Run "
+                        "with an unlimited memlock limit, e.g. "
+                        "`docker run --ulimit memlock=-1`."
+                    )
             if self._use_nccl_suspend:
                 self.collective_rpc(
                     _validate_nccl_checkpoint, args=(False,), timeout=30
