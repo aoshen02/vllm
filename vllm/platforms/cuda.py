@@ -777,12 +777,16 @@ class CudaPlatformBase(Platform):
     @classmethod
     @cache
     def is_arch_support_pdl(cls) -> bool:
+        # torch.cuda.current_device() would create a CUDA context in processes
+        # that never launch kernels, such as the API server, which then hold
+        # GPU memory for their lifetime. Ask the platform instead (NVML where
+        # available), which leaves CUDA uninitialized.
         try:
-            device = torch.cuda.current_device()
-            major, _ = torch.cuda.get_device_capability(device)
+            device = torch.cuda.current_device() if torch.cuda.is_initialized() else 0
+            capability = cls.get_device_capability(device)
         except Exception:
             return False
-        return major >= 9
+        return capability is not None and capability.major >= 9
 
 
 # NVML utils
