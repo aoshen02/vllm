@@ -405,6 +405,11 @@ class MuseSparkQKVOGateParallelLinear(ColumnParallelLinear):
         assert param_shard.shape == loaded_weight.shape
         param_shard.copy_(loaded_weight)
 
+    # v2-loader linear methods bind ``weight_loader_v2`` to the parameters;
+    # route it here so every write goes through the parameter's loader, which a
+    # weight reload wraps to track what arrived.
+    weight_loader_v2 = weight_loader
+
     def load_weights(
         self, weights: Iterable[tuple[str, torch.Tensor]]
     ) -> Iterable[str]:
@@ -413,7 +418,7 @@ class MuseSparkQKVOGateParallelLinear(ColumnParallelLinear):
             if name == "bias" and self.bias is None:
                 continue
             param = getattr(self, name)
-            self.weight_loader(param, loaded_weight, shard_id)
+            param.weight_loader(param, loaded_weight, shard_id)
             yield name
 
 
