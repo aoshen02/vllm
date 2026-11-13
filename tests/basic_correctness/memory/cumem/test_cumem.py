@@ -141,9 +141,9 @@ def test_python_error():
         allocator.wake_up()
 
 
-@pytest.mark.parametrize("register_error", [0, 1], ids=["pinned", "register-fails"])
+@pytest.mark.parametrize("alloc_error", [0, 1], ids=["pinned", "alloc-fails"])
 @create_new_process_for_each_test("fork" if current_platform.is_cuda() else "spawn")
-def test_basic_cumem(register_error, monkeypatch):
+def test_basic_cumem(alloc_error, monkeypatch):
     # some tensors from default memory pool
     shape = (1024, 1024)
     x = torch.empty(shape, device=DEVICE_TYPE)
@@ -176,23 +176,23 @@ def test_basic_cumem(register_error, monkeypatch):
         return original_empty_cache()
 
     monkeypatch.setattr(torch.accelerator, "empty_cache", record_empty_cache)
-    if register_error:
+    if alloc_error:
         monkeypatch.setattr(
-            cumem.libcudart, "cudaHostRegister", lambda *args: register_error
+            cumem.libcudart, "cudaHostAlloc", lambda *args: (0, alloc_error)
         )
-    unregistered = []
-    original_unregister = cumem.libcudart.cudaHostUnregister
+    freed = []
+    original_free_host = cumem.libcudart.cudaFreeHost
 
-    def record_unregister(ptr):
-        unregistered.append(ptr)
-        return original_unregister(ptr)
+    def record_free_host(ptr):
+        freed.append(ptr)
+        return original_free_host(ptr)
 
-    monkeypatch.setattr(cumem.libcudart, "cudaHostUnregister", record_unregister)
+    monkeypatch.setattr(cumem.libcudart, "cudaFreeHost", record_free_host)
     warnings = []
     monkeypatch.setattr(
         cumem.logger, "warning_once", lambda msg, *args: warnings.append(msg % args)
     )
-    pinned = PIN_MEMORY and not register_error
+    pinned = PIN_MEMORY and not alloc_error
     backup_ptrs = None
     for _ in range(3):
         host_before = host_cache_bytes()
@@ -242,8 +242,8 @@ def test_basic_cumem(register_error, monkeypatch):
     assert not cpu_backups(allocator, set())
     assert backup_ptrs is not None
     released = [*backup_ptrs.values(), *data_ptrs(temp_backups).values()]
-    assert sorted(unregistered) == (sorted(released) if pinned else [])
-    assert bool(warnings) == (PIN_MEMORY and bool(register_error))
+    assert sorted(freed) == (sorted(released) if pinned else [])
+    assert bool(warnings) == (PIN_MEMORY and bool(alloc_error))
     assert all("pageable" in warning for warning in warnings)
 
 

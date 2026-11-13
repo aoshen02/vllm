@@ -88,6 +88,14 @@ class CudaRTLibrary:
         ),
         # cudaError_t cudaHostUnregister ( void* ptr )
         Function("cudaHostUnregister", cudaError_t, [ctypes.c_void_p]),
+        # cudaError_t cudaHostAlloc ( void** pHost, size_t size, unsigned int flags )
+        Function(
+            "cudaHostAlloc",
+            cudaError_t,
+            [ctypes.POINTER(ctypes.c_void_p), ctypes.c_size_t, ctypes.c_uint],
+        ),
+        # cudaError_t cudaFreeHost ( void* ptr )
+        Function("cudaFreeHost", cudaError_t, [ctypes.c_void_p]),
         # cudaError_t cudaGetLastError ( void )
         Function("cudaGetLastError", cudaError_t, []),
     ]
@@ -107,6 +115,8 @@ class CudaRTLibrary:
         "cudaIpcCloseMemHandle": "hipIpcCloseMemHandle",
         "cudaHostRegister": "hipHostRegister",
         "cudaHostUnregister": "hipHostUnregister",
+        "cudaHostAlloc": "hipHostMalloc",
+        "cudaFreeHost": "hipHostFree",
         "cudaGetLastError": "hipGetLastError",
     }
 
@@ -228,6 +238,18 @@ class CudaRTLibrary:
     def cudaHostUnregister(self, ptr: int) -> int:
         """Return the raw error code instead of raising."""
         return self.funcs["cudaHostUnregister"](ctypes.c_void_p(ptr))
+
+    def cudaHostAlloc(self, size: int, flags: int = 0) -> tuple[int, int]:
+        """Return (pointer, raw error code) instead of raising, since callers
+        can fall back to pageable memory. Drain a failure with
+        cudaGetLastError."""
+        ptr = ctypes.c_void_p()
+        error = self.funcs["cudaHostAlloc"](ctypes.byref(ptr), size, flags)
+        return ptr.value or 0, error
+
+    def cudaFreeHost(self, ptr: int) -> int:
+        """Return the raw error code instead of raising."""
+        return self.funcs["cudaFreeHost"](ctypes.c_void_p(ptr))
 
     def cudaGetLastError(self) -> int:
         """Return and clear the error pending on this thread."""

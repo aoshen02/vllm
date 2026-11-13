@@ -9,6 +9,7 @@
 # not sure why, they are created from a different context.
 # the only successful approach is to call cuda driver API in C.
 import atexit
+import ctypes
 import gc
 import mmap
 from collections.abc import Collection, Iterator
@@ -40,6 +41,8 @@ logger = init_logger(__name__)
 
 cumem_available = False
 libcudart: Any = None
+# Backups from cudaHostAlloc, freed with cudaFreeHost on release.
+_host_alloc_ptrs: set[int] = set()
 try:
     from vllm.cumem_allocator import (
         init_module,
@@ -137,24 +140,33 @@ class CuMemAllocator:
 
     @staticmethod
     def _create_cpu_backup(size_in_bytes: int) -> torch.Tensor:
-        backup = torch.frombuffer(
+        # Use cudaHostAlloc rather than mmap + cudaHostRegister. On ATS systems
+        # such as Grace, a registered anonymous mapping stays ordinary process
+        # memory: NUMA balancing faults and migrates its pages, some into GPU
+        # memory, so a reused backup's next copy crawls page by page.
+        if PIN_MEMORY:
+            ptr, error = libcudart.cudaHostAlloc(size_in_bytes)
+            if not error:
+                _host_alloc_ptrs.add(ptr)
+                buffer = (ctypes.c_uint8 * size_in_bytes).from_address(ptr)
+                return torch.frombuffer(buffer, dtype=torch.uint8)
+            libcudart.cudaGetLastError()
+            logger.warning_once(
+                "cudaHostAlloc failed (error %d); sleep mode CPU backups "
+                "fall back to pageable memory.",
+                error,
+            )
+        return torch.frombuffer(
             mmap.mmap(-1, size_in_bytes, flags=mmap.MAP_PRIVATE), dtype=torch.uint8
         )
-        if PIN_MEMORY:
-            error = libcudart.cudaHostRegister(backup.data_ptr(), size_in_bytes)
-            if error:
-                libcudart.cudaGetLastError()
-                logger.warning_once(
-                    "cudaHostRegister failed (error %d); sleep mode CPU backups "
-                    "fall back to pageable memory.",
-                    error,
-                )
-        return backup
 
     @staticmethod
     def _release_cpu_backup(backup: torch.Tensor) -> None:
-        if backup.is_pinned() and libcudart.cudaHostUnregister(backup.data_ptr()):
-            libcudart.cudaGetLastError()
+        ptr = backup.data_ptr()
+        if ptr in _host_alloc_ptrs:
+            _host_alloc_ptrs.remove(ptr)
+            if libcudart.cudaFreeHost(ptr):
+                libcudart.cudaGetLastError()
 
     def _get_pluggable_allocator(self) -> torch.cuda.memory.CUDAPluggableAllocator:
         init_module(self.python_malloc_callback, self.python_free_callback)
