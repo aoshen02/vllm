@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from vllm import ir
+from vllm import envs, ir
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
 from vllm.platforms import CpuArchEnum, current_platform
@@ -111,6 +111,58 @@ class FatreluAndMul(CustomOp):
         return self.forward_cuda(x)
 
 
+# VLLM_TRITON_SILU_MUL (opt-in): memory-bound Triton silu_and_mul, bit-identical
+# to the CUDA op (silu in fp32 rounded to the input dtype, then the product
+# rounded to the input dtype); ~2x faster on GB300 at d=17408, M~1k.
+_TRITON_SILU_MUL = envs.VLLM_TRITON_SILU_MUL
+
+
+@triton.jit
+def _silu_and_mul_kernel(x_ptr, o_ptr, x_stride, o_stride, d, BLOCK: tl.constexpr):
+    row = tl.program_id(0).to(tl.int64)
+    off = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    m = off < d
+    g = tl.load(x_ptr + row * x_stride + off, mask=m, other=0.0)
+    u = tl.load(x_ptr + row * x_stride + d + off, mask=m, other=0.0)
+    gf = g.to(tl.float32)
+    s = (gf / (1.0 + tl.exp(-gf))).to(g.dtype).to(tl.float32)
+    tl.store(o_ptr + row * o_stride + off, (s * u.to(tl.float32)).to(g.dtype), mask=m)
+
+
+def _silu_and_mul_triton_impl(out: torch.Tensor, x: torch.Tensor) -> None:
+    d = x.shape[-1] // 2
+    x2 = x.reshape(-1, 2 * d)
+    o2 = out.view(-1, d)
+    M = x2.shape[0]
+    if M == 0:
+        return
+    BLOCK = 1024 if M > 128 else 2048
+    _silu_and_mul_kernel[(M, triton.cdiv(d, BLOCK))](
+        x2,
+        o2,
+        x2.stride(0),
+        o2.stride(0),
+        d,
+        BLOCK=BLOCK,
+        num_warps=4 if BLOCK == 1024 else 8,
+    )
+
+
+def _silu_and_mul_triton_fake(out: torch.Tensor, x: torch.Tensor) -> None:
+    return None
+
+
+if _TRITON_SILU_MUL:
+    from vllm.utils.torch_utils import direct_register_custom_op
+
+    direct_register_custom_op(
+        op_name="silu_and_mul_triton",
+        op_func=_silu_and_mul_triton_impl,
+        mutates_args=["out"],
+        fake_impl=_silu_and_mul_triton_fake,
+    )
+
+
 # --8<-- [start:silu_and_mul]
 @CustomOp.register("silu_and_mul")
 class SiluAndMul(CustomOp):
@@ -147,6 +199,14 @@ class SiluAndMul(CustomOp):
         d = x.shape[-1] // 2
         output_shape = x.shape[:-1] + (d,)
         out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
+        if (
+            _TRITON_SILU_MUL
+            and current_platform.is_cuda()
+            and x.dtype in (torch.bfloat16, torch.float16)
+            and x.stride(-1) == 1
+        ):
+            torch.ops.vllm.silu_and_mul_triton(out, x)
+            return out
         self.op(out, x)
         return out
 
