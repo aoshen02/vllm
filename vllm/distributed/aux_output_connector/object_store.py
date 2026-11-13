@@ -28,7 +28,9 @@ class AuxObjectStore(ABC):
     """
 
     @abstractmethod
-    def put_batch(self, keys: Sequence[str], values: Sequence[bytes]) -> None:
+    def put_batch(
+        self, keys: Sequence[str], values: Sequence[bytes | memoryview]
+    ) -> None:
         """Write every object, or raise `AuxObjectStoreError`."""
 
     @abstractmethod
@@ -59,7 +61,9 @@ class LocalAuxObjectStore(AuxObjectStore):
         self._objects: dict[str, bytes] = {}
         self._lock = Lock()
 
-    def put_batch(self, keys: Sequence[str], values: Sequence[bytes]) -> None:
+    def put_batch(
+        self, keys: Sequence[str], values: Sequence[bytes | memoryview]
+    ) -> None:
         if len(keys) != len(values):
             raise ValueError("key and value counts differ")
         with self._lock:
@@ -130,7 +134,9 @@ class MooncakeAuxObjectStore(AuxObjectStore):
         replicate_config.with_hard_pin = True
         return cls(store, replicate_config)
 
-    def put_batch(self, keys: Sequence[str], values: Sequence[bytes]) -> None:
+    def put_batch(
+        self, keys: Sequence[str], values: Sequence[bytes | memoryview]
+    ) -> None:
         if len(keys) != len(values):
             raise ValueError("key and value counts differ")
         if not keys:
