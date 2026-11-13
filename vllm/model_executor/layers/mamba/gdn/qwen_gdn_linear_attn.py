@@ -129,6 +129,11 @@ MAX_FUSED_GDN_MTP_TOKENS = 9  # kMaxMtpTokens in fused_gdn_decode_kernel.cu
 _BA_PROJ_OVERLAP_MAX_TOKENS = 256
 FUSED_GDN_STATE_DTYPES = (torch.float32, torch.bfloat16)
 
+# Opt-in: run the decode rows of mixed (prefill + decode) GDN batches through
+# the packed decode kernel that decode-only batches use, instead of
+# rearrange_mixed_qkv + fused_sigmoid_gating_delta_rule_update.
+_GDN_MIXED_PACKED_DECODE = envs.VLLM_GDN_MIXED_PACKED_DECODE
+
 
 def supports_fused_mtp_decode() -> bool:
     """ROCm runs the Triton port; elsewhere the CUDA op must be built."""
@@ -1992,7 +1997,30 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             core_attn_out_spec, last_recurrent_state = None, None
 
         # 2.2: Process non-spec-decode part
-        if split_non_spec:
+        packed_mixed_decode = (
+            split_non_spec
+            and _GDN_MIXED_PACKED_DECODE
+            and self.enable_packed_recurrent_decode
+        )
+        if packed_mixed_decode:
+            # Packed decode kernel on the peeled decode rows (one token each),
+            # written straight into their output rows.
+            core_attn_out_decode = core_attn_out[:num_decode_tokens].unsqueeze(1)
+            fused_recurrent_gated_delta_rule_packed_decode(
+                mixed_qkv=mixed_qkv_non_spec[:num_decode_tokens],  # type: ignore[index]
+                a=a[:num_decode_tokens],
+                b=b[:num_decode_tokens],
+                A_log=self.A_log,
+                dt_bias=self.dt_bias,
+                scale=self.head_k_dim**-0.5,
+                initial_state=ssm_state,
+                out=core_attn_out_decode,
+                ssm_state_indices=non_spec_state_indices_tensor[:num_decode_tokens],  # type: ignore[index]
+                use_qk_l2norm_in_kernel=True,
+            )
+            # (1, num_decode_tokens, HV, V), as the stitching below expects.
+            core_attn_out_decode = core_attn_out_decode.squeeze(1).unsqueeze(0)
+        elif split_non_spec:
             query_decode, key_decode, value_decode = self.rearrange_mixed_qkv(
                 mixed_qkv_non_spec[:num_decode_tokens]  # type: ignore[index]
             )
@@ -2073,7 +2101,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             scatter_states(ssm_state, last_recurrent_state, prefill_state_indices)
 
             if split_non_spec and prefill_in_place:
-                core_attn_out[:num_decode_tokens] = core_attn_out_decode.squeeze(0)
+                if not packed_mixed_decode:  # else already written in place
+                    core_attn_out[:num_decode_tokens] = core_attn_out_decode.squeeze(0)
             elif split_non_spec:
                 # Stitch the peeled decode outputs in front of the prefill
                 # outputs (decode-first order).
