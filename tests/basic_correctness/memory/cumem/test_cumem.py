@@ -141,9 +141,13 @@ def test_python_error():
         allocator.wake_up()
 
 
-@pytest.mark.parametrize("alloc_error", [0, 1], ids=["pinned", "alloc-fails"])
+@pytest.mark.parametrize(
+    "alloc_error,mlock_result",
+    [(0, 0), (0, -1), (1, 0)],
+    ids=["pinned", "mlock-fails", "alloc-fails"],
+)
 @create_new_process_for_each_test("fork" if current_platform.is_cuda() else "spawn")
-def test_basic_cumem(alloc_error, monkeypatch):
+def test_basic_cumem(alloc_error, mlock_result, monkeypatch):
     # some tensors from default memory pool
     shape = (1024, 1024)
     x = torch.empty(shape, device=DEVICE_TYPE)
@@ -192,6 +196,13 @@ def test_basic_cumem(alloc_error, monkeypatch):
     monkeypatch.setattr(
         cumem.logger, "warning_once", lambda msg, *args: warnings.append(msg % args)
     )
+    locked = []
+
+    def record_mlock(ptr, size):
+        locked.append(ptr)
+        return mlock_result
+
+    monkeypatch.setattr(cumem, "_mlock", record_mlock)
     pinned = PIN_MEMORY and not alloc_error
     backup_ptrs = None
     for _ in range(3):
@@ -243,8 +254,11 @@ def test_basic_cumem(alloc_error, monkeypatch):
     assert backup_ptrs is not None
     released = [*backup_ptrs.values(), *data_ptrs(temp_backups).values()]
     assert sorted(freed) == (sorted(released) if pinned else [])
-    assert bool(warnings) == (PIN_MEMORY and bool(alloc_error))
-    assert all("pageable" in warning for warning in warnings)
+    # Each pinned backup is locked once, when it is created.
+    assert sorted(locked) == (sorted(released) if pinned else [])
+    assert bool(warnings) == (PIN_MEMORY and bool(alloc_error or mlock_result))
+    expected_warning = "pageable" if alloc_error else "mlock"
+    assert all(expected_warning in warning for warning in warnings)
 
 
 @pytest.mark.parametrize("full_sleep", [0, 1, 2], ids=["kv-only", "sleep-1", "sleep-2"])

@@ -43,6 +43,19 @@ cumem_available = False
 libcudart: Any = None
 # Backups from cudaHostAlloc, freed with cudaFreeHost on release.
 _host_alloc_ptrs: set[int] = set()
+
+
+def _load_mlock() -> Any:
+    try:
+        fn = ctypes.CDLL(None, use_errno=True).mlock
+    except (OSError, AttributeError, TypeError):
+        return None
+    fn.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+    fn.restype = ctypes.c_int
+    return fn
+
+
+_mlock = _load_mlock()
 try:
     from vllm.cumem_allocator import (
         init_module,
@@ -60,6 +73,22 @@ except ModuleNotFoundError:
     python_create_and_map = None
     python_unmap_and_release = None
     lib_name = None
+
+
+def _lock_cpu_backup(ptr: int, size_in_bytes: int) -> None:
+    # On ATS systems such as Grace, cudaHostAlloc memory is an ordinary shared
+    # mapping that the GPU reaches through the CPU page tables. Under memory
+    # pressure, reclaim unmaps or swaps out idle backup pages, and the next
+    # copy faults on every page (about 0.25 GB/s: minutes for a model's
+    # weights). Locking keeps the pages resident and mapped.
+    if _mlock is None or _mlock(ptr, size_in_bytes) == 0:
+        return
+    logger.warning_once(
+        "Could not mlock sleep mode CPU backups (errno %d); under host memory "
+        "pressure, wake may slow down. Raise the memlock limit, e.g. "
+        "`docker run --ulimit memlock=-1`.",
+        ctypes.get_errno(),
+    )
 
 
 class CuMemAllocator:
@@ -148,6 +177,7 @@ class CuMemAllocator:
             ptr, error = libcudart.cudaHostAlloc(size_in_bytes)
             if not error:
                 _host_alloc_ptrs.add(ptr)
+                _lock_cpu_backup(ptr, size_in_bytes)
                 buffer = (ctypes.c_uint8 * size_in_bytes).from_address(ptr)
                 return torch.frombuffer(buffer, dtype=torch.uint8)
             libcudart.cudaGetLastError()
