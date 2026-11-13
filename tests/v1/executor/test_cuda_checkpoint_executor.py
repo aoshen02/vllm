@@ -22,6 +22,7 @@ def executor():
     obj = CUDACheckpointExecutor.__new__(CUDACheckpointExecutor)
     obj._checkpoint_lock = threading.RLock()
     obj._checkpoint_active = False
+    obj._memory_locked = True
     obj._use_nccl_suspend = False
     obj._checkpoint_flashinfer = False
     obj.is_failed = False
@@ -321,6 +322,50 @@ def test_sleep_worker_rpc_has_deadline(executor):
         assert rpc.call_args.kwargs["timeout"] == 120
         obj.collective_rpc("wake_up", timeout=7)
         assert rpc.call_args.kwargs["timeout"] == 7
+
+
+@pytest.mark.parametrize(
+    "locked,warned", [([True, True], False), ([True, False], True)], ids=["ok", "fails"]
+)
+def test_first_sleep_locks_worker_memory_once(executor, locked, warned):
+    from vllm.v1.executor.cuda_checkpoint_executor import _lock_process_memory
+
+    obj, calls = executor
+    obj._memory_locked = False
+    with (
+        patch.object(MultiprocExecutor, "collective_rpc", return_value=locked) as rpc,
+        patch("vllm.v1.executor.cuda_checkpoint_executor.logger") as log,
+    ):
+        obj.sleep()
+        obj.wake_up()
+        obj.sleep()
+    assert [c.args[0] for c in rpc.call_args_list] == [_lock_process_memory]
+    assert calls[:2] == [("sleep", 1), ("checkpoint", [11, 22])]
+    assert log.warning_once.called == warned
+
+
+@pytest.mark.parametrize(
+    "limit,mlockall_calls",
+    [(-1, 1), (8 << 20, 0)],
+    ids=["unlimited", "limited"],
+)
+def test_lock_process_memory_respects_memlock_limit(limit, mlockall_calls):
+    import resource
+
+    from vllm.v1.executor.cuda_checkpoint_executor import _lock_process_memory
+
+    libc = Mock()
+    libc.mlockall.return_value = 0
+    limit = resource.RLIM_INFINITY if limit == -1 else limit
+    with (
+        patch("resource.getrlimit", return_value=(limit, limit)),
+        patch("ctypes.CDLL", return_value=libc),
+    ):
+        assert _lock_process_memory(None) == bool(mlockall_calls)
+    assert libc.mlockall.call_count == mlockall_calls
+    if mlockall_calls:
+        # MCL_CURRENT | MCL_FUTURE | MCL_ONFAULT: lock on touch, never prefault.
+        assert libc.mlockall.call_args.args == (1 | 2 | 4,)
 
 
 def test_worker_termination_reaps_real_processes():
