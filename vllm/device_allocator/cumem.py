@@ -9,6 +9,7 @@
 # not sure why, they are created from a different context.
 # the only successful approach is to call cuda driver API in C.
 import atexit
+import ctypes
 import gc
 import mmap
 from collections.abc import Collection, Iterator
@@ -40,6 +41,21 @@ logger = init_logger(__name__)
 
 cumem_available = False
 libcudart: Any = None
+# Backups from cudaHostAlloc, freed with cudaFreeHost on release.
+_host_alloc_ptrs: set[int] = set()
+
+
+def _load_mlock() -> Any:
+    try:
+        fn = ctypes.CDLL(None, use_errno=True).mlock
+    except (OSError, AttributeError, TypeError):
+        return None
+    fn.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+    fn.restype = ctypes.c_int
+    return fn
+
+
+_mlock = _load_mlock()
 try:
     from vllm.cumem_allocator import (
         init_module,
@@ -57,6 +73,22 @@ except ModuleNotFoundError:
     python_create_and_map = None
     python_unmap_and_release = None
     lib_name = None
+
+
+def _lock_cpu_backup(ptr: int, size_in_bytes: int) -> None:
+    # On ATS systems such as Grace, cudaHostAlloc memory is an ordinary shared
+    # mapping that the GPU reaches through the CPU page tables. Under memory
+    # pressure, reclaim unmaps or swaps out idle backup pages, and the next
+    # copy faults on every page (about 0.25 GB/s: minutes for a model's
+    # weights). Locking keeps the pages resident and mapped.
+    if _mlock is None or _mlock(ptr, size_in_bytes) == 0:
+        return
+    logger.warning_once(
+        "Could not mlock sleep mode CPU backups (errno %d); under host memory "
+        "pressure, wake may slow down. Raise the memlock limit, e.g. "
+        "`docker run --ulimit memlock=-1`.",
+        ctypes.get_errno(),
+    )
 
 
 class CuMemAllocator:
@@ -137,24 +169,34 @@ class CuMemAllocator:
 
     @staticmethod
     def _create_cpu_backup(size_in_bytes: int) -> torch.Tensor:
-        backup = torch.frombuffer(
+        # Use cudaHostAlloc rather than mmap + cudaHostRegister. On ATS systems
+        # such as Grace, a registered anonymous mapping stays ordinary process
+        # memory: NUMA balancing faults and migrates its pages, some into GPU
+        # memory, so a reused backup's next copy crawls page by page.
+        if PIN_MEMORY:
+            ptr, error = libcudart.cudaHostAlloc(size_in_bytes)
+            if not error:
+                _host_alloc_ptrs.add(ptr)
+                _lock_cpu_backup(ptr, size_in_bytes)
+                buffer = (ctypes.c_uint8 * size_in_bytes).from_address(ptr)
+                return torch.frombuffer(buffer, dtype=torch.uint8)
+            libcudart.cudaGetLastError()
+            logger.warning_once(
+                "cudaHostAlloc failed (error %d); sleep mode CPU backups "
+                "fall back to pageable memory.",
+                error,
+            )
+        return torch.frombuffer(
             mmap.mmap(-1, size_in_bytes, flags=mmap.MAP_PRIVATE), dtype=torch.uint8
         )
-        if PIN_MEMORY:
-            error = libcudart.cudaHostRegister(backup.data_ptr(), size_in_bytes)
-            if error:
-                libcudart.cudaGetLastError()
-                logger.warning_once(
-                    "cudaHostRegister failed (error %d); sleep mode CPU backups "
-                    "fall back to pageable memory.",
-                    error,
-                )
-        return backup
 
     @staticmethod
     def _release_cpu_backup(backup: torch.Tensor) -> None:
-        if backup.is_pinned() and libcudart.cudaHostUnregister(backup.data_ptr()):
-            libcudart.cudaGetLastError()
+        ptr = backup.data_ptr()
+        if ptr in _host_alloc_ptrs:
+            _host_alloc_ptrs.remove(ptr)
+            if libcudart.cudaFreeHost(ptr):
+                libcudart.cudaGetLastError()
 
     def _get_pluggable_allocator(self) -> torch.cuda.memory.CUDAPluggableAllocator:
         init_module(self.python_malloc_callback, self.python_free_callback)

@@ -141,9 +141,13 @@ def test_python_error():
         allocator.wake_up()
 
 
-@pytest.mark.parametrize("register_error", [0, 1], ids=["pinned", "register-fails"])
+@pytest.mark.parametrize(
+    "alloc_error,mlock_result",
+    [(0, 0), (0, -1), (1, 0)],
+    ids=["pinned", "mlock-fails", "alloc-fails"],
+)
 @create_new_process_for_each_test("fork" if current_platform.is_cuda() else "spawn")
-def test_basic_cumem(register_error, monkeypatch):
+def test_basic_cumem(alloc_error, mlock_result, monkeypatch):
     # some tensors from default memory pool
     shape = (1024, 1024)
     x = torch.empty(shape, device=DEVICE_TYPE)
@@ -176,23 +180,30 @@ def test_basic_cumem(register_error, monkeypatch):
         return original_empty_cache()
 
     monkeypatch.setattr(torch.accelerator, "empty_cache", record_empty_cache)
-    if register_error:
+    if alloc_error:
         monkeypatch.setattr(
-            cumem.libcudart, "cudaHostRegister", lambda *args: register_error
+            cumem.libcudart, "cudaHostAlloc", lambda *args: (0, alloc_error)
         )
-    unregistered = []
-    original_unregister = cumem.libcudart.cudaHostUnregister
+    freed = []
+    original_free_host = cumem.libcudart.cudaFreeHost
 
-    def record_unregister(ptr):
-        unregistered.append(ptr)
-        return original_unregister(ptr)
+    def record_free_host(ptr):
+        freed.append(ptr)
+        return original_free_host(ptr)
 
-    monkeypatch.setattr(cumem.libcudart, "cudaHostUnregister", record_unregister)
+    monkeypatch.setattr(cumem.libcudart, "cudaFreeHost", record_free_host)
     warnings = []
     monkeypatch.setattr(
         cumem.logger, "warning_once", lambda msg, *args: warnings.append(msg % args)
     )
-    pinned = PIN_MEMORY and not register_error
+    locked = []
+
+    def record_mlock(ptr, size):
+        locked.append(ptr)
+        return mlock_result
+
+    monkeypatch.setattr(cumem, "_mlock", record_mlock)
+    pinned = PIN_MEMORY and not alloc_error
     backup_ptrs = None
     for _ in range(3):
         host_before = host_cache_bytes()
@@ -226,7 +237,8 @@ def test_basic_cumem(register_error, monkeypatch):
     with allocator.use_memory_pool("free-test"):
         temp = torch.full((4 << 20,), 7, dtype=torch.uint8, device=DEVICE_TYPE)
     allocator.sleep(offload_tags="free-test")
-    assert_released(backups)
+    # Freed host memory may back the next backup at the same address, so
+    # release is checked through cudaFreeHost below, not is_pinned().
     temp_backups = cpu_backups(allocator, {"free-test"}, pinned)
     allocator.wake_up()
     assert torch.equal(temp, torch.full_like(temp, 7))
@@ -238,13 +250,15 @@ def test_basic_cumem(register_error, monkeypatch):
         pass
     assert device_index is not None
     assert device_index in sync_devices
-    assert_released(temp_backups)
     assert not cpu_backups(allocator, set())
     assert backup_ptrs is not None
     released = [*backup_ptrs.values(), *data_ptrs(temp_backups).values()]
-    assert sorted(unregistered) == (sorted(released) if pinned else [])
-    assert bool(warnings) == (PIN_MEMORY and bool(register_error))
-    assert all("pageable" in warning for warning in warnings)
+    assert sorted(freed) == (sorted(released) if pinned else [])
+    # Each pinned backup is locked once, when it is created.
+    assert sorted(locked) == (sorted(released) if pinned else [])
+    assert bool(warnings) == (PIN_MEMORY and bool(alloc_error or mlock_result))
+    expected_warning = "pageable" if alloc_error else "mlock"
+    assert all(expected_warning in warning for warning in warnings)
 
 
 @pytest.mark.parametrize("full_sleep", [0, 1, 2], ids=["kv-only", "sleep-1", "sleep-2"])
