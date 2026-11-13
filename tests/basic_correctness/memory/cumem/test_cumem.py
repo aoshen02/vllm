@@ -237,7 +237,8 @@ def test_basic_cumem(alloc_error, mlock_result, monkeypatch):
     with allocator.use_memory_pool("free-test"):
         temp = torch.full((4 << 20,), 7, dtype=torch.uint8, device=DEVICE_TYPE)
     allocator.sleep(offload_tags="free-test")
-    assert_released(backups)
+    # Freed host memory may back the next backup at the same address, so
+    # release is checked through cudaFreeHost below, not is_pinned().
     temp_backups = cpu_backups(allocator, {"free-test"}, pinned)
     allocator.wake_up()
     assert torch.equal(temp, torch.full_like(temp, 7))
@@ -249,7 +250,6 @@ def test_basic_cumem(alloc_error, mlock_result, monkeypatch):
         pass
     assert device_index is not None
     assert device_index in sync_devices
-    assert_released(temp_backups)
     assert not cpu_backups(allocator, set())
     assert backup_ptrs is not None
     released = [*backup_ptrs.values(), *data_ptrs(temp_backups).values()]
