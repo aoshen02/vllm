@@ -397,6 +397,19 @@ class Scheduler(SchedulerInterface):
         # prefill batch fully drained the waiting queue. Prefill throttling
         # is disabled in this case.
         self.prefill_capacity_bound = False
+        # DP prefill token balancing (VLLM_DP_PREFILL_BALANCE, opt-in). The DP
+        # engine core sets these right before every schedule() call:
+        #   dp_prefill_cap: max prefill tokens this step (None = no cap);
+        #   dp_prefill_fill: this off-cadence step was un-throttled only to
+        #     fill time another rank spends prefilling anyway, so it must not
+        #     update prefill_capacity_bound.
+        self.dp_prefill_cap: int | None = None
+        self.dp_prefill_fill = False
+        # EMA of uncached/total prompt tokens at admission, used to estimate the
+        # prefill demand of the waiting queue (prefix hits are unknown there).
+        self._dp_uncached_ratio = 1.0
+        self._dp_adm_new = 0
+        self._dp_adm_total = 0
         # The DP engine core drives this cadence from a counter shared across
         # ranks; an engine without one never throttles, so apply the interval
         # locally, timed from the last prefill-carrying step. Three regimes:
@@ -697,6 +710,42 @@ class Scheduler(SchedulerInterface):
         )
         return blocks, num_local, shared_prefix_boundary, False
 
+    def dp_prefill_demand(self) -> tuple[int, bool, bool]:
+        """Estimate of the prefill tokens the next schedule() would run if
+        not throttled, for DP prefill token balancing.
+
+        Returns (tokens, prefill_capacity_bound, has_decodes). Tokens are the
+        remaining in-flight prefill chunks plus the waiting queue (scaled by
+        the observed uncached ratio), each request capped at the long-prefill
+        threshold, total capped at max_num_batched_tokens.
+        """
+        budget = self.scheduler_config.max_num_batched_tokens
+        thr = 0
+        if self.scheduler_config.enable_chunked_prefill:
+            thr = self.scheduler_config.long_prefill_token_threshold
+            num_eligible = len(self.running) + len(self.waiting)
+            if thr > 0 and self.adaptive_long_prefill_threshold and num_eligible:
+                thr = max(thr, budget // num_eligible)
+        if thr <= 0:
+            thr = budget
+        demand = 0
+        for req in self._inflight_prefills:
+            rem = req.num_tokens - req.num_computed_tokens
+            if rem > 0:
+                demand += min(rem, thr)
+                if demand >= budget:
+                    break
+        if demand < budget and self._pause_state == PauseState.UNPAUSED:
+            ratio = self._dp_uncached_ratio
+            for n, req in enumerate(self.waiting):
+                rem = req.num_tokens - req.num_computed_tokens
+                if rem > 1:
+                    demand += min(max(int(rem * ratio), 1), thr)
+                if demand >= budget or n >= 512:
+                    break
+        has_decodes = any(not r.is_prefill_chunk for r in self.running)
+        return min(demand, budget), self.prefill_capacity_bound, has_decodes
+
     def _reserve_prefill_lookahead(
         self,
         request: Request,
@@ -766,6 +815,14 @@ class Scheduler(SchedulerInterface):
         scheduled_timestamp = time.monotonic()
 
         self.kv_cache_manager.new_step_starts()
+
+        # DP prefill token balancing: per-step prefill token budget.
+        dp_balance = self.dp_prefill_cap is not None
+        prefill_budget = (
+            self.dp_prefill_cap
+            if self.dp_prefill_cap is not None
+            else self.max_num_scheduled_tokens
+        )
 
         # DP prefill balancing: on a throttled (non-cadence-aligned) step, defer
         # all prefill compute unless saturated.
@@ -868,6 +925,9 @@ class Scheduler(SchedulerInterface):
             num_new_tokens = min(
                 num_new_tokens, token_budget, input_budget - draft_slots
             )
+            if dp_balance and request.is_prefill_chunk:
+                # DP prefill balancing; 0 skips this chunk below.
+                num_new_tokens = min(num_new_tokens, max(prefill_budget, 0))
 
             # Make sure the input position does not exceed the max model len.
             # This is necessary when using spec decoding.
@@ -1023,6 +1083,8 @@ class Scheduler(SchedulerInterface):
             num_scheduled_tokens[request_id] = num_new_tokens
             token_budget -= num_new_tokens
             input_budget -= num_new_tokens + draft_slots
+            if dp_balance and request.is_prefill_chunk:
+                prefill_budget -= num_new_tokens
             req_index += 1
             drafts_needed = drafts_needed or not self._drafts_unused(
                 request, request.num_computed_tokens, num_new_tokens
@@ -1349,6 +1411,12 @@ class Scheduler(SchedulerInterface):
                     break
                 else:
                     request_token_budget = min(token_budget, input_budget - draft_slots)
+                    is_prefill_admission = num_computed_tokens < request.num_tokens - 1
+                    if dp_balance and is_prefill_admission:
+                        # DP prefill balancing: same exit as the deferral gate.
+                        if prefill_budget <= 0:
+                            break
+                        request_token_budget = min(request_token_budget, prefill_budget)
                     if did_prefix_cache_lookup:
                         # Fresh admission: local and/or sync external hit.
                         num_replay_tokens = self._mark_prefix_replay(
@@ -1637,6 +1705,11 @@ class Scheduler(SchedulerInterface):
                 num_scheduled_tokens[request_id] = num_new_tokens
                 token_budget -= num_new_tokens
                 input_budget -= num_new_tokens + draft_slots
+                if dp_balance and num_computed_tokens < request.num_tokens - 1:
+                    prefill_budget -= num_new_tokens
+                    if did_prefix_cache_lookup:
+                        self._dp_adm_new += request.num_tokens - num_computed_tokens
+                        self._dp_adm_total += request.num_tokens
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
                 self._set_kv_fetch_stage(request, None)
@@ -1688,9 +1761,14 @@ class Scheduler(SchedulerInterface):
 
             # DP prefill balancing: on a step that admitted prefills (release),
             # record whether it was capacity-bound.
-            if not defer_prefills:
+            if not defer_prefills and not self.dp_prefill_fill:
                 _, num_waiting = self.get_request_counts()
                 self.prefill_capacity_bound = num_waiting > len(self.deferred_waiting)
+
+        if dp_balance and self._dp_adm_total > 0:
+            ratio = self._dp_adm_new / self._dp_adm_total
+            self._dp_uncached_ratio = 0.8 * self._dp_uncached_ratio + 0.2 * ratio
+            self._dp_adm_new = self._dp_adm_total = 0
 
         # Check if the scheduling constraints are satisfied.
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
