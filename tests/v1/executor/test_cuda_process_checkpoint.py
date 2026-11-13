@@ -173,15 +173,23 @@ def test_driver_rejects_non_object_response(response, stage_driver):
         driver.run_stage([11], "Restore")
 
 
-def test_driver_accepts_complete_stage_response(stage_driver):
+@pytest.mark.parametrize(
+    "op,state,deadline",
+    [("Lock", 1, 30), ("Checkpoint", 2, 300), ("Restore", 1, 300), ("Unlock", 0, 30)],
+    ids=["lock", "checkpoint", "restore", "unlock"],
+)
+def test_driver_accepts_complete_stage_response(op, state, deadline, stage_driver):
+    # Copying stages get a deadline that covers a large model's first restore
+    # (up to 28 s per rank for DeepSeek-V4.1-Flash on GB300).
     driver, response = stage_driver
     rows = [
-        {"pid": pid, "op": "Restore", "rc": 0, "after": {"rc": 0, "value": 1}}
+        {"pid": pid, "op": op, "rc": 0, "after": {"rc": 0, "value": state}}
         for pid in [11, 22]
     ]
-    response.return_value = {"kind": "stage", "op": "Restore", "results": rows}
-    driver.run_stage([11, 22], "Restore")
-    assert json.loads(driver.proc.stdin.getvalue()) == [[11, 22], "Restore"]
+    response.return_value = {"kind": "stage", "op": op, "results": rows}
+    driver.run_stage([11, 22], op)
+    response.assert_called_once_with(deadline)
+    assert json.loads(driver.proc.stdin.getvalue()) == [[11, 22], op]
     for row in rows:
         driver.emit.assert_any_call(**row)
 
