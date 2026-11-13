@@ -240,8 +240,8 @@ class CUDACheckpointExecutor(MultiprocExecutor):
     def sleep(self, level=1):
         if self.is_failed:
             raise RuntimeError("CUDA checkpoint executor failed")
-        if level != 1:
-            raise ValueError("CUDA checkpoint currently supports sleep level 1 only")
+        if level not in (1, 2):
+            raise ValueError("CUDA checkpoint supports sleep levels 1 and 2")
         if self._checkpoint_active:
             return
         # Match the parent's no-op after KV-first partial wake: weights are

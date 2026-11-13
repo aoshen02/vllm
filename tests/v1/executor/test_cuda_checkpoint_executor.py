@@ -55,12 +55,13 @@ def executor():
     obj._checkpoint = None
 
 
-def test_sleep_then_restore_precedes_worker_wake(executor):
+@pytest.mark.parametrize("level", [1, 2])
+def test_sleep_then_restore_precedes_worker_wake(executor, level):
     obj, calls = executor
-    obj.sleep()
+    obj.sleep(level)
     obj.wake_up()
     assert calls == [
-        ("sleep", 1),
+        ("sleep", level),
         ("checkpoint", [11, 22]),
         ("restore",),
         ("wake", None),
@@ -120,10 +121,11 @@ def test_shutdown_does_not_restore_checkpointed_memory(executor):
     assert ("wake", None) not in calls
 
 
-def test_level_two_rejected_before_sleep(executor):
+@pytest.mark.parametrize("level", [0, 3])
+def test_unsupported_level_rejected_before_sleep(executor, level):
     obj, calls = executor
-    with pytest.raises(ValueError):
-        obj.sleep(2)
+    with pytest.raises(ValueError, match="levels 1 and 2"):
+        obj.sleep(level)
     assert not calls
 
 
