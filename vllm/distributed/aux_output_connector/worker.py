@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
+from functools import partial
 from threading import Lock
 from typing import TYPE_CHECKING, Any
 
@@ -51,6 +52,7 @@ from vllm.model_executor.layers.indexer_topk_capturer import (
     IndexerTopkCapturer,
     bind_indexer_topk_capturer,
 )
+from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes
 
 if TYPE_CHECKING:
@@ -118,6 +120,9 @@ class AuxOutputWorkerConnector:
     _indexer: IndexerTopkCapturer | None = None
     _return_hidden_states = False
     _topk_logprobs = 0
+    _topk_fn: (
+        Callable[[torch.Tensor, int], tuple[torch.Tensor, torch.Tensor]] | None
+    ) = None
     _inline_fields = False
 
     def __init__(
@@ -164,6 +169,12 @@ class AuxOutputWorkerConnector:
             vllm_config.aux_output_config.enable_return_hidden_states
         )
         self._topk_logprobs = vllm_config.aux_output_config.return_topk_logprobs
+        if self._topk_logprobs:
+            self._topk_fn = partial(
+                model.logits_processor.get_top_k_tokens,
+                model.lm_head,
+                return_log_probs=True,
+            )
         self._inline_fields = vllm_config.aux_output_config.object_store is None
         self._session_request_ids: set[str] = set()
         self._session_generation = 0
@@ -243,13 +254,11 @@ class AuxOutputWorkerConnector:
         self,
         input_batch: InputBatch,
         hidden_states: torch.Tensor | None = None,
-        logits_fn: Callable[[torch.Tensor], torch.Tensor | None] | None = None,
     ) -> PendingAuxOutput | None:
         """Snapshot one step's auxiliary tensors for asynchronous CPU transfer.
 
-        `hidden_states` are the step's LM-head inputs, one row per query token,
-        and `logits_fn` computes logits from them. Call on every rank: the
-        top-k logprobs need the logits collective.
+        `hidden_states` are the step's LM-head inputs, one row per query token.
+        Call on every rank: the top-k logprobs gather candidates across ranks.
         """
         if self._step_metadata is None or (
             self._buffer is None and not self._topk_logprobs
@@ -259,7 +268,7 @@ class AuxOutputWorkerConnector:
         query_start_loc = input_batch.query_start_loc_np[: len(request_ids) + 1]
         num_rows = int(query_start_loc[-1])
         topk = None
-        if self._topk_logprobs and hidden_states is not None and logits_fn is not None:
+        if self._topk_fn is not None and hidden_states is not None:
             rows = (
                 np.arange(num_rows)
                 if self._inline_fields
@@ -269,7 +278,7 @@ class AuxOutputWorkerConnector:
             )
             if len(rows):
                 topk = compute_topk_logprobs(
-                    hidden_states, logits_fn, self._topk_logprobs, rows, num_rows
+                    hidden_states, self._topk_fn, self._topk_logprobs, rows, num_rows
                 )
         if self._buffer is None:
             return None
@@ -642,27 +651,21 @@ def session_rows(
 
 def compute_topk_logprobs(
     hidden_states: torch.Tensor,
-    logits_fn: Callable[[torch.Tensor], torch.Tensor | None],
+    topk_fn: Callable[[torch.Tensor, int], tuple[torch.Tensor, torch.Tensor]],
     k: int,
     rows: np.ndarray,
     num_rows: int,
     chunk_size: int = 1024,
-) -> tuple[torch.Tensor, torch.Tensor] | None:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Top-k next-token ids (int32) and log-probabilities (float32) of `rows`,
-    scattered into `[num_rows, k]` tensors (other rows hold -1 and -inf), or
-    None on ranks that do not receive the logits."""
-    index = torch.from_numpy(rows).to(hidden_states.device)
+    scattered into `[num_rows, k]` tensors (other rows hold -1 and -inf)."""
+    index = async_tensor_h2d(rows, hidden_states.device)
     selected = hidden_states.index_select(0, index)
     token_ids, logprobs = [], []
     for start in range(0, len(selected), chunk_size):
-        logits = logits_fn(selected[start : start + chunk_size])
-        if logits is None:
-            continue
-        values, indices = torch.log_softmax(logits.float(), dim=-1).topk(k, dim=-1)
-        token_ids.append(indices.to(torch.int32))
+        ids, values = topk_fn(selected[start : start + chunk_size], k)
+        token_ids.append(ids.to(torch.int32))
         logprobs.append(values)
-    if not token_ids:
-        return None
     all_token_ids = torch.full(
         (num_rows, k), -1, dtype=torch.int32, device=hidden_states.device
     )
