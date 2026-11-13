@@ -282,6 +282,13 @@ class CuMemAllocator:
             offload_tags = (offload_tags,)
 
         assert isinstance(offload_tags, tuple)
+        # A tensor still alive in a released graph pool would wake up as garbage.
+        if "cudagraph" not in offload_tags and any(
+            segment["allocated_size"]
+            for pool, _ in self.allocator_and_pools.get("cudagraph", ())
+            for segment in pool.snapshot()
+        ):
+            raise RuntimeError("Cannot release the CUDA graph pool: tensors are live")
 
         total_bytes = 0
         backup_bytes = 0

@@ -167,13 +167,15 @@ llm.wake_up()
 
 Block hashes do not cover the weights. If the weights may change before the wake-up, keep the default, or give requests a `cache_salt` per weight version so that blocks computed with older weights are never matched.
 
-#### Offloading CUDA graph memory
+#### Releasing CUDA graph memory
 
 By default, CUDA graph memory stays on the GPU while asleep. With
 `sleep_mode_offload_cudagraph=True` (off by default), CUDA graphs are captured
-into a cuMem pool that sleep backs up to CPU memory at both levels and any wake
-restores in place, so graphs are replayed, not recaptured. It needs the default
-`cumem` backend, CUDA or ROCm, and CUDA graphs; otherwise it has no effect.
+into a cuMem pool that sleep releases at both levels and any wake maps back at
+the same addresses, so graphs are replayed, not recaptured. The pool holds only
+scratch that every replay writes before it reads, so nothing is backed up;
+sleep refuses if a tensor is still alive in it. It needs the default `cumem`
+backend, CUDA or ROCm, and CUDA graphs; otherwise it has no effect.
 
 ```python
 llm = LLM("Qwen/Qwen3-8B", enable_sleep_mode=True, sleep_mode_offload_cudagraph=True)
@@ -181,11 +183,10 @@ llm = LLM("Qwen/Qwen3-8B", enable_sleep_mode=True, sleep_mode_offload_cudagraph=
 
 or `vllm serve <model> --enable-sleep-mode --sleep-mode-offload-cudagraph`.
 
-The cost is pinned host memory for the pool's backup, also at level 2, and one
-extra copy per captured custom allreduce (about 3% decode latency at batch
-size 1). `NCCL_GRAPH_REGISTER` defaults to `0`, since NCCL graph registration
-would pin the pool; an explicit value is kept with a warning. Graph executables
-outside PyTorch pools stay resident.
+The cost is one extra copy per captured custom allreduce (about 3% decode
+latency at batch size 1). `NCCL_GRAPH_REGISTER` defaults to `0`, since NCCL
+graph registration would pin the pool; an explicit value is kept with a warning.
+Graph executables outside PyTorch pools stay resident.
 
 #### Releasing NCCL communicator memory
 

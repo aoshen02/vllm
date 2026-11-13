@@ -127,9 +127,10 @@ class CuMemBackend(SleepModeBackend):
         from vllm.device_allocator import get_mem_allocator_instance
 
         self._state = "SUSPENDED"
-        get_mem_allocator_instance().sleep(
-            ("weights", "runtime", "cudagraph"), discardable
-        )
+        # Graph pools hold only scratch that every replay rewrites, so they
+        # are released, not backed up; the allocator refuses if a tensor
+        # outlived capture in them.
+        get_mem_allocator_instance().sleep(("weights", "runtime"), discardable)
 
     def resume(self, tags: list[str] | None = None) -> None:
         from vllm.device_allocator import get_mem_allocator_instance
