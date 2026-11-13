@@ -211,3 +211,17 @@ def test_arch_support_pdl_leaves_cuda_uninitialized():
     assert capability is not None
     assert current_platform.is_arch_support_pdl() == (capability.major >= 9)
     assert not torch.cuda.is_initialized()
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA not available")
+@create_new_process_for_each_test("spawn")
+def test_deep_gemm_query_leaves_cuda_uninitialized():
+    """Asking which DeepGEMM kernels exist, as the DeepSeek config check does in
+    the API server, must not create a CUDA context (DeepGEMM's set_pdl would)."""
+    from vllm.utils.deep_gemm import has_deep_gemm, has_deep_gemm_sparse_mqa
+
+    if not has_deep_gemm():
+        pytest.skip("DeepGEMM not installed")
+    has_deep_gemm_sparse_mqa()
+    assert not check_cuda_context()[0]
+    assert not torch.cuda.is_initialized()
