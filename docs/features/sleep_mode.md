@@ -318,11 +318,13 @@ for other GPU, driver, and communication-library combinations is not established
 Only single-node tensor parallelism is accepted. Tensor parallel sizes 1, 2,
 and 4 have been GPU-tested; other sizes remain unvalidated. Use the standard
 GPU worker and the `cumem` sleep backend. Pipeline, data, context and expert parallelism, external cache or
-weight transfer, custom worker classes, and sleep level 2 are rejected before
-worker startup (sleep level 2 is rejected when requested). Worker extensions
-that allocate additional CUDA IPC resources are outside the validated scope.
-Level 0 remains
-a scheduler pause and does not perform a CUDA checkpoint.
+weight transfer, and custom worker classes are rejected before worker startup.
+Worker extensions that allocate additional CUDA IPC resources are outside the
+validated scope. Level 0 remains a scheduler pause and does not perform a CUDA
+checkpoint. Levels 1 and 2 checkpoint what the sleep leaves on the GPU. Level 2
+discards the parameters, so neither the level-1 weight backup nor the checkpoint
+holds them in host memory; refill them after the wake, e.g. with
+`collective_rpc("reload_weights")`.
 
 For tensor parallel sizes greater than 1, use NCCL 2.29.7 or later with memory
 suspension support, set `enable_nccl_comm_suspend=True`, and pass
