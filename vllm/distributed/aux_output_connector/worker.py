@@ -54,6 +54,9 @@ from vllm.model_executor.layers.indexer_topk_capturer import (
 )
 from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes
+from vllm.v1.worker.gpu.sample.prompt_logprob import (
+    CHUNK_SIZE as PROMPT_LOGPROBS_CHUNK_SIZE,
+)
 
 if TYPE_CHECKING:
     from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -120,6 +123,7 @@ class AuxOutputWorkerConnector:
     _indexer: IndexerTopkCapturer | None = None
     _return_hidden_states = False
     _topk_logprobs = 0
+    _topk_chunk_size = PROMPT_LOGPROBS_CHUNK_SIZE
     _topk_fn: (
         Callable[[torch.Tensor, int], tuple[torch.Tensor, torch.Tensor]] | None
     ) = None
@@ -175,6 +179,7 @@ class AuxOutputWorkerConnector:
                 model.lm_head,
                 return_log_probs=True,
             )
+            self._topk_chunk_size = PROMPT_LOGPROBS_CHUNK_SIZE * model.lm_head.tp_size
         self._inline_fields = vllm_config.aux_output_config.object_store is None
         self._session_request_ids: set[str] = set()
         self._session_generation = 0
@@ -278,7 +283,12 @@ class AuxOutputWorkerConnector:
             )
             if len(rows):
                 topk = compute_topk_logprobs(
-                    hidden_states, self._topk_fn, self._topk_logprobs, rows, num_rows
+                    hidden_states,
+                    self._topk_fn,
+                    self._topk_logprobs,
+                    rows,
+                    num_rows,
+                    self._topk_chunk_size,
                 )
         if self._buffer is None:
             return None
