@@ -6,7 +6,6 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal, overload
 
-import vllm.envs as envs
 from vllm.distributed.kv_events import BlockStored, KVCacheEvent
 from vllm.logger import init_logger
 from vllm.utils.hashing import sha256
@@ -302,6 +301,7 @@ class KVCacheManager:
         metrics_collector: KVCacheMetricsCollector | None = None,
         watermark: float = 0.0,
         enable_mamba_shared_prefix_checkpoint: bool = False,
+        mamba_frontier_checkpoint: bool = False,
     ) -> None:
         self.max_model_len = max_model_len
         # When unset, fall back to `max_model_len` so the recycling-aware cap
@@ -359,7 +359,7 @@ class KVCacheManager:
         )
         self.kv_cache_config = kv_cache_config
         self.frontier: FrontierCheckpoints | None = None
-        if envs.VLLM_MAMBA_FRONTIER_CHECKPOINT and enable_caching:
+        if mamba_frontier_checkpoint and enable_caching:
             self.frontier = FrontierCheckpoints(self.coordinator)
 
         # Watermark: minimum number of KV cache blocks to keep free when
