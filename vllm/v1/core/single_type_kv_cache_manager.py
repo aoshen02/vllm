@@ -1455,6 +1455,11 @@ class MambaManager(SingleTypeKVCacheManager):
         # Mamba checkpoints follow Eagle's global replay boundary.
         self.drop_eagle_checkpoint_block = False
         self.cached_blocks_this_step: set[BlockHashWithGroupId] = set()
+        # Set by the frontier checkpoint: a resume may start inside a block.
+        self.track_unwritten_blocks = False
+        # Block a chunk starts inside and runs past: its column keeps the
+        # chunk's start state, not the state at the block's end.
+        self._unwritten_blocks: dict[str, int] = {}
         if self.mamba_cache_mode == "align":
             # Mapping from request ID to the index of the block
             # allocated in the previous step
@@ -1787,6 +1792,15 @@ class MambaManager(SingleTypeKVCacheManager):
                     )
                 else:
                     self._checkpoints.pop(request_id, None)
+                start_block = total_computed_tokens // self.block_size
+                if (
+                    self.track_unwritten_blocks
+                    and total_computed_tokens % self.block_size
+                    and num_tokens > (start_block + 1) * self.block_size
+                ):
+                    self._unwritten_blocks[request_id] = start_block
+                else:
+                    self._unwritten_blocks.pop(request_id, None)
             if num_new_blocks > 0:
                 blocks_allocated = request_id in self._allocated_block_reqs
                 physical_block_cap = 1 + int(has_partial_hit) + checkpoint_block
@@ -1960,6 +1974,7 @@ class MambaManager(SingleTypeKVCacheManager):
             self.last_state_block_idx.pop(request_id, None)
             self._num_retired_blocks.pop(request_id, None)
             self._checkpoints.pop(request_id, None)
+            self._unwritten_blocks.pop(request_id, None)
             self._producer_partial_tail_reqs.pop(request_id, None)
             # An offer is only guaranteed to hold committed bytes until the end
             # of the pass that made it. This request's blocks are going back to
@@ -1997,6 +2012,14 @@ class MambaManager(SingleTypeKVCacheManager):
         )
         num_cached_blocks_after = self.num_cached_block.get(request.request_id, 0)
         if self.mamba_cache_mode == "align":
+            unwritten = self._unwritten_blocks.pop(request.request_id, None)
+            if (
+                unwritten is not None
+                and num_cached_blocks_before <= unwritten < num_cached_blocks_after
+            ):
+                block = self.req_to_blocks[request.request_id][unwritten]
+                if not block.is_null and block.block_hash is not None:
+                    self.block_pool._maybe_evict_cached_block(block)
             partial_hash = self._cache_partial_tail_block(
                 request, num_tokens, retention_interval=retention_interval
             )

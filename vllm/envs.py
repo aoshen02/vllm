@@ -165,6 +165,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT: bool = False
     VLLM_ROCM_PARALLEL_INDEX_TOPK: bool = False
     VLLM_ENABLE_V1_MULTIPROCESSING: bool = True
+    VLLM_MAMBA_FRONTIER_CHECKPOINT: bool = False
     VLLM_LOG_BATCHSIZE_INTERVAL: float = -1
     VLLM_DISABLE_COMPILE_CACHE: bool = False
     VLLM_REPLICATE_EMBED: bool = False
@@ -1509,6 +1510,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("VLLM_ROCM_PARALLEL_INDEX_TOPK", "0") == "1"
     ),
     # If set, enable multiprocessing in LLM for the V1 code path.
+    # Hybrid Mamba prefix caching (align mode): cache a finished request's
+    # state at its exact end so a later turn extending it resumes there.
+    "VLLM_MAMBA_FRONTIER_CHECKPOINT": lambda: bool(
+        int(os.getenv("VLLM_MAMBA_FRONTIER_CHECKPOINT", "0"))
+    ),
     "VLLM_ENABLE_V1_MULTIPROCESSING": lambda: bool(
         int(os.getenv("VLLM_ENABLE_V1_MULTIPROCESSING", "1"))
     ),

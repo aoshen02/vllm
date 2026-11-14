@@ -6,16 +6,27 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal, overload
 
+import vllm.envs as envs
 from vllm.distributed.kv_events import BlockStored, KVCacheEvent
 from vllm.logger import init_logger
+from vllm.utils.hashing import sha256
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.kv_cache_coordinator import (
     HybridKVCacheCoordinator,
     get_kv_cache_coordinator,
 )
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
-from vllm.v1.core.kv_cache_utils import KVCacheBlock, KVCacheBlockCopy, trim_null_head
-from vllm.v1.core.single_type_kv_cache_manager import MambaManager
+from vllm.v1.core.kv_cache_utils import (
+    BlockHash,
+    KVCacheBlock,
+    KVCacheBlockCopy,
+    make_block_hash_with_group_id,
+    trim_null_head,
+)
+from vllm.v1.core.single_type_kv_cache_manager import (
+    FullAttentionManager,
+    MambaManager,
+)
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     CrossAttentionSpec,
@@ -29,6 +40,150 @@ from vllm.v1.metrics.stats import PrefixCacheStats
 from vllm.v1.request import Request, RequestStatus
 
 logger = init_logger(__name__)
+
+
+class FrontierCheckpoints:
+    """A finished request's state at its exact end `L` (inside block `k`):
+    its attention page `k` and Mamba running-state block, cached under a key
+    of its first `L` tokens. A later request extending them resumes at `L`;
+    the partial-hit copy-on-write gives it private copies. Validated lazily:
+    usable only while every block still holds the key."""
+
+    def __init__(self, coordinator) -> None:
+        managers = coordinator.single_type_managers
+        self.managers = managers
+        self.pool = coordinator.block_pool
+        self.block_size = coordinator.scheduler_block_size
+        self.unit = self.pool.hash_block_size
+        self.pages = [
+            g for g, m in enumerate(managers) if type(m) is FullAttentionManager
+        ]
+        self.states = [g for g, m in enumerate(managers) if type(m) is MambaManager]
+        if (
+            not self.pages
+            or not self.states
+            or len(self.pages) + len(self.states) != len(managers)
+            or any(managers[g].mamba_cache_mode != "align" for g in self.states)
+        ):
+            raise ValueError("frontier checkpoints need full attention + align Mamba")
+        for g in self.states:
+            managers[g].track_unwritten_blocks = True
+        # key -> (anchor, L, group -> block); anchor -> L -> count
+        self.entries: dict[
+            BlockHash, tuple[BlockHash, int, dict[int, KVCacheBlock]]
+        ] = {}
+        self.index: dict[BlockHash, dict[int, int]] = {}
+
+    def _key(self, request: Request, num_tokens: int) -> BlockHash:
+        h = num_tokens // self.unit
+        lora = request.lora_request.lora_name if request.lora_request else None
+        tail = tuple(request.all_token_ids[h * self.unit : num_tokens])
+        data = (request.block_hashes[h - 1], tail, num_tokens, lora)
+        return BlockHash(sha256(data))
+
+    def _alive(self, key: BlockHash, blocks: dict[int, KVCacheBlock]) -> bool:
+        cached = self.pool.cached_block_hash_to_block
+        return all(
+            cached.contain(make_block_hash_with_group_id(key, g), b.block_id)
+            for g, b in blocks.items()
+        )
+
+    def _remove(self, key: BlockHash) -> None:
+        anchor, num_tokens, _ = self.entries.pop(key)
+        lengths = self.index[anchor]
+        lengths[num_tokens] -= 1
+        if not lengths[num_tokens]:
+            del lengths[num_tokens]
+            if not lengths:
+                del self.index[anchor]
+
+    def publish(self, request: Request) -> None:
+        """Before a finished request's blocks are freed."""
+        num_tokens = request.num_computed_tokens
+        h = num_tokens // self.unit
+        if (
+            num_tokens % self.block_size == 0
+            or h == 0
+            or h > len(request.block_hashes)
+            or request.resumable
+            or request.mm_features
+            or request.status == RequestStatus.FINISHED_ABORTED
+            # An input token of a dispatched step is not known yet.
+            or request.num_tokens < num_tokens
+        ):
+            return
+        k = num_tokens // self.block_size
+        blocks: dict[int, KVCacheBlock] = {}
+        for g in self.pages + self.states:
+            table = self.managers[g].req_to_blocks.get(request.request_id) or []
+            # Align mode keeps the running state in the last block.
+            if len(table) <= k or (g in self.states and len(table) != k + 1):
+                return
+            block = table[k]
+            if block.is_null or (
+                g in self.states
+                and (
+                    block.block_hash is not None
+                    or block.block_id in self.pool.cached_block_hashes_by_block
+                )
+            ):
+                return
+            blocks[g] = block
+        key = self._key(request, num_tokens)
+        if key in self.entries:
+            if self._alive(key, self.entries[key][2]):
+                return
+            self._remove(key)
+        for g, block in blocks.items():
+            self.pool._insert_block_hash(
+                make_block_hash_with_group_id(key, g), block, num_tokens
+            )
+        anchor = request.block_hashes[h - 1]
+        self.entries[key] = (anchor, num_tokens, blocks)
+        lengths = self.index.setdefault(anchor, {})
+        lengths[num_tokens] = lengths.get(num_tokens, 0) + 1
+
+    def extend(self, request: Request, blocks, hit: int, max_length: int):
+        """`(blocks, hit)` resumed at the longest live frontier past `hit`."""
+        if not self.entries:
+            return blocks, hit
+        B, u = self.block_size, self.unit
+        hashes = request.block_hashes
+        for h in range(min(max_length // u, len(hashes)), max(hit // u, 1) - 1, -1):
+            lengths = self.index.get(hashes[h - 1])
+            if not lengths:
+                continue
+            for num_tokens in sorted(lengths, reverse=True):
+                if num_tokens > max_length or num_tokens <= hit:
+                    continue
+                key = self._key(request, num_tokens)
+                entry = self.entries.get(key)
+                if entry is None:
+                    continue
+                if not self._alive(key, entry[2]):
+                    self._remove(key)
+                    continue
+                k = num_tokens // B
+                # Attention pages [0, k): the aligned hit's, then cached ones.
+                n = hit // B
+                pages = {g: list(blocks[g][:n]) for g in self.pages}
+                per = B // u
+                for i in range(n, k):
+                    found = self.pool.get_cached_block(
+                        hashes[(i + 1) * per - 1], self.pages
+                    )
+                    if found is None:
+                        break
+                    for g, b in zip(self.pages, found):
+                        pages[g].append(b)
+                else:
+                    out = list(blocks)
+                    for g in self.pages:
+                        out[g] = pages[g] + [entry[2][g]]
+                    for g in self.states:
+                        out[g] = [self.pool.null_block] * k + [entry[2][g]]
+                    return tuple(out), num_tokens
+        return blocks, hit
 
 
 @dataclass
@@ -203,6 +358,9 @@ class KVCacheManager:
             if manager.retains_longer_hit
         )
         self.kv_cache_config = kv_cache_config
+        self.frontier: FrontierCheckpoints | None = None
+        if envs.VLLM_MAMBA_FRONTIER_CHECKPOINT and enable_caching:
+            self.frontier = FrontierCheckpoints(self.coordinator)
 
         # Watermark: minimum number of KV cache blocks to keep free when
         # admitting waiting/preempted requests, to avoid frequent preemptions.
@@ -327,6 +485,11 @@ class KVCacheManager:
                 request.block_hashes, max_cache_hit_length
             )
         )
+        aligned_hit = num_new_computed_tokens
+        if self.frontier is not None:
+            computed_blocks, num_new_computed_tokens = self.frontier.extend(
+                request, computed_blocks, num_new_computed_tokens, max_cache_hit_length
+            )
 
         # When kv_cache_report_mode is "full", emit BlockStored events
         # for the reused prefix cache blocks so that external consumers
@@ -342,8 +505,9 @@ class KVCacheManager:
         # (``num_new_computed_tokens``) plus the uncached shared prefix -- i.e.
         # the longest single-group hit. Sub-block gaps are left to the mask,
         # which floors to the alignment boundary (a no-op there).
+        junction = aligned_hit + num_uncached
         shared_prefix_boundary = (
-            num_new_computed_tokens + num_uncached if num_uncached else 0
+            junction if num_uncached and junction > num_new_computed_tokens else 0
         )
 
         blocks = self.create_kv_cache_blocks(computed_blocks)
@@ -656,6 +820,8 @@ class KVCacheManager:
             request: The request to free the blocks.
 
         """
+        if self.frontier is not None and request.is_finished():
+            self.frontier.publish(request)
         self.coordinator.free(request.request_id)
 
     def remove_skipped_blocks(
