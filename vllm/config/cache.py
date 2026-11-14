@@ -312,6 +312,12 @@ class CacheConfig:
       token of each scheduler step and when the token is at position
       i * block_size.
     """
+    mamba_frontier_checkpoint: bool = False
+    """Cache a finished request's attention page and Mamba state at its exact
+    end, so a later request extending it (e.g. the next turn of a multi-turn
+    session) resumes there instead of at the last block-aligned checkpoint.
+    Only takes effect with prefix caching enabled, Mamba cache mode "align",
+    and only full-attention and Mamba KV cache groups."""
     enable_mamba_shared_prefix_checkpoint: bool = False
     """Also register a Mamba "align" checkpoint at the shared-prefix junction --
     where an EAGLE/MTP sibling was observed to resume -- instead of only at the
@@ -429,6 +435,7 @@ class CacheConfig:
             # Prefix-caching implementation detail (doesn't affect compiled graph).
             "prefix_match_unit",
             "enable_mamba_shared_prefix_checkpoint",
+            "mamba_frontier_checkpoint",
             "mamba_page_size_padded",
             "skip_page_size_padded",
             "user_specified_block_size",
