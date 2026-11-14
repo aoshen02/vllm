@@ -43,10 +43,10 @@ logger = init_logger(__name__)
 
 class FrontierCheckpoints:
     """A finished request's state at its exact end `L` (inside block `k`):
-    its attention page `k` and Mamba running-state block, cached under a key
-    of its first `L` tokens. A later request extending them resumes at `L`;
-    the partial-hit copy-on-write gives it private copies. Validated lazily:
-    usable only while every block still holds the key."""
+    its attention page `k` and Mamba running-state block, cached in the block
+    pool under a key of its first `L` tokens. A later request extending them
+    resumes at `L`; the partial-hit copy-on-write gives it private copies.
+    The pool owns liveness: an evicted block drops the key with it."""
 
     def __init__(self, coordinator) -> None:
         managers = coordinator.single_type_managers
@@ -67,11 +67,8 @@ class FrontierCheckpoints:
             raise ValueError("frontier checkpoints need full attention + align Mamba")
         for g in self.states:
             managers[g].track_unwritten_blocks = True
-        # key -> (anchor, L, group -> block); anchor -> L -> count
-        self.entries: dict[
-            BlockHash, tuple[BlockHash, int, dict[int, KVCacheBlock]]
-        ] = {}
-        self.index: dict[BlockHash, dict[int, int]] = {}
+        # Candidate ends: hash of the last full hash block before `L` -> L -> key.
+        self.ends: dict[BlockHash, dict[int, BlockHash]] = {}
 
     def _key(self, request: Request, num_tokens: int) -> BlockHash:
         h = num_tokens // self.unit
@@ -79,22 +76,6 @@ class FrontierCheckpoints:
         tail = tuple(request.all_token_ids[h * self.unit : num_tokens])
         data = (request.block_hashes[h - 1], tail, num_tokens, lora)
         return BlockHash(sha256(data))
-
-    def _alive(self, key: BlockHash, blocks: dict[int, KVCacheBlock]) -> bool:
-        cached = self.pool.cached_block_hash_to_block
-        return all(
-            cached.contain(make_block_hash_with_group_id(key, g), b.block_id)
-            for g, b in blocks.items()
-        )
-
-    def _remove(self, key: BlockHash) -> None:
-        anchor, num_tokens, _ = self.entries.pop(key)
-        lengths = self.index[anchor]
-        lengths[num_tokens] -= 1
-        if not lengths[num_tokens]:
-            del lengths[num_tokens]
-            if not lengths:
-                del self.index[anchor]
 
     def publish(self, request: Request) -> None:
         """Before a finished request's blocks are freed."""
@@ -129,58 +110,51 @@ class FrontierCheckpoints:
                 return
             blocks[g] = block
         key = self._key(request, num_tokens)
-        if key in self.entries:
-            if self._alive(key, self.entries[key][2]):
-                return
-            self._remove(key)
         for g, block in blocks.items():
             self.pool._insert_block_hash(
                 make_block_hash_with_group_id(key, g), block, num_tokens
             )
-        anchor = request.block_hashes[h - 1]
-        self.entries[key] = (anchor, num_tokens, blocks)
-        lengths = self.index.setdefault(anchor, {})
-        lengths[num_tokens] = lengths.get(num_tokens, 0) + 1
+        self.ends.setdefault(request.block_hashes[h - 1], {})[num_tokens] = key
 
     def extend(self, request: Request, blocks, hit: int, max_length: int):
         """`(blocks, hit)` resumed at the longest live frontier past `hit`."""
-        if not self.entries:
+        if not self.ends:
             return blocks, hit
         B, u = self.block_size, self.unit
         hashes = request.block_hashes
         for h in range(min(max_length // u, len(hashes)), max(hit // u, 1) - 1, -1):
-            lengths = self.index.get(hashes[h - 1])
-            if not lengths:
+            ends = self.ends.get(hashes[h - 1])
+            if not ends:
                 continue
-            for num_tokens in sorted(lengths, reverse=True):
-                if num_tokens > max_length or num_tokens <= hit:
+            for num_tokens in sorted(ends, reverse=True):
+                if not hit < num_tokens <= max_length:
                     continue
                 key = self._key(request, num_tokens)
-                entry = self.entries.get(key)
-                if entry is None:
+                found = self.pool.get_cached_block(key, self.pages + self.states)
+                if found is None:
+                    if ends[num_tokens] == key:  # evicted
+                        del ends[num_tokens]
                     continue
-                if not self._alive(key, entry[2]):
-                    self._remove(key)
-                    continue
+                frontier = dict(zip(self.pages + self.states, found))
                 k = num_tokens // B
                 # Attention pages [0, k): the aligned hit's, then cached ones.
                 n = hit // B
                 pages = {g: list(blocks[g][:n]) for g in self.pages}
                 per = B // u
                 for i in range(n, k):
-                    found = self.pool.get_cached_block(
+                    cached = self.pool.get_cached_block(
                         hashes[(i + 1) * per - 1], self.pages
                     )
-                    if found is None:
+                    if cached is None:
                         break
-                    for g, b in zip(self.pages, found):
+                    for g, b in zip(self.pages, cached):
                         pages[g].append(b)
                 else:
                     out = list(blocks)
                     for g in self.pages:
-                        out[g] = pages[g] + [entry[2][g]]
+                        out[g] = pages[g] + [frontier[g]]
                     for g in self.states:
-                        out[g] = [self.pool.null_block] * k + [entry[2][g]]
+                        out[g] = [self.pool.null_block] * k + [frontier[g]]
                     return tuple(out), num_tokens
         return blocks, hit
 
