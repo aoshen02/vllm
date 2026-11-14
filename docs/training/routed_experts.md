@@ -63,3 +63,19 @@ experts = np.load(io.BytesIO(base64.b64decode(choice["routed_experts"])))
 Per-request, default `0`: drops the first N prompt-token rows (e.g. routing already received in earlier turns). Must be `0 <= value <= prompt_len`, else HTTP 400. Pass it top-level on `/v1/*completions`, inside `sampling_params` on `/inference/v1/generate`, or as `SamplingParams(routed_experts_prompt_start=...)`.
 
 Example: [examples/rl/routed_experts_e2e.py](../../examples/rl/routed_experts_e2e.py).
+
+## Delivering rows through a shared object store
+
+Returning every row inline costs one copy per turn through the engine output path. With `--aux-output-config '{"enable_return_routed_experts": true, "object_store": {"backend": "mooncake", "key_prefix": "<job>"}}'` (the Mooncake client is configured by `MOONCAKE_CONFIG_PATH`, as for the Mooncake KV connector), a request that sets `SamplingParams(aux_session=...)` gets its rows through the store instead:
+
+- The engine writes one immutable object per KV cache block, the prefix-cache hit granularity, named `<key_prefix>/<aux_session>/<hash of the object's last hash block>@<weight version>`, where the weight version is the one set with `update_weight_version` when the block's last row was computed. A session writes each key once; a block recomputed under a new weight version gets a new key.
+- The finished response lists in `aux_output_keys` the keys of the objects covering rows `[0, B)`, where `B` is the last block boundary at or below `num_tokens - 1`, and returns rows `[B, num_tokens - 1)` in `routed_experts`. Every turn lists the full key list, so the caller replaces what it holds from the first key that differs. `routed_experts_prompt_start` must be `0`.
+- Read the rows with `vllm.distributed.aux_output_connector.objects.read_aux_rows(store, keys, "routed_experts", tail)`, which waits for objects that are still being written.
+- A session request's prefix-cache hit covers only objects this session has published, so every listed key exists. An object counts as published once its rows have been committed by the worker; rows of an aborted step that never completed are not, so a later request recomputes those positions. If another session or a request without a session has since recomputed the block under a different weight version, the cached KV may come from that computation, so the hit stops there and the session recomputes the block. Requests without `aux_session` keep the inline behavior.
+
+Objects stay in the store until the caller removes them:
+
+- After reading a session, remove the union of the keys its responses listed with `store.remove(keys)` (a forced batch remove on Mooncake). A key that is still being written may fail to remove; the job-end sweep catches it.
+- Never send another request with a released `aux_session`: the engine may still allow it to hit objects that were removed. Continue under a new session name instead, which recomputes the prefix.
+- At the end of the job, `store.remove_prefix("<key_prefix>/")` removes everything left, including objects of aborted or discarded samples.
+- The engine forgets a session that has had no running request for `session_idle_timeout_s` (default one hour); its next request then hits only objects it publishes again.

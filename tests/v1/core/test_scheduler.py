@@ -4,6 +4,7 @@ import dataclasses
 import random
 from concurrent.futures import Future
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import Mock, patch
 
 import numpy as np
@@ -317,10 +318,14 @@ def test_add_requests():
         assert len(scheduler.waiting) == i + 1
 
 
-def _aux_output_connector(scheduler: Scheduler) -> AuxOutputSchedulerConnector:
+def _aux_output_connector(
+    scheduler: Scheduler, **kwargs: Any
+) -> AuxOutputSchedulerConnector:
     manager = scheduler.kv_cache_manager
     return AuxOutputSchedulerConnector(
-        manager, retained_objects(scheduler.vllm_config, manager.kv_cache_config)[0]
+        manager,
+        retained_objects(scheduler.vllm_config, manager.kv_cache_config)[0],
+        **kwargs,
     )
 
 
@@ -357,6 +362,205 @@ def test_routed_experts_prompt_start_at_prompt_end(max_tokens):
     output = outputs[request.client_index].outputs[0]
     assert output.new_token_ids == [0]
     assert output.routed_experts.shape == (0, 1, 1)
+
+
+@pytest.mark.parametrize(
+    "second_session,expected_hit",
+    [("s", 80), ("t", 0)],
+    ids=["same-session", "other-session"],
+)
+def test_session_requests_return_object_keys_and_hit_published_objects(
+    second_session, expected_hit
+):
+    scheduler = create_scheduler(enable_prefix_caching=True)
+    scheduler.aux_output_connector = _aux_output_connector(
+        scheduler,
+        object_store=True,
+        key_prefix="job",
+    )
+    first, second = create_requests(
+        num_requests=2, num_tokens=86, max_tokens=1, same_prompt=True
+    )
+    first.sampling_params = first.sampling_params.clone()
+    first.sampling_params.aux_session = "s"
+    second.sampling_params.aux_session = second_session
+    scheduler.add_request(first)
+    scheduler_output = scheduler.schedule()
+    metadata = scheduler_output.aux_output_connector_metadata
+    assert metadata.sessions == {first.request_id: "s"}
+    rows = np.arange(86, dtype=np.uint8).reshape(-1, 1, 1)
+    outputs = scheduler.update_from_output(
+        scheduler_output,
+        ModelRunnerOutput(
+            req_ids=[first.request_id],
+            sampled_token_ids=[[0]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+            aux_output_connector_output={first.request_id: AuxRequestOutput(0, rows)},
+        ),
+    )
+
+    output = outputs[first.client_index].outputs[0]
+    hashes = [block_hash.hex() for block_hash in first.block_hashes]
+    assert output.aux_output_keys == [f"job/s/{h}@default" for h in hashes[:5]]
+    assert output.routed_experts[:, 0, 0].tolist() == list(range(80, 86))
+
+    scheduler.add_request(second)
+    scheduler_output = scheduler.schedule()
+    assert scheduler_output.num_scheduled_tokens[second.request_id] == (
+        86 - expected_hit
+    )
+
+
+@pytest.mark.parametrize(
+    "idle_s,expected_hit,released",
+    [(10.0, 80, ()), (100.0, 0, ("s",))],
+    ids=["recent", "idle"],
+)
+def test_idle_sessions_are_forgotten(monkeypatch, idle_s, expected_hit, released):
+    from vllm.distributed.aux_output_connector import connector as aux_connector
+
+    now = [1000.0]
+    monkeypatch.setattr(aux_connector.time, "monotonic", lambda: now[0])
+    scheduler = create_scheduler(enable_prefix_caching=True)
+    scheduler.aux_output_connector = _aux_output_connector(
+        scheduler,
+        object_store=True,
+        key_prefix="job",
+        session_idle_timeout_s=60.0,
+    )
+    first, second = create_requests(
+        num_requests=2, num_tokens=86, max_tokens=1, same_prompt=True
+    )
+    for request in (first, second):
+        request.sampling_params = request.sampling_params.clone()
+        request.sampling_params.aux_session = "s"
+    scheduler.add_request(first)
+    scheduler_output = scheduler.schedule()
+    scheduler.update_from_output(
+        scheduler_output,
+        ModelRunnerOutput(
+            req_ids=[first.request_id],
+            sampled_token_ids=[[0]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+            aux_output_connector_output={
+                first.request_id: AuxRequestOutput(
+                    0, np.zeros((86, 1, 1), dtype=np.uint8)
+                )
+            },
+        ),
+    )
+
+    now[0] += idle_s
+    metadata = scheduler.schedule().aux_output_connector_metadata
+    assert metadata.released_sessions == released
+    scheduler.add_request(second)
+    scheduler_output = scheduler.schedule()
+    assert scheduler_output.num_scheduled_tokens[second.request_id] == (
+        86 - expected_hit
+    )
+
+
+@pytest.mark.parametrize(
+    "rows_received,expected_hit",
+    [(True, 80), (False, 0)],
+    ids=["committed", "aborted-in-flight"],
+)
+def test_sessions_publish_only_committed_objects(rows_received, expected_hit):
+    scheduler = create_scheduler(enable_prefix_caching=True)
+    scheduler.aux_output_connector = _aux_output_connector(
+        scheduler, object_store=True, key_prefix="job"
+    )
+    first, second = create_requests(
+        num_requests=2, num_tokens=86, max_tokens=8, same_prompt=True
+    )
+    for request in (first, second):
+        request.sampling_params = request.sampling_params.clone()
+        request.sampling_params.aux_session = "s"
+    scheduler.add_request(first)
+    scheduler_output = scheduler.schedule()
+    if rows_received:
+        scheduler.update_from_output(
+            scheduler_output,
+            ModelRunnerOutput(
+                req_ids=[first.request_id],
+                sampled_token_ids=[[0]],
+                logprobs=None,
+                prompt_logprobs_dict={},
+                pooler_output=[],
+                aux_output_connector_output={
+                    first.request_id: AuxRequestOutput(
+                        0, np.zeros((86, 1, 1), dtype=np.uint8)
+                    )
+                },
+            ),
+        )
+    scheduler.finish_requests(first.request_id, RequestStatus.FINISHED_ABORTED)
+
+    scheduler.add_request(second)
+    scheduler_output = scheduler.schedule()
+    assert scheduler_output.num_scheduled_tokens[second.request_id] == (
+        86 - expected_hit
+    )
+
+
+@pytest.mark.parametrize(
+    "recompute_session,expected_hit",
+    [("s", 80), ("t", 0), (None, 0)],
+    ids=["same-session", "other-session", "no-session"],
+)
+def test_session_objects_follow_weight_version(recompute_session, expected_hit):
+    scheduler = create_scheduler(enable_prefix_caching=True)
+    scheduler.aux_output_connector = _aux_output_connector(
+        scheduler, object_store=True, key_prefix="job"
+    )
+    first, recompute, last = create_requests(
+        num_requests=3, num_tokens=86, max_tokens=1, same_prompt=True
+    )
+    for request, session in ((first, "s"), (recompute, recompute_session), (last, "s")):
+        request.sampling_params = request.sampling_params.clone()
+        request.sampling_params.aux_session = session
+
+    def run(request):
+        scheduler.add_request(request)
+        scheduler_output = scheduler.schedule()
+        num_scheduled = scheduler_output.num_scheduled_tokens[request.request_id]
+        outputs = scheduler.update_from_output(
+            scheduler_output,
+            ModelRunnerOutput(
+                req_ids=[request.request_id],
+                sampled_token_ids=[[0]],
+                logprobs=None,
+                prompt_logprobs_dict={},
+                pooler_output=[],
+                aux_output_connector_output={
+                    request.request_id: AuxRequestOutput(
+                        86 - num_scheduled,
+                        np.zeros((num_scheduled, 1, 1), dtype=np.uint8),
+                    )
+                },
+            ),
+        )
+        return num_scheduled, outputs[request.client_index].outputs[0]
+
+    run(first)
+    scheduler.aux_output_connector.set_weight_version("v2")
+    assert scheduler.reset_prefix_cache()
+    num_scheduled, output = run(recompute)
+    hashes = [block_hash.hex() for block_hash in recompute.block_hashes]
+    assert num_scheduled == 86
+    assert output.aux_output_keys == (
+        None
+        if recompute_session is None
+        else [f"job/{recompute_session}/{h}@v2" for h in hashes[:5]]
+    )
+
+    scheduler.add_request(last)
+    scheduler_output = scheduler.schedule()
+    assert scheduler_output.num_scheduled_tokens[last.request_id] == (86 - expected_hit)
 
 
 def test_routed_experts_hashes_follow_scheduled_tokens():
