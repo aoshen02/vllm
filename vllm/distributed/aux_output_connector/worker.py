@@ -47,9 +47,9 @@ class _WorkerRequestState:
     capture_cursor: int | None = None
     scheduled_cursor: int = 0
     emit_cursor: int = 0
-    pending_outputs: int = 0
-    # Terminal event received; teardown waits for in-flight step outputs.
-    finished: bool = False
+    # Terminal event received while steps were in flight: sequence number of
+    # the last step that may cover the request; teardown waits for it.
+    finished_seq: int | None = None
     # Delta mode, start > 0: rows are sliced from step outputs, never stored.
     # Rows from emit_cursor that no step returned yet (non-final prefill chunks).
     unkeyed: bool = False
@@ -62,6 +62,7 @@ class PendingAuxOutput:
     """Own one step's R3 snapshot until its asynchronous copy is consumed."""
 
     connector: AuxOutputWorkerConnector
+    seq: int
     request_ids: list[str]
     token_starts: np.ndarray
     query_start_loc: np.ndarray
@@ -126,6 +127,9 @@ class AuxOutputWorkerConnector:
         # consumes step outputs in order, so at most max_concurrent_batches
         # are outstanding; guarded by _lock against the output thread.
         self._pending_outputs: list[PendingAuxOutput] = []
+        self._seq = 0
+        # Finished requests whose teardown waits for in-flight steps.
+        self._deferred: list[str] = []
         self._lock = Lock()
         self._max_concurrent_batches = vllm_config.max_concurrent_batches
 
@@ -177,8 +181,10 @@ class AuxOutputWorkerConnector:
             kept = buf[: replay.rows.numel(), start:].clone()
             buf[:num_rows, start:] = -1
             buf[replay.rows, start:] = kept
+        self._seq += 1
         pending_output = PendingAuxOutput(
             connector=self,
+            seq=self._seq,
             request_ids=request_ids,
             token_starts=input_batch.num_computed_tokens_np,
             query_start_loc=query_start_loc,
@@ -189,8 +195,6 @@ class AuxOutputWorkerConnector:
                 "auxiliary output step outputs are not consumed in order"
             )
             self._pending_outputs.append(pending_output)
-            for request_id in pending_output.request_ids:
-                self._requests[request_id].pending_outputs += 1
         return pending_output
 
     def process_output(self, pending: PendingAuxOutput) -> AuxStepOutput:
@@ -206,12 +210,19 @@ class AuxOutputWorkerConnector:
                 outputs = self._commit_output(pending)
             finally:
                 self._pending_outputs.remove(pending)
-                for request_id in pending.request_ids:
+                # Steps are consumed in order: a finished request is settled
+                # once every step up to its finished_seq is consumed.
+                oldest = self._pending_outputs[0].seq if self._pending_outputs else None
+                keep = []
+                for request_id in self._deferred:
                     state = self._requests[request_id]
-                    state.pending_outputs -= 1
-                    if state.pending_outputs == 0 and state.finished:
-                        teardown.append(request_id)
-                        release_keys.extend(reversed(state.aux_output_keys))
+                    assert state.finished_seq is not None
+                    if oldest is not None and state.finished_seq >= oldest:
+                        keep.append(request_id)
+                        continue
+                    teardown.append(request_id)
+                    release_keys.extend(reversed(state.aux_output_keys))
+                self._deferred = keep
             if teardown:
                 self._publish_blocks([], release_keys=release_keys)
                 self._teardown(teardown)
@@ -261,6 +272,12 @@ class AuxOutputWorkerConnector:
                 "auxiliary output rejected-token count is invalid"
             )
             if state.unkeyed:
+                if sampled and not state.unsent and state.unsent_end == token_start:
+                    # Common case: every row of this request is returned now.
+                    n = request_num_tokens - rejected
+                    spans[request_id] = (token_start, start, n)
+                    state.emit_cursor = state.unsent_end = token_start + n
+                    continue
                 self._slice_unkeyed(
                     request_id,
                     state,
@@ -449,6 +466,7 @@ class AuxOutputWorkerConnector:
                 )
                 self._buffer.reset()
                 self._requests.clear()
+                self._deferred.clear()
                 self._generation = metadata.generation
             for request_id, emit_start in metadata.requests.items():
                 state = self._requests.get(request_id)
@@ -458,9 +476,9 @@ class AuxOutputWorkerConnector:
                         unkeyed=self._delta and emit_start > 0,
                         unsent_end=emit_start,
                     )
-                if state.pending_outputs == 0:
+                if not self._pending_outputs:
                     # In-flight steps leave the worker cursor behind the
-                    # scheduler's optimistic view; only check settled requests.
+                    # scheduler's optimistic view; only check when settled.
                     assert emit_start <= state.emit_cursor, (
                         "auxiliary output Scheduler emit cursor moved ahead"
                     )
@@ -476,8 +494,9 @@ class AuxOutputWorkerConnector:
             finished_now: list[str] = []
             for request_id in metadata.finished_requests:
                 state = self._requests[request_id]
-                state.finished = True
-                if state.pending_outputs:
+                if self._pending_outputs:
+                    state.finished_seq = self._seq
+                    self._deferred.append(request_id)
                     continue
                 finished_now.append(request_id)
                 release_keys.extend(reversed(state.aux_output_keys))
@@ -487,6 +506,7 @@ class AuxOutputWorkerConnector:
     def close(self) -> None:
         with self._lock:
             self._pending_outputs.clear()
+            self._deferred.clear()
             if self._store is not None:
                 try:
                     self._store.close()
