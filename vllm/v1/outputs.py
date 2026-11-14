@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from abc import ABC, abstractmethod
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from copy import copy
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, NamedTuple, TypeAlias
@@ -305,7 +305,7 @@ class ModelRunnerOutput:
     # information related to cudagraph execution
     cudagraph_stats: CUDAGraphStat | None = None
 
-    aux_output_connector_output: dict[str, AuxRequestOutput] | None = None
+    aux_output_connector_output: Mapping[str, AuxRequestOutput] | None = None
 
     # ``None`` when ``return_sampling_mask`` is off.
     sampling_masks: SamplingMaskLists | None = None

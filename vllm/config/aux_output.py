@@ -18,6 +18,20 @@ class AuxOutputConfig:
     """Initial capacity, or ``None`` to derive it from the KV cache capacity.
     Grows when every object is referenced."""
 
+    routed_experts_delta: bool = False
+    """Optimize for clients that request each turn's routed experts from where
+    the previous turn ended (``routed_experts_prompt_start`` > 0 on later
+    turns). Such requests take no prefix-cache hit past the block holding their
+    start, so every returned row is computed in the request itself and is
+    sliced from the step output without being stored. Only first-turn prompt
+    rows (start 0) are kept for prefix hits."""
+
+    mask_trimmed_routed_experts: bool = False
+    """For models with a bounded decoder replay (DeepSeek-V4.1), let prompt
+    rows outside the replay window skip the replay layers as they do without
+    routed-experts capture. Their routed experts in those layers are returned
+    as -1 (all bits set) instead of being computed."""
+
     @property
     def enabled(self) -> bool:
         """Whether any execution auxiliary output is enabled."""
@@ -29,5 +43,6 @@ class AuxOutputConfig:
         """
         ignored_factors = {
             "max_bytes",
+            "routed_experts_delta",
         }
         return get_compile_factors(self, ignored_factors)
