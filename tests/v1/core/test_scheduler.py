@@ -63,7 +63,7 @@ from vllm.v1.core.single_type_kv_cache_manager import (
     MambaManager,
     SlidingWindowManager,
 )
-from vllm.v1.engine import CheckpointState, FinishReason
+from vllm.v1.engine import CheckpointState, EngineCoreRequest, FinishReason
 from vllm.v1.engine.core import EngineCore
 from vllm.v1.executor.uniproc_executor import UniProcExecutor
 from vllm.v1.hisparse.coordinator import get_hisparse_coordinator
@@ -322,6 +322,65 @@ def _aux_output_connector(scheduler: Scheduler) -> AuxOutputSchedulerConnector:
     return AuxOutputSchedulerConnector(
         manager, retained_objects(scheduler.vllm_config, manager.kv_cache_config)[0]
     )
+
+
+def _preprocess_session_request(
+    request_id, session, block_hashes=None, cache_salt=None, key_prefix="job"
+) -> Request:
+    init_none_hash(sha256)
+    core = object.__new__(EngineCore)
+    core.mm_receiver_cache = None
+    core.vllm_config = SimpleNamespace(
+        watermark_config=None,
+        aux_output_config=SimpleNamespace(object_key_prefix=key_prefix),
+    )
+    core.prefix_hash_config = SimpleNamespace(
+        num_lookahead_tokens=0, hash_block_size=16
+    )
+    core.request_block_hasher = get_request_block_hasher(16, sha256)
+    request, _ = core.preprocess_add_request(
+        EngineCoreRequest(
+            request_id=request_id,
+            prompt_token_ids=[0] * 86,
+            mm_features=None,
+            sampling_params=SamplingParams(max_tokens=1, aux_session=session),
+            pooling_params=None,
+            arrival_time=0.0,
+            lora_request=None,
+            cache_salt=cache_salt,
+            data_parallel_rank=None,
+            block_hashes=block_hashes,
+        )
+    )
+    return request
+
+
+@pytest.mark.parametrize(
+    "session,salt,key_prefix,kept",
+    [
+        (None, "salt", "job", True),
+        ("s", None, "job", False),
+        (None, 'aux_session:["s", null]', "job", False),
+        (None, "aux_session:x", None, True),
+    ],
+    ids=["plain", "session", "forged", "no-prefix"],
+)
+def test_session_salt_replaces_frontend_hashes(session, salt, key_prefix, kept):
+    hashes = [bytes([i]) * 32 for i in range(5)]
+    request = _preprocess_session_request("r", session, hashes, salt, key_prefix)
+    assert (list(request.block_hashes) == hashes) == kept
+    assert (request.cache_salt == salt) == kept
+    other = _preprocess_session_request("o", "s")
+    assert (request.block_hashes == other.block_hashes) == (session == "s")
+
+
+def test_engine_core_forwards_the_weight_version():
+    scheduler = create_scheduler(enable_prefix_caching=True)
+    scheduler.aux_output_connector = connector = Mock()
+    core = object.__new__(EngineCore)
+    core.scheduler = scheduler
+    core.set_weight_version("v2")
+    connector.set_weight_version.assert_called_once_with("v2")
 
 
 @pytest.mark.parametrize("max_tokens", [1, 2])
@@ -2537,6 +2596,7 @@ def test_preemption_processes_stale_aux_output():
     scheduler_output = scheduler.schedule()
     scheduler.running.remove(request)
     scheduler.aux_output_connector = Mock()
+    scheduler.aux_output_connector.take_rows_and_keys.return_value = (None, None)
     scheduler._preempt_request(request, 0.0)
     scheduler.aux_output_connector.request_finished.assert_called_once_with(request)
 
@@ -2551,7 +2611,9 @@ def test_preemption_processes_stale_aux_output():
         ),
     )
 
-    scheduler.aux_output_connector.take_output.assert_called_once_with(request, None)
+    scheduler.aux_output_connector.take_rows_and_keys.assert_called_once_with(
+        request, None, False
+    )
 
 
 def test_prefix_cache_stats_not_recorded_when_caching_disabled():

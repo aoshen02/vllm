@@ -465,6 +465,8 @@ class Scheduler(SchedulerInterface):
             AuxOutputSchedulerConnector(
                 self.kv_cache_manager,
                 retained_objects(vllm_config, self.kv_cache_manager.kv_cache_config)[0],
+                vllm_config.aux_output_config.object_key_prefix,
+                self.connector,
             )
             if vllm_config.aux_output_config.enabled
             else None
@@ -972,6 +974,8 @@ class Scheduler(SchedulerInterface):
                 break
 
             # Schedule the request.
+            if self.aux_output_connector is not None:
+                self.aux_output_connector.request_scheduled(request, num_new_tokens)
             scheduled_running_reqs.append(request)
             prefill_scheduled |= request.is_prefill_chunk
             request_id = request.request_id
@@ -1198,14 +1202,15 @@ class Scheduler(SchedulerInterface):
                             num_external_computed_tokens = ext_tokens
 
                         if self.aux_output_connector is not None:
-                            num_external_computed_tokens = (
-                                self.aux_output_connector.cap_external_hit(
-                                    request,
-                                    num_new_local_computed_tokens,
-                                    num_external_computed_tokens,
-                                )
+                            (
+                                num_external_computed_tokens,
+                                load_kv_async,
+                            ) = self.aux_output_connector.cap_external_hit(
+                                request,
+                                num_new_local_computed_tokens,
+                                num_external_computed_tokens,
+                                load_kv_async,
                             )
-                            load_kv_async &= num_external_computed_tokens > 0
 
                         if hit_diverged and num_external_computed_tokens == 0:
                             # No external tokens back the deeper local hit, so its
@@ -1605,6 +1610,8 @@ class Scheduler(SchedulerInterface):
                 input_budget -= num_new_tokens + draft_slots
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
+                if self.aux_output_connector is not None:
+                    self.aux_output_connector.request_scheduled(request, num_new_tokens)
                 self._set_kv_fetch_stage(request, None)
                 drafts_needed = drafts_needed or not self._drafts_unused(
                     request, num_computed_tokens, num_new_tokens
@@ -2449,13 +2456,17 @@ class Scheduler(SchedulerInterface):
                 request.resumable = False
                 stopped = True
 
-            routed_experts = None
+            routed_experts = aux_output_keys = None
             should_emit_output = bool(
                 new_token_ids or pooler_output is not None or stopped
             )
             if self.aux_output_connector is not None and should_emit_output:
-                routed_experts = self.aux_output_connector.take_output(
-                    request, model_runner_output.aux_output_connector_output
+                routed_experts, aux_output_keys = (
+                    self.aux_output_connector.take_rows_and_keys(
+                        request,
+                        model_runner_output.aux_output_connector_output,
+                        stopped,
+                    )
                 )
             if should_emit_output:
                 prefill_stats = request.take_prefill_stats()
@@ -2548,6 +2559,7 @@ class Scheduler(SchedulerInterface):
                         routed_experts=routed_experts,
                         num_nans_in_logits=request.num_nans_in_logits,
                         watermarking=watermarking,
+                        aux_output_keys=aux_output_keys,
                     )
                 )
             else:

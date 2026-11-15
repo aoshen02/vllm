@@ -1057,7 +1057,36 @@ def test_sync_load_budget_is_shared_per_step():
 
     assert scheduler.get_num_new_matched_tokens(first, 0) == (28, False)
     assert scheduler.get_num_new_matched_tokens(second, 0) == (28, True)
-    assert scheduler._current_batch_sync_loads == {"a"}
+    assert scheduler._current_batch_sync_loads == {"a": hit_bytes}
+
+
+def test_sync_load_budget_of_a_request_that_loads_nothing_is_released():
+    scheduler = _make_partial_tail_scheduler()
+    scheduler.config = scheduler.config._replace(
+        sync_load_budget_bytes=28 * scheduler.config.kv_bytes_per_token
+    )
+    refused = _make_partial_tail_request(scheduler, request_id="a")
+    accepted = _make_partial_tail_request(scheduler, request_id="b")
+    scheduler.manager.lookup.return_value = LookupResult.HIT
+
+    assert scheduler.get_num_new_matched_tokens(refused, 0) == (28, False)
+    scheduler.update_state_after_alloc(refused, KVCacheBlocks(([], [])), 0)
+    assert scheduler.get_num_new_matched_tokens(accepted, 0) == (28, False)
+
+
+def test_sync_load_budget_of_a_request_looked_up_again_is_reserved_once():
+    scheduler = _make_partial_tail_scheduler()
+    bytes_per_token = scheduler.config.kv_bytes_per_token
+    scheduler.config = scheduler.config._replace(
+        sync_load_budget_bytes=28 * bytes_per_token
+    )
+    request = _make_partial_tail_request(scheduler)
+    scheduler.manager.lookup.return_value = LookupResult.HIT
+
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (28, False)
+    tokens = scheduler.get_num_new_matched_tokens(request, 0, max_num_new_tokens=20)
+    assert tokens == (20, False)
+    assert scheduler._current_batch_sync_load_bytes == 20 * bytes_per_token
 
 
 def test_lookup_cap_stops_at_authoritative_prefix_boundary():

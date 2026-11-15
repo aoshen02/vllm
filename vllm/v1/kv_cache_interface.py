@@ -700,6 +700,8 @@ class KVCacheGroup:
     dcp_sharded: bool = False
     # Whether this group holds draft layers and takes the EAGLE last-block drop.
     is_eagle_group: bool = False
+    # Whether every layer of this group belongs to a draft model.
+    draft_only: bool = False
     # Host groups use the dedicated HiSparse pool; others share the device pool.
     host_resident: bool = False
     # Whether this group is part of the externally transferable KV state.

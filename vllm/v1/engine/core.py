@@ -30,6 +30,7 @@ from vllm.distributed import (
     cleanup_dist_env_and_memory,
     stateless_destroy_torch_distributed_process_group,
 )
+from vllm.distributed.aux_output_connector.session_objects import salt_aux_session
 from vllm.distributed.ec_transfer.ec_connector.encoder_output_width import (
     measure_encoder_output_widths,
 )
@@ -1250,6 +1251,9 @@ class EngineCore:
 
     def set_weight_version(self, weight_version: str) -> None:
         self._weight_version = weight_version
+        connector = getattr(self.scheduler, "aux_output_connector", None)
+        if connector is not None:
+            connector.set_weight_version(weight_version)
 
     def get_weight_version(self) -> str:
         """Return the latest committed weight version."""
@@ -1284,6 +1288,7 @@ class EngineCore:
                 warn_watermarking_override()
             params.watermarking = True
 
+        salt_aux_session(self.vllm_config, request)
         frontend_hashes = frontend_block_hashes(request, self.prefix_hash_config)
         req = Request.from_engine_core_request(
             request, self.request_block_hasher, frontend_hashes

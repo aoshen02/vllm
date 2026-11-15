@@ -154,6 +154,10 @@ pub struct EngineCoreOutput {
     /// engine has a `watermark_config`.
     #[serde(default)]
     pub watermarking: Option<bool>,
+    /// Shared-object keys of a stopped session request's routed experts,
+    /// when `AuxOutputConfig.object_key_prefix` is set.
+    #[serde(default)]
+    pub aux_output_keys: Option<Vec<String>>,
 }
 
 /// A request-level error that does not mark the engine as unhealthy.
@@ -658,6 +662,7 @@ mod tests {
                             prompt_token_id_logprobs: None,
                             error: None,
                             watermarking: None,
+                            aux_output_keys: None,
                         },
                     ],
                     scheduler_stats: None,
