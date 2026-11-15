@@ -66,6 +66,10 @@ class AttentionConfig:
     flash_attn_max_num_splits_for_cuda_graph: int = 32
     """Flash Attention max number splits for cuda graph decode."""
 
+    flashinfer_cake_decode: bool = False
+    """FlashInfer with a BF16/FP16 KV cache: store K and V as separate head
+    slots and decode with the load-balanced Cake split-KV kernel."""
+
     tokenspeed_mla_min_split_kv: int = Field(default=1, ge=1, le=256)
     """Minimum KV splits for TokenSpeed MLA decode. The default of 1 preserves
     automatic scheduling. Larger values request a split floor and may increase
