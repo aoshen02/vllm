@@ -22,7 +22,6 @@ def executor():
     obj = CUDACheckpointExecutor.__new__(CUDACheckpointExecutor)
     obj._checkpoint_lock = threading.RLock()
     obj._checkpoint_active = False
-    obj._memory_locked = True
     obj._use_nccl_suspend = False
     obj._checkpoint_flashinfer = False
     obj.is_failed = False
@@ -264,10 +263,12 @@ def test_transport_requires_suspension_and_no_nvls(
     with (
         patch.object(MultiprocExecutor, "__init__", return_value=None),
         patch.object(MultiprocExecutor, "shutdown"),
+        patch.object(CUDACheckpointExecutor, "_lock_worker_memory") as lock,
     ):
         if accepted:
             obj = CUDACheckpointExecutor(config)
             assert obj._checkpoint_flashinfer == fusion
+            lock.assert_called_once_with()
             obj.shutdown()
         else:
             with pytest.raises(ValueError, match="NCCL checkpoint configuration"):
@@ -327,20 +328,19 @@ def test_sleep_worker_rpc_has_deadline(executor):
 @pytest.mark.parametrize(
     "locked,warned", [([True, True], False), ([True, False], True)], ids=["ok", "fails"]
 )
-def test_first_sleep_locks_worker_memory_once(executor, locked, warned):
+def test_worker_memory_locked_before_first_sleep(executor, locked, warned):
     from vllm.v1.executor.cuda_checkpoint_executor import _lock_process_memory
 
     obj, calls = executor
-    obj._memory_locked = False
     with (
         patch.object(MultiprocExecutor, "collective_rpc", return_value=locked) as rpc,
         patch("vllm.v1.executor.cuda_checkpoint_executor.logger") as log,
     ):
+        obj._lock_worker_memory()
+        assert [c.args[0] for c in rpc.call_args_list] == [_lock_process_memory]
         obj.sleep()
         obj.wake_up()
-        obj.sleep()
     assert [c.args[0] for c in rpc.call_args_list] == [_lock_process_memory]
-    assert calls[:2] == [("sleep", 1), ("checkpoint", [11, 22])]
     assert log.warning_once.called == warned
 
 
