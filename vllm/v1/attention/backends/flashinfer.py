@@ -124,12 +124,15 @@ def _use_fa2_native_decode() -> bool:
 
 _KVPair = tuple[torch.Tensor, torch.Tensor]
 
-# VLLM_FLASHINFER_CAKE_DECODE (opt-in): store BF16/FP16 K and V as separate
-# head slots ([B, 2*H, N, D], K heads then V heads, like NVFP4) instead of
-# packing them in the content dim ([B, H, N, 2*D]), and run trtllm-API decode
-# with FlashInfer's Cake kernel, which splits long sequences across CTAs from
-# an on-device work plan (needs the dense [H, N, D] K/V pages).
-_FI_CAKE_DECODE = envs.VLLM_FLASHINFER_CAKE_DECODE
+
+def _use_cake_decode() -> bool:
+    """attention_config.flashinfer_cake_decode: K and V as separate head slots
+    ([B, 2*H, N, D], like NVFP4) so trtllm-API decode can run FlashInfer's
+    Cake kernel, which needs dense [H, N, D] K/V pages."""
+    vllm_config = get_current_vllm_config_or_none()
+    return (
+        vllm_config is not None and vllm_config.attention_config.flashinfer_cake_decode
+    )
 
 
 def _nvfp4_kv_views(
@@ -568,7 +571,7 @@ class FlashInferBackend(AttentionBackend):
         """NVFP4 stores K and V as separate per-head slots of packed fp4 data
         plus fp8 block scales."""
         if (
-            _FI_CAKE_DECODE
+            _use_cake_decode()
             and spec.state_content_bytes is None
             and spec.num_head_slots is None
             and spec.kv_quant_mode == KVQuantMode.NONE
@@ -2144,7 +2147,7 @@ class FlashInferImpl(AttentionImpl):
         # Cake decode: only for the unquantized split-K/V cache without DCP.
         self._decode_backend_override: str | None = None
         if (
-            _FI_CAKE_DECODE
+            _use_cake_decode()
             and kv_cache_dtype == "auto"
             and self.dcp_world_size == 1
             and head_size in (64, 128, 256)
@@ -2407,7 +2410,7 @@ class FlashInferImpl(AttentionImpl):
         hs = self.head_size
         nvfp4_kv_data = None
         nvfp4_kv_block_scales = None
-        # VLLM_FLASHINFER_CAKE_DECODE also stores K/V as separate head groups.
+        # Cake decode also stores K/V as separate head groups.
         if self.is_kvcache_nvfp4 or kv_cache.shape[1] == 2 * self.num_kv_heads:
             k_cache, v_cache = kv_cache.split(self.num_kv_heads, dim=1)
             kv_cache_tuple = (
