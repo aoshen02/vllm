@@ -107,17 +107,11 @@ class AuxOutputWorkerConnector:
         self._delta = aux_config.routed_experts_delta
         # Bounded decoder replay: trimmed rows skip the replay layers, which
         # capture only the kept rows, packed at the front.
-        self._replay_layers = None
-        self._replay_start = 0
-        if aux_config.mask_trimmed_routed_experts:
-            self._replay_layers = getattr(model, "decoder_replay_layers", None)
-            # run_layers is the inner model's bound _run_replay_layers.
-            run_layers = getattr(self._replay_layers, "run_layers", None)
-            inner = getattr(run_layers, "__self__", None)
-            self._replay_start = int(getattr(inner, "decoder_replay_start", 0))
-            assert self._replay_layers is None or self._replay_start > 0, (
-                "mask_trimmed_routed_experts: replay layer start not found"
-            )
+        self._replay_layers = (
+            getattr(model, "decoder_replay_layers", None)
+            if aux_config.mask_trimmed_routed_experts
+            else None
+        )
         self._store: BackgroundBlockObjectStore | None = None
         self._buffer: RoutedExpertsBuffer | None = None
         self._requests: dict[str, _WorkerRequestState] = {}
@@ -172,12 +166,17 @@ class AuxOutputWorkerConnector:
         request_ids = list(input_batch.req_ids)
         query_start_loc = input_batch.query_start_loc_np[: len(request_ids) + 1]
         num_rows = int(query_start_loc[-1])
-        replay = getattr(self._replay_layers, "replay_batch", None)
-        if replay is not None and 0 < replay.rows.numel() < num_rows:
+        layers = self._replay_layers
+        replay = None if layers is None else layers.replay_batch
+        if (
+            layers is not None
+            and replay is not None
+            and (0 < replay.rows.numel() < num_rows)
+        ):
             # Scatter the replay layers' packed rows back to batch order; the
             # trimmed rows never ran those layers.
             buf = self._capturer.device_buffer
-            start = self._replay_start
+            start = layers.start_layer
             kept = buf[: replay.rows.numel(), start:].clone()
             buf[:num_rows, start:] = -1
             buf[replay.rows, start:] = kept
