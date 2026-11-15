@@ -32,7 +32,7 @@ from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
     RoutedExpertsCapturer,
     bind_routed_experts_capturer,
 )
-from vllm.utils.math_utils import cdiv
+from vllm.utils.math_utils import round_up
 from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes
 
 if TYPE_CHECKING:
@@ -237,6 +237,8 @@ class AuxOutputWorkerConnector:
             capture_cursor = state.capture_cursor
             if capture_cursor is None:
                 capture_cursor = capture_start
+                # KV loaded up to mid-block has no rows here for that block.
+                state.buffer_start = round_up(capture_start, block_size)
 
             assert capture_start >= capture_cursor, (
                 "auxiliary output capture moved backwards"
@@ -248,11 +250,7 @@ class AuxOutputWorkerConnector:
                 )
                 capture_start = capture_cursor
 
-            if state.capture_cursor is None and capture_start % block_size:
-                # Local hits are block aligned: the KV before this token was
-                # loaded from a P/D prefill instance, which returns its rows.
-                state.buffer_start = cdiv(capture_start, block_size) * block_size
-            skip = min(max(state.buffer_start - capture_start, 0), len(rows))
+            skip = max(state.buffer_start - capture_start, 0)
 
             emit_start = state.emit_cursor
             # Complete blocks without keys remain pending until a hash update.

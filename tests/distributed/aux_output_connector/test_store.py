@@ -1929,41 +1929,18 @@ def test_prompt_end_offset_through_worker_and_scheduler(chunk_size, max_tokens):
         worker.close()
 
 
-def test_pd_decode_returns_rows_from_prompt_end():
-    """A P/D decode request loads KV up to a mid-block token. With
-    routed_experts_prompt_start at the prompt end, its rows continue the
-    prefill instance's rows, which cover the whole prompt."""
-    connector = _make_connector()
+def test_worker_skips_initial_partial_block():
     worker = _make_worker(1)
-    request = _scheduler_request(
-        "decode", [b"a" * 32], num_tokens=6, num_output_tokens=0, prompt_start=6
-    )
-    request.num_computed_tokens = 5
-    requests = {request.request_id: request}
-    rows = np.arange(10 * 3 * 2, dtype=_DTYPE).reshape(10, *_SHAPE)
-    returned = []
+    rows = np.arange(9 * 6, dtype=_DTYPE).reshape(9, *_SHAPE)
     try:
         for start in range(5, 9):
-            metadata = connector.build_connector_meta(
-                _step_output([request.request_id], [start], [1]), requests
-            )
-            assert metadata.requests == {request.request_id: max(start, 6)}
+            emit = max(6, start)
+            step = _metadata(0, [_request_metadata("decode", start, 1, emit, [])], {})
             output = _process_output(
-                worker,
-                metadata,
-                rows[start : start + 1],
-                [request.request_id],
-                np.array([0]),
-                token_starts=(start,),
-                num_tokens=(1,),
-            )
-            request.num_tokens = start + 2
-            request.num_output_tokens = start - 4
-            request.num_computed_tokens = start + 1
-            taken = connector.take_output(request, output)
-            if taken is not None:
-                returned.append(taken)
-        np.testing.assert_array_equal(np.concatenate(returned), rows[6:9])
+                worker, step, rows[start : start + 1], ["decode"], np.array([0])
+            )["decode"]
+            assert output.token_start == emit
+            np.testing.assert_array_equal(output.rows, rows[emit : start + 1])
     finally:
         worker.close()
 
@@ -2050,7 +2027,9 @@ def _kv_cache_metadata(connector: AuxOutputSchedulerConnector):
 def _finished_request_with_cached_blocks(num_blocks: int = 1):
     cached = {_HASHES[1]: [Mock()], _HASHES[3]: [Mock()]}
     connector = AuxOutputSchedulerConnector(_kv_cache_manager(cached, 2, num_blocks))
-    request = _SchedulerRequest("request", list(_HASHES), 17, num_computed_tokens=16)
+    request = _SchedulerRequest(
+        "request", list(_HASHES), 17, num_output_tokens=0, num_computed_tokens=16
+    )
     connector.request_finished(request)
     assert _kv_cache_metadata(connector) == (_HASHES, [])
     return cached, connector, request
@@ -2059,6 +2038,39 @@ def _finished_request_with_cached_blocks(num_blocks: int = 1):
 def _finish_empty_request(connector: AuxOutputSchedulerConnector):
     connector.request_finished(_SchedulerRequest("empty", [], 1))
     return _kv_cache_metadata(connector)
+
+
+@pytest.mark.parametrize(
+    "num_output_tokens,prompt_start",
+    [(0, 17), (1, 0)],
+    ids=["prompt-start", "resumed"],
+)
+def test_connector_hit_needs_rows_from_emit_start(num_output_tokens, prompt_start):
+    connector = _make_connector()
+    request = _SchedulerRequest("request", [], 17, num_output_tokens=num_output_tokens)
+    request.sampling_params.routed_experts_prompt_start = prompt_start
+
+    assert connector.max_cache_hit(request) == 16
+
+
+def test_connector_forgets_loaded_blocks_once_evicted():
+    cached: dict = {}
+    connector = AuxOutputSchedulerConnector(_kv_cache_manager(cached, 2, 1))
+    decode = _SchedulerRequest("decode", list(_HASHES), 17, num_output_tokens=0)
+    decode.sampling_params.routed_experts_prompt_start = 16
+    request = _SchedulerRequest("request", list(_HASHES), 17, num_output_tokens=0)
+    blocks = {_HASHES[1]: [Mock()], _HASHES[3]: [Mock()]}
+
+    assert connector.cap_external_hit(decode, 0, 16) == 16
+    connector.request_loading(decode, 16)
+    _finish_empty_request(connector)
+    cached.update(blocks)
+    assert connector.max_cache_hit(request) == 0
+
+    cached.clear()
+    connector.request_finished(decode)
+    cached.update(blocks)
+    assert connector.max_cache_hit(request) == 16
 
 
 def test_connector_releases_oldest_uncached_blocks_past_capacity():

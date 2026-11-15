@@ -12,7 +12,6 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
-from vllm.utils.math_utils import cdiv
 from vllm.v1.core.kv_cache_utils import maybe_convert_block_hash
 
 if TYPE_CHECKING:
@@ -75,10 +74,11 @@ class AuxOutputSchedulerConnector:
             OrderedDict()
         )
         self._loading: dict[str, set[ExternalBlockHash]] = {}
-        # GPU blocks holding KV loaded without rows, mapped to their last hash
-        # (None until it exists); the KV's source returned those rows.
-        self._rowless: dict[int, BlockHash | None] = {}
-        self._rowless_ranges: dict[str, range] = {}
+        # KV blocks whose rows are not all here: loaded without rows, or
+        # computed from mid-block on. Any other cached GPU block has rows.
+        self._rowless: dict[ExternalBlockHash, BlockHash] = {}
+        # First token each active request computes here.
+        self._computed_from: dict[str, int] = {}
         self._capacity = kv_cache_manager.kv_cache_config.num_blocks * (
             2 if kv_connector else 1
         )
@@ -96,21 +96,14 @@ class AuxOutputSchedulerConnector:
         for request_id, num_tokens in scheduler_output.num_scheduled_tokens.items():
             self._sent_hash_counts.setdefault(request_id, 0)
             request = requests[request_id]
+            self._computed_from.setdefault(request_id, request.num_computed_tokens)
             packed = self._take_new_hashes(
                 request, request.num_computed_tokens + num_tokens
             )
             if packed is not None:
                 block_hashes_by_request[request_id] = packed
             self._loading.pop(request_id, None)
-            assert request.sampling_params is not None
-            # A P/D prefiller may cut the prompt short of the requested start.
-            scheduled_requests[request_id] = max(
-                min(
-                    request.sampling_params.routed_experts_prompt_start,
-                    request.num_prompt_tokens,
-                ),
-                0 if request.num_output_tokens == 0 else request.num_tokens - 1,
-            )
+            scheduled_requests[request_id] = self._emit_start(request)
         # A settled token can complete a hash block after the next async schedule
         # was built. Send a hash-only update if the request was not rescheduled.
         if len(self._sent_hash_counts) != len(scheduled_requests):
@@ -140,28 +133,43 @@ class AuxOutputSchedulerConnector:
         self._retained_hashes, self._released_hashes = [], []
         return metadata
 
+    @staticmethod
+    def _emit_start(request: Request) -> int:
+        if request.num_output_tokens:
+            return request.num_tokens - 1
+        assert request.sampling_params is not None
+        # A P/D prefiller may cut the prompt short of the requested start.
+        return min(
+            request.sampling_params.routed_experts_prompt_start,
+            request.num_prompt_tokens,
+        )
+
     def max_cache_hit(self, request: Request) -> int:
         num_blocks = 0
         for block, keys in self._kv_blocks(request.block_hashes):
             if block in self._kv_cached:
                 self._kv_cached.move_to_end(block)
-            elif not self._gpu_rows(keys[-1]):
+            elif block in self._rowless or not self._gpu_cached(keys[-1]):
                 break
             num_blocks += 1
-        return min(num_blocks * self._block_size, request.num_tokens - 1)
+        # A hit needs rows only from the first returned position on.
+        num_hit = max(num_blocks * self._block_size, self._emit_start(request))
+        return min(num_hit, request.num_tokens - 1)
 
     def cap_external_hit(
         self, request: Request, num_local: int, num_external: int
     ) -> int:
         num_hit = num_local + num_external
-        if num_hit % self._block_size == 0 and num_hit <= self.max_cache_hit(request):
-            return num_external
-        assert request.sampling_params is not None
-        if num_hit > request.sampling_params.routed_experts_prompt_start:
+        if num_hit <= self._emit_start(request):
+            for block, keys in islice(
+                self._kv_blocks(request.block_hashes),
+                num_local // self._block_size,
+                num_hit // self._block_size,
+            ):
+                if block not in self._kv_cached:
+                    self._rowless[block] = keys[-1]
+        elif num_hit % self._block_size or num_hit > self.max_cache_hit(request):
             return 0
-        # Rows before the prompt start are not returned, e.g. under P/D.
-        first = num_local // self._block_size
-        self._rowless_ranges[request.request_id] = range(first, first)
         return num_external
 
     def request_loading(self, request: Request, num_tokens: int) -> None:
@@ -169,17 +177,18 @@ class AuxOutputSchedulerConnector:
             self._kv_blocks(request.block_hashes), num_tokens // self._block_size
         )
         self._loading[request.request_id] = {block for block, _ in blocks}
-        if (rowless := self._rowless_ranges.get(request.request_id)) is None:
-            return
-        rowless = range(rowless.start, cdiv(num_tokens, self._block_size))
-        self._rowless_ranges[request.request_id] = rowless
-        self._mark_rowless(request, rowless, loading=True)
 
     def _release_unheld(self) -> None:
+        loading = set().union(*self._loading.values())
+        if len(self._rowless) > self._capacity:
+            self._rowless = {
+                block: block_hash
+                for block, block_hash in self._rowless.items()
+                if block in loading or self._gpu_cached(block_hash)
+            }
         excess = len(self._kv_cached) - self._capacity
         if excess <= 0:
             return
-        loading = set().union(*self._loading.values())
         victims = []
         for block, keys in self._kv_cached.items():
             if block not in loading and not self._gpu_cached(keys[-1]):
@@ -191,28 +200,6 @@ class AuxOutputSchedulerConnector:
 
     def _gpu_cached(self, block_hash: BlockHash) -> list[KVCacheBlock] | None:
         return self._manager.block_pool.get_cached_block(block_hash, [self._group_id])
-
-    def _gpu_rows(self, block_hash: BlockHash) -> bool:
-        cached = self._gpu_cached(block_hash)
-        if cached is None:
-            return False
-        block_id = cached[0].block_id
-        return block_id not in self._rowless or self._rowless[block_id] not in (
-            None,
-            block_hash,
-        )
-
-    def _mark_rowless(self, request: Request, rowless: range, loading: bool) -> None:
-        hashes = [keys[-1] for _, keys in self._kv_blocks(request.block_hashes)]
-        kv_blocks = self._manager.req_to_blocks[request.request_id]
-        for index in rowless:
-            block_id = kv_blocks[index].block_id
-            if index < len(hashes):
-                self._rowless[block_id] = hashes[index]
-            elif loading:
-                self._rowless[block_id] = None
-            else:
-                self._rowless.pop(block_id, None)
 
     def _kv_blocks(
         self, hashes: Sequence[BlockHash]
@@ -255,12 +242,20 @@ class AuxOutputSchedulerConnector:
         """Queue a request's terminal event and final block hashes."""
         request_id = request.request_id
         self._loading.pop(request_id, None)
-        if (rowless := self._rowless_ranges.pop(request_id, None)) is not None:
-            # The last block is hashed once filled by this request's tokens.
-            self._mark_rowless(request, rowless, loading=False)
         num_blocks = request.num_computed_tokens // self._block_size
-        for block, keys in islice(self._kv_blocks(request.block_hashes), num_blocks):
-            if block not in self._kv_cached and self._gpu_rows(keys[-1]):
+        computed_from = self._computed_from.pop(request_id, request.num_tokens)
+        blocks = islice(self._kv_blocks(request.block_hashes), num_blocks)
+        for index, (block, keys) in enumerate(blocks):
+            start = index * self._block_size
+            if start >= computed_from:
+                self._rowless.pop(block, None)
+            elif start + self._block_size > computed_from:
+                self._rowless.setdefault(block, keys[-1])
+            if (
+                block not in self._kv_cached
+                and block not in self._rowless
+                and self._gpu_cached(keys[-1])
+            ):
                 self._kv_cached[block] = keys
                 self._retained_hashes.extend(keys)
         self._release_unheld()
@@ -294,6 +289,7 @@ class AuxOutputSchedulerConnector:
         """Start a new auxiliary output namespace after a prefix-cache reset."""
         # The worker drops temporary state on generation changes; resend hashes.
         self._sent_hash_counts.clear()
+        self._computed_from.clear()
         self._finished_requests.clear()
         self._generation += 1
         self._released_hashes.extend(chain.from_iterable(self._kv_cached.values()))
