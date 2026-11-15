@@ -1929,6 +1929,45 @@ def test_prompt_end_offset_through_worker_and_scheduler(chunk_size, max_tokens):
         worker.close()
 
 
+def test_pd_decode_returns_rows_from_prompt_end():
+    """A P/D decode request loads KV up to a mid-block token. With
+    routed_experts_prompt_start at the prompt end, its rows continue the
+    prefill instance's rows, which cover the whole prompt."""
+    connector = _make_connector()
+    worker = _make_worker(1)
+    request = _scheduler_request(
+        "decode", [b"a" * 32], num_tokens=6, num_output_tokens=0, prompt_start=6
+    )
+    request.num_computed_tokens = 5
+    requests = {request.request_id: request}
+    rows = np.arange(10 * 3 * 2, dtype=_DTYPE).reshape(10, *_SHAPE)
+    returned = []
+    try:
+        for start in range(5, 9):
+            metadata = connector.build_connector_meta(
+                _step_output([request.request_id], [start], [1]), requests
+            )
+            assert metadata.requests == {request.request_id: max(start, 6)}
+            output = _process_output(
+                worker,
+                metadata,
+                rows[start : start + 1],
+                [request.request_id],
+                np.array([0]),
+                token_starts=(start,),
+                num_tokens=(1,),
+            )
+            request.num_tokens = start + 2
+            request.num_output_tokens = start - 4
+            request.num_computed_tokens = start + 1
+            taken = connector.take_output(request, output)
+            if taken is not None:
+                returned.append(taken)
+        np.testing.assert_array_equal(np.concatenate(returned), rows[6:9])
+    finally:
+        worker.close()
+
+
 def test_scheduler_connector_sends_each_block_hash_once():
     connector = _make_connector()
     request = _scheduler_request("request", [b"a" * 32, b"b" * 32], num_tokens=12)
