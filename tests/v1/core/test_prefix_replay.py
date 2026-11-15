@@ -35,6 +35,9 @@ def _replay_scheduler(
     *,
     long_prefill_token_threshold: int = 0,
     use_kv_connector: MockKVConfig | str | None = None,
+    scheduling_policy: str = "fcfs",
+    num_blocks: int = 10000,
+    window: int = WINDOW,
 ) -> Scheduler:
     """A hybrid layout: one prefix-cacheable full-attention group and one
     replayed sliding-window group."""
@@ -43,10 +46,11 @@ def _replay_scheduler(
         enable_prefix_caching=True,
         long_prefill_token_threshold=long_prefill_token_threshold,
         use_kv_connector=use_kv_connector,
+        scheduling_policy=scheduling_policy,
     )
     vllm_config = base.vllm_config
     kv_cache_config = KVCacheConfig(
-        num_blocks=10000,
+        num_blocks=num_blocks,
         kv_cache_tensors=[],
         kv_cache_groups=[
             new_kv_cache_group(
@@ -67,7 +71,7 @@ def _replay_scheduler(
                         head_size=64,
                         dtype=torch.bfloat16,
                     ),
-                    sliding_window=WINDOW,
+                    sliding_window=window,
                     bounded_replay=True,
                 ),
             ),
@@ -80,7 +84,7 @@ def _replay_scheduler(
         log_stats=True,
         structured_output_manager=StructuredOutputManager(vllm_config),
     )
-    assert scheduler.prefix_replay_tokens == WINDOW
+    assert scheduler.prefix_replay_tokens == window
     return scheduler
 
 
@@ -369,3 +373,39 @@ def test_kv_load_zeroing_respects_loaded_groups(is_async, loads_window):
             assert not new_ids & zeroed
         else:
             assert new_ids <= zeroed
+
+
+def test_priority_preemption_keeps_the_replayed_hit_cached():
+    scheduler = _replay_scheduler(
+        long_prefill_token_threshold=BLOCK_SIZE,
+        scheduling_policy="priority",
+        num_blocks=31,
+        window=96,
+    )
+    first, low, sibling = create_requests(
+        num_requests=3,
+        num_tokens=132,
+        same_prompt=True,
+        max_tokens=50,
+        req_ids=["first", "low", "sibling"],
+    )
+    high = create_requests(num_requests=2, num_tokens=64, req_ids=["unused", "high"])[
+        -1
+    ]
+    low.priority = 1
+
+    def step():
+        out = scheduler.schedule()
+        scheduler.update_from_output(out, _step_output(out, [first, low, high]))
+        return out
+
+    scheduler.add_request(first)
+    while first.num_computed_tokens <= first.num_prompt_tokens:
+        step()
+    scheduler.add_request(low)
+    step()
+    scheduler.add_request(high)
+    for _ in range(4):
+        step()
+    assert step().preempted_req_ids == {"low"}
+    assert scheduler.kv_cache_manager.get_computed_blocks(sibling)[1] == 128

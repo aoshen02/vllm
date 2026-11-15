@@ -91,7 +91,9 @@ from .utils import (
     create_scheduler,
     mock_kv,
     new_kv_cache_group,
+    new_mamba_layer,
     new_sliding_window_layer,
+    sliding_window_layer,
 )
 
 pytestmark = pytest.mark.cpu_test
@@ -5245,6 +5247,133 @@ def test_abort_request_when_structured_output_fsm_cannot_advance():
     assert engine_core_output.request_id == request.request_id
     assert engine_core_output.new_token_ids == [123]
     assert engine_core_output.finish_reason == FinishReason.ERROR
+
+
+def _attention_spec(block_size):
+    return AttentionSpec(
+        block_size=block_size, num_kv_heads=1, head_size=1, dtype=torch.float32
+    )
+
+
+@pytest.mark.parametrize(
+    "groups,mamba_cache_mode,block_size,num_blocks,threshold,num_tokens,num_steps,"
+    "expected",
+    [
+        (
+            lambda: [new_kv_cache_group(["full"], _attention_spec(16))],
+            "none",
+            16,
+            11,
+            32,
+            130,
+            2,
+            96,
+        ),
+        (
+            lambda: [
+                new_kv_cache_group(["full"], _attention_spec(16)),
+                new_kv_cache_group(
+                    ["window"], sliding_window_layer(_attention_spec(32), 64)
+                ),
+            ],
+            "none",
+            32,
+            25,
+            64,
+            258,
+            2,
+            192,
+        ),
+        (
+            lambda: [
+                new_kv_cache_group(["full"], _attention_spec(32)),
+                new_kv_cache_group(
+                    ["mamba"], new_mamba_layer(mamba_cache_mode="align", block_size=32)
+                ),
+            ],
+            "align",
+            32,
+            14,
+            32,
+            194,
+            3,
+            128,
+        ),
+    ],
+    ids=["full", "full+window", "full+mamba"],
+)
+def test_priority_preemption_does_not_cache_blocks_of_an_unscheduled_step(
+    groups,
+    mamba_cache_mode,
+    block_size,
+    num_blocks,
+    threshold,
+    num_tokens,
+    num_steps,
+    expected,
+):
+    base = create_scheduler(
+        enable_prefix_caching=True,
+        scheduling_policy="priority",
+        max_num_batched_tokens=2 * threshold,
+        max_model_len=512,
+        long_prefill_token_threshold=threshold,
+        block_size=block_size,
+    )
+    base.vllm_config.cache_config.mamba_cache_mode = mamba_cache_mode
+    scheduler = Scheduler(
+        vllm_config=base.vllm_config,
+        kv_cache_config=KVCacheConfig(
+            num_blocks=num_blocks, kv_cache_tensors=[], kv_cache_groups=groups()
+        ),
+        block_size=block_size,
+        hash_block_size=16,
+        log_stats=True,
+        structured_output_manager=base.structured_output_manager,
+    )
+
+    def make_request(request_id, prompt, num_tokens, max_tokens, priority=0):
+        request = create_requests(
+            num_requests=prompt + 1,
+            num_tokens=num_tokens,
+            req_ids=[f"unused-{i}" for i in range(prompt)] + [request_id],
+            sampling_params=SamplingParams(max_tokens=max_tokens),
+        )[-1]
+        request.priority = priority
+        return request
+
+    def step():
+        scheduler_output = scheduler.schedule()
+        request_ids = list(scheduler_output.num_scheduled_tokens)
+        requests = [scheduler.requests[request_id] for request_id in request_ids]
+        scheduler.update_from_output(
+            scheduler_output,
+            ModelRunnerOutput(
+                req_ids=request_ids,
+                sampled_token_ids=[
+                    [0] if request.num_computed_tokens == request.num_tokens else []
+                    for request in requests
+                ],
+                logprobs=None,
+                prompt_logprobs_dict={},
+                pooler_output=[],
+            ),
+        )
+        return scheduler_output
+
+    scheduler.add_request(make_request("filler", 2, 159, 2))
+    while scheduler.has_requests():
+        step()
+
+    scheduler.add_request(make_request("low", 0, num_tokens, 1, priority=1))
+    step()
+    scheduler.add_request(make_request("high", 1, 32, 2))
+    for _ in range(num_steps - 1):
+        step()
+    assert step().preempted_req_ids == {"low"}
+
+    sibling = make_request("sibling", 0, num_tokens, 1)
+    assert scheduler.kv_cache_manager.get_computed_blocks(sibling)[1] == expected
 
 
 @pytest.mark.parametrize(

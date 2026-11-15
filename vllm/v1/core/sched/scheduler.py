@@ -889,6 +889,7 @@ class Scheduler(SchedulerInterface):
                         request,
                         num_new_tokens,
                         num_lookahead_tokens=self.num_lookahead_tokens,
+                        delay_cache_blocks=self.policy == SchedulingPolicy.PRIORITY,
                     )
 
                     if new_blocks is not None:
@@ -1013,6 +1014,17 @@ class Scheduler(SchedulerInterface):
                     request,
                     (encoder_inputs_to_schedule or []) + external_load_encoder_input,
                     duplicate_encoder_inputs,
+                )
+
+        if self.policy == SchedulingPolicy.PRIORITY:
+            for request in scheduled_running_reqs:
+                self.kv_cache_manager.cache_blocks(
+                    request,
+                    min(
+                        request.num_computed_tokens
+                        + num_scheduled_tokens[request.request_id],
+                        request.num_tokens,
+                    ),
                 )
 
         # Record the LoRAs of all running requests, including those not
