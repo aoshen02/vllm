@@ -175,7 +175,7 @@ class AuxOutputSchedulerConnector:
 
     def request_loading(self, request: Request, num_tokens: int) -> None:
         blocks = islice(
-            self._kv_blocks(request.block_hashes), num_tokens // self._block_size
+            self._kv_blocks(request.block_hashes), cdiv(num_tokens, self._block_size)
         )
         self._loading[request.request_id] = {block for block, _ in blocks}
 
@@ -216,6 +216,19 @@ class AuxOutputSchedulerConnector:
     ) -> np.ndarray | None:
         """Return the accepted R3 rows for one scheduled request."""
         request_id = request.request_id
+        # The block this request started mid-block has no rows here. Its hash
+        # exists only once its last token is known; record the block before
+        # the scheduler can cache it.
+        computed_from = self._computed_from.get(request_id, 0)
+        index, offset = divmod(computed_from, self._block_size)
+        last = (index + 1) * (self._block_size // self._hash_block_size) - 1
+        if offset and self._sent_hash_counts[request_id] <= last < len(
+            request.block_hashes
+        ):
+            block_hash = request.block_hashes[last]
+            block = maybe_convert_block_hash(block_hash)
+            if block not in self._kv_cached:
+                self._rowless[block] = block_hash
         assert output is not None and request_id in output, (
             f"auxiliary output worker output is missing {request_id}"
         )
@@ -280,16 +293,6 @@ class AuxOutputSchedulerConnector:
         if num_keyed <= num_sent:
             return None
         self._sent_hash_counts[request.request_id] = num_keyed
-        # The block this request starts computing mid-block has no rows here.
-        index, offset = divmod(
-            self._computed_from[request.request_id], self._block_size
-        )
-        step = self._block_size // self._hash_block_size
-        if offset and num_sent < (index + 1) * step <= num_keyed:
-            keys = block_hashes[index * step : (index + 1) * step]
-            block = maybe_convert_block_hash(keys[-1])
-            if block not in self._kv_cached:
-                self._rowless[block] = keys[-1]
         return self._pack_hashes(block_hashes[num_sent:num_keyed])
 
     def reset(self) -> None:

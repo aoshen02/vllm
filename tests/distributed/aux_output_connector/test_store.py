@@ -2073,27 +2073,32 @@ def test_connector_forgets_loaded_blocks_once_evicted():
     assert connector.max_cache_hit(request) == 16
 
 
-def test_connector_marks_partly_loaded_block_at_admission():
+def test_connector_keeps_mark_of_partly_loaded_block():
     cached = {_HASHES[0]: [Mock()], _HASHES[1]: [Mock()]}
     connector = AuxOutputSchedulerConnector(_kv_cache_manager(cached))
-    decode = _SchedulerRequest("decode", list(_HASHES[:2]), 9, num_output_tokens=0)
-    decode.sampling_params.routed_experts_prompt_start = 5
-    request = _SchedulerRequest("request", list(_HASHES[:2]), 9, num_output_tokens=0)
+    decode = _SchedulerRequest("decode", list(_HASHES[:3]), 13, num_output_tokens=0)
+    decode.sampling_params.routed_experts_prompt_start = 9
+    request = _SchedulerRequest("request", list(_HASHES[:3]), 13, num_output_tokens=0)
 
-    assert connector.cap_external_hit(decode, 4, 1) == 1
-    assert connector.max_cache_hit(request) == 4
+    assert connector.cap_external_hit(decode, 8, 1) == 1
+    connector.request_loading(decode, 9)
+    _finish_empty_request(connector)
+    cached[_HASHES[2]] = [Mock()]
+    assert connector.max_cache_hit(request) == 8
 
 
-def test_connector_marks_partly_computed_block_while_request_runs():
+def test_connector_marks_partly_computed_block_once_its_hash_exists():
     cached = {_HASHES[0]: [Mock()], _HASHES[1]: [Mock()]}
     connector = AuxOutputSchedulerConnector(_kv_cache_manager(cached))
-    decode = _SchedulerRequest(
-        "decode", list(_HASHES[:2]), 9, num_output_tokens=0, num_computed_tokens=5
-    )
+    decode = _SchedulerRequest("decode", [_HASHES[0]], 7, num_computed_tokens=5)
     request = _SchedulerRequest("request", list(_HASHES[:2]), 9, num_output_tokens=0)
     connector.build_connector_meta(
-        _step_output(["decode"], [5], [3]), {"decode": decode}
+        _step_output(["decode"], [5], [1]), {"decode": decode}
     )
+    decode.block_hashes.append(_HASHES[1])
+    decode.num_tokens = 8
+    rows = np.zeros((2, *_SHAPE), dtype=_DTYPE)
+    connector.take_output(decode, {"decode": AuxRequestOutput(5, rows)})
 
     assert connector.max_cache_hit(request) == 4
 
