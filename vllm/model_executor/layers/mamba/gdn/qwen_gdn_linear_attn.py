@@ -129,11 +129,6 @@ MAX_FUSED_GDN_MTP_TOKENS = 9  # kMaxMtpTokens in fused_gdn_decode_kernel.cu
 _BA_PROJ_OVERLAP_MAX_TOKENS = 256
 FUSED_GDN_STATE_DTYPES = (torch.float32, torch.bfloat16)
 
-# Opt-in: run the decode rows of mixed (prefill + decode) GDN batches through
-# the packed decode kernel that decode-only batches use, instead of
-# rearrange_mixed_qkv + fused_sigmoid_gating_delta_rule_update.
-_GDN_MIXED_PACKED_DECODE = envs.VLLM_GDN_MIXED_PACKED_DECODE
-
 
 def supports_fused_mtp_decode() -> bool:
     """ROCm runs the Triton port; elsewhere the CUDA op must be built."""
@@ -1997,14 +1992,10 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             core_attn_out_spec, last_recurrent_state = None, None
 
         # 2.2: Process non-spec-decode part
-        packed_mixed_decode = (
-            split_non_spec
-            and _GDN_MIXED_PACKED_DECODE
-            and self.enable_packed_recurrent_decode
-        )
+        # Decode rows of a mixed batch use the packed decode kernel of
+        # decode-only batches, written straight into their output rows.
+        packed_mixed_decode = split_non_spec and self.enable_packed_recurrent_decode
         if packed_mixed_decode:
-            # Packed decode kernel on the peeled decode rows (one token each),
-            # written straight into their output rows.
             core_attn_out_decode = core_attn_out[:num_decode_tokens].unsqueeze(1)
             fused_recurrent_gated_delta_rule_packed_decode(
                 mixed_qkv=mixed_qkv_non_spec[:num_decode_tokens],  # type: ignore[index]
