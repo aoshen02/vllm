@@ -48,6 +48,7 @@ class DecoderReplayLayers:
     first replay layer's SWA metadata, built with the batch's window starts.
     ``has_early_aux`` tells whether layers before the replay layers capture aux
     hidden states, which the forward holds across the replay layers.
+    ``start_layer`` is the first replay layer.
     """
 
     def __init__(
@@ -58,8 +59,10 @@ class DecoderReplayLayers:
         metadata_prefixes: set[str],
         first_swa_prefix: str,
         has_early_aux: Callable[[], bool] = lambda: False,
+        start_layer: int = 0,
     ) -> None:
         self.window = window
+        self.start_layer = start_layer
         self.run_layers = run_layers
         self.write_batch_kv = write_batch_kv
         self.metadata_prefixes = metadata_prefixes

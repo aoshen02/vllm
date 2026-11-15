@@ -16,6 +16,7 @@ from vllm.config import VllmConfig
 from vllm.distributed.aux_output_connector.connector import (
     AuxOutputConnectorMetadata,
     AuxRequestOutput,
+    AuxStepOutput,
 )
 from vllm.distributed.aux_output_connector.routed_experts import (
     RoutedExpertsBuffer,
@@ -46,9 +47,14 @@ class _WorkerRequestState:
     capture_cursor: int | None = None
     scheduled_cursor: int = 0
     emit_cursor: int = 0
-    pending_outputs: int = 0
-    # Terminal event received; teardown waits for in-flight step outputs.
-    finished: bool = False
+    # Terminal event received while steps were in flight: sequence number of
+    # the last step that may cover the request; teardown waits for it.
+    finished_seq: int | None = None
+    # Delta mode, start > 0: rows are sliced from step outputs, never stored.
+    # Rows from emit_cursor that no step returned yet (non-final prefill chunks).
+    unkeyed: bool = False
+    unsent: list[np.ndarray] = field(default_factory=list)
+    unsent_end: int = 0
 
 
 @dataclass
@@ -56,6 +62,7 @@ class PendingAuxOutput:
     """Own one step's R3 snapshot until its asynchronous copy is consumed."""
 
     connector: AuxOutputWorkerConnector
+    seq: int
     request_ids: list[str]
     token_starts: np.ndarray
     query_start_loc: np.ndarray
@@ -76,7 +83,7 @@ class PendingAuxOutput:
             "cpu", non_blocking=True
         ).numpy()
 
-    def process_output(self) -> dict[str, AuxRequestOutput]:
+    def process_output(self) -> AuxStepOutput:
         return self.connector.process_output(self)
 
 
@@ -96,6 +103,15 @@ class AuxOutputWorkerConnector:
         bind_routed_experts_capturer(model, capturer)
         self._capturer = capturer
         self._vllm_config = vllm_config
+        aux_config = vllm_config.aux_output_config
+        self._delta = aux_config.routed_experts_delta
+        # Bounded decoder replay: trimmed rows skip the replay layers, which
+        # capture only the kept rows, packed at the front.
+        self._replay_layers = (
+            getattr(model, "decoder_replay_layers", None)
+            if aux_config.mask_trimmed_routed_experts
+            else None
+        )
         self._store: BackgroundBlockObjectStore | None = None
         self._buffer: RoutedExpertsBuffer | None = None
         self._requests: dict[str, _WorkerRequestState] = {}
@@ -105,6 +121,9 @@ class AuxOutputWorkerConnector:
         # consumes step outputs in order, so at most max_concurrent_batches
         # are outstanding; guarded by _lock against the output thread.
         self._pending_outputs: list[PendingAuxOutput] = []
+        self._seq = 0
+        # Finished requests whose teardown waits for in-flight steps.
+        self._deferred: list[str] = []
         self._lock = Lock()
         self._max_concurrent_batches = vllm_config.max_concurrent_batches
 
@@ -147,8 +166,24 @@ class AuxOutputWorkerConnector:
         request_ids = list(input_batch.req_ids)
         query_start_loc = input_batch.query_start_loc_np[: len(request_ids) + 1]
         num_rows = int(query_start_loc[-1])
+        layers = self._replay_layers
+        replay = None if layers is None else layers.replay_batch
+        if (
+            layers is not None
+            and replay is not None
+            and (0 < replay.rows.numel() < num_rows)
+        ):
+            # Scatter the replay layers' packed rows back to batch order; the
+            # trimmed rows never ran those layers.
+            buf = self._capturer.device_buffer
+            start = layers.start_layer
+            kept = buf[: replay.rows.numel(), start:].clone()
+            buf[:num_rows, start:] = -1
+            buf[replay.rows, start:] = kept
+        self._seq += 1
         pending_output = PendingAuxOutput(
             connector=self,
+            seq=self._seq,
             request_ids=request_ids,
             token_starts=input_batch.num_computed_tokens_np,
             query_start_loc=query_start_loc,
@@ -159,11 +194,9 @@ class AuxOutputWorkerConnector:
                 "auxiliary output step outputs are not consumed in order"
             )
             self._pending_outputs.append(pending_output)
-            for request_id in pending_output.request_ids:
-                self._requests[request_id].pending_outputs += 1
         return pending_output
 
-    def process_output(self, pending: PendingAuxOutput) -> dict[str, AuxRequestOutput]:
+    def process_output(self, pending: PendingAuxOutput) -> AuxStepOutput:
         """Commit one consumed R3 snapshot and build request outputs.
 
         Request teardown deferred by begin_step is completed here once no
@@ -176,18 +209,25 @@ class AuxOutputWorkerConnector:
                 outputs = self._commit_output(pending)
             finally:
                 self._pending_outputs.remove(pending)
-                for request_id in pending.request_ids:
+                # Steps are consumed in order: a finished request is settled
+                # once every step up to its finished_seq is consumed.
+                oldest = self._pending_outputs[0].seq if self._pending_outputs else None
+                keep = []
+                for request_id in self._deferred:
                     state = self._requests[request_id]
-                    state.pending_outputs -= 1
-                    if state.pending_outputs == 0 and state.finished:
-                        teardown.append(request_id)
-                        release_keys.extend(reversed(state.aux_output_keys))
+                    assert state.finished_seq is not None
+                    if oldest is not None and state.finished_seq >= oldest:
+                        keep.append(request_id)
+                        continue
+                    teardown.append(request_id)
+                    release_keys.extend(reversed(state.aux_output_keys))
+                self._deferred = keep
             if teardown:
                 self._publish_blocks([], release_keys=release_keys)
                 self._teardown(teardown)
             return outputs
 
-    def _commit_output(self, pending: PendingAuxOutput) -> dict[str, AuxRequestOutput]:
+    def _commit_output(self, pending: PendingAuxOutput) -> AuxStepOutput:
         buffer = self._buffer
         store = self._store
         assert buffer is not None and store is not None
@@ -206,15 +246,17 @@ class AuxOutputWorkerConnector:
         materialize_outputs: list[tuple[str, int, int]] = []
         block_batches = []
         outputs: dict[str, AuxRequestOutput] = {}
+        spans: dict[str, tuple[int, int, int]] = {}
 
         # Use the ModelRunner's actual batch boundaries rather than rebuilding them.
+        # Python ints: numpy scalars in spans make the step pickle much slower.
         for request_id, token_start, start, end, sampled, rejected in zip(
             pending.request_ids,
-            pending.token_starts,
-            pending.query_start_loc[:-1],
-            pending.query_start_loc[1:],
-            num_sampled,
-            num_rejected,
+            pending.token_starts.tolist(),
+            pending.query_start_loc[:-1].tolist(),
+            pending.query_start_loc[1:].tolist(),
+            np.asarray(num_sampled).tolist(),
+            np.asarray(num_rejected).tolist(),
             strict=True,
         ):
             request_num_tokens = end - start
@@ -225,10 +267,28 @@ class AuxOutputWorkerConnector:
 
             # Capture precedes speculative acceptance, so discard the rejected
             # suffix. Batch boundaries still span the full executed range.
-            rejected = int(rejected)
             assert 0 <= rejected <= request_num_tokens, (
                 "auxiliary output rejected-token count is invalid"
             )
+            if state.unkeyed:
+                if sampled and not state.unsent and state.unsent_end == token_start:
+                    # Common case: every row of this request is returned now.
+                    n = request_num_tokens - rejected
+                    spans[request_id] = (token_start, start, n)
+                    state.emit_cursor = state.unsent_end = token_start + n
+                    continue
+                self._slice_unkeyed(
+                    request_id,
+                    state,
+                    routed_experts,
+                    token_start,
+                    start,
+                    end - rejected,
+                    sampled,
+                    spans,
+                    outputs,
+                )
+                continue
             rows = routed_experts[start : end - rejected]
 
             capture_start = token_start
@@ -256,8 +316,10 @@ class AuxOutputWorkerConnector:
 
             if sampled > 0 and emit_start <= token_end:
                 if emit_start >= capture_start:
-                    outputs[request_id] = AuxRequestOutput(
-                        emit_start, rows[emit_start - capture_start :]
+                    spans[request_id] = (
+                        emit_start,
+                        start + emit_start - capture_start,
+                        token_end - emit_start,
                     )
                     state.emit_cursor = token_end
                 else:
@@ -292,7 +354,39 @@ class AuxOutputWorkerConnector:
                 )
             outputs[request_id] = AuxRequestOutput(emit_start, rows)
             state.emit_cursor = token_end
-        return outputs
+        return AuxStepOutput(routed_experts, spans, outputs)
+
+    @staticmethod
+    def _slice_unkeyed(
+        request_id: str,
+        state: _WorkerRequestState,
+        routed_experts: np.ndarray,
+        token_start: int,
+        start: int,
+        end: int,
+        sampled: int,
+        spans: dict[str, tuple[int, int, int]],
+        outputs: dict[str, AuxRequestOutput],
+    ) -> None:
+        """Delta mode, start > 0: the scheduler keeps the prefix hit at or
+        below emit_cursor, so every row from there on runs in this request."""
+        token_end = token_start + end - start
+        # Rows below unsent_end were already held back (or are being recomputed
+        # after a preemption).
+        lo = max(state.unsent_end, token_start)
+        assert token_start <= state.unsent_end, "unkeyed rows have a gap"
+        new_rows = routed_experts[start + lo - token_start : end]
+        if sampled > 0:
+            if state.unsent:
+                rows = np.concatenate((*state.unsent, new_rows))
+                outputs[request_id] = AuxRequestOutput(state.emit_cursor, rows)
+                state.unsent.clear()
+            else:
+                spans[request_id] = (lo, start + lo - token_start, len(new_rows))
+            state.emit_cursor = state.unsent_end = max(lo, token_end)
+        elif len(new_rows):
+            state.unsent.append(new_rows.copy())
+            state.unsent_end = token_end
 
     def _publish_blocks(
         self,
@@ -371,14 +465,19 @@ class AuxOutputWorkerConnector:
                 )
                 self._buffer.reset()
                 self._requests.clear()
+                self._deferred.clear()
                 self._generation = metadata.generation
             for request_id, emit_start in metadata.requests.items():
-                state = self._requests.setdefault(
-                    request_id, _WorkerRequestState(emit_cursor=emit_start)
-                )
-                if state.pending_outputs == 0:
+                state = self._requests.get(request_id)
+                if state is None:
+                    state = self._requests[request_id] = _WorkerRequestState(
+                        emit_cursor=emit_start,
+                        unkeyed=self._delta and emit_start > 0,
+                        unsent_end=emit_start,
+                    )
+                if not self._pending_outputs:
                     # In-flight steps leave the worker cursor behind the
-                    # scheduler's optimistic view; only check settled requests.
+                    # scheduler's optimistic view; only check when settled.
                     assert emit_start <= state.emit_cursor, (
                         "auxiliary output Scheduler emit cursor moved ahead"
                     )
@@ -394,8 +493,9 @@ class AuxOutputWorkerConnector:
             finished_now: list[str] = []
             for request_id in metadata.finished_requests:
                 state = self._requests[request_id]
-                state.finished = True
-                if state.pending_outputs:
+                if self._pending_outputs:
+                    state.finished_seq = self._seq
+                    self._deferred.append(request_id)
                     continue
                 finished_now.append(request_id)
                 release_keys.extend(reversed(state.aux_output_keys))
@@ -405,6 +505,7 @@ class AuxOutputWorkerConnector:
     def close(self) -> None:
         with self._lock:
             self._pending_outputs.clear()
+            self._deferred.clear()
             if self._store is not None:
                 try:
                     self._store.close()

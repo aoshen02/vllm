@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 from collections import OrderedDict
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from itertools import chain, islice
 from typing import TYPE_CHECKING
@@ -51,6 +51,31 @@ class AuxRequestOutput:
     rows: np.ndarray
 
 
+@dataclass
+class AuxStepOutput(Mapping[str, AuxRequestOutput]):
+    """One step's outputs as a single array that requests index into, so the
+    worker does not pickle one array per request."""
+
+    rows: np.ndarray
+    # request id -> (token start, first row, number of rows)
+    spans: dict[str, tuple[int, int, int]]
+    # Requests whose rows were assembled outside the step array.
+    extra: dict[str, AuxRequestOutput]
+
+    def __getitem__(self, request_id: str) -> AuxRequestOutput:
+        span = self.spans.get(request_id)
+        if span is None:
+            return self.extra[request_id]
+        token_start, first, num_rows = span
+        return AuxRequestOutput(token_start, self.rows[first : first + num_rows])
+
+    def __iter__(self) -> Iterator[str]:
+        return chain(self.spans, self.extra)
+
+    def __len__(self) -> int:
+        return len(self.spans) + len(self.extra)
+
+
 class AuxOutputSchedulerConnector:
     """Build worker metadata without owning auxiliary output payloads or stores."""
 
@@ -58,9 +83,13 @@ class AuxOutputSchedulerConnector:
         self,
         kv_cache_manager: KVCacheManager,
         kv_connector: KVConnectorBase_V1 | None = None,
+        delta: bool = False,
     ) -> None:
         # Number of hashes already sent to the worker for each active request.
         self._sent_hash_counts: dict[str, int] = {}
+        # Delta mode: requests starting past 0 need no hashes (see max_cache_hit).
+        self._delta = delta
+        self._unkeyed: set[str] = set()
         # Terminal events are delivered with the next connector metadata.
         self._finished_requests: dict[str, PackedBlockHashes | None] = {}
         self._generation = 0
@@ -88,29 +117,39 @@ class AuxOutputSchedulerConnector:
         """Build one step's incremental worker metadata."""
         scheduled_requests: dict[str, int] = {}
         block_hashes_by_request: dict[str, PackedBlockHashes] = {}
-        for request_id, num_tokens in scheduler_output.num_scheduled_tokens.items():
-            self._sent_hash_counts.setdefault(request_id, 0)
+        num_scheduled = scheduler_output.num_scheduled_tokens
+        for request_id, num_tokens in num_scheduled.items():
+            if request_id in self._unkeyed:
+                continue
             request = requests[request_id]
+            self._loading.pop(request_id, None)
+            if request_id not in self._sent_hash_counts:
+                # The worker keeps per-request cursors; only new requests need
+                # their emit start.
+                assert request.sampling_params is not None
+                # A P/D prefiller may cut the prompt short of the requested start.
+                emit_start = max(
+                    min(
+                        request.sampling_params.routed_experts_prompt_start,
+                        request.num_prompt_tokens,
+                    ),
+                    0 if request.num_output_tokens == 0 else request.num_tokens - 1,
+                )
+                scheduled_requests[request_id] = emit_start
+                if self._delta and emit_start > 0:
+                    self._unkeyed.add(request_id)
+                    continue
+                self._sent_hash_counts[request_id] = 0
             packed = self._take_new_hashes(
                 request, request.num_computed_tokens + num_tokens
             )
             if packed is not None:
                 block_hashes_by_request[request_id] = packed
-            self._loading.pop(request_id, None)
-            assert request.sampling_params is not None
-            # A P/D prefiller may cut the prompt short of the requested start.
-            scheduled_requests[request_id] = max(
-                min(
-                    request.sampling_params.routed_experts_prompt_start,
-                    request.num_prompt_tokens,
-                ),
-                0 if request.num_output_tokens == 0 else request.num_tokens - 1,
-            )
         # A settled token can complete a hash block after the next async schedule
         # was built. Send a hash-only update if the request was not rescheduled.
-        if len(self._sent_hash_counts) != len(scheduled_requests):
+        if len(self._sent_hash_counts) + len(self._unkeyed) != len(num_scheduled):
             for request_id in self._sent_hash_counts:
-                if request_id in scheduled_requests:
+                if request_id in num_scheduled:
                     continue
                 request = requests[request_id]
                 packed = self._take_new_hashes(request, request.num_computed_tokens)
@@ -136,6 +175,18 @@ class AuxOutputSchedulerConnector:
         return metadata
 
     def max_cache_hit(self, request: Request) -> int:
+        if self._delta:
+            assert request.sampling_params is not None
+            start = min(
+                request.sampling_params.routed_experts_prompt_start,
+                request.num_prompt_tokens,
+            )
+            if start > 0:
+                # Rows below the start are never returned, so a hit up to the
+                # block holding it needs no stored rows; the worker computes
+                # every returned row in this request.
+                start -= start % self._block_size
+                return min(start, request.num_tokens - 1)
         num_blocks = 0
         for block, keys in self._kv_blocks(request.block_hashes):
             if block in self._kv_cached:
@@ -186,7 +237,7 @@ class AuxOutputSchedulerConnector:
     def take_output(
         self,
         request: Request,
-        output: dict[str, AuxRequestOutput] | None,
+        output: Mapping[str, AuxRequestOutput] | None,
     ) -> np.ndarray | None:
         """Return the accepted R3 rows for one scheduled request."""
         request_id = request.request_id
@@ -217,7 +268,15 @@ class AuxOutputSchedulerConnector:
         """Queue a request's terminal event and final block hashes."""
         request_id = request.request_id
         self._loading.pop(request_id, None)
+        if request_id in self._unkeyed:
+            self._unkeyed.discard(request_id)
+            self._finished_requests[request_id] = None
+            return
         num_blocks = request.num_computed_tokens // self._block_size
+        if self._delta:
+            # Later turns start at this turn's end, so stored rows only serve
+            # requests that share this first-turn prompt.
+            num_blocks = min(num_blocks, request.num_prompt_tokens // self._block_size)
         for block, keys in islice(self._kv_blocks(request.block_hashes), num_blocks):
             if block not in self._kv_cached and self._gpu_cached(keys[-1]):
                 self._kv_cached[block] = keys
@@ -253,6 +312,7 @@ class AuxOutputSchedulerConnector:
         """Start a new auxiliary output namespace after a prefix-cache reset."""
         # The worker drops temporary state on generation changes; resend hashes.
         self._sent_hash_counts.clear()
+        self._unkeyed.clear()
         self._finished_requests.clear()
         self._generation += 1
         self._released_hashes.extend(chain.from_iterable(self._kv_cached.values()))

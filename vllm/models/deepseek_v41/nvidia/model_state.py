@@ -286,13 +286,17 @@ class DeepseekV41ModelState(DefaultModelState):
         self._replay_start_np[req_index] = new_req_data.replay_start
         if self.decoder_replay_layers is not None:
             params = new_req_data.sampling_params
+            aux_config = self.vllm_config.aux_output_config
             self._keeps_rows_np[req_index] = (
                 params is not None
                 and (
                     params.prompt_logprobs is not None
                     or params.prompt_logprob_token_ids is not None
                 )
-            ) or self.vllm_config.aux_output_config.enable_return_routed_experts
+            ) or (
+                aux_config.enable_return_routed_experts
+                and not aux_config.mask_trimmed_routed_experts
+            )
 
     def prepare_inputs(
         self, input_batch: InputBatch, req_states: RequestState
