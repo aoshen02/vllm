@@ -2073,6 +2073,20 @@ def test_connector_forgets_loaded_blocks_once_evicted():
     assert connector.max_cache_hit(request) == 16
 
 
+def test_connector_marks_partly_computed_block_while_request_runs():
+    cached = {_HASHES[0]: [Mock()], _HASHES[1]: [Mock()]}
+    connector = AuxOutputSchedulerConnector(_kv_cache_manager(cached))
+    decode = _SchedulerRequest(
+        "decode", list(_HASHES[:2]), 9, num_output_tokens=0, num_computed_tokens=5
+    )
+    request = _SchedulerRequest("request", list(_HASHES[:2]), 9, num_output_tokens=0)
+    connector.build_connector_meta(
+        _step_output(["decode"], [5], [3]), {"decode": decode}
+    )
+
+    assert connector.max_cache_hit(request) == 4
+
+
 def test_connector_releases_oldest_uncached_blocks_past_capacity():
     cached, connector, request = _finished_request_with_cached_blocks()
     assert _finish_empty_request(connector) == ([], [])

@@ -242,15 +242,15 @@ class AuxOutputSchedulerConnector:
         """Queue a request's terminal event and final block hashes."""
         request_id = request.request_id
         self._loading.pop(request_id, None)
+        if request_id in self._sent_hash_counts:
+            # The next metadata delivers this terminal event to the worker.
+            self._finished_requests[request_id] = self._take_new_hashes(
+                request, request.num_computed_tokens
+            )
+            del self._sent_hash_counts[request_id]
+            del self._computed_from[request_id]
         num_blocks = request.num_computed_tokens // self._block_size
-        computed_from = self._computed_from.pop(request_id, request.num_tokens)
-        blocks = islice(self._kv_blocks(request.block_hashes), num_blocks)
-        for index, (block, keys) in enumerate(blocks):
-            start = index * self._block_size
-            if start >= computed_from:
-                self._rowless.pop(block, None)
-            elif start + self._block_size > computed_from:
-                self._rowless.setdefault(block, keys[-1])
+        for block, keys in islice(self._kv_blocks(request.block_hashes), num_blocks):
             if (
                 block not in self._kv_cached
                 and block not in self._rowless
@@ -259,13 +259,6 @@ class AuxOutputSchedulerConnector:
                 self._kv_cached[block] = keys
                 self._retained_hashes.extend(keys)
         self._release_unheld()
-        if request_id not in self._sent_hash_counts:
-            return
-        # The next metadata delivers this terminal event to the worker.
-        self._finished_requests[request_id] = self._take_new_hashes(
-            request, request.num_computed_tokens
-        )
-        del self._sent_hash_counts[request_id]
 
     @staticmethod
     def _pack_hashes(hashes: Sequence[bytes]) -> PackedBlockHashes | None:
@@ -283,6 +276,21 @@ class AuxOutputSchedulerConnector:
         if num_keyed <= num_sent:
             return None
         self._sent_hash_counts[request.request_id] = num_keyed
+        # A block this request computes in full has rows here; one it starts
+        # mid-block does not, unless they are retained from earlier.
+        computed_from = self._computed_from[request.request_id]
+        step = self._block_size // self._hash_block_size
+        for index in range(num_sent // step, num_keyed // step):
+            keys = block_hashes[index * step : (index + 1) * step]
+            block = maybe_convert_block_hash(keys[-1])
+            start = index * self._block_size
+            if start >= computed_from:
+                self._rowless.pop(block, None)
+            elif (
+                start + self._block_size > computed_from
+                and block not in self._kv_cached
+            ):
+                self._rowless[block] = keys[-1]
         return self._pack_hashes(block_hashes[num_sent:num_keyed])
 
     def reset(self) -> None:
