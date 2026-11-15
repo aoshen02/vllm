@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
+from vllm.utils.math_utils import cdiv
 from vllm.v1.core.kv_cache_utils import maybe_convert_block_hash
 
 if TYPE_CHECKING:
@@ -164,7 +165,7 @@ class AuxOutputSchedulerConnector:
             for block, keys in islice(
                 self._kv_blocks(request.block_hashes),
                 num_local // self._block_size,
-                num_hit // self._block_size,
+                cdiv(num_hit, self._block_size),
             ):
                 if block not in self._kv_cached:
                     self._rowless[block] = keys[-1]
@@ -248,9 +249,12 @@ class AuxOutputSchedulerConnector:
                 request, request.num_computed_tokens
             )
             del self._sent_hash_counts[request_id]
-            del self._computed_from[request_id]
+        computed_from = self._computed_from.pop(request_id, request.num_tokens)
         num_blocks = request.num_computed_tokens // self._block_size
-        for block, keys in islice(self._kv_blocks(request.block_hashes), num_blocks):
+        blocks = islice(self._kv_blocks(request.block_hashes), num_blocks)
+        for index, (block, keys) in enumerate(blocks):
+            if index * self._block_size >= computed_from:
+                self._rowless.pop(block, None)
             if (
                 block not in self._kv_cached
                 and block not in self._rowless
@@ -276,20 +280,15 @@ class AuxOutputSchedulerConnector:
         if num_keyed <= num_sent:
             return None
         self._sent_hash_counts[request.request_id] = num_keyed
-        # A block this request computes in full has rows here; one it starts
-        # mid-block does not, unless they are retained from earlier.
-        computed_from = self._computed_from[request.request_id]
+        # The block this request starts computing mid-block has no rows here.
+        index, offset = divmod(
+            self._computed_from[request.request_id], self._block_size
+        )
         step = self._block_size // self._hash_block_size
-        for index in range(num_sent // step, num_keyed // step):
+        if offset and num_sent < (index + 1) * step <= num_keyed:
             keys = block_hashes[index * step : (index + 1) * step]
             block = maybe_convert_block_hash(keys[-1])
-            start = index * self._block_size
-            if start >= computed_from:
-                self._rowless.pop(block, None)
-            elif (
-                start + self._block_size > computed_from
-                and block not in self._kv_cached
-            ):
+            if block not in self._kv_cached:
                 self._rowless[block] = keys[-1]
         return self._pack_hashes(block_hashes[num_sent:num_keyed])
 

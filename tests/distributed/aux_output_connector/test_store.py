@@ -2073,6 +2073,17 @@ def test_connector_forgets_loaded_blocks_once_evicted():
     assert connector.max_cache_hit(request) == 16
 
 
+def test_connector_marks_partly_loaded_block_at_admission():
+    cached = {_HASHES[0]: [Mock()], _HASHES[1]: [Mock()]}
+    connector = AuxOutputSchedulerConnector(_kv_cache_manager(cached))
+    decode = _SchedulerRequest("decode", list(_HASHES[:2]), 9, num_output_tokens=0)
+    decode.sampling_params.routed_experts_prompt_start = 5
+    request = _SchedulerRequest("request", list(_HASHES[:2]), 9, num_output_tokens=0)
+
+    assert connector.cap_external_hit(decode, 4, 1) == 1
+    assert connector.max_cache_hit(request) == 4
+
+
 def test_connector_marks_partly_computed_block_while_request_runs():
     cached = {_HASHES[0]: [Mock()], _HASHES[1]: [Mock()]}
     connector = AuxOutputSchedulerConnector(_kv_cache_manager(cached))
