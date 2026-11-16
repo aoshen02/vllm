@@ -46,7 +46,6 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from vllm.model_executor.model_loader.weight_utils import stash_weight_part
 from vllm.model_executor.models.module_mapping import MultiModelKeys
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import (
@@ -112,7 +111,7 @@ class MolmoImageInputs(TensorSchema):
     num_crops: Annotated[torch.Tensor, TensorShape("bn")]
 
 
-@dataclass
+@dataclass(slots=True)
 class VisionBackboneConfig:
     image_default_input_size: tuple[int, int] = (336, 336)
     image_patch_size: int = 14
@@ -1155,14 +1154,14 @@ class MolmoMultiModalProcessor(BaseMultiModalProcessor[MolmoProcessingInfo]):
 
     def _postprocess_hf_mm_data(
         self,
-        hf_data: Mapping[str, object],
-        hf_kwargs: Mapping[str, object],
+        mm_data: Mapping[str, object],
+        hf_processor_mm_kwargs: Mapping[str, object],
         processed_data: BatchFeature,
     ) -> BatchFeature:
-        if not hf_data:
+        if not mm_data:
             return processed_data
 
-        hf_processor = self.info.get_hf_processor(**hf_kwargs)
+        hf_processor = self.info.get_hf_processor(**hf_processor_mm_kwargs)
         tokenizer = hf_processor.tokenizer
         image_patch_id = tokenizer.vocab[IMAGE_PATCH_TOKEN]
 
@@ -1170,7 +1169,7 @@ class MolmoMultiModalProcessor(BaseMultiModalProcessor[MolmoProcessingInfo]):
 
         processed_data.pop("input_ids")
 
-        if (images := hf_data.get("images")) is not None:
+        if (images := mm_data.get("images")) is not None:
             mm_items = self.info.parse_mm_data({"image": images}, validate=False)
             parsed_images = mm_items.get_items("image", ImageProcessorItems)
             image_sizes = [
@@ -1446,7 +1445,7 @@ class MolmoForCausalLM(
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         loader = AutoWeightsLoader(self)
-        weights = _get_weights_with_merged_embedding(self, weights)
+        weights = _get_weights_with_merged_embedding(weights)
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
     def get_mm_mapping(self) -> MultiModelKeys:
@@ -1459,23 +1458,20 @@ class MolmoForCausalLM(
 
 
 def _get_weights_with_merged_embedding(
-    module: nn.Module,
     weights: Iterable[tuple[str, torch.Tensor]],
 ) -> Iterable[tuple[str, torch.Tensor]]:
+    embedding_weights = {}
     for name, weight in weights:
         if "wte.embedding" in name:
-            part = "embedding"
+            embedding_weights["embedding"] = weight
         elif "wte.new_embedding" in name:
-            part = "new_embedding"
+            embedding_weights["new_embedding"] = weight
         else:
             yield (name, weight)
-            continue
-        parts = stash_weight_part(
-            module, "wte", part, weight, ("embedding", "new_embedding")
-        )
-        # Quantization leaves embed_tokens unquantized, so the concat is safe.
-        if parts is not None:
-            yield (
-                "model.embed_tokens.weight",
-                torch.cat([parts["embedding"], parts["new_embedding"]], dim=0),
-            )
+    # this is compatible with most of quantization,
+    # because they won't quantize embed_tokens
+    embedding_weights = torch.cat(
+        [embedding_weights["embedding"], embedding_weights["new_embedding"]],
+        dim=0,
+    )
+    yield ("model.embed_tokens.weight", embedding_weights)

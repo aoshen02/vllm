@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from pathlib import Path
 
 import pytest
 import torch
+from safetensors.torch import safe_open, save_file
 
 from vllm.model_executor.kernels.linear.mixed_precision.MPLinearKernel import (
     MPLinearKernel,
@@ -14,9 +16,11 @@ from vllm.model_executor.parameter import (
     permute_param_layout_,
 )
 from vllm.model_executor.utils import (
+    copy_weight_,
     get_live_param,
     kernel_parameters,
     move_parameter,
+    refill_derived,
     replace_parameter,
     retire_parameter,
     set_kernel_parameter,
@@ -51,6 +55,7 @@ def test_replace_parameter_preserves_custom_attribute(wrap_in_parameter: bool) -
         "weight", torch.nn.Parameter(torch.zeros(4, 4), requires_grad=False)
     )
     original = layer.weight
+    original_ptr = original.data_ptr()
 
     new_data: torch.Tensor = torch.ones(4, 4).t()
     if wrap_in_parameter:
@@ -70,23 +75,25 @@ def test_replace_parameter_preserves_custom_attribute(wrap_in_parameter: bool) -
 
     assert layer.weight is original
     assert layer.weight.stride() == new_data.stride()
-    assert layer.weight.data_ptr() == new_data.data_ptr()
+    # same byte size: copied into the loaded storage, address kept
+    assert layer.weight.data_ptr() == original_ptr
 
 
 @pytest.mark.parametrize(
     "new_data,copies",
     [
         (torch.ones(4, 4, dtype=torch.float32, device="cpu"), True),
-        (torch.ones(4, 4, dtype=torch.float32, device="cpu").t(), False),
+        (torch.ones(4, 4, dtype=torch.float32, device="cpu").t(), True),
         (torch.ones(8, 4, dtype=torch.float32, device="cpu"), False),
-        # A smaller result goes into the loaded storage, which never shrinks.
+        # A result that fits (equal or smaller) goes into the loaded storage,
+        # which never shrinks.
         (torch.ones(4, 4, dtype=torch.bfloat16, device="cpu"), True),
         (torch.ones(4, 2, dtype=torch.float32, device="cpu"), True),
         (torch.tensor(1.0, device="cpu"), True),
     ],
     ids=[
         "same-layout-copies",
-        "new-strides",
+        "new-strides-copies",
         "larger-shape",
         "smaller-dtype-copies",
         "smaller-shape-copies",
@@ -153,7 +160,7 @@ def test_humming_replace_keeps_loaded_params(single_rank_tp: None) -> None:
 
     assert layer.weight is packed and layer.weight_scale is scale_inv
     assert torch.equal(layer.weight, torch.full((32, 8), 2.0))
-    assert packed.untyped_storage().nbytes() == 64 * 8 * 4
+    assert packed.untyped_storage().nbytes() == 64 * 8 * packed.element_size()
     assert set(kernel_parameters(layer)) == {"weight", "weight_scale"}
 
 
@@ -369,6 +376,34 @@ def test_replace_parameter_with_own_parameter_keeps_layout(single_rank_tp) -> No
     assert torch.equal(layer.weight, torch.ones(4, 4))
 
 
+def test_kept_param_ops_skip_python_torch_function(single_rank_tp: None) -> None:
+    """Kept vLLM params must dispatch eager ops like a plain Parameter: a Python
+    `__torch_function__` would put every op on them through the interpreter."""
+    layer = torch.nn.Module()
+    layer.register_parameter(
+        "weight",
+        ModelWeightParameter(
+            data=torch.zeros(4, 4),
+            input_dim=1,
+            output_dim=0,
+            weight_loader=lambda param, loaded_weight: None,
+        ),
+    )
+    replace_parameter(layer, "weight", torch.ones(4, 4))
+
+    assert type(layer.weight) is ModelWeightParameter
+    # A kept param must dispatch like a plain Parameter. Compare against a
+    # plain Parameter rather than asserting an absolute False: on ROCm,
+    # has_torch_function can return True for plain Parameters too.
+    plain = torch.nn.Parameter(torch.ones(4, 4))
+    assert torch.overrides.has_torch_function(
+        (layer.weight,)
+    ) == torch.overrides.has_torch_function((plain,))
+    out = layer.weight + 1
+    assert type(out) is torch.Tensor
+    assert torch.equal(out, torch.full((4, 4), 2.0))
+
+
 def test_transposed_kept_param_keeps_checkpoint_dims(single_rank_tp: None) -> None:
     """The loader shards a kept param by its dims on reload, so a kernel transform
     that transposes it must not leave the post-transform dims on it."""
@@ -391,3 +426,113 @@ def test_transposed_kept_param_keeps_checkpoint_dims(single_rank_tp: None) -> No
     assert layer.weight is weight
     assert torch.equal(weight, torch.arange(6.0).view(2, 3).t())
     assert (weight.input_dim, weight.output_dim) == (1, 0)
+
+
+@pytest.fixture
+def prefault_on(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Take the integrated-GPU path of `copy_weight_` without a GPU."""
+    monkeypatch.setattr(
+        "vllm.model_executor.utils._is_integrated_gpu", lambda device: True
+    )
+
+
+@pytest.mark.parametrize(
+    "src",
+    [
+        torch.tensor(0.5),
+        torch.empty(0, 8),
+        torch.randn(64, 1024).to(torch.bfloat16),
+        torch.randint(0, 256, (64, 1024), dtype=torch.uint8).view(torch.float8_e4m3fn),
+        torch.randn(64, 1024).narrow(1, 512, 512),
+        torch.arange(2, dtype=torch.float32)[::2],
+    ],
+    ids=["0d", "empty", "bf16", "fp8", "dim1_narrow", "strided_1elem"],
+)
+def test_copy_weight_prefault_copies_exact_bytes(
+    prefault_on: None, src: torch.Tensor
+) -> None:
+    """The touch only runs on integrated GPUs, which CI doesn't have. It must
+    accept the shapes and dtypes weight loaders pass and leave the copy
+    unchanged.
+    """
+    dst = torch.empty_like(src, memory_format=torch.contiguous_format)
+    copy_weight_(dst, src)
+    expected = src.clone(memory_format=torch.contiguous_format)
+    assert torch.equal(
+        dst.reshape(-1).view(torch.uint8), expected.reshape(-1).view(torch.uint8)
+    )
+
+
+def test_copy_weight_prefault_maps_the_mmap_view(
+    prefault_on: None, tmp_path: Path
+) -> None:
+    """Every page of the safetensors view must be mapped before the copy: a
+    host-to-device copy that takes those faults itself is the slow path on
+    integrated GPUs (#58726). The meta destination keeps the copy itself from
+    reading the source.
+    """
+    path = str((tmp_path / "w.safetensors").resolve())
+    save_file({"w": torch.randn(1 << 20)}, path)
+
+    def mapped_bytes() -> int:
+        total, in_file = 0, False
+        with open("/proc/self/smaps") as smaps:
+            for line in smaps:
+                fields = line.split()
+                if ":" not in fields[0]:
+                    in_file = fields[-1] == path
+                elif in_file and fields[0] == "Rss:":
+                    total += int(fields[1]) * 1024
+        return total
+
+    with safe_open(path, framework="pt") as f:
+        src = f.get_tensor("w")
+        assert mapped_bytes() < src.nbytes
+        copy_weight_(torch.empty_like(src, device="meta"), src)
+        assert mapped_bytes() >= src.nbytes
+
+
+@pytest.mark.parametrize(
+    "held,shape,in_place",
+    [(True, (2, 3), True), (True, (3, 3), False), (False, (2, 3), False)],
+    ids=["same", "new", "absent"],
+)
+def test_refill_derived(held: bool, shape: tuple[int, int], in_place: bool) -> None:
+    """A tensor derived from the weights (a plain attribute kernels read) is
+    refilled in place when the layout matches, so captured graphs keep its
+    address, and never becomes a parameter."""
+    layer = torch.nn.Module()
+    if held:
+        layer.t = torch.zeros(2, 3)
+    old = getattr(layer, "t", None)
+    new = refill_derived(layer, "t", torch.full(shape, 2.0))
+    assert new is layer.t
+    torch.testing.assert_close(new, torch.full(shape, 2.0))
+    assert (new is old) == in_place
+    assert not dict(layer.named_parameters())
+
+
+def test_mxfp4_lora_experts_keep_mxfp4_constants() -> None:
+    """The LoRA experts keep the MXFP4 SwiGLU constants (the MRO would otherwise
+    resolve the base class's empty tuple) and the bias index, so a rerun's new
+    experts object reads the first one's tensors."""
+    from vllm.model_executor.layers.fused_moe.experts.trtllm_lora_moe import (
+        TrtLlmMxfp4LoRAExperts,
+    )
+    from vllm.model_executor.layers.fused_moe.experts.trtllm_mxfp4_moe import (
+        TrtLlmMxfp4ExpertsBase,
+    )
+
+    names = TrtLlmMxfp4LoRAExperts.kept_constants
+    assert set(TrtLlmMxfp4ExpertsBase.kept_constants) <= set(names)
+    assert "_w13_bias_up_gate_index" in names
+
+    layer = torch.nn.Module()
+    kept = []
+    for _ in range(2):  # every rerun builds new experts
+        experts = object.__new__(TrtLlmMxfp4LoRAExperts)
+        for name in names:
+            setattr(experts, name, torch.rand(4))
+        experts.keep_constants(layer)
+        kept.append([getattr(experts, name) for name in names])
+    assert all(first is second for first, second in zip(*kept))

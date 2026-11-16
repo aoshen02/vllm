@@ -348,6 +348,7 @@ class GptOssRoutedExperts(RoutedExperts):
         ) or quant_method_name in (
             "CompressedTensorsW4A4Nvfp4MoEMethod",
             "Nvfp4OnlineMoEMethod",
+            "ModelOptNvFp4FusedMoE",
             "CompressedTensorsWNA16MoEMethod",
         ):
             self._load_packed_expert(expert_data, loaded_weight, weight_name, shard_id)
@@ -472,6 +473,7 @@ class TransformerBlock(torch.nn.Module):
 class GptOssModel(nn.Module, EagleModelMixin):
     # Override to swap in an alternative TransformerBlock subclass.
     block_cls: type[nn.Module] = TransformerBlock
+    supports_aux_hidden_states_over_pp = True
 
     def __init__(
         self,
@@ -531,7 +533,13 @@ class GptOssModel(nn.Module, EagleModelMixin):
             x, residual = layer(x, positions, residual)
             self._maybe_add_hidden_state(aux_hidden_states, i + 1, x, residual)
         if not get_pp_group().is_last_rank:
-            return IntermediateTensors({"hidden_states": x, "residual": residual})
+            return IntermediateTensors(
+                {
+                    "hidden_states": x,
+                    "residual": residual,
+                    **self.pack_local_aux_hidden_states(aux_hidden_states),
+                }
+            )
         x, _ = self.norm(x, residual)
 
         if len(aux_hidden_states) > 0:
@@ -1260,7 +1268,7 @@ class GptOssModel(nn.Module, EagleModelMixin):
         name: str,
         params_dict: dict[str, torch.nn.Parameter],
     ) -> tuple[int, str, str] | None:
-        """Parse ``...experts.<expert_id>.<fused_param>`` checkpoint keys."""
+        """Parse `...experts.<expert_id>.<fused_param>` checkpoint keys."""
         if ".mlp.experts." not in name:
             return None
         suffix = name.rsplit(".", 1)[-1]

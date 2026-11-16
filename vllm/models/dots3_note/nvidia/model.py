@@ -20,6 +20,7 @@ from vllm.distributed import (
 )
 from vllm.model_executor.layers.attention import MLAAttention
 from vllm.model_executor.layers.fused_embed_norm import has_full_vocab_on_rank
+from vllm.model_executor.layers.fused_moe import RoutedScaleMode
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
@@ -34,7 +35,6 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 )
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
-from vllm.model_executor.model_loader.weight_utils import stash_weight_part
 from vllm.model_executor.models.deepseek_v2 import (
     DeepSeekV2FusedQkvAProjLinear,
     DeepseekV2MLAAttention,
@@ -45,6 +45,7 @@ from vllm.model_executor.models.utils import (
     PPMissingLayer,
     make_empty_intermediate_tensors_factory,
     make_layers,
+    pp_topk_buffers,
     sequence_parallel_chunk,
 )
 from vllm.models.deepseek_v32.nvidia.model import (
@@ -53,7 +54,7 @@ from vllm.models.deepseek_v32.nvidia.model import (
     DeepseekV32Model,
 )
 from vllm.platforms import current_platform
-from vllm.v1.kv_cache_interface import MLAAttentionSpec
+from vllm.v1.kv_cache_interface import KVCacheLayerConfig, MLAAttentionSpec
 
 from .attention import (
     Dots3NoteFlashAttnPrefillBackend,
@@ -107,7 +108,7 @@ class Dots3NoteMoE(DeepseekV2MoE):
         quant_config: QuantizationConfig | None = None,
         reduce_results: bool = True,
         prefix: str = "",
-        apply_routed_scale_to_output: bool = False,
+        routed_scale_mode: RoutedScaleMode = RoutedScaleMode.ROUTER,
     ) -> None:
         num_shared_experts = config.n_shared_experts
         routed_config = copy.copy(config)
@@ -118,7 +119,7 @@ class Dots3NoteMoE(DeepseekV2MoE):
             quant_config=quant_config,
             reduce_results=False,
             prefix=prefix,
-            apply_routed_scale_to_output=apply_routed_scale_to_output,
+            routed_scale_mode=routed_scale_mode,
         )
         self.n_shared_experts = num_shared_experts
         self.reduce_results = reduce_results
@@ -234,10 +235,13 @@ class Dots3NotePaddedMLAAttention(MLAAttention):
         assert physical_head_size >= self.head_size
         self.physical_head_size = physical_head_size
 
-    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> MLAAttentionSpec:
-        spec = super().get_kv_cache_spec(vllm_config)
-        assert isinstance(spec, MLAAttentionSpec)
-        return replace(spec, head_size=self.physical_head_size)
+    def get_kv_cache_config(self, vllm_config: VllmConfig) -> KVCacheLayerConfig:
+        layer_config = super().get_kv_cache_config(vllm_config)
+        assert isinstance(layer_config.spec, MLAAttentionSpec)
+        return replace(
+            layer_config,
+            spec=replace(layer_config.spec, head_size=self.physical_head_size),
+        )
 
 
 class Dots3NoteFullAttention(DeepseekV2MLAAttention):
@@ -548,7 +552,7 @@ class Dots3NoteDecoderLayer(DeepseekV32DecoderLayer):
                 quant_config=quant_config,
                 reduce_results=False,
                 prefix=f"{prefix}.mlp",
-                apply_routed_scale_to_output=False,
+                routed_scale_mode=RoutedScaleMode.ROUTER,
             )
         else:
             self.mlp = DeepseekV2MLP(
@@ -583,7 +587,7 @@ class Dots3NoteModel(DeepseekV32Model):
         self.use_sequence_parallel = False
         self.is_v32 = True
         self._weight_block_size = getattr(quant_config, "weight_block_size", None)
-        topk_indices_buffer = torch.empty(
+        self.topk_indices_buffer = torch.empty(
             vllm_config.scheduler_config.max_num_batched_tokens,
             config.index_topk,
             dtype=torch.int32,
@@ -604,7 +608,7 @@ class Dots3NoteModel(DeepseekV32Model):
             lambda prefix: Dots3NoteDecoderLayer(
                 vllm_config=vllm_config,
                 prefix=prefix,
-                topk_indices_buffer=topk_indices_buffer,
+                topk_indices_buffer=self.topk_indices_buffer,
             ),
             prefix=f"{prefix}.layers",
         )
@@ -612,8 +616,11 @@ class Dots3NoteModel(DeepseekV32Model):
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
             self.norm = PPMissingLayer()
+        self.pp_buffers = pp_topk_buffers(
+            config, self.topk_indices_buffer, range(config.num_hidden_layers)
+        )
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
-            ["hidden_states", "residual"], config.hidden_size
+            ["hidden_states"], config.hidden_size, self.pp_buffers
         )
         self.aux_hidden_state_layers = tuple[int, ...]()
         self.num_redundant_experts = (
@@ -623,6 +630,7 @@ class Dots3NoteModel(DeepseekV32Model):
     def _adapt_weights(
         self, weights: Iterable[tuple[str, torch.Tensor]]
     ) -> Iterator[tuple[str, torch.Tensor]]:
+        pending_indexer_fp8: dict[tuple[str, str], dict[str, torch.Tensor]] = {}
         for name, weight in weights:
             if name.startswith("mtp."):
                 continue
@@ -650,16 +658,14 @@ class Dots3NoteModel(DeepseekV32Model):
                 is_scale = "weight_scale" in name
                 if projection is not None and (is_fp8_weight or is_scale):
                     layer_prefix = name.rsplit(f".{projection}.", 1)[0]
-                    entry = stash_weight_part(
-                        self,
-                        f"{layer_prefix}.{projection}",
-                        "weight" if is_fp8_weight else "scale",
-                        weight,
-                    )
-                    if entry is None:
+                    key = (layer_prefix, projection)
+                    entry = pending_indexer_fp8.setdefault(key, {})
+                    entry["weight" if is_fp8_weight else "scale"] = weight
+                    if "weight" not in entry or "scale" not in entry:
                         continue
                     weight_fp8 = entry["weight"]
                     scale_inv = entry["scale"]
+                    del pending_indexer_fp8[key]
                     group_shape = GroupShape(
                         weight_fp8.shape[0] // scale_inv.shape[0],
                         weight_fp8.shape[1] // scale_inv.shape[1],

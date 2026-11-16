@@ -28,10 +28,12 @@ from vllm.model_executor.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from vllm.model_executor.models.interfaces import EagleModelMixin, SupportsEagle3
+from vllm.model_executor.utils import refill_derived
 from vllm.multimodal.inputs import NestedTensors
+from vllm.v1.worker.gpu.spec_decode.dflash.config import DFlashSpeculatorConfig
 
 from .laguna import LagunaDecoderLayer
-from .qwen3_dflash import DFlashQwen3Model, _reads_raw_weights
+from .qwen3_dflash import DFlashQwen3Model
 from .utils import (
     AutoWeightsLoader,
     get_draft_quant_config,
@@ -69,6 +71,10 @@ class DFlashLagunaModel(DFlashQwen3Model, EagleModelMixin):
         prefix: str = "",
     ) -> None:
         nn.Module.__init__(self)
+        # derived from the weights after loading, refilled in place on reloads
+        self._kv_weights: torch.Tensor
+        self._kv_biases: torch.Tensor | None = None
+        self._input_layernorm_weights: torch.Tensor
         speculative_config = vllm_config.speculative_config
         assert speculative_config is not None
         self.config = speculative_config.draft_model_config.hf_config
@@ -157,24 +163,22 @@ class DFlashLagunaModel(DFlashQwen3Model, EagleModelMixin):
         layers_attn: list[nn.Module],
         has_bias: bool,
     ) -> None:
-        self._context_qkv_projs = [a.qkv_proj for a in layers_attn]
-        self._context_q_sizes = [a.q_size for a in layers_attn]
-        self._kv_weights: torch.Tensor | None = None
-        self._kv_biases: torch.Tensor | None = None
-        if _reads_raw_weights(self._context_qkv_projs):
-            self._kv_weights = torch.stack(
-                [a.qkv_proj.weight[a.q_size :] for a in layers_attn], dim=0
+        kv_weights = torch.stack(
+            [a.qkv_proj.weight[a.q_size :] for a in layers_attn], dim=0
+        ).contiguous()
+        kv_biases = None
+        if has_bias:
+            kv_biases = torch.stack(
+                [a.qkv_proj.bias[a.q_size :] for a in layers_attn], dim=0
             ).contiguous()
-            if has_bias:
-                self._kv_biases = torch.stack(
-                    [a.qkv_proj.bias[a.q_size :] for a in layers_attn], dim=0
-                ).contiguous()
-        self._input_layernorm_weights = torch.stack(
-            [layer.input_layernorm.weight.data for layer in self.layers], dim=0
-        ).contiguous()
-        self._k_norm_weights = torch.stack(
-            [a.k_norm.weight.data for a in layers_attn], dim=0
-        ).contiguous()
+        refill_derived(self, "_kv_weights", kv_weights)
+        refill_derived(self, "_kv_biases", kv_biases)
+        input_norms = [layer.input_layernorm.weight.data for layer in self.layers]
+        refill_derived(
+            self, "_input_layernorm_weights", torch.stack(input_norms).contiguous()
+        )
+        k_norms = [a.k_norm.weight.data for a in layers_attn]
+        refill_derived(self, "_k_norm_weights", torch.stack(k_norms).contiguous())
 
     def _project_context_kv(
         self,
@@ -195,25 +199,12 @@ class DFlashLagunaModel(DFlashQwen3Model, EagleModelMixin):
             self._input_layernorm_weights,
             self._rms_norm_eps,
         )
-        if self._kv_weights is not None:
-            all_kv_flat = torch.bmm(
-                normed_context_states,
-                self._kv_weights.transpose(1, 2),
-            )
-            if self._kv_biases is not None:
-                all_kv_flat += self._kv_biases[:, None, :]
-        else:
-            all_kv_flat = torch.stack(
-                [
-                    proj(x)[0][:, q_size:]
-                    for proj, q_size, x in zip(
-                        self._context_qkv_projs,
-                        self._context_q_sizes,
-                        normed_context_states,
-                        strict=True,
-                    )
-                ]
-            )
+        all_kv_flat = torch.bmm(
+            normed_context_states,
+            self._kv_weights.transpose(1, 2),
+        )
+        if self._kv_biases is not None:
+            all_kv_flat += self._kv_biases[:, None, :]
         all_kv = (
             all_kv_flat.view(num_layers, num_ctx, 2, num_kv_heads, head_dim)
             .permute(2, 0, 1, 3, 4)
@@ -252,6 +243,9 @@ class DFlashLagunaModel(DFlashQwen3Model, EagleModelMixin):
 
 
 class DFlashLagunaForCausalLM(nn.Module, SupportsEagle3):
+    # The speculator this is a draft model of (see SpeculativeDraftModel).
+    speculator_config_class = DFlashSpeculatorConfig
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         nn.Module.__init__(self)
         speculative_config = vllm_config.speculative_config

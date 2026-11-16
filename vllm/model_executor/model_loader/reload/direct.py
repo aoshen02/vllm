@@ -1,42 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Direct weight reload.
+"""Direct weight reload (`VLLM_RELOAD_MODE=direct`).
 
-Instead of moving layers to meta and rebuilding them, the loader writes
-checkpoint-format tensors straight into the live tensors and the cold-start
-post-load processing runs once at the end:
+Cold start records each tensor's checkpoint layout before post-load processing
+(PWAL). `begin` views re-laid-out tensors back to that layout on their
+storage, the loaders write the checkpoint in place, and `finish` reruns PWAL,
+which must keep addresses (captured CUDA graphs) and refill derived tensors.
+Between `begin` and a successful `finish` the model must not run; there is
+no rollback, the next full update repairs it.
 
-- cold start records each tensor's checkpoint layout (before post-load
-  processing);
-- ``begin`` views tensors whose layout post-load processing changed back to
-  their checkpoint layout, on the same storage;
-- ``finish`` reruns ``process_weights_after_loading`` for every module, as
-  cold start does. Post-load processing has to refill derived tensors in
-  place (captured CUDA graphs keep their startup addresses); nothing moves
-  them back.
-
-A reload is exactly as correct as a cold start on the delivered weights: no
-module is skipped because it "received nothing" (a loader may bypass the
-parameter's ``weight_loader``, and post-processing may read other modules'
-tensors).
-
-Delivery contract: an update must deliver every checkpoint tensor of each
-module whose post-load processing changes the tensor's layout or is not
-idempotent (it would convert the kept runtime bytes again). A tensor without
-such processing (e.g. an embedding table the trainer keeps frozen) may be left
-out and keeps its bytes. Nothing checks this contract here.
-
-Post-load processing must keep every checkpoint tensor registered under its
-checkpoint name (`replace_parameter`, `retire_parameter`): a reload loads it
-by that name.
-
-Online quantization (a BF16 checkpoint quantized at load) is the one case the
-kernel storage cannot hold the checkpoint tensor. Those modules reload the
-way they cold start: the layerwise path stages the checkpoint tensors on the
-side, quantizes once the module is complete and copies the result into the
-kernel tensors, so their addresses are kept too.
-
-Selected with ``VLLM_RELOAD_MODE=direct``.
+Delivery contract (not checked here): an update delivers every checkpoint
+tensor of each module whose PWAL changes its layout or is not idempotent, and
+of every `padding_fill_params()` parameter, which `begin` zero-fills whole.
 """
 
 from collections.abc import Iterator
@@ -44,62 +19,157 @@ from collections.abc import Iterator
 import torch
 
 import vllm.envs as envs
-from vllm.config import get_current_vllm_config_or_none
+from vllm.config import ModelConfig
 from vllm.logger import init_logger
-from vllm.model_executor.utils import _extent, is_weights_pre_processed
-
-from .layerwise import finalize_layerwise_processing, stage_layer_for_reload
+from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
+from vllm.model_executor.utils import (
+    is_weights_pre_processed,
+    storage_view,
+)
 
 logger = init_logger(__name__)
 
 __all__ = [
     "begin_direct_reload",
+    "direct_reload_active",
     "direct_reload_enabled",
     "finish_direct_reload",
+    "loadable_tensors",
     "record_checkpoint_layout",
 ]
 
 
+# Loader metadata post-load processing may retag on a kept parameter (AWQ
+# repacks along another dim); the checkpoint loaders shard with it.
+_LOADER_ATTRS = (
+    "_input_dim",
+    "_output_dim",
+    "_packed_dim",
+    "_packed_factor",
+    "_marlin_tile_size",
+    "input_dim",
+    "output_dim",
+    "packed_dim",
+    "packed_factor",
+    "pack_factor",
+)
+
+
 def direct_reload_enabled() -> bool:
+    """Whether weight updates reload in place (`VLLM_RELOAD_MODE=direct`)."""
     return envs.VLLM_RELOAD_MODE == "direct"
 
 
-def _own_tensors(module: torch.nn.Module) -> Iterator[tuple[str, torch.Tensor]]:
-    """A module's own parameters and persistent buffers."""
-    for n, p in module._parameters.items():
-        if p is not None:
-            yield n, p
-    for n, b in module._buffers.items():
-        if b is not None and n not in module._non_persistent_buffers_set:
-            yield n, b
+def direct_reload_active(model: torch.nn.Module) -> bool:
+    """Whether `model` is between `begin_direct_reload` and its finish."""
+    return getattr(model, "_direct_reload_begun", False)
 
 
-def _loadable_tensors(model: torch.nn.Module) -> Iterator[tuple[str, torch.Tensor]]:
+def _layout(t: torch.Tensor) -> tuple:
+    return tuple(t.shape), t.stride(), t.dtype, t.storage_offset()
+
+
+def loadable_tensors(model: torch.nn.Module) -> Iterator[tuple[str, torch.Tensor]]:
     """Parameters and persistent buffers, each object once."""
     seen: set[int] = set()
     for module_name, module in model.named_modules():
-        for name, tensor in _own_tensors(module):
-            if id(tensor) in seen:
+        persistent = (
+            (n, b)
+            for n, b in module._buffers.items()
+            if n not in module._non_persistent_buffers_set
+        )
+        for name, tensor in [*module._parameters.items(), *persistent]:
+            if tensor is None or id(tensor) in seen:
                 continue
             seen.add(id(tensor))
             yield (f"{module_name}.{name}" if module_name else name), tensor
 
 
+def _check_supported_modules(model: torch.nn.Module) -> None:
+    # config-level refusals: VllmConfig._verify_direct_reload_compat
+    from vllm.model_executor.layers.quantization.humming import (
+        HummingLinearMethod,
+        HummingMoEMethod,
+    )
+    from vllm.model_executor.layers.quantization.input_hadamard import (
+        InputHadamardLinearMethod,
+    )
+    from vllm.model_executor.layers.quantization.online.fp8 import OnlineLinearBase
+    from vllm.model_executor.layers.quantization.online.moe_base import (
+        OnlineMoEMethodBase,
+    )
+
+    for name, module in model.named_modules():
+        method = getattr(module, "quant_method", None)
+        if isinstance(method, InputHadamardLinearMethod):
+            method = method.quant_method
+        # also without an online config (experts_int8); fused shared experts
+        # quantize staging parameters that post-load processing deletes
+        if isinstance(method, (OnlineLinearBase, OnlineMoEMethodBase)) or (
+            getattr(module, "shared_expert_online_loader", None) is not None
+        ):
+            raise RuntimeError(
+                f"direct reload: online quantization is not supported "
+                f"({name}: {type(method).__name__})"
+            )
+        if isinstance(method, (HummingLinearMethod, HummingMoEMethod)):
+            # its post-load processing runs once per quant method (a guard on
+            # the method, not the module): a reload would keep checkpoint bytes
+            raise RuntimeError(f"direct reload: humming is not supported ({name})")
+
+
 def record_checkpoint_layout(model: torch.nn.Module) -> None:
     """Cold start, before post-load processing: remember each tensor's
-    checkpoint layout. Runs once; reloads reuse the cold-start record."""
-    if getattr(model, "_direct_layout_recorded", False) or is_weights_pre_processed():
+    checkpoint layout and loader metadata, which tensors this model owns (those
+    no other model recorded first), and which parameter names hold checkpoint
+    tensors.
+    Runs once; reloads reuse the cold-start record."""
+    if hasattr(model, "_ckpt_param_names") or is_weights_pre_processed():
         return  # pre-processed weights are already in runtime layout
-    config = get_current_vllm_config_or_none()
-    spec = config.speculative_config if config is not None else None
-    if spec is not None and spec.draft_lm_head_quantization is not None:
-        # after `begin` the draft's quantized lm_head is a view of the target
-        # lm_head's storage: post-load processing would write it there
-        raise RuntimeError("direct reload: draft_lm_head_quantization is not supported")
-    model._direct_layout_recorded = True
-    for _, t in _loadable_tensors(model):
-        if not t.is_meta and not hasattr(t, "_ckpt_layout"):
-            t._ckpt_layout = (tuple(t.shape), t.stride(), t.dtype, t.storage_offset())
+    _check_supported_modules(model)
+    # a model owns the tensors it records first; `begin` refuses a shared one
+    # (a target lm_head in a draft) whose post-load processing re-laid it out
+    model._ckpt_owner = object()  # tags owned tensors (ids of freed ones recur)
+    for _, t in loadable_tensors(model):
+        if not t.is_meta and not hasattr(t, "_ckpt"):
+            attrs = {k: t.__dict__[k] for k in _LOADER_ATTRS if k in t.__dict__}
+            storage = t.untyped_storage().data_ptr()
+            t._ckpt = (model._ckpt_owner, _layout(t), attrs, storage)
+    # Before PWAL, which may pad moe_config; by name, so a dropped param isn't kept.
+    model._ckpt_padding_fill = [
+        (module, name)
+        for module in model.modules()
+        if hasattr(module, "padding_fill_params")
+        for name in module.padding_fill_params()
+    ]
+    # every name, aliases included: post-load processing may replace either
+    model._ckpt_param_names = frozenset(
+        name
+        for name, p in model.named_parameters(remove_duplicate=False)
+        if hasattr(p, "_ckpt")
+    )
+
+
+def _check_params_kept(model: torch.nn.Module) -> None:
+    """Raise if post-load processing registered a new parameter under a
+    checkpoint name: `begin` cannot view it back, and the loader would write
+    checkpoint bytes into its runtime layout."""
+    replaced = [
+        name
+        for name, p in model.named_parameters(remove_duplicate=False)
+        if name in model._ckpt_param_names and not hasattr(p, "_ckpt")
+    ]
+    if replaced:
+        raise RuntimeError(
+            f"direct reload: post-load processing replaced the parameter object "
+            f"of {len(replaced)} checkpoint tensors (e.g. {replaced[:3]}); keep "
+            "it with `replace_parameter` / `retire_parameter` instead"
+        )
+
+
+def _owned(model: torch.nn.Module, t: torch.Tensor) -> bool:
+    ckpt = getattr(t, "_ckpt", None)
+    return ckpt is not None and ckpt[0] is model._ckpt_owner
 
 
 def _checkpoint_views(
@@ -109,24 +179,31 @@ def _checkpoint_views(
     tensor post-load processing re-laid out; raises if a storage cannot
     hold its checkpoint layout."""
     views: list[tuple[torch.Tensor, torch.Tensor]] = []
-    for name, t in _loadable_tensors(model):
-        layout = getattr(t, "_ckpt_layout", None)
-        if layout is None:
+    for name, t in loadable_tensors(model):
+        ckpt = getattr(t, "_ckpt", None)
+        if ckpt is None:
             continue  # no layout: created by post-load processing, derived
-        if (tuple(t.shape), t.stride(), t.dtype, t.storage_offset()) == layout:
+        if _layout(t) == ckpt[1]:
             continue
-        shape, stride, dtype, offset = layout
+        if ckpt[0] is not model._ckpt_owner:
+            # shared from another model (a target lm_head in a draft): this
+            # finish would reprocess bytes a draft update does not resend
+            raise RuntimeError(
+                f"direct reload: {name} is shared from another model and its "
+                "post-load processing changed its layout"
+            )
+        shape, stride, dtype, offset = ckpt[1]
         storage = t.untyped_storage()
-        span = _extent(torch.empty_strided(shape, stride, device="meta"))
+        if storage.data_ptr() != ckpt[3]:  # moved, e.g. `set_` into a fused buffer
+            offset = t.storage_offset()
+        span = 0 if 0 in shape else 1 + sum((n - 1) * s for n, s in zip(shape, stride))
         need = (offset + span) * dtype.itemsize
         if need > storage.nbytes():
             raise RuntimeError(
                 f"direct reload: {name} storage has {storage.nbytes()} bytes, "
                 f"its checkpoint layout needs {need}"
             )
-        view = torch.empty(0, dtype=dtype, device=t.device)
-        view.set_(storage, offset, shape, stride)
-        views.append((t, view))
+        views.append((t, storage_view(storage, offset, shape, stride, dtype)))
     return views
 
 
@@ -137,47 +214,52 @@ def begin_direct_reload(model: torch.nn.Module) -> None:
     Everything that can refuse the reload is checked first and raises with
     the model untouched. Once this returns, the model holds checkpoint-layout
     bytes until a finish succeeds."""
-    if not getattr(model, "_direct_layout_recorded", False):
+    if not hasattr(model, "_ckpt_param_names"):
         raise RuntimeError("direct reload: no checkpoint layout was recorded")
+    _check_params_kept(model)
     views = _checkpoint_views(model)
 
     # nothing above modified the model
+    model._direct_reload_begun = True  # one finish per begin
     for t, view in views:
         t.data = view  # no zeroing: the full sync rewrites the checkpoint region
+    for _, t in loadable_tensors(model):
+        if not _owned(model, t):
+            continue
+        for k in _LOADER_ATTRS:
+            t.__dict__.pop(k, None)
+        t.__dict__.update(t._ckpt[2])
+    # Reset padding the loaders skip; erases the checkpoint region, so all is resent.
+    for module, name in model._ckpt_padding_fill:
+        t = module._parameters.get(name)
+        if t is not None and _owned(model, t):
+            t.data.zero_()
     logger.info(
         "direct reload: %d tensors viewed back to checkpoint layout", len(views)
     )
-    for layer in _online_quant_layers(model):
-        stage_layer_for_reload(layer)
-
-
-def _online_quant_layers(model: torch.nn.Module) -> Iterator[torch.nn.Module]:
-    for module in model.modules():
-        if getattr(getattr(module, "quant_method", None), "uses_meta_device", False):
-            yield module
 
 
 @torch.no_grad()
-def finish_direct_reload(model: torch.nn.Module, model_config) -> None:
+def finish_direct_reload(
+    model: torch.nn.Module, model_config: ModelConfig, device: torch.device
+) -> None:
     """Rerun cold-start post-load processing."""
     from vllm.model_executor.model_loader.utils import process_weights_after_loading
 
-    torch.accelerator.synchronize()  # engines may write on other streams
-
-    # online-quantized modules: quantize what arrived, or keep the kernel
-    # tensors of one the update left out; their one-shot guard stays, the
-    # rerun below must not quantize the kernel bytes again
-    finalize_layerwise_processing(model, model_config)
-    online = set(_online_quant_layers(model))
+    if not model.__dict__.pop("_direct_reload_begun", False):
+        # e.g. a retry after a failed finish, which may have processed some
+        # modules already: only a new full update repairs the model
+        raise RuntimeError(
+            "direct reload: finish without a begin; start a new full update"
+        )
+    if device.type != "cpu":
+        torch.accelerator.synchronize()  # engines may write on other streams
 
     # One-shot "already processed" guards would make the rerun below a no-op
-    # and leave the freshly written checkpoint layout in place.
+    # and leave the freshly written checkpoint layout in place. Only quant
+    # methods' guards: other modules set it for other reasons.
     for module in model.modules():
-        if module not in online:
+        if isinstance(getattr(module, "quant_method", None), QuantizeMethodBase):
             module.__dict__.pop("_already_called_process_weights_after_loading", None)
 
-    device = next(
-        (p.device for p in model.parameters() if p.device.type == "cuda"),
-        torch.accelerator.current_accelerator(),
-    )
     process_weights_after_loading(model, model_config, device)

@@ -46,6 +46,7 @@ from vllm.model_executor.layers.attention import (
 from vllm.model_executor.layers.fused_moe import (
     FusedMoEFactory,
     GateLinear,
+    RoutedScaleMode,
 )
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
@@ -205,7 +206,7 @@ class OpenPanguMoE(nn.Module):
             prefix=f"{prefix}.experts",
             scoring_func="sigmoid",
             routed_scaling_factor=self.routed_scaling_factor,
-            apply_routed_scale_to_output=True,
+            routed_scale_mode=RoutedScaleMode.OUTPUT_FP16_GUARD,
             e_score_correction_bias=self.gate.e_score_correction_bias,
             enable_eplb=self.enable_eplb,
             num_redundant_experts=self.n_redundant_experts,
@@ -505,16 +506,10 @@ class OpenPanguEmbeddedAttention(nn.Module):
         quant_config: QuantizationConfig | None,
     ) -> None:
         is_neox_style = True
-        rope_parameters = config.rope_parameters or {}
-        if rope_parameters is not None and rope_parameters.get(
-            "mrope_interleaved", False
-        ):
-            rope_parameters["rope_type"] = "openpangu"
-
         self.rotary_emb = get_rope(
             self.head_dim,
             max_position=self.max_position_embeddings,
-            rope_parameters=rope_parameters,
+            rope_parameters=config.rope_parameters,
             is_neox_style=is_neox_style,
         )
 
@@ -827,7 +822,7 @@ class OpenPanguDecoderLayer(nn.Module):
                     f"is_causal={config.is_causal} is not support "
                     "for attention with sink"
                 )
-            rope_parameters = getattr(config, "rope_scaling", None)
+            rope_parameters = getattr(config, "rope_parameters", None)
             if rope_parameters is None:
                 rope_parameters = {
                     "rope_type": "default",
@@ -973,13 +968,6 @@ class OpenPanguDecoderLayer(nn.Module):
         return hidden_states, residual
 
 
-def run_post_weight_load(root: nn.Module) -> None:
-    """Rebuild every submodule's weight-derived tensors."""
-    for module in root.modules():
-        if hasattr(module, "post_weight_load"):
-            module.post_weight_load()
-
-
 @support_torch_compile
 class OpenPanguModel(nn.Module):
     fall_back_to_pt_during_load = False
@@ -1093,7 +1081,16 @@ class OpenPanguModel(nn.Module):
             orig_to_new_stacked=stacked,
         )
         loader = AutoWeightsLoader(self)
-        return loader.load_weights(self._filter_spec_layers(weights), mapper=mapper)
+        loaded = loader.load_weights(self._filter_spec_layers(weights), mapper=mapper)
+        self.post_weight_load()
+        return loaded
+
+    def post_weight_load(self) -> None:
+        for _, module in self.named_modules():
+            if module is self:
+                continue
+            if hasattr(module, "post_weight_load"):
+                module.post_weight_load()
 
 
 class OpenPanguModelBase(nn.Module, SupportsPP, SupportsLoRA):
@@ -1162,9 +1159,6 @@ class OpenPanguModelBase(nn.Module, SupportsPP, SupportsLoRA):
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
         return loader.load_weights(weights)
-
-    def process_weights_after_loading(self) -> None:
-        run_post_weight_load(self)
 
 
 class OpenPanguMoEModel(OpenPanguModelBase, MixtureOfExperts):

@@ -395,6 +395,12 @@ class BertModel(nn.Module, SupportsQuant):
     ) -> None:
         super().__init__()
 
+        if vllm_config.model_config.enable_prompt_embeds:
+            raise ValueError(
+                "--enable-prompt-embeds is not supported with BERT/RoBERTa models "
+                "because they encode token type IDs in input_ids."
+            )
+
         self.config = vllm_config.model_config.hf_config
         self.embeddings = embedding_class(self.config)
         self.encoder = BertEncoder(vllm_config=vllm_config, prefix=f"{prefix}.encoder")
@@ -928,11 +934,11 @@ class BertForTokenClassification(nn.Module, SupportsLoRA):
 @attn_type("encoder_only")
 @default_pooling_type(tok_pooling_type="ALL")
 class BertForMaskedLM(nn.Module):
-    """Bert with a masked-language-modeling head on top of ``BertModel``.
+    """Bert with a masked-language-modeling head on top of `BertModel`.
 
     Produces per-token logits over the vocabulary. In vLLM terms this is a
-    token-level pooling model (``tok_pooling_type="ALL"``): the encoder output
-    is projected by the MLM head to ``vocab_size`` logits for every position,
+    token-level pooling model (`tok_pooling_type="ALL"`): the encoder output
+    is projected by the MLM head to `vocab_size` logits for every position,
     and the token pooler returns one vector per token.
     """
 
@@ -975,7 +981,6 @@ class BertForMaskedLM(nn.Module):
             vocab_size=config.vocab_size,
             layer_norm_eps=getattr(config, "layer_norm_eps", 1e-12),
         )
-        self.decoder_in_checkpoint = False
 
         pooler_config = vllm_config.model_config.pooler_config
         assert pooler_config is not None
@@ -988,20 +993,17 @@ class BertForMaskedLM(nn.Module):
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         loader = AutoWeightsLoader(self)
         loaded = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
-        # across load_weights calls (weight-transfer buckets)
-        self.decoder_in_checkpoint |= "mlm_head.decoder.weight" in loaded
-        loaded.add("mlm_head.decoder.weight")
-        return loaded
 
-    def process_weights_after_loading(self) -> None:
         # The MLM decoder shares its weight with the input embeddings. When the
         # checkpoint relies on `tie_word_embeddings` (e.g. google-bert/*) it
         # doesn't ship an explicit decoder weight, so tie it here. Copy the
         # first `vocab_size` rows since VocabParallelEmbedding may pad the vocab.
-        if not self.decoder_in_checkpoint:
+        if "mlm_head.decoder.weight" not in loaded:
             emb = self.bert.embeddings.word_embeddings.weight
             decoder = self.mlm_head.decoder.weight
             decoder.data.copy_(emb.data[: decoder.shape[0]])
+            loaded.add("mlm_head.decoder.weight")
+        return loaded
 
     def forward(
         self,

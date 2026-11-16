@@ -13,7 +13,7 @@ from .mteb_embed_utils import mteb_test_embed_models
 def _fp8_scaled_mm_unsupported() -> bool:
     """Whether the ModernBERT online FP8 test should be skipped.
 
-    ``is_quant_method_supported("fp8")`` returns True on MI250 (gfx90a), but
+    `is_quant_method_supported("fp8")` returns True on MI250 (gfx90a), but
     serving a per-tensor FP8 linear layer on ROCm requires CDNA3+ or RDNA4,
     so treat it as unsupported here.
     """
@@ -39,9 +39,7 @@ MODEL_INFO = EmbedModelInfo(
 
 
 def _assert_modernbert_online_fp8(model) -> None:
-    from vllm.model_executor.layers.quantization.online.fp8 import (
-        Fp8PerTensorOnlineLinearMethod,
-    )
+    from vllm.model_executor.layers.quantization.fp8 import Fp8LinearMethod
 
     layer = model.encoder_layer.layers[0]
     linears = {
@@ -51,7 +49,7 @@ def _assert_modernbert_online_fp8(model) -> None:
         "mlp.Wo": layer.mlp.Wo,
     }
     for name, linear in linears.items():
-        assert isinstance(linear.quant_method, Fp8PerTensorOnlineLinearMethod), (
+        assert isinstance(linear.quant_method, Fp8LinearMethod), (
             f"{name} was not quantized with online FP8"
         )
         if current_platform.is_xpu():
