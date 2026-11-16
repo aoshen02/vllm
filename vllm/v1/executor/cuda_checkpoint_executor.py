@@ -196,6 +196,16 @@ class CUDACheckpointExecutor(MultiprocExecutor):
                     f"all-reduce and NCCL checkpoint configuration: {required}"
                 )
         super().__init__(vllm_config, monitor_workers)
+        # Lock before the first sleep: its host allocations trigger reclaim,
+        # which ages unlocked pages and makes the first restore slow.
+        self._memory_locked = True
+        if not all(self.collective_rpc(_lock_process_memory, timeout=30)):
+            logger.warning_once(
+                "Could not lock worker memory; under host memory pressure "
+                "the first restore after a checkpoint may be slow. Run "
+                "with an unlimited memlock limit, e.g. "
+                "`docker run --ulimit memlock=-1`."
+            )
 
     def _record(self, **event):
         event["monotonic_s"] = time.monotonic()
@@ -308,15 +318,6 @@ class CUDACheckpointExecutor(MultiprocExecutor):
         if self._checkpoint is None:
             self._checkpoint = CudaProcessCheckpoint(self._record)
         try:
-            if not self._memory_locked:
-                self._memory_locked = True
-                if not all(self.collective_rpc(_lock_process_memory, timeout=30)):
-                    logger.warning_once(
-                        "Could not lock worker memory; under host memory pressure "
-                        "the first restore after a checkpoint may be slow. Run "
-                        "with an unlimited memlock limit, e.g. "
-                        "`docker run --ulimit memlock=-1`."
-                    )
             if self._use_nccl_suspend:
                 self.collective_rpc(
                     _validate_nccl_checkpoint, args=(False,), timeout=30
