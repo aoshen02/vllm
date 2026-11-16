@@ -345,11 +345,13 @@ def test_worker_memory_locked_before_first_sleep(executor, locked, warned):
 
 
 @pytest.mark.parametrize(
-    "limit,mlockall_calls",
-    [(-1, 1), (8 << 20, 0)],
-    ids=["unlimited", "limited"],
+    "ats,limit,locked,mlockall_calls",
+    [(True, -1, True, 1), (True, 8 << 20, False, 0), (False, -1, True, 0)],
+    ids=["ats-unlimited", "ats-limited", "no-ats"],
 )
-def test_lock_process_memory_respects_memlock_limit(limit, mlockall_calls):
+def test_lock_process_memory_only_on_ats_with_unlimited_memlock(
+    ats, limit, locked, mlockall_calls
+):
     import resource
 
     from vllm.v1.executor.cuda_checkpoint_executor import _lock_process_memory
@@ -358,10 +360,14 @@ def test_lock_process_memory_respects_memlock_limit(limit, mlockall_calls):
     libc.mlockall.return_value = 0
     limit = resource.RLIM_INFINITY if limit == -1 else limit
     with (
+        patch(
+            "vllm.v1.executor.cuda_checkpoint_executor._uses_host_page_tables",
+            return_value=ats,
+        ),
         patch("resource.getrlimit", return_value=(limit, limit)),
         patch("ctypes.CDLL", return_value=libc),
     ):
-        assert _lock_process_memory(None) == bool(mlockall_calls)
+        assert _lock_process_memory(None) == locked
     assert libc.mlockall.call_count == mlockall_calls
     if mlockall_calls:
         # MCL_CURRENT | MCL_FUTURE | MCL_ONFAULT: lock on touch, never prefault.

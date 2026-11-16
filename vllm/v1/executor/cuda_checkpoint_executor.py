@@ -46,20 +46,40 @@ def _validate_nccl_checkpoint(worker, suspended):
         )
 
 
+def _uses_host_page_tables() -> bool:
+    import ctypes
+
+    import torch
+
+    cuda = ctypes.CDLL("libcuda.so.1")
+    device, value = ctypes.c_int(), ctypes.c_int()
+    # CU_DEVICE_ATTRIBUTE_PAGEABLE_MEMORY_ACCESS_USES_HOST_PAGE_TABLES
+    attribute = 100
+    return (
+        cuda.cuDeviceGet(ctypes.byref(device), torch.cuda.current_device()) == 0
+        and cuda.cuDeviceGetAttribute(ctypes.byref(value), attribute, device) == 0
+        and value.value == 1
+    )
+
+
 def _lock_process_memory(worker) -> bool:
     """Keep the worker's host pages locked once touched.
 
     On ATS systems such as Grace, the GPU reaches host memory through the CPU
     page tables. Under host memory pressure, reclaim ages unlocked pages, and
     restore then pays one SMMU invalidation per aged page (10-15 s instead of
-    3 s on GB300). Locked pages are not aged. MCL_ONFAULT locks pages as they
-    are touched, so nothing is prefaulted. MCL_FUTURE makes later mappings
-    count against RLIMIT_MEMLOCK, so lock only when that limit cannot make
-    allocations fail.
+    3 s on GB300). Locked pages are not aged. Other systems do not lock.
+
+    MCL_ONFAULT locks pages as they are touched, so nothing is prefaulted;
+    locked pages cannot be reclaimed or swapped until the worker exits.
+    MCL_FUTURE makes later mappings count against RLIMIT_MEMLOCK, so lock only
+    when that limit is unlimited; a finite limit opts out.
     """
     import ctypes
     import resource
 
+    if not _uses_host_page_tables():
+        return True
     if resource.getrlimit(resource.RLIMIT_MEMLOCK)[0] != resource.RLIM_INFINITY:
         return False
     mcl_current, mcl_future, mcl_onfault = 1, 2, 4
