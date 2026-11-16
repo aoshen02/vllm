@@ -65,7 +65,6 @@ def _model_tensor_ptrs(worker) -> dict[str, int]:
 def test_reload_keeps_moe_output(
     model: str, moe_backend: str, compare_outputs: bool, vllm_runner, monkeypatch
 ) -> None:
-    monkeypatch.setenv("VLLM_RELOAD_MODE", "direct")
     monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
     with vllm_runner(
         model,

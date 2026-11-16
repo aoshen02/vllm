@@ -708,9 +708,9 @@ def measure_kv_cache_blocks(
     return num_blocks
 
 
-# A layerwise weight update holds a layer's checkpoint-format copy while weight
-# processing (format conversion, padding, shuffles) allocates around as much
-# again, or twice that, before the result is copied into place.
+# Rerunning a layer's weight processing (format conversion, padding, shuffles)
+# on a weight update allocates up to a few copies of its checkpoint-format
+# size before the result is copied into place.
 WEIGHT_UPDATE_PEAK_LAYER_FACTOR = 3
 
 
@@ -722,7 +722,7 @@ def kv_cache_lent_for_weight_update(
     reclaimable: bool,
     fail_if_short: bool,
 ) -> Generator[None]:
-    """Make room for a layerwise weight update of model within the context.
+    """Make room for a weight update of model within the context.
 
     Only an extensible KV cache (kv_cache, None for a standard one) leaves
     the free memory short, since it keeps free just the transients warmup

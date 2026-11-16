@@ -243,11 +243,9 @@ class _Model(torch.nn.Module):
         self.experts.requantize_block_fp8()
 
 
-@pytest.mark.parametrize("mode", ["layerwise", "direct"])
-def test_reload_requantizes_into_the_kernel_tensors(monkeypatch, mode):
+def test_reload_requantizes_into_the_kernel_tensors():
     """A reload writes the block-FP8 shards and finishes with the model's
     process_weights_after_loading; the kernel tensors keep their storage."""
-    monkeypatch.setenv("VLLM_RELOAD_MODE", mode)
     model_config = SimpleNamespace(
         word_embeddings_untied_by_checkpoint=False, quantization=None
     )
@@ -269,9 +267,6 @@ def test_reload_requantizes_into_the_kernel_tensors(monkeypatch, mode):
     start_reload(model)
     _load_shuffled(experts, ckpt, seed=1)
     _load_shared(experts, shared_ckpt)
-    # Every loaded tensor is in, so the layer is not meta any more: the derived
-    # kernel scales do not count as missing loads.
-    assert not experts.w13_weight.is_meta
     finish_reload(model, model_config, device)  # type: ignore[arg-type]
 
     _assert_layout(_routed(experts), _expected_routed(ckpt))

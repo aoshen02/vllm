@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Direct weight reload (`VLLM_RELOAD_MODE=direct`).
+"""Direct weight reload.
 
 Cold start records each tensor's checkpoint layout before post-load processing
 (PWAL). `begin` views re-laid-out tensors back to that layout on their
@@ -18,7 +18,6 @@ from collections.abc import Iterator
 
 import torch
 
-import vllm.envs as envs
 from vllm.config import ModelConfig
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
@@ -32,7 +31,6 @@ logger = init_logger(__name__)
 __all__ = [
     "begin_direct_reload",
     "direct_reload_active",
-    "direct_reload_enabled",
     "finish_direct_reload",
     "loadable_tensors",
     "record_checkpoint_layout",
@@ -53,11 +51,6 @@ _LOADER_ATTRS = (
     "packed_factor",
     "pack_factor",
 )
-
-
-def direct_reload_enabled() -> bool:
-    """Whether weight updates reload in place (`VLLM_RELOAD_MODE=direct`)."""
-    return envs.VLLM_RELOAD_MODE == "direct"
 
 
 def direct_reload_active(model: torch.nn.Module) -> bool:
@@ -85,34 +78,6 @@ def loadable_tensors(model: torch.nn.Module) -> Iterator[tuple[str, torch.Tensor
             yield (f"{module_name}.{name}" if module_name else name), tensor
 
 
-def _check_supported_modules(model: torch.nn.Module) -> None:
-    # config-level refusals: VllmConfig._verify_direct_reload_compat
-    from vllm.model_executor.layers.quantization.humming import (
-        HummingLinearMethod,
-        HummingMoEMethod,
-    )
-    from vllm.model_executor.layers.quantization.online.fp8 import OnlineLinearBase
-    from vllm.model_executor.layers.quantization.online.moe_base import (
-        OnlineMoEMethodBase,
-    )
-
-    for name, module in model.named_modules():
-        method = getattr(module, "quant_method", None)
-        # also without an online config (experts_int8); fused shared experts
-        # quantize staging parameters that post-load processing deletes
-        if isinstance(method, (OnlineLinearBase, OnlineMoEMethodBase)) or (
-            getattr(module, "shared_expert_online_loader", None) is not None
-        ):
-            raise RuntimeError(
-                f"direct reload: online quantization is not supported "
-                f"({name}: {type(method).__name__})"
-            )
-        if isinstance(method, (HummingLinearMethod, HummingMoEMethod)):
-            # its post-load processing runs once per quant method (a guard on
-            # the method, not the module): a reload would keep checkpoint bytes
-            raise RuntimeError(f"direct reload: humming is not supported ({name})")
-
-
 def record_checkpoint_layout(model: torch.nn.Module) -> None:
     """Cold start, before post-load processing: remember each tensor's
     checkpoint layout and loader metadata, which tensors this model owns (those
@@ -121,7 +86,6 @@ def record_checkpoint_layout(model: torch.nn.Module) -> None:
     Runs once; reloads reuse the cold-start record."""
     if hasattr(model, "_ckpt_param_names") or is_weights_pre_processed():
         return  # pre-processed weights are already in runtime layout
-    _check_supported_modules(model)
     # a model owns the tensors it records first; `begin` refuses a shared one
     # (a target lm_head in a draft) whose post-load processing re-laid it out
     model._ckpt_owner = object()  # tags owned tensors (ids of freed ones recur)

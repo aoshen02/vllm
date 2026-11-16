@@ -305,7 +305,6 @@ class TestNCCLEngineParsing:
         import vllm.distributed.weight_transfer.nccl_engine as nccl_engine_mod
         import vllm.model_executor.model_loader.reload as reload_mod
 
-        monkeypatch.setenv("VLLM_RELOAD_MODE", "direct")
         monkeypatch.setattr(
             nccl_engine_mod, "worker_init_process_group", lambda info, pc: MagicMock()
         )
@@ -365,8 +364,7 @@ class TestNCCLEngineParsing:
         assert [c[0] for c in calls] == ["start", "plan", "start"]
         assert engine._plan is None
 
-    @pytest.mark.parametrize("refusal", ["layerwise", "eplb"])
-    def test_use_load_plan_refusal_at_init_leaves_the_model(self, monkeypatch, refusal):
+    def test_use_load_plan_refusal_at_init_leaves_the_model(self, monkeypatch):
         """A configuration no plan supports is refused at init, after the
         group forms (then destroyed) and before any `start_reload` changes the
         model."""
@@ -375,9 +373,6 @@ class TestNCCLEngineParsing:
             record_checkpoint_layout,
         )
 
-        monkeypatch.setenv(
-            "VLLM_RELOAD_MODE", "layerwise" if refusal == "layerwise" else "direct"
-        )
         group = MagicMock()
         monkeypatch.setattr(
             nccl_engine_mod, "worker_init_process_group", lambda info, pc: group
@@ -385,17 +380,15 @@ class TestNCCLEngineParsing:
         model = _module_with(("w", torch.arange(6.0).view(2, 3)))
         record_checkpoint_layout(model)
         model.w.data = model.w.data.t()  # post-load processing re-laid it out
-        if refusal == "eplb":
-            parallel = SimpleNamespace(enable_eplb=True)
-            model.moe_config = SimpleNamespace(moe_parallel_config=parallel)
+        parallel = SimpleNamespace(enable_eplb=True)
+        model.moe_config = SimpleNamespace(moe_parallel_config=parallel)
         engine = NCCLWeightTransferEngine(
             WeightTransferConfig(backend="nccl"),
             create_mock_vllm_config(),
             torch.device("cpu"),
             model,
         )
-        match = "VLLM_RELOAD_MODE=direct" if refusal == "layerwise" else "EPLB"
-        with pytest.raises(RuntimeError, match=match):
+        with pytest.raises(RuntimeError, match="EPLB"):
             engine.init_transfer_engine(
                 NCCLWeightTransferInitInfo(
                     master_address="127.0.0.1",
@@ -408,8 +401,7 @@ class TestNCCLEngineParsing:
             )
         group.destroy.assert_called_once()
         assert engine.model_update_group is None
-        assert model.w.device.type == "cpu"  # not moved to meta (layerwise)
-        assert model.w.shape == (3, 2)  # not viewed back (direct)
+        assert model.w.shape == (3, 2)  # not viewed back
         assert not hasattr(model, "_direct_reload_begun")
 
     @pytest.mark.parametrize("draft", [False, True])

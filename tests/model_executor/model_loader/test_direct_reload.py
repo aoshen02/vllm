@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Direct weight reload (`VLLM_RELOAD_MODE=direct`) on a toy model whose
+"""Direct weight reload on a toy model whose
 post-load processing has the hazards found on real models:
 
 (a) a parent derives a separate tensor from a child's weight (MLA W_UK/W_UV
@@ -22,13 +22,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from vllm.config import VllmConfig
 from vllm.model_executor.layers.linear import MergedColumnParallelLinear
 from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
-from vllm.model_executor.layers.quantization.online.base import OnlineQuantizationConfig
-from vllm.model_executor.layers.quantization.online.fp8 import (
-    Fp8PerTensorOnlineLinearMethod,
-)
 from vllm.model_executor.model_loader.reload import finish_reload, start_reload
 from vllm.model_executor.model_loader.reload.direct import (
     begin_direct_reload,
@@ -250,11 +245,6 @@ def _runs(model: _ToyModel) -> dict[str, int]:
     }
 
 
-@pytest.fixture(autouse=True)
-def _direct_mode(monkeypatch):
-    monkeypatch.setenv("VLLM_RELOAD_MODE", "direct")
-
-
 class TestReloadEqualsColdStart:
     def test_same_checkpoint_is_bit_identical(self):
         model = _cold_start(_checkpoint())
@@ -329,48 +319,6 @@ class TestRefusals:
         with pytest.raises(RuntimeError, match="checkpoint layout needs"):
             begin_direct_reload(model)
         _assert_same(_state(model), before, addresses=True)
-
-    def test_online_quantization_refused(self, monkeypatch):
-        # finish clears the guard that keeps online quantization from
-        # quantizing its converted bytes again
-        online = object.__new__(Fp8PerTensorOnlineLinearMethod)
-        init = _ToyModel.__init__
-
-        def with_online_layer(self):
-            init(self)
-            self.proj.quant_method = online
-
-        monkeypatch.setattr(_ToyModel, "__init__", with_online_layer)
-        with pytest.raises(RuntimeError, match="online quantization"):
-            _cold_start(_checkpoint())
-
-    def test_online_shared_experts_refused(self, monkeypatch):
-        # post-load processing deletes the staging parameters a reload loads
-        init = _ToyModel.__init__
-
-        def with_online_shared_experts(self):
-            init(self)
-            self.proj.shared_expert_online_loader = object()
-
-        monkeypatch.setattr(_ToyModel, "__init__", with_online_shared_experts)
-        with pytest.raises(RuntimeError, match="online quantization"):
-            _cold_start(_checkpoint())
-
-    @pytest.mark.parametrize("method_cls", ["HummingLinearMethod", "HummingMoEMethod"])
-    def test_humming_refused(self, monkeypatch, method_cls):
-        # its post-load processing runs only once per quant method
-        from vllm.model_executor.layers.quantization import humming as humming_mod
-
-        humming = object.__new__(getattr(humming_mod, method_cls))
-        init = _ToyModel.__init__
-
-        def with_humming_layer(self):
-            init(self)
-            self.proj.quant_method = humming
-
-        monkeypatch.setattr(_ToyModel, "__init__", with_humming_layer)
-        with pytest.raises(RuntimeError, match="humming"):
-            _cold_start(_checkpoint())
 
     def test_replaced_param_refused(self):
         # a new Parameter under a checkpoint name has no checkpoint layout:
@@ -525,108 +473,3 @@ def test_replace_parameter_keeps_the_target_checkpoint_layout():
     ckpt = model.proj.weight._ckpt
     replace_parameter(model.proj, "weight", model.mimo.weight)
     assert model.proj.weight._ckpt == ckpt
-
-
-def _config(**overrides) -> SimpleNamespace:
-    offload = SimpleNamespace(
-        offload_backend="auto",
-        prefetch=SimpleNamespace(offload_group_size=0),
-        uva=SimpleNamespace(cpu_offload_gb=0),
-    )
-    fields = dict(
-        offload_config=offload,
-        model_config=SimpleNamespace(quantization=None),
-        quant_config=None,
-        lora_config=None,
-        speculative_config=None,
-        weight_transfer_config=None,
-    )
-    return SimpleNamespace(**(fields | overrides))
-
-
-_ONLINE = object.__new__(OnlineQuantizationConfig)
-
-
-@pytest.mark.parametrize(
-    "mode,overrides,match",
-    [
-        ("direct", {}, None),
-        ("layerwise", {"lora_config": object()}, None),
-        (
-            "direct",
-            {
-                "offload_config": SimpleNamespace(
-                    offload_backend="uva",
-                    prefetch=SimpleNamespace(offload_group_size=0),
-                    uva=SimpleNamespace(cpu_offload_gb=0),
-                )
-            },
-            "weight offloading",
-        ),
-        (
-            "direct",
-            {
-                "offload_config": SimpleNamespace(
-                    offload_backend="auto",
-                    prefetch=SimpleNamespace(offload_group_size=2),
-                    uva=SimpleNamespace(cpu_offload_gb=0),
-                )
-            },
-            "weight offloading",
-        ),
-        (
-            "direct",
-            {
-                "offload_config": SimpleNamespace(
-                    offload_backend="auto",
-                    prefetch=SimpleNamespace(offload_group_size=0),
-                    uva=SimpleNamespace(cpu_offload_gb=1),
-                )
-            },
-            "weight offloading",
-        ),
-        (
-            "direct",
-            {"model_config": SimpleNamespace(quantization="torchao")},
-            "torchao",
-        ),
-        ("direct", {"quant_config": _ONLINE}, "online quantization"),
-        (
-            "direct",
-            {"quant_config": SimpleNamespace(online_quantization_config=_ONLINE)},
-            "online quantization",
-        ),
-        ("direct", {"lora_config": object()}, "LoRA"),
-        (
-            "direct",
-            {"speculative_config": SimpleNamespace(draft_lm_head_quantization="fp8")},
-            "draft_lm_head_quantization",
-        ),
-        (
-            "direct",
-            {"weight_transfer_config": SimpleNamespace(backend="sharded_rdt")},
-            "sharded_rdt",
-        ),
-    ],
-    ids=[
-        "defaults",
-        "layerwise-lora",
-        "offload-backend",
-        "offload-prefetch",
-        "offload-uva",
-        "torchao",
-        "online-config",
-        "online-composed",
-        "lora",
-        "draft-lm-head-quant",
-        "sharded-rdt",
-    ],
-)
-def test_verify_direct_reload_compat(monkeypatch, mode, overrides, match):
-    monkeypatch.setenv("VLLM_RELOAD_MODE", mode)
-    config = _config(**overrides)
-    if match is None:
-        VllmConfig._verify_direct_reload_compat(config)
-    else:
-        with pytest.raises(ValueError, match=match):
-            VllmConfig._verify_direct_reload_compat(config)
