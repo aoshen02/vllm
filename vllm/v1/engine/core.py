@@ -1049,6 +1049,8 @@ class EngineCore:
 
         if mode == "abort":
             self.scheduler.finish_requests(None, RequestStatus.FINISHED_ABORTED)
+        elif mode == "keep" and clear_cache:
+            self.scheduler.abort_kv_transfers()
 
         pause_state = PauseState.PAUSED_ALL if mode == "keep" else PauseState.PAUSED_NEW
         self.scheduler.set_pause_state(pause_state)
@@ -2453,6 +2455,8 @@ class EngineCoreProc(EngineCore):
                 None, RequestStatus.FINISHED_ABORTED
             )
             self._send_abort_outputs(aborted_reqs)
+        elif mode == "keep" and clear_cache:
+            self._send_abort_outputs(self.scheduler.abort_kv_transfers())
 
         pause_state = PauseState.PAUSED_ALL if mode == "keep" else PauseState.PAUSED_NEW
         self.scheduler.set_pause_state(pause_state)

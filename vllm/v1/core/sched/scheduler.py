@@ -3163,6 +3163,17 @@ class Scheduler(SchedulerInterface):
         logger.info("setting pause state to %s", pause_state.name)
         self._pause_state = pause_state
 
+    def abort_kv_transfers(self) -> list[Request]:
+        if self.connector is None:
+            return []
+        self.connector.abort_exports()
+        req_ids = [
+            req.request_id
+            for req in self.kv_holding_waiting
+            if req.status != RequestStatus.WAITING_FOR_STREAMING_REQ
+        ]
+        return self.finish_requests(req_ids, RequestStatus.FINISHED_ABORTED)
+
     def _request_blocks_can_be_freed(self, request: Request) -> bool:
         # We must defer freeing blocks if an async kv connector may
         # write to them immediately (not ordered with GPU stream).
@@ -3292,14 +3303,8 @@ class Scheduler(SchedulerInterface):
                 request = self.running.pop()
                 self._preempt_request(request, timestamp, drop_stale_output=True)
 
+        # KV transfers can still hold blocks; the caller retries on False.
         reset_successful = self.kv_cache_manager.reset_prefix_cache()
-        if reset_running_requests and not reset_successful:
-            raise RuntimeError(
-                "Failed to reset KV cache even when all the running requests are "
-                "preempted and moved to the waiting queue. This is likely due to "
-                "the presence of running requests waiting for remote KV transfer, "
-                "which is not supported yet."
-            )
 
         if reset_connector:
             reset_successful = self.reset_connector_cache() and reset_successful

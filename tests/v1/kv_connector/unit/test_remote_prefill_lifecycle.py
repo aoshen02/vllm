@@ -1194,3 +1194,33 @@ def test_deferred_lookup_does_not_block_parked_load():
         scheduler_output = scheduler.schedule()
         assert req_a.status == RequestStatus.RUNNING
         assert scheduler_output.num_scheduled_tokens[req_a.request_id] > 0
+
+
+def test_reset_prefix_cache_waits_for_aborted_remote_load():
+    """A reset fails softly while a remote load holds blocks; aborting the
+    request frees them once the load settles, and the reset succeeds."""
+    vllm_config = create_vllm_config()
+    scheduler = create_scheduler(vllm_config)
+    BLOCK_SIZE = vllm_config.cache_config.block_size
+    request = create_request(
+        request_id=1,
+        block_size=BLOCK_SIZE,
+        num_tokens=BLOCK_SIZE * 2,
+        do_remote_prefill=True,
+    )
+    scheduler.add_request(request)
+    scheduler.update_from_output(scheduler.schedule(), EMPTY_MODEL_RUNNER_OUTPUT)
+    assert request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+    assert not scheduler.reset_prefix_cache(reset_running_requests=True)
+
+    assert scheduler.abort_kv_transfers() == [request]
+    # P may still write the blocks until the load settles.
+    assert not scheduler.reset_prefix_cache(reset_running_requests=True)
+
+    scheduler_output = scheduler.schedule()
+    model_runner_output = copy.deepcopy(EMPTY_MODEL_RUNNER_OUTPUT)
+    model_runner_output.kv_connector_output = KVConnectorOutput(
+        finished_recving={request.request_id}
+    )
+    scheduler.update_from_output(scheduler_output, model_runner_output)
+    assert scheduler.reset_prefix_cache(reset_running_requests=True)
