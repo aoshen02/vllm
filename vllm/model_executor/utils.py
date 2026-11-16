@@ -98,8 +98,11 @@ def copy_weight_(dst: torch.Tensor, src: torch.Tensor) -> torch.Tensor:
     pageable memory through the CPU page tables (Grace), copying from the same
     pageable pages hundreds of times makes the UVM driver allocate GPU memory,
     in 128 MiB units, that no process owns and that stays until the process
-    exits. Elsewhere, the driver copies a pageable source through its own
-    pinned buffer, so this saves a copy.
+    exits. This needs pinned memory from cudaHostAlloc, PyTorch's default;
+    with pinned_use_cuda_host_register, pinned memory is registered pageable
+    memory and still triggers it. Elsewhere, the driver stages pageable copies
+    through its own pinned buffer, so this saves a host copy only for
+    non-contiguous or dtype-converting sources.
     """
     if src.device.type == "cpu" and dst.device.type == "cuda":
         computed = src.untyped_storage().resizable() and not src.is_pinned()
