@@ -3066,6 +3066,8 @@ class Scheduler(SchedulerInterface):
             request_ids = set(request_ids)
         else:
             request_ids = self.requests.keys()
+            if finished_status == RequestStatus.FINISHED_ABORTED and self.connector:
+                self.connector.abort_exports()
 
         running_requests_to_remove = set()
         waiting_requests_to_remove = []

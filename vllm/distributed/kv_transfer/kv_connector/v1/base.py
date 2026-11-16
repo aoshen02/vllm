@@ -719,6 +719,11 @@ class KVConnectorBase_V1(ABC):
         """Whether pending transfers can release blocks instead of preemption."""
         return False
 
+    def abort_exports(self) -> None:
+        """Abort KV transfers that are not running: free the KV kept for remote
+        readers and fail reads that wait for a prefill."""
+        return
+
     def has_pending_push_work(self) -> bool:
         """Return True if the connector has push-mode work that requires
         the engine main loop to keep stepping (e.g. a P-side request whose

@@ -2159,8 +2159,9 @@ async def test_prefill_side_channel_renews_leases(kv_lease_duration):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("freed_by", ["expiry", "send"])
 @pytest.mark.parametrize("with_live_req", [False, True])
-async def test_pull_after_expiry_fails_without_waiting(with_live_req):
+async def test_pull_after_expiry_fails_without_waiting(with_live_req, freed_by):
     """A pull for KV that P already freed must not wait for a prefill."""
     vllm_config = _make_worker_vllm_config("kv_producer")
     with set_current_vllm_config(vllm_config), patch_worker_dependencies():
@@ -2175,13 +2176,23 @@ async def test_pull_after_expiry_fails_without_waiting(with_live_req):
         sender_loop = producer.sender_loop
         producer.sender_loop = asyncio.get_running_loop()
 
-        producer.reqs_need_send["xfer-expired"] = SendBlockMeta(
+        freed = SendBlockMeta(
             p_req_id="p-req-expired",
             transfer_id="xfer-expired",
             local_block_ids=[[1]],
             ready=asyncio.Event(),
             expire_time=time.perf_counter() - 1,
         )
+        producer.reqs_need_send["xfer-expired"] = freed
+        if freed_by == "send":
+            freed.ready.set()
+            first = _xfer_meta(
+                [_region(0x2000, row_offset=-1, layer_name="model.layers.0.self_attn")],
+                {"d-req-first": ("xfer-expired", [[100]])},
+            )
+            sock = AsyncMock(spec=zmq.asyncio.Socket, send_multipart=AsyncMock())
+            with patch.object(producer, "_send_blocks", return_value=0):
+                await producer.send_kv_to_decode(b"consumer", sock, first)
         assert await producer.fetch_finished_sending_reqs() == {"p-req-expired"}
 
         req_blocks = {"d-req-expired": ("xfer-expired", [[100]])}
@@ -2222,6 +2233,70 @@ async def test_pull_after_expiry_fails_without_waiting(with_live_req):
             assert len(responses) == 1
 
         producer.sender_loop = sender_loop
+        producer.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_producer_frees_kv_held_only_for_decoders():
+    """A request P drops before export fails its pulls at once. An export abort
+    frees exports no send reads, and fails pulls for requests in prefill."""
+    vllm_config = _make_worker_vllm_config("kv_producer")
+    with set_current_vllm_config(vllm_config), patch_worker_dependencies():
+        producer = MooncakeConnector(
+            vllm_config, KVConnectorRole.WORKER, _make_test_kv_cache_config()
+        ).connector_worker
+
+        def meta(**kwargs) -> MooncakeConnectorMetadata:
+            m = MooncakeConnectorMetadata()
+            for k, v in kwargs.items():
+                setattr(m, k, v)
+            return m
+
+        # xfer-early: a pull waits before P aborts it. xfer-live: still in
+        # prefill. xfer-idle / xfer-busy: exported, busy is being sent.
+        early = SendBlockMeta(
+            p_req_id="",
+            transfer_id="xfer-early",
+            local_block_ids=[],
+            ready=asyncio.Event(),
+        )
+        producer.reqs_need_send["xfer-early"] = early
+        await producer.record_send_reqs(
+            meta(
+                reqs_to_send={
+                    f"p-{x}": (f"xfer-{x}", []) for x in ("live", "idle", "busy")
+                }
+            )
+        )
+        await producer.record_send_reqs(
+            meta(
+                reqs_to_send={f"p-{x}": (f"xfer-{x}", [[1]]) for x in ("idle", "busy")},
+                reqs_not_processed={"xfer-early"},
+            )
+        )
+        assert early.ready.is_set()
+        assert "xfer-early" not in producer.reqs_need_send
+        assert "xfer-early" in producer._expired_transfer_ids
+
+        live = producer.reqs_need_send["xfer-live"]
+        producer.reqs_need_send["xfer-busy"].sending = 1
+        await producer.record_send_reqs(meta(abort_exports=True))
+        assert live.ready.is_set()
+        assert "xfer-live" in producer._expired_transfer_ids
+        assert await producer.fetch_finished_sending_reqs() == {"p-idle"}
+        assert set(producer.reqs_need_send) == {"xfer-busy"}
+
+        producer.reqs_need_send["xfer-busy"].sending = 0
+        assert await producer.fetch_finished_sending_reqs() == {"p-busy"}
+        # The dropped request is preempted, rescheduled and finishes later.
+        await producer.record_send_reqs(
+            meta(reqs_to_send={"p-live": ("xfer-live", [])})
+        )
+        await producer.record_send_reqs(
+            meta(reqs_to_send={"p-live": ("xfer-live", [[2]])})
+        )
+        assert not producer.reqs_need_send
+        assert await producer.fetch_finished_sending_reqs() == {"p-live"}
         producer.shutdown()
 
 
