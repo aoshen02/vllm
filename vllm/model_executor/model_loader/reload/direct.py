@@ -100,8 +100,10 @@ def _check_supported_modules(model: torch.nn.Module) -> None:
         method = getattr(module, "quant_method", None)
         # also without an online config (experts_int8); fused shared experts
         # quantize staging parameters that post-load processing deletes
-        if isinstance(method, (OnlineLinearBase, OnlineMoEMethodBase)) or (
-            getattr(module, "shared_expert_online_loader", None) is not None
+        if (
+            getattr(method, "uses_meta_device", False)
+            or isinstance(method, (OnlineLinearBase, OnlineMoEMethodBase))
+            or getattr(module, "shared_expert_online_loader", None) is not None
         ):
             raise RuntimeError(
                 f"direct reload: online quantization is not supported "

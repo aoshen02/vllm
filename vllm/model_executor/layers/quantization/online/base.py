@@ -8,6 +8,7 @@ from typing import Any
 
 import torch
 
+import vllm.envs as envs
 from vllm.config.quantization import (
     _ONLINE_SHORTHANDS,
     QuantizationConfigArgs,
@@ -52,6 +53,9 @@ from vllm.model_executor.layers.quantization.online.int8 import (
 )
 from vllm.model_executor.layers.quantization.online.lm_head import (
     OnlineLMHeadMethodBase,
+)
+from vllm.model_executor.layers.quantization.online.loading import (
+    checkpoint_method,
 )
 from vllm.model_executor.layers.quantization.online.lut_b import (
     LutBOnlineMoEMethod,
@@ -496,7 +500,7 @@ class OnlineQuantizationConfig(QuantizationConfig):
         )
 
     def get_quant_method(
-        self, layer: torch.nn.Module, prefix: str
+        self, layer: torch.nn.Module, prefix: str, requantize: bool = False
     ) -> "QuantizeMethodBase | None":
         # `targets` takes precedence over `moe` and `linear` and is exclusive.
         resolved = self.resolve_quant_method_cls(type(layer), prefix)
@@ -510,6 +514,13 @@ class OnlineQuantizationConfig(QuantizationConfig):
                 target_pattern,
             )
             assert issubclass(quant_method_cls, (OnlineMoEMethodBase, OnlineLinearBase))
+            default = getattr(quant_method_cls, "activation_quant_key", None)
+            if (
+                not requantize
+                and envs.VLLM_RELOAD_MODE == "direct"
+                and (method := checkpoint_method(layer, quant_spec, default))
+            ):
+                return method
             kwargs = {}
             if quant_method_cls.accepts_activation_override:
                 kwargs["activation_quant_key"] = quant_spec.activation
