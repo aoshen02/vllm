@@ -319,6 +319,12 @@ class EngineCoreOutput(
     # for array_like compatibility.
     watermarking: bool | None = None
 
+    # Shared-object keys of a stopped session request's routed experts and
+    # the version segments of their names. Appended last for array_like
+    # compatibility.
+    aux_output_keys: list[str] | None = None
+    aux_version_segments: list[tuple[int, str | None]] | None = None
+
     @property
     def finished(self) -> bool:
         return self.finish_reason is not None
