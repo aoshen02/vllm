@@ -48,6 +48,7 @@ from vllm.model_executor.layers.quantization.utils.ocp_mx_utils import (
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
+    gather_rows,
     kFp8Dynamic128Sym,
     kFp8StaticTensorSym,
     kInt4Static32,
@@ -136,13 +137,18 @@ def _swizzle_cutlass_mxfp4_scales(scale: torch.Tensor) -> torch.Tensor:
         swizzle_mxfp4_scales,
     )
 
-    n, scale_k = scale.shape[1:]
-    return torch.stack(
-        [swizzle_mxfp4_scales(s, n, scale_k * 32).reshape(n, scale_k) for s in scale]
-    )
+    e, n, scale_k = scale.shape
+    return swizzle_mxfp4_scales(scale, n, scale_k * 32).reshape(e, n, scale_k)
 
 
 class Mxfp4MoeBackend(Enum):
+    # No oracle-selected kernel backend. Used for:
+    # - Quark OCP-MX MoE schemes without an oracle backend, which fall back to
+    #   EMULATION (`QuarkOCP_MX_MoEMethod`);
+    # - online MXFP4 with no kernel, which only quantizes and pads the weights
+    #   (`Mxfp4OnlineMoEMethod`, `Mxfp4MoEMethod` skip kernel setup);
+    # - requantization sources (checkpoint methods that only dequantize weights
+    #   for an online method), see `MoEKernelOracle.placeholder_backend`.
     NONE = "None"
     # b12x backends
     B12X_MXFP4_MXFP8 = "B12X_MXFP4_MXFP8"
@@ -372,7 +378,7 @@ def map_mxfp4_backend(runner_backend: MoEBackend) -> list[Mxfp4MoeBackend]:
     """Map a moe_backend string to its candidate Mxfp4MoeBackends.
 
     Vendor families return all activation variants; the caller picks one
-    via ``activation_key`` and ``is_supported_config``.
+    via `activation_key` and `is_supported_config`.
     """
     mapping: dict[str, list[Mxfp4MoeBackend]] = {
         "b12x": list(B12X_BACKENDS),
@@ -461,7 +467,7 @@ def _get_priority_backends_for_gpt_oss() -> list[Mxfp4MoeBackend]:
 def _get_priority_backends() -> list[Mxfp4MoeBackend]:
     """Get available backends in priority order. SM100+ prefers DeepGEMM FP4 /
     TRTLLM MXFP8; SM90 falls through to Humming or Marlin (the
-    backend-level ``is_supported_config`` check filters by device capability).
+    backend-level `is_supported_config` check filters by device capability).
     """
     if current_platform.is_rocm():
         return [
@@ -520,8 +526,8 @@ def _user_moe_activation_override_is_set() -> bool:
 def _resolve_activation_key(
     model_activation_key: QuantKey | None,
 ) -> QuantKey | None:
-    """Apply ``--quantization-config.moe.activation`` to the checkpoint's
-    activation key. An explicit override wins, ``null`` included (BF16)."""
+    """Apply `--quantization-config.moe.activation` to the checkpoint's
+    activation key. An explicit override wins, `null` included (BF16)."""
     user_override = _user_moe_activation_override()
     if user_override is None and not _user_moe_activation_override_is_set():
         return model_activation_key
@@ -561,22 +567,30 @@ def _humming_input_schema(model_activation_key: QuantKey | None):
     return quant_key_to_input_schema(activation_key)
 
 
-def _warn_on_bf16_fallback(
+def _applies_requested_activation(
     backend: Mxfp4MoeBackend, requested_activation_key: QuantKey | None
-) -> None:
+) -> bool:
+    """Whether `backend` quantizes activations to the requested key itself
+    rather than to a key of its own."""
     # Humming quantizes activations itself to the user's override.
-    applies_request = backend == Mxfp4MoeBackend.EMULATION or (
+    return backend == Mxfp4MoeBackend.EMULATION or (
         backend == Mxfp4MoeBackend.HUMMING
         and requested_activation_key == _user_moe_activation_override()
     )
+
+
+def _warn_on_bf16_fallback(
+    backend: Mxfp4MoeBackend, requested_activation_key: QuantKey | None
+) -> None:
     if (
         requested_activation_key is not None
-        and not applies_request
+        and not _applies_requested_activation(backend, requested_activation_key)
         and _backend_activation_key(backend) is None
     ):
         logger.warning_once(
             "No Mxfp4 MoE backend supports activation=%s for the deployment "
-            "configuration. Falling back to '%s' with BF16 activations.",
+            "configuration. Falling back to '%s' with BF16 activations. Set "
+            "VLLM_STRICT_QUANT_SCHEME=1 to forbid this fallback.",
             requested_activation_key,
             backend.value,
         )
@@ -586,6 +600,7 @@ class Mxfp4MoEKernelOracle(MoEKernelOracle[Mxfp4MoeBackend]):
     """MXFP4 MoE backend selection for one deployment configuration."""
 
     name = "Mxfp4"
+    placeholder_backend = Mxfp4MoeBackend.NONE
 
     def backend_to_kernel_cls(
         self, backend: Mxfp4MoeBackend
@@ -621,10 +636,11 @@ def _filter_by_activation(
     backends: list[Mxfp4MoeBackend],
     requested_activation_key: QuantKey | None,
 ) -> list[Mxfp4MoeBackend]:
-    """Pick variants matching ``requested_activation_key``, followed by BF16
-    variants as a higher-precision fallback; without one, prefer BF16 if the
-    list has any, else keep the list as-is so explicit non-BF16 picks (e.g.
-    the ``_afp8`` aliases) still land."""
+    """Pick variants matching `requested_activation_key`, followed by BF16
+    variants as a higher-precision fallback unless VLLM_STRICT_QUANT_SCHEME
+    forbids it; without one, prefer BF16 if the list has any, else keep the
+    list as-is so explicit non-BF16 picks (e.g. the `_afp8` aliases) still
+    land."""
     bf16 = [b for b in backends if _backend_activation_key(b) is None]
     if requested_activation_key is not None:
         matching = [
@@ -633,6 +649,12 @@ def _filter_by_activation(
             if _backend_activation_key(b) == requested_activation_key
             or b == Mxfp4MoeBackend.EMULATION
         ]
+        if envs.VLLM_STRICT_QUANT_SCHEME:
+            bf16 = [
+                b
+                for b in bf16
+                if _applies_requested_activation(b, requested_activation_key)
+            ]
         return matching + [b for b in bf16 if b not in matching]
     return bf16 if bf16 else backends
 
@@ -644,7 +666,10 @@ def _get_requested_backends(
     backends = map_mxfp4_backend(runner_backend)
     if runner_backend == "b12x":
         if envs.VLLM_B12X_MOE_FP4_FORCE_A16:
-            return [Mxfp4MoeBackend.B12X_MXFP4_BF16]
+            backends = [Mxfp4MoeBackend.B12X_MXFP4_BF16]
+            if requested_activation_key is None:
+                return backends
+            return _filter_by_activation(backends, requested_activation_key)
         # W4A8 is the high-throughput b12x path and is preferred when the
         # model does not request an activation format. Keep this as backend
         # policy instead of exposing a separate backend name per precision.
@@ -667,8 +692,14 @@ def select_mxfp4_moe_backend(
             Use kFp8StaticTensorSym for W4A8 scheme.
 
     Note: Shape-specific fallbacks may still occur at runtime.
+    Returns `NONE` and a placeholder experts class for requantization sources.
 
     """
+    # TODO: migrate to oracle base method.
+    source = Mxfp4MoEKernelOracle.maybe_skip_for_requantization_source()
+    if source is not None:
+        return source
+
     runner_backend = config.moe_backend
     requested_activation_key = _resolve_activation_key(activation_key)
 
@@ -684,9 +715,14 @@ def select_mxfp4_moe_backend(
                 for b in requested_backends
             ]
         if not requested_backends:
+            strict = (
+                " (VLLM_STRICT_QUANT_SCHEME=1 forbids running it with BF16 activations)"
+                if envs.VLLM_STRICT_QUANT_SCHEME
+                else ""
+            )
             raise ValueError(
                 f"moe_backend={runner_backend!r} does not support "
-                f"activation={requested_activation_key}"
+                f"activation={requested_activation_key}{strict}"
             )
         oracle = Mxfp4MoEKernelOracle(config, kMxfp4Static, requested_activation_key)
         last_error: Exception | None = None
@@ -731,7 +767,9 @@ def select_mxfp4_moe_backend(
             return backend, kernel_cls
         unsupported_reasons.extend((backend, reason) for _, reason in rejected)
 
-    if current_platform.is_xpu():
+    if current_platform.is_xpu() and not (
+        envs.VLLM_STRICT_QUANT_SCHEME and requested_activation_key is not None
+    ):
         return oracle.return_or_raise(
             Mxfp4MoeBackend.XPU,
             kernel_classes=_requested_kernel_cls(Mxfp4MoeBackend.XPU, config),
@@ -758,7 +796,13 @@ def select_deepseek_v4_mxfp4_moe_backend(
 ) -> tuple[Mxfp4MoeBackend, type[mk.FusedMoEExperts] | None]:
     """Select the MXFP4 MoE backend with MXFP8 activation as top priority.
     Falls back through BF16 and other backends.
+    Returns `NONE` and a placeholder experts class for requantization sources.
     """
+    # TODO: migrate to oracle base method.
+    source = Mxfp4MoEKernelOracle.maybe_skip_for_requantization_source()
+    if source is not None:
+        return source
+
     activation_format = config.activation_format
 
     # Honor explicit moe_backend (e.g. "marlin", "triton_unfused") before
@@ -1011,121 +1055,44 @@ def convert_gpt_oss_weight_to_mxfp4_moe_kernel_format(
         w13_bias = w13_bias.data.to(torch.float32)
         w2_bias = w2_bias.data.to(torch.float32)
 
-        # Swap w1 and w3 as the definition of swiglu is different in trtllm-gen
-        def swap_every_two_rows(x, axis=-1):
-            shape = x.shape
-            if axis < 0:
-                axis = len(shape) + axis
-            new_shape = list(shape)
-            new_shape[axis] = shape[axis] // 2
-            new_shape.insert(axis + 1, 2)
-            x = x.reshape(*new_shape)
-            x = x.flip(axis + 1)
-            new_shape = list(shape)
-            return x.reshape(*new_shape)
-
-        w13_weight_scale = swap_every_two_rows(w13_weight_scale, -2)
-        w13_weight = swap_every_two_rows(w13_weight, -2)
-        w13_bias = swap_every_two_rows(w13_bias, -1)
-
-        # Shuffle weights and scaling factors for transposed mma output
-        gemm1_weights_shuffled = []
-        gemm1_scales_shuffled = []
-        gemm2_weights_shuffled = []
-        gemm2_scales_shuffled = []
-        gemm1_bias_shuffled = []
-        gemm2_bias_shuffled = []
+        # trtllm-gen's swiglu takes w3 before w1: swap every two rows of w13,
+        # then shuffle for transposed mma output. Every expert has the same
+        # shape, so one index (swap folded in) gathers all experts at once.
+        dev = w13_weight.device
         epilogue_tile_m = 128
-        for i in range(num_experts):
-            # w13 weight
-            permute_indices = get_w2_permute_indices_with_cache(
-                _cache_permute_indices,
-                w13_weight[i].view(torch.uint8),
-                epilogue_tile_m,
-            )
-            gemm1_weights_shuffled.append(
-                w13_weight[i]
-                .view(torch.uint8)[permute_indices.to(w13_weight.device)]
-                .contiguous()
-            )
-            # w13 scale
-            permute_sf_indices = get_w2_permute_indices_with_cache(
-                _cache_permute_indices,
-                w13_weight_scale[i].view(torch.uint8),
-                epilogue_tile_m,
-                num_elts_per_sf=16,
-            )
-            gemm1_scales_shuffled.append(
-                nvfp4_block_scale_interleave(
-                    w13_weight_scale[i]
-                    .view(torch.uint8)[permute_sf_indices.to(w13_weight_scale.device)]
-                    .contiguous()
-                )
-            )
-            # w13 bias
-            permute_bias_indices = get_w2_permute_indices_with_cache(
-                _cache_permute_indices,
-                w13_bias[i].clone().reshape(-1, 1),
-                epilogue_tile_m,
-            )
-            gemm1_bias_shuffled.append(
-                w13_bias[i]
-                .clone()
-                .reshape(-1, 1)[permute_bias_indices.to(w13_bias.device)]
-                .contiguous()
-            )
-            # w2 weight
-            permute_indices = get_w2_permute_indices_with_cache(
-                _cache_permute_indices,
-                w2_weight[i].view(torch.uint8),
-                epilogue_tile_m,
-            )
-            gemm2_weights_shuffled.append(
-                w2_weight[i]
-                .view(torch.uint8)[permute_indices.to(w2_weight.device)]
-                .contiguous()
-            )
-            # w2 scale
-            permute_sf_indices = get_w2_permute_indices_with_cache(
-                _cache_permute_indices,
-                w2_weight_scale[i].view(torch.uint8),
-                epilogue_tile_m,
-                num_elts_per_sf=16,
-            )
-            gemm2_scales_shuffled.append(
-                nvfp4_block_scale_interleave(
-                    w2_weight_scale[i]
-                    .view(torch.uint8)[permute_sf_indices.to(w2_weight_scale.device)]
-                    .contiguous()
-                )
-            )
-            # w2 bias
-            permute_indices = get_w2_permute_indices_with_cache(
-                _cache_permute_indices,
-                w2_bias[i].clone().reshape(-1, 1),
-                epilogue_tile_m,
-            )
-            gemm2_bias_shuffled.append(
-                w2_bias[i]
-                .clone()
-                .reshape(-1, 1)[permute_indices.to(w2_bias.device)]
-                .contiguous()
-            )
+        rows = 2 * intermediate_size
+        swap = torch.arange(rows, device=dev) ^ 1
 
-        w13_weight = torch.stack(gemm1_weights_shuffled)
+        def perm(t: torch.Tensor, **kw) -> torch.Tensor:
+            return get_w2_permute_indices_with_cache(
+                _cache_permute_indices, t, epilogue_tile_m, **kw
+            ).to(dev)
+
+        w13_perm = swap[perm(w13_weight[0].view(torch.uint8))]
+        w13_sf_perm = swap[
+            perm(w13_weight_scale[0].view(torch.uint8), num_elts_per_sf=16)
+        ]
+        w13_b_perm = swap[perm(w13_bias[0].reshape(-1, 1)).reshape(-1)]
+        w2_perm = perm(w2_weight[0].view(torch.uint8))
+        w2_sf_perm = perm(w2_weight_scale[0].view(torch.uint8), num_elts_per_sf=16)
+        w2_b_perm = perm(w2_bias[0].reshape(-1, 1)).reshape(-1)
+
+        w13_weight = gather_rows(w13_weight, w13_perm)
+        w2_weight = gather_rows(w2_weight, w2_perm)
+        w13_s = gather_rows(w13_weight_scale, w13_sf_perm)
+        w2_s = gather_rows(w2_weight_scale, w2_sf_perm)
         w13_weight_scale = (
-            torch.stack(gemm1_scales_shuffled)
+            nvfp4_block_scale_interleave(w13_s)
             .reshape(num_experts, 2 * intermediate_size, hidden_size // sf_block_size)
             .view(torch.float8_e4m3fn)
         )
-        w2_weight = torch.stack(gemm2_weights_shuffled)
         w2_weight_scale = (
-            torch.stack(gemm2_scales_shuffled)
+            nvfp4_block_scale_interleave(w2_s)
             .reshape(num_experts, hidden_size, intermediate_size // sf_block_size)
             .view(torch.float8_e4m3fn)
         )
-        w13_bias = torch.stack(gemm1_bias_shuffled).reshape(num_experts, -1)
-        w2_bias = torch.stack(gemm2_bias_shuffled).reshape(num_experts, -1)
+        w13_bias = w13_bias[:, w13_b_perm].contiguous()
+        w2_bias = w2_bias[:, w2_b_perm].contiguous()
 
         return (
             w13_weight,
@@ -1673,17 +1640,10 @@ def convert_weight_to_mxfp4_moe_kernel_format(
         # Swap w1/w3 and interleave to match TRTLLM SwiGLU convention.
         # Standard loading gives contiguous [w1/gate, w3/up].
         # TRTLLM kernel expects interleaved [w3_0, w1_0, w3_1, w1_1, ...].
-        w1_weight = w13_weight[:, :intermediate_size, :]
-        w3_weight = w13_weight[:, intermediate_size:, :]
-        w13_weight = torch.stack([w3_weight, w1_weight], dim=2).reshape(
-            w13_weight.shape
-        )
-
-        w1_scale = w13_weight_scale[:, :intermediate_size, :]
-        w3_scale = w13_weight_scale[:, intermediate_size:, :]
-        w13_weight_scale = torch.stack([w3_scale, w1_scale], dim=2).reshape(
-            w13_weight_scale.shape
-        )
+        # Interleaved row 2i is w3 row i (loaded row I + i), row 2i + 1 is w1
+        # row i; folded into the shuffle below so each tensor is gathered once.
+        rows = torch.arange(intermediate_size, device=w13_weight.device)
+        interleave = torch.stack([rows + intermediate_size, rows], dim=1).reshape(-1)
 
         if w13_bias is not None:
             b1 = w13_bias[:, :intermediate_size]
@@ -1701,7 +1661,7 @@ def convert_weight_to_mxfp4_moe_kernel_format(
             w13_weight[0].view(torch.uint8),
             epilogue_tile_m,
         ).to(w13_weight.device)
-        w13_weight = w13_weight.view(torch.uint8)[:, w13_perm].contiguous()
+        w13_weight = gather_rows(w13_weight, interleave[w13_perm])
 
         # w13 scale permute + interleave
         w13_sf_perm = get_w2_permute_indices_with_cache(
@@ -1710,7 +1670,7 @@ def convert_weight_to_mxfp4_moe_kernel_format(
             epilogue_tile_m,
             num_elts_per_sf=16,
         ).to(w13_weight_scale.device)
-        w13_s = w13_weight_scale.view(torch.uint8)[:, w13_sf_perm].contiguous()
+        w13_s = gather_rows(w13_weight_scale.view(torch.uint8), interleave[w13_sf_perm])
         E, N_s, K_s = w13_s.shape
         w13_weight_scale = (
             nvfp4_block_scale_interleave(w13_s.reshape(E * N_s, K_s))
@@ -1724,7 +1684,7 @@ def convert_weight_to_mxfp4_moe_kernel_format(
             w2_weight[0].view(torch.uint8),
             epilogue_tile_m,
         ).to(w2_weight.device)
-        w2_weight = w2_weight.view(torch.uint8)[:, w2_perm].contiguous()
+        w2_weight = gather_rows(w2_weight, w2_perm)
 
         # w2 scale permute + interleave
         w2_sf_perm = get_w2_permute_indices_with_cache(
@@ -1733,7 +1693,7 @@ def convert_weight_to_mxfp4_moe_kernel_format(
             epilogue_tile_m,
             num_elts_per_sf=16,
         ).to(w2_weight_scale.device)
-        w2_s = w2_weight_scale.view(torch.uint8)[:, w2_sf_perm].contiguous()
+        w2_s = gather_rows(w2_weight_scale, w2_sf_perm)
         E2, N2_s, K2_s = w2_s.shape
         w2_weight_scale = (
             nvfp4_block_scale_interleave(w2_s.reshape(E2 * N2_s, K2_s))
