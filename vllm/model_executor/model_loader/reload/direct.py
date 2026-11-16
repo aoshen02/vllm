@@ -91,9 +91,6 @@ def _check_supported_modules(model: torch.nn.Module) -> None:
         HummingLinearMethod,
         HummingMoEMethod,
     )
-    from vllm.model_executor.layers.quantization.input_hadamard import (
-        InputHadamardLinearMethod,
-    )
     from vllm.model_executor.layers.quantization.online.fp8 import OnlineLinearBase
     from vllm.model_executor.layers.quantization.online.moe_base import (
         OnlineMoEMethodBase,
@@ -101,12 +98,12 @@ def _check_supported_modules(model: torch.nn.Module) -> None:
 
     for name, module in model.named_modules():
         method = getattr(module, "quant_method", None)
-        if isinstance(method, InputHadamardLinearMethod):
-            method = method.quant_method
         # also without an online config (experts_int8); fused shared experts
         # quantize staging parameters that post-load processing deletes
-        if isinstance(method, (OnlineLinearBase, OnlineMoEMethodBase)) or (
-            getattr(module, "shared_expert_online_loader", None) is not None
+        if (
+            getattr(method, "uses_meta_device", False)
+            or isinstance(method, (OnlineLinearBase, OnlineMoEMethodBase))
+            or getattr(module, "shared_expert_online_loader", None) is not None
         ):
             raise RuntimeError(
                 f"direct reload: online quantization is not supported "

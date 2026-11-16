@@ -86,10 +86,6 @@ from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tenso
 from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4a4_nvfp4 import (  # noqa: E501
     CompressedTensorsW4A4Nvfp4MoEMethod,
 )
-from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w8a8_fp8 import (  # noqa: E501
-    CompressedTensorsW8A8Fp8MoEMethod,
-)
-from vllm.model_executor.layers.quantization.fp8 import Fp8LinearMethod, Fp8MoEMethod
 from vllm.model_executor.layers.quantization.modelopt import (
     ModelOptFp8Config,
     ModelOptLinearMethod,
@@ -97,7 +93,6 @@ from vllm.model_executor.layers.quantization.modelopt import (
     ModelOptNvFp4Config,
     ModelOptNvFp4FusedMoE,
 )
-from vllm.model_executor.layers.quantization.mxfp4 import Mxfp4MoEMethod
 from vllm.model_executor.layers.quantization.online.base import (
     OnlineQuantizationConfig,
 )
@@ -247,10 +242,13 @@ def test_online_linear_methods_resolve_activation_quant_key(
     )
 
     config = OnlineQuantizationConfig(args)
+    method = config.get_quant_method(_TestLinear(), "linear")
+    assert method is not None
+    assert isinstance(method, method_cls)
+    assert method.activation_quant_key == activation_quant_key
     # The resolver must return the resolved key, not a placeholder.
     resolved = config.resolve_quant_method_cls(_TestLinear, "linear")
-    assert resolved is not None and resolved[-1] is method_cls
-    assert resolved[3].activation == activation_quant_key
+    assert resolved is not None and resolved[3].activation == activation_quant_key
 
 
 @pytest.mark.parametrize(
@@ -398,15 +396,8 @@ def test_online_moe_stages_quantized_weights_for_humming(
 
     def load(runner, factor):
         layer = runner.routed_experts
-        shapes = {"w13_weight": (2, 512, 256), "w2_weight": (2, 256, 256)}
         for name, parameter in list(layer.named_parameters()):
-            if getattr(layer, "quantizes_on_load", False):
-                if "scale" in name:
-                    continue
-                weight = torch.full(
-                    shapes[name], 0.125 * factor, dtype=torch.bfloat16, device=DEVICE
-                )
-            elif "scale" in name:
+            if "scale" in name:
                 weight = torch.full(
                     parameter.shape,
                     0.125 * factor,
@@ -753,9 +744,7 @@ def test_online_prequantized_compatibility(
     }
 
     layer = ColumnParallelLinear(**layer_kwargs)
-    assert isinstance(
-        layer.quant_method, (Mxfp8OnlineLinearMethod, ModelOptLinearMethod)
-    )
+    assert isinstance(layer.quant_method, Mxfp8OnlineLinearMethod)
 
     if layer.weight.is_meta:
         # Weight loading.
@@ -781,7 +770,8 @@ def test_online_prequantized_compatibility(
             layer.quant_method.requantization_source, ModelOptLinearMethod
         )
     elif not raises_requantization_error:
-        assert layer.quantizes_on_load
+        assert layer.quant_method.uses_meta_device
+        assert layer.quant_method.requantization_source is None
 
 
 @pytest.mark.skipif(
@@ -1939,8 +1929,8 @@ def test_nvfp4_one_sided_rejects_unsupported_input_dtype(input_dtype: torch.dtyp
             GRANITE_MODEL_NAME,
             "fp8_per_tensor",
             None,
-            Fp8LinearMethod,
-            Fp8MoEMethod,
+            Fp8PerTensorOnlineLinearMethod,
+            Fp8PerTensorOnlineMoEMethod,
             {},
             id="fp8_per_tensor",
         ),
@@ -1949,8 +1939,8 @@ def test_nvfp4_one_sided_rejects_unsupported_input_dtype(input_dtype: torch.dtyp
             GRANITE_MODEL_NAME,
             "fp8_per_tensor",
             None,
-            Fp8LinearMethod,
-            Fp8MoEMethod,
+            Fp8PerTensorOnlineLinearMethod,
+            Fp8PerTensorOnlineMoEMethod,
             {"kv_cache_dtype": "fp8"},
             id="fp8_per_tensor-fp8-kv-cache",
         ),
@@ -1958,8 +1948,8 @@ def test_nvfp4_one_sided_rejects_unsupported_input_dtype(input_dtype: torch.dtyp
             GRANITE_MODEL_NAME,
             "fp8_per_tensor",
             None,
-            Fp8LinearMethod,
-            Fp8MoEMethod,
+            Fp8PerTensorOnlineLinearMethod,
+            Fp8PerTensorOnlineMoEMethod,
             {"linear_backend": "marlin", "moe_backend": "marlin"},
             marks=pytest.mark.skipif(
                 not current_platform.is_cuda(),
@@ -1971,8 +1961,8 @@ def test_nvfp4_one_sided_rejects_unsupported_input_dtype(input_dtype: torch.dtyp
             GRANITE_MODEL_NAME,
             "fp8_per_tensor",
             None,
-            Fp8LinearMethod,
-            Fp8MoEMethod,
+            Fp8PerTensorOnlineLinearMethod,
+            Fp8PerTensorOnlineMoEMethod,
             {
                 "kv_cache_dtype": "fp8",
                 "linear_backend": "marlin",
@@ -1989,8 +1979,8 @@ def test_nvfp4_one_sided_rejects_unsupported_input_dtype(input_dtype: torch.dtyp
             GRANITE_MODEL_NAME,
             "fp8_per_block",
             None,
-            Fp8LinearMethod,
-            Fp8MoEMethod,
+            Fp8PerBlockOnlineLinearMethod,
+            Fp8PerBlockOnlineMoEMethod,
             {},
             id="fp8_per_block",
         ),
@@ -1998,8 +1988,8 @@ def test_nvfp4_one_sided_rejects_unsupported_input_dtype(input_dtype: torch.dtyp
             GRANITE_MODEL_NAME,
             "fp8_per_channel",
             None,
-            ModelOptLinearMethod,
-            CompressedTensorsW8A8Fp8MoEMethod,
+            Fp8PtpcOnlineLinearMethod,
+            Fp8PtpcOnlineMoEMethod,
             {},
             id="fp8_per_channel",
         ),
@@ -2011,8 +2001,8 @@ def test_nvfp4_one_sided_rejects_unsupported_input_dtype(input_dtype: torch.dtyp
                 "linear": "fp8_per_block",
                 "moe": "fp8_per_tensor",
             },
-            Fp8LinearMethod,
-            Fp8MoEMethod,
+            Fp8PerBlockOnlineLinearMethod,
+            Fp8PerTensorOnlineMoEMethod,
             {},
             id="per_layer_kind_overrides",
         ),
@@ -2026,8 +2016,8 @@ def test_nvfp4_one_sided_rejects_unsupported_input_dtype(input_dtype: torch.dtyp
                     r"re:.*block_sparse_moe\.experts": "fp8_per_tensor",
                 }
             },
-            Fp8LinearMethod,
-            Fp8MoEMethod,
+            Fp8PerBlockOnlineLinearMethod,
+            Fp8PerTensorOnlineMoEMethod,
             {},
             id="targets",
         ),
@@ -2038,8 +2028,8 @@ def test_nvfp4_one_sided_rejects_unsupported_input_dtype(input_dtype: torch.dtyp
             # qkv_proj is fused from q_proj/k_proj/v_proj. The shard regex
             # remains supported alongside direct fused-name regexes.
             {"ignore": ["model.layers.1.self_attn.o_proj", "re:.*[qkv]_proj"]},
-            Fp8LinearMethod,
-            Fp8MoEMethod,
+            Fp8PerTensorOnlineLinearMethod,
+            Fp8PerTensorOnlineMoEMethod,
             {},
             id="ignore",
         ),
@@ -2048,7 +2038,7 @@ def test_nvfp4_one_sided_rejects_unsupported_input_dtype(input_dtype: torch.dtyp
             "mxfp4",
             None,
             Mxfp4OnlineLinearMethod,
-            Mxfp4MoEMethod,
+            Mxfp4OnlineMoEMethod,
             {},
             id="mxfp4",
         ),
@@ -2056,7 +2046,7 @@ def test_nvfp4_one_sided_rejects_unsupported_input_dtype(input_dtype: torch.dtyp
             PARTIALLY_PREQUANTIZED_MODEL_NAME,
             None,
             {"targets": {"model.layers.1.self_attn.o_proj": "mxfp8"}},
-            ModelOptLinearMethod,
+            Mxfp8OnlineLinearMethod,
             CompressedTensorsMoEMethod,
             {},
             id="partially_prequantized_checkpoint",
@@ -2143,10 +2133,9 @@ def test_online_quantization(
         if isinstance(online_quant_args, dict)
         else {}
     )
-    if (
-        quant_scheme == "mxfp4"
-        or expected_moe_cls in (Mxfp4OnlineMoEMethod, Mxfp4MoEMethod)
-    ) and not (on_gfx950() or on_gfx942()):
+    if (quant_scheme == "mxfp4" or expected_moe_cls is Mxfp4OnlineMoEMethod) and not (
+        on_gfx950() or on_gfx942()
+    ):
         pytest.skip("mxfp4 online quantization is only tested on AMD gfx942, gfx950.")
 
     if current_platform.is_rocm():
@@ -2334,14 +2323,16 @@ def test_online_quantization(
         else:
             assert o_proj.weight.dtype == torch.uint8
     elif current_platform.is_cuda() or current_platform.is_xpu():
-        method = o_proj.quant_method
-        kernel = getattr(method, "fp8_linear", getattr(method, "kernel", None))
         if current_platform.supports_fp8() and not force_marlin:
             assert o_proj.weight.dtype == torch.float8_e4m3fn
-            assert not isinstance(kernel, MarlinFP8ScaledMMLinearKernel)
+            assert not isinstance(
+                o_proj.quant_method.fp8_linear, MarlinFP8ScaledMMLinearKernel
+            )
         else:
             assert o_proj.weight.dtype == torch.int32
-            assert isinstance(kernel, MarlinFP8ScaledMMLinearKernel)
+            assert isinstance(
+                o_proj.quant_method.fp8_linear, MarlinFP8ScaledMMLinearKernel
+            )
     elif current_platform.is_rocm():
         assert o_proj.weight.dtype == current_platform.fp8_dtype()
     else:
@@ -2450,7 +2441,7 @@ def test_online_quantization_loads_real_weights(
             def check_model(model):
                 assert isinstance(
                     model.model.layers[1].self_attn.o_proj.quant_method,
-                    ModelOptLinearMethod,
+                    Mxfp8OnlineLinearMethod,
                 )
                 assert isinstance(
                     model.model.layers[0].self_attn.o_proj.quant_method,
@@ -2476,21 +2467,21 @@ def test_online_quantization_loads_real_weights(
         (
             {r"re:.*self_attn\.o_proj": "fp8_per_block"},
             "model.layers.0.self_attn.o_proj",
-            Fp8LinearMethod,
+            Fp8PerBlockOnlineLinearMethod,
             "model.layers.0.self_attn.qkv_proj",
             ("targets", "fp8_per_block", r"re:.*self_attn\.o_proj"),
         ),
         (
             {r"re:.*qkv_proj.*": "fp8_per_tensor"},
             "model.layers.0.self_attn.qkv_proj",
-            Fp8LinearMethod,
+            Fp8PerTensorOnlineLinearMethod,
             "model.layers.0.self_attn.o_proj",
             ("targets", "fp8_per_tensor", r"re:.*qkv_proj.*"),
         ),
         (
             {r"re:.*[qkv]_proj": "fp8_per_tensor"},
             "model.layers.0.self_attn.qkv_proj",
-            Fp8LinearMethod,
+            Fp8PerTensorOnlineLinearMethod,
             "model.layers.0.self_attn.o_proj",
             ("targets", "fp8_per_tensor", r"re:.*[qkv]_proj"),
         ),
@@ -2546,7 +2537,7 @@ def test_online_quantization_records_global_config(
 
     method = config.get_quant_method(layer, prefix)
 
-    assert isinstance(method, Fp8LinearMethod)
+    assert isinstance(method, Fp8PerBlockOnlineLinearMethod)
     assert config.quantized_layers == {
         prefix: ("linear", str(config.args.linear), None)
     }
@@ -2767,7 +2758,7 @@ def test_online_nvfp4_per_token_moe(vllm_runner, monkeypatch) -> None:
         def check_model(model):
             layer = model.model.layers[0]
             assert isinstance(
-                layer.block_sparse_moe.experts._quant_method, ModelOptNvFp4FusedMoE
+                layer.block_sparse_moe.experts._quant_method, Nvfp4OnlineMoEMethod
             )
             assert isinstance(
                 layer.self_attn.o_proj.quant_method, UnquantizedLinearMethod

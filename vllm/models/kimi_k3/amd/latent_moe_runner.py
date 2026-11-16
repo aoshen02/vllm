@@ -21,7 +21,6 @@ from vllm.model_executor.layers.fused_moe.prepare_finalize.no_dp_ep import (
     MoEPrepareAndFinalizeNoDPEPModular,
 )
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
-from vllm.model_executor.layers.quantization.modelopt import ModelOptLinearMethod
 from vllm.model_executor.layers.quantization.online.fp8 import Fp8PtpcOnlineLinearMethod
 from vllm.model_executor.layers.quantization.online.mxfp4 import Mxfp4OnlineLinearMethod
 
@@ -258,12 +257,9 @@ def enable_quantized_routed_input(runner) -> bool:
             projection.weight.dtype != torch.bfloat16
             and not isinstance(
                 projection.quant_method,
-                (
-                    Mxfp4OnlineLinearMethod,
-                    Fp8PtpcOnlineLinearMethod,
-                    ModelOptLinearMethod,
-                ),
+                (Mxfp4OnlineLinearMethod, Fp8PtpcOnlineLinearMethod),
             )
+            and not getattr(projection, "quantizes_on_load", False)
         )
         or get_current_vllm_config().lora_config is not None
         or runner.routed_experts.activation != MoEActivation.SITU

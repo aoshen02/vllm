@@ -8,6 +8,7 @@ from typing import Any
 
 import torch
 
+import vllm.envs as envs
 from vllm.config.quantization import (
     _ONLINE_SHORTHANDS,
     QuantizationConfigArgs,
@@ -514,8 +515,10 @@ class OnlineQuantizationConfig(QuantizationConfig):
             )
             assert issubclass(quant_method_cls, (OnlineMoEMethodBase, OnlineLinearBase))
             default = getattr(quant_method_cls, "activation_quant_key", None)
-            if not requantize and (
-                method := checkpoint_method(layer, quant_spec, default)
+            if (
+                not requantize
+                and envs.VLLM_RELOAD_MODE == "direct"
+                and (method := checkpoint_method(layer, quant_spec, default))
             ):
                 return method
             kwargs = {}

@@ -39,7 +39,9 @@ MODEL_INFO = EmbedModelInfo(
 
 
 def _assert_modernbert_online_fp8(model) -> None:
-    from vllm.model_executor.layers.quantization.fp8 import Fp8LinearMethod
+    from vllm.model_executor.layers.quantization.online.fp8 import (
+        Fp8PerTensorOnlineLinearMethod,
+    )
 
     layer = model.encoder_layer.layers[0]
     linears = {
@@ -49,7 +51,7 @@ def _assert_modernbert_online_fp8(model) -> None:
         "mlp.Wo": layer.mlp.Wo,
     }
     for name, linear in linears.items():
-        assert isinstance(linear.quant_method, Fp8LinearMethod), (
+        assert isinstance(linear.quant_method, Fp8PerTensorOnlineLinearMethod), (
             f"{name} was not quantized with online FP8"
         )
         if current_platform.is_xpu():

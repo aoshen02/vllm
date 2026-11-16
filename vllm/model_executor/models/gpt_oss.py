@@ -342,13 +342,14 @@ class GptOssRoutedExperts(RoutedExperts):
 
         if weight_name.endswith("_bias"):
             self._load_expert_bias(expert_data, loaded_weight, shard_id)
+        elif getattr(self, "quantizes_on_load", False):  # noqa: SIM114
+            self._load_packed_expert(expert_data, loaded_weight, weight_name, shard_id)
         elif weight_dtype in (
             "gpt_oss_mxfp4",
             "mxfp4",
         ) or quant_method_name in (
             "CompressedTensorsW4A4Nvfp4MoEMethod",
             "Nvfp4OnlineMoEMethod",
-            "ModelOptNvFp4FusedMoE",
             "CompressedTensorsWNA16MoEMethod",
         ):
             self._load_packed_expert(expert_data, loaded_weight, weight_name, shard_id)
