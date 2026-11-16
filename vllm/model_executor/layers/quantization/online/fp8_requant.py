@@ -29,7 +29,7 @@ from vllm.model_executor.layers.quantization.utils.mxfp4_utils import (
     mxfp4_quantize,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import kMxfp4Dynamic
-from vllm.model_executor.model_loader.reload.layerwise import (
+from vllm.model_executor.model_loader.online_processing import (
     initialize_online_processing,
 )
 from vllm.model_executor.utils import replace_parameter
@@ -59,7 +59,7 @@ class Fp8BlockExpertsAsMxfp4FusedMoE(Mxfp4OnlineMoEMethod):
     """
 
     # FP8 expert parameters live on the meta device and are materialized one
-    # layer at a time by the layerwise online-processing loader, so each layer
+    # layer at a time by the online-processing loader, so each layer
     # is re-quantized as soon as its experts are loaded: peak memory is the
     # MXFP4 model plus one layer of FP8 experts (TP4 would not fit otherwise).
     uses_meta_device = True

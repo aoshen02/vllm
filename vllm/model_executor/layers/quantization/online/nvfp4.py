@@ -201,7 +201,7 @@ class Nvfp4OnlineMoEMethod(OnlineMoEMethodBase):
             self.moe_kernel.fused_experts.keep_constants(layer)
         else:
             # Reload creates new scale tensors; derived kernel scales must use
-            # their new values before layerwise reload restores captured storage.
+            # their new values.
             assert self.moe_quant_config is not None
             assert self.moe_quant_config.g1_alphas is not None
             assert self.moe_quant_config.g2_alphas is not None

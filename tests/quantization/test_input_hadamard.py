@@ -22,11 +22,6 @@ from vllm.model_executor.layers.quantization.online.mxfp4 import (
     Mxfp4OnlineLinearMethod,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import kMxfp4Dynamic
-from vllm.model_executor.model_loader.reload.layerwise import (
-    finalize_layerwise_reload,
-    initialize_layerwise_reload,
-    record_metadata_for_reloading,
-)
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.utils import replace_parameter, set_weight_attrs
 from vllm.platforms import current_platform
@@ -108,7 +103,7 @@ def test_rotates_weight_once_and_input_on_apply():
     layer.weight.data.copy_(w)
 
     method.process_weights_after_loading(layer)
-    method.process_weights_after_loading(layer)  # e.g. after layerwise loading
+    method.process_weights_after_loading(layer)  # e.g. after online loading
 
     h = hadamard_matrix(32, w.device)
     torch.testing.assert_close(layer.processed_weight, block_hadamard_rotate(w, h))
@@ -139,47 +134,6 @@ def test_rejects_non_sylvester_and_missing_rotation():
         layer.input_rotation.weight_loader(layer.input_rotation, flipped.to(torch.int8))
     with pytest.raises(ValueError, match="input_rotation"):
         method.process_weights_after_loading(layer)
-
-
-@pytest.mark.parametrize("rotate_weight", [True, False])
-def test_layerwise_reload(rotate_weight: bool, default_vllm_config):
-    """Reloading reruns the weight rotation, or the input_rotation check and
-    drop, on the new weights, and keeps the processed tensors in place."""
-    default_vllm_config.model_config = ModelConfig()
-    layer = torch.nn.Module()
-    layer.weight_loader = default_weight_loader
-    method = InputHadamardLinearMethod(_DenseOnlineMethod(), 32, rotate_weight)
-    method.create_weights(
-        layer, 128, [16], 128, 16, torch.float32, weight_loader=default_weight_loader
-    )
-    layer.quant_method = method
-    model = torch.nn.Sequential(layer)
-    record_metadata_for_reloading(model)
-    h = hadamard_matrix(32, torch.device("cpu"))
-    signs = (h * 32**0.5).round().to(torch.int8)
-
-    def load(w: torch.Tensor) -> None:
-        layer.weight.weight_loader(
-            layer.weight, w if rotate_weight else block_hadamard_rotate(w, h)
-        )
-        if not rotate_weight:
-            layer.input_rotation.weight_loader(layer.input_rotation, signs)
-
-    set_random_seed(0)
-    load(torch.randn(16, 128))
-    method.process_weights_after_loading(layer)
-    weight = layer.weight
-    w = torch.randn(16, 128)
-    x = torch.randn(4, 128)
-
-    initialize_layerwise_reload(model)
-    load(w)
-    finalize_layerwise_reload(model, default_vllm_config.model_config)
-
-    assert layer.weight is weight
-    assert not hasattr(layer, "input_rotation")
-    torch.testing.assert_close(layer.weight, block_hadamard_rotate(w, h))
-    torch.testing.assert_close(method.apply(layer, x), x @ w.T, rtol=1e-4, atol=1e-4)
 
 
 def test_rejects_indivisible_input_size():

@@ -226,9 +226,10 @@ def load_checkpoint_weight_patches(
     is a batching target; one tensor may exceed it.
 
     Online checkpoint-format dense updates require the caller to manage vLLM's
-    layerwise reload lifecycle. Sparse online updates modify initialized model
-    tensors in place and must not use that lifecycle. Patch shapes, dtypes, value
-    lengths, and sparse indices are validated before loading begins.
+    reload lifecycle (`start_reload` / `finish_reload`). Sparse online updates
+    modify initialized model tensors in place and must not use that lifecycle.
+    Patch shapes, dtypes, value lengths, and sparse indices are validated before
+    loading begins.
 
     This function does not roll back a partial update. If a loader fails after a
     write, some destinations may already be changed. Do not serve from the affected

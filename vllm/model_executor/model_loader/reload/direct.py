@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Direct weight reload (`VLLM_RELOAD_MODE=direct`).
+"""Direct weight reload.
 
 Cold start records each tensor's checkpoint layout before post-load processing
 (PWAL). `begin` views re-laid-out tensors back to that layout on their
@@ -15,13 +15,14 @@ of every `padding_fill_params()` parameter, which `begin` zero-fills whole.
 """
 
 from collections.abc import Iterator
+from contextlib import contextmanager
 
 import torch
 
-import vllm.envs as envs
 from vllm.config import ModelConfig
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
+from vllm.model_executor.model_loader.online_processing import SKIP_LOAD_TENSORS
 from vllm.model_executor.utils import (
     is_weights_pre_processed,
     storage_view,
@@ -32,9 +33,9 @@ logger = init_logger(__name__)
 __all__ = [
     "begin_direct_reload",
     "direct_reload_active",
-    "direct_reload_enabled",
     "finish_direct_reload",
     "loadable_tensors",
+    "meta_checkpoint_layout",
     "record_checkpoint_layout",
 ]
 
@@ -53,11 +54,6 @@ _LOADER_ATTRS = (
     "packed_factor",
     "pack_factor",
 )
-
-
-def direct_reload_enabled() -> bool:
-    """Whether weight updates reload in place (`VLLM_RELOAD_MODE=direct`)."""
-    return envs.VLLM_RELOAD_MODE == "direct"
 
 
 def direct_reload_active(model: torch.nn.Module) -> bool:
@@ -85,34 +81,6 @@ def loadable_tensors(model: torch.nn.Module) -> Iterator[tuple[str, torch.Tensor
             yield (f"{module_name}.{name}" if module_name else name), tensor
 
 
-def _check_supported_modules(model: torch.nn.Module) -> None:
-    # config-level refusals: VllmConfig._verify_direct_reload_compat
-    from vllm.model_executor.layers.quantization.humming import (
-        HummingLinearMethod,
-        HummingMoEMethod,
-    )
-    from vllm.model_executor.layers.quantization.online.fp8 import OnlineLinearBase
-    from vllm.model_executor.layers.quantization.online.moe_base import (
-        OnlineMoEMethodBase,
-    )
-
-    for name, module in model.named_modules():
-        method = getattr(module, "quant_method", None)
-        # also without an online config (experts_int8); fused shared experts
-        # quantize staging parameters that post-load processing deletes
-        if isinstance(method, (OnlineLinearBase, OnlineMoEMethodBase)) or (
-            getattr(module, "shared_expert_online_loader", None) is not None
-        ):
-            raise RuntimeError(
-                f"direct reload: online quantization is not supported "
-                f"({name}: {type(method).__name__})"
-            )
-        if isinstance(method, (HummingLinearMethod, HummingMoEMethod)):
-            # its post-load processing runs once per quant method (a guard on
-            # the method, not the module): a reload would keep checkpoint bytes
-            raise RuntimeError(f"direct reload: humming is not supported ({name})")
-
-
 def record_checkpoint_layout(model: torch.nn.Module) -> None:
     """Cold start, before post-load processing: remember each tensor's
     checkpoint layout and loader metadata, which tensors this model owns (those
@@ -121,7 +89,6 @@ def record_checkpoint_layout(model: torch.nn.Module) -> None:
     Runs once; reloads reuse the cold-start record."""
     if hasattr(model, "_ckpt_param_names") or is_weights_pre_processed():
         return  # pre-processed weights are already in runtime layout
-    _check_supported_modules(model)
     # a model owns the tensors it records first; `begin` refuses a shared one
     # (a target lm_head in a draft) whose post-load processing re-laid it out
     model._ckpt_owner = object()  # tags owned tensors (ids of freed ones recur)
@@ -200,6 +167,40 @@ def _checkpoint_views(
             )
         views.append((t, storage_view(storage, offset, shape, stride, dtype)))
     return views
+
+
+@contextmanager
+def meta_checkpoint_layout(model: torch.nn.Module) -> Iterator[None]:
+    """Within, every tensor this model owns is a meta tensor in its checkpoint
+    layout (at the storage offset `begin` would view it at) with its checkpoint
+    loader metadata, so a dry-run `load_weights` records where each checkpoint
+    tensor lands after `begin` without touching the model. Restored on exit."""
+    if not hasattr(model, "_ckpt_param_names"):
+        raise RuntimeError("direct reload: no checkpoint layout was recorded")
+    saved: list[tuple[torch.Tensor, torch.Tensor, dict]] = []
+    try:
+        for name, t in loadable_tensors(model):
+            # loaders read expert maps; they stay real
+            if not _owned(model, t) or name.rpartition(".")[2] in SKIP_LOAD_TENSORS:
+                continue
+            shape, stride, dtype, offset = t._ckpt[1]
+            if t.untyped_storage().data_ptr() != t._ckpt[3]:
+                offset = t.storage_offset()  # moved, as in `_checkpoint_views`
+            span = (
+                0 if 0 in shape else 1 + sum((n - 1) * s for n, s in zip(shape, stride))
+            )
+            meta = torch.empty(offset + span, dtype=dtype, device="meta")
+            saved.append((t, t.data, dict(t.__dict__)))
+            t.data = meta.as_strided(shape, stride, offset)
+            for k in _LOADER_ATTRS:
+                t.__dict__.pop(k, None)
+            t.__dict__.update(t._ckpt[2])
+        yield
+    finally:
+        for t, data, attrs in saved:
+            t.data = data
+            t.__dict__.clear()
+            t.__dict__.update(attrs)
 
 
 @torch.no_grad()

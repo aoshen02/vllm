@@ -35,7 +35,6 @@ from vllm.model_executor.model_loader.reload.direct import (
     begin_direct_reload,
     finish_direct_reload,
 )
-from vllm.model_executor.model_loader.reload.meta import materialize_meta_tensor
 from vllm.model_executor.model_loader.utils import process_weights_after_loading
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.platforms import current_platform
@@ -55,7 +54,10 @@ def _load(layer: torch.nn.Module, names: list[str] | None = None) -> None:
         if names is not None and name not in names:
             continue
         if param.is_meta:
-            param = materialize_meta_tensor(param)
+            new = torch.zeros_like(param, device=torch.get_default_device())
+            new.__class__ = param.__class__
+            new.__dict__ = param.__dict__.copy()
+            param = new
             setattr(layer, name, param)
         if param.dtype == torch.uint8:  # packed FP4 values or E8M0 scales
             param.data.copy_(torch.randint(120, 130, param.shape))
@@ -409,7 +411,6 @@ def test_direct_reload_keeps_kernel_tensor_addresses(
     """Post-load processing reruns on every reload (and rebuilds MoE experts
     objects); every tensor the kernel reads keeps the cold-start address and
     holds what a cold start on the new weights computes."""
-    monkeypatch.setenv("VLLM_RELOAD_MODE", "direct")
     default_vllm_config.model_config = ModelConfig()
     default_vllm_config.kernel_config.moe_backend = backend
     default_vllm_config.kernel_config.linear_backend = backend

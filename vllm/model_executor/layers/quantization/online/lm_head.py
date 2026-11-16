@@ -37,7 +37,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     UnquantizedEmbeddingMethod,
 )
-from vllm.model_executor.model_loader.reload.layerwise import get_layerwise_info
+from vllm.model_executor.model_loader.online_processing import stop_online_processing
 from vllm.model_executor.utils import replace_parameter, set_weight_attrs
 from vllm.scalar_type import ScalarType
 from vllm.utils.torch_utils import set_default_torch_dtype
@@ -144,10 +144,10 @@ class OnlineLMHeadMethodBase(OnlineLinearBase):
 
     def tie_weights(self, layer: Module, embed_tokens: Module) -> Module:
         # The head reads the embeddings' loaded weight. Nothing is loaded into
-        # the head itself, so it leaves layerwise loading; the model loader's
+        # the head itself, so it leaves online processing; the model loader's
         # process_weights_after_loading pass quantizes it.
         layer.weight = embed_tokens.weight
-        get_layerwise_info(layer).reset()
+        stop_online_processing(layer)
         layer.online_lm_head_tied_weight = True
         return layer
 
@@ -324,9 +324,8 @@ def quantized_lm_head_copy(
     `refresh_quantized_lm_heads` re-derives it after `lm_head` changes.
     """
     head = _quantize_copy(lm_head, quantization)
-    # Keep it out of layerwise reload, which would re-run
-    # process_weights_after_loading on the already-quantized weight.
-    get_layerwise_info(head).reset()
+    # Its weight is quantized already: keep it out of online processing.
+    stop_online_processing(head)
     _SOURCES[head] = (lm_head, quantization)
     logger.info(
         "Quantized a %s copy of the lm_head (%d x %d per rank).",

@@ -3,7 +3,6 @@
 """A draft-model weight update reruns the drafter's post-load processing; the
 tensors the speculator's CUDA graphs read must keep their addresses."""
 
-import pytest
 import torch
 
 PROMPTS = [
@@ -37,11 +36,9 @@ def _update_draft_weights(worker) -> None:
     finish_reload(model, config, worker.device)
 
 
-@pytest.mark.parametrize("reload_mode", ["direct", "layerwise"])
 def test_draft_weight_update_keeps_draft_tensor_addresses(
-    reload_mode: str, vllm_runner, monkeypatch
+    vllm_runner, monkeypatch
 ) -> None:
-    monkeypatch.setenv("VLLM_RELOAD_MODE", reload_mode)
     monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
     with vllm_runner(
         "Qwen/Qwen3-4B",

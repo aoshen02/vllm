@@ -20,11 +20,6 @@ from vllm.model_executor.layers.quantization.modelopt import ModelOptMxFp8Config
 from vllm.model_executor.layers.quantization.online.base import (
     OnlineQuantizationConfig,
 )
-from vllm.model_executor.model_loader.reload import (
-    finalize_layerwise_reload,
-    initialize_layerwise_reload,
-    record_metadata_for_reloading,
-)
 from vllm.models.qwen4_exp.nvidia.mega_moe import (
     Qwen4ExpMegaMoEExperts,
     mega_moe_expert_formats,
@@ -252,26 +247,3 @@ def test_weight_and_scale_may_arrive_in_separate_calls(any_device_mega_moe):
     experts.load_weights([n for n in names if n not in first])
     experts.quant_method.process_weights_after_loading(experts)
     _assert_same_experts(experts, _expected("fp8_block", MEGA_MOE_MXFP8, ckpt, 2, 0, 2))
-
-
-def test_layerwise_reload_replaces_routed_experts(any_device_mega_moe):
-    """reload_weights / weight transfer put the experts on meta and wrap their
-    loaders; the new experts must land in the original kernel tensors."""
-    checkpoint_format, fmt = "fp8_block", MEGA_MOE_MXFP4
-    generator = torch.Generator().manual_seed(5)
-    old = _checkpoint(checkpoint_format, 2, generator)
-    new = _checkpoint(checkpoint_format, 2, generator)
-    experts = _experts(Qwen4ExpMegaMoEExperts, fmt, 2, 0, 2, checkpoint_format)
-    with torch.device("cuda"):
-        record_metadata_for_reloading(experts)
-    experts.load_weights(_names(checkpoint_format, old, generator))
-    experts.quant_method.process_weights_after_loading(experts)
-    pointers = {n: p.data_ptr() for n, p in experts.named_parameters()}
-
-    initialize_layerwise_reload(experts)
-    experts.load_weights(_names(checkpoint_format, new, generator))
-    finalize_layerwise_reload(experts, None)
-
-    _assert_same_experts(experts, _expected(checkpoint_format, fmt, new, 2, 0, 2))
-    # CUDA graphs keep pointing at the same storage.
-    assert {n: p.data_ptr() for n, p in experts.named_parameters()} == pointers

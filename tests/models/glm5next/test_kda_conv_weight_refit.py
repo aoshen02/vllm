@@ -13,11 +13,6 @@ import pytest
 import torch
 from torch import nn
 
-from vllm.model_executor.model_loader.reload.layerwise import (
-    finalize_layerwise_reload,
-    initialize_layerwise_reload,
-    record_metadata_for_reloading,
-)
 from vllm.models.glm5next.common import kda
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 
@@ -51,22 +46,14 @@ def test_fused_conv_loads_checkpoint_shards_in_qkv_order(conv1d):
 
 
 def test_refit_updates_fused_conv_without_moving_it(conv1d):
-    """Refits through load_weights (RL weight sync) and through the layerwise
-    reload (`reload_weights`) both land at the original address."""
+    """Refits through load_weights (RL weight sync) land at the original
+    address."""
     data_ptr = conv1d.weight.data_ptr()
     _load(conv1d, _checkpoint_weights(seed=0))
 
     refit = _checkpoint_weights(seed=1)
     _load(conv1d, refit)
     assert torch.equal(_kernel_view(conv1d), torch.cat(refit).squeeze(1))
-
-    reload = _checkpoint_weights(seed=2)
-    model = nn.Sequential(conv1d)
-    record_metadata_for_reloading(model)
-    initialize_layerwise_reload(model)
-    _load(conv1d, reload)
-    finalize_layerwise_reload(model, model_config=None)
-    assert torch.equal(_kernel_view(conv1d), torch.cat(reload).squeeze(1))
     assert conv1d.weight.data_ptr() == data_ptr
 
 

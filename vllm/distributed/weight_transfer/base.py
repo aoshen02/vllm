@@ -460,7 +460,7 @@ class WeightTransferEngine(ABC, Generic[TInitInfo, TUpdateInfo]):
 
     Callers that go through `finish_weight_update` need do nothing: the engine
     drains there. A caller that instead drives the tail itself — running its own
-    `finalize_layerwise_reload`, say — must read this flag and call
+    `finish_reload`, say — must read this flag and call
     `drain_pending()` first, because with it set a returned `update_weights` means
     "queued", not "applied".
     """
@@ -569,9 +569,8 @@ class WeightTransferEngine(ABC, Generic[TInitInfo, TUpdateInfo]):
     def start_weight_update(self) -> None:
         """Prepare the engine for a new weight update.
 
-        Engines that receive weights in checkpoint format initialize layerwise reloading
+        Engines that receive weights in checkpoint format call `start_reload`
         here, else this is typically a no-op.
-        See: https://docs.vllm.ai/en/latest/training/layerwise/ for more details.
         """
         raise NotImplementedError
 
@@ -579,8 +578,8 @@ class WeightTransferEngine(ABC, Generic[TInitInfo, TUpdateInfo]):
     def finish_weight_update(self) -> None:
         """Finalize the current weight update.
 
-        Checkpoint-format engines finalize layerwise reloading here; engines
-        that apply weights in place leave this as a no-op.
+        Checkpoint-format engines call `finish_reload` here; engines that
+        apply weights in place leave this as a no-op.
         """
         raise NotImplementedError
 

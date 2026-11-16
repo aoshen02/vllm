@@ -20,10 +20,6 @@ from vllm.model_executor.layers.quantization.online.base import (
 from vllm.model_executor.layers.quantization.online.fp8 import (
     Fp8PtpcOnlineMoEMethod,
 )
-from vllm.model_executor.model_loader.reload import (
-    finalize_layerwise_reload,
-    initialize_layerwise_reload,
-)
 from vllm.models.muse_spark.common.layers import MuseSparkRMSNormWithInputScale
 from vllm.models.muse_spark.nvidia.muse_moe_runner import (
     MuseSparkFp8FusedMoE,
@@ -165,33 +161,6 @@ def test_fp8_experts_match_reference_with_post_expert_norm(dist_init, workspace_
     )
 
 
-@requires_fp8_triton
-@torch.inference_mode()
-def test_layerwise_reload_requantizes_in_place(dist_init, workspace_init):
-    """An RL weight update re-quantizes the new BF16 weights into the tensors
-    captured CUDA graphs read."""
-    router, norm, runner, vllm_config = _build(
-        _checkpoint(0), _online_config(moe="fp8_per_channel")
-    )
-    routed = runner.routed_experts
-    before = _dequantized(routed)
-    ptrs = {n: p.data_ptr() for n, p in routed.named_parameters()}
-
-    initialize_layerwise_reload(routed)
-    list(routed.load_weights(list(_checkpoint(1).items())))
-    finalize_layerwise_reload(routed, None)
-
-    assert {n: p.data_ptr() for n, p in routed.named_parameters()} == ptrs
-    kernel = routed.quant_method.moe_kernel
-    assert kernel is not None
-    assert kernel.fused_experts.post_gemm2_hook is runner.post_expert_finalize
-    assert not torch.equal(_dequantized(routed)[0], before[0])
-    torch.manual_seed(0)
-    x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda") / 10
-    logits = torch.randn(M, E, dtype=torch.float32, device="cuda")
-    assert _rel_to_reference(router, norm, runner, vllm_config, x, logits) < 5e-2
-
-
 def test_other_online_moe_formats_are_rejected(dist_init):
     with pytest.raises(NotImplementedError, match="fp8_per_channel only"):
         make_runner(
@@ -210,5 +179,5 @@ def test_other_online_moe_formats_are_rejected(dist_init):
 def test_direct_load_weights_after_init_is_refused(dist_init, workspace_init):
     """A direct load_weights would cast BF16 into the FP8 experts unscaled."""
     _, _, runner, _ = _build(_checkpoint(0), _online_config(moe="fp8_per_channel"))
-    with pytest.raises(RuntimeError, match="layerwise reload"):
+    with pytest.raises(RuntimeError, match="not supported"):
         list(runner.routed_experts.load_weights(list(_checkpoint(1).items())))
