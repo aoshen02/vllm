@@ -126,6 +126,39 @@ def test_routed_experts_offset_validated_before_engine_submission(offset):
     )
 
 
+@pytest.mark.parametrize(
+    "key_prefix,params,resumable,error",
+    [
+        ("job", {"aux_session": "s", "stop_token_ids": [2]}, False, None),
+        (None, {"aux_session": "s"}, False, "requires AuxOutputConfig"),
+        ("job", {"aux_session": ""}, False, "non-empty"),
+        ("job", {"aux_session": "a/b"}, False, "without '/'"),
+        ("job", {"aux_session": "s", "stop": ["</s>"]}, False, "stop strings"),
+        ("job", {"aux_session": "s"}, True, "streaming input"),
+    ],
+    ids=["valid", "no-key-prefix", "empty", "slash", "stop-string", "resumable"],
+)
+def test_aux_session_validated_before_engine_submission(
+    key_prefix, params, resumable, error
+):
+    processor = Mock(spec=InputProcessor)
+    processor.tokenizer = None
+    processor.generation_config_fields = {}
+    processor.renderer = Mock()
+    processor.renderer.get_eos_token_id.return_value = None
+    processor.vllm_config = Mock()
+    processor.vllm_config.aux_output_config.object_key_prefix = key_prefix
+    prompt = {"type": "token", "prompt_token_ids": [1, 2, 3]}
+    args = ("request", prompt, SamplingParams(**params), ("generate",))
+
+    if error is None:
+        request = InputProcessor.process_inputs(processor, *args)
+        assert request.sampling_params.aux_session == "s"
+        return
+    with pytest.raises(VLLMValidationError, match=error):
+        InputProcessor.process_inputs(processor, *args, resumable=resumable)
+
+
 def _process_inputs_with_max_model_len(
     params: SamplingParams, max_model_len: int = 2048
 ):

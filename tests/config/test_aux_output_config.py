@@ -155,3 +155,25 @@ def test_aux_output_guards_are_inactive_when_capture_is_disabled():
     config.aux_output_config = AuxOutputConfig()
 
     config._verify_aux_output_compatibility()
+
+
+@pytest.mark.parametrize(
+    "kwargs,error",
+    [
+        ({"object_key_prefix": "run-1"}, None),
+        ({"object_key_prefix": ""}, "non-empty"),
+        ({"object_key_prefix": "runs/1"}, "without '/'"),
+        (
+            {"object_key_prefix": "run-1", "enable_return_routed_experts": False},
+            "enable_return_routed_experts",
+        ),
+    ],
+    ids=["valid", "empty-prefix", "slash", "no-capture"],
+)
+def test_object_key_prefix_is_validated(kwargs, error):
+    kwargs = {"enable_return_routed_experts": True, **kwargs}
+    if error is None:
+        AuxOutputConfig(**kwargs)
+        return
+    with pytest.raises(ValueError, match=error):
+        AuxOutputConfig(**kwargs)

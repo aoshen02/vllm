@@ -267,7 +267,7 @@ class OffloadingConnectorScheduler:
         self._req_status: dict[ReqId, RequestOffloadState] = {}
         self._current_batch_load_jobs: dict[int, TransferJob] = {}
         # Requests loading synchronously in the current engine step
-        self._current_batch_sync_loads: set[ReqId] = set()
+        self._current_batch_sync_loads: dict[ReqId, int] = {}
         self._current_batch_sync_load_bytes = 0
         self._current_batch_jobs_to_flush: set[int] = set()
         # GPU block IDs allocated in the current engine step
@@ -994,7 +994,9 @@ class OffloadingConnectorScheduler:
     ) -> bool:
         """Reserve the step's sync-load budget for a hit, if it fits."""
         req_id = req_status.req.request_id
-        self._current_batch_sync_loads.discard(req_id)
+        self._current_batch_sync_load_bytes -= self._current_batch_sync_loads.pop(
+            req_id, 0
+        )
         # Keep at least one token to compute, or the request can't be scheduled.
         if (
             not self.config.sync_load_budget_bytes
@@ -1008,7 +1010,7 @@ class OffloadingConnectorScheduler:
         if self._current_batch_sync_load_bytes + num_bytes > budget:
             return False
         self._current_batch_sync_load_bytes += num_bytes
-        self._current_batch_sync_loads.add(req_id)
+        self._current_batch_sync_loads[req_id] = num_bytes
         return True
 
     def get_external_cache_hit_sources(
@@ -1070,6 +1072,9 @@ class OffloadingConnectorScheduler:
             )
 
         if num_external_tokens == 0:
+            self._current_batch_sync_load_bytes -= self._current_batch_sync_loads.pop(
+                request.request_id, 0
+            )
             return
 
         # prepare_load() below pins keys that get_num_new_matched_tokens()
@@ -1401,7 +1406,7 @@ class OffloadingConnectorScheduler:
             if not req_status.transfer_jobs:
                 self._remove_request(req_id)
         self._current_batch_load_jobs = {}
-        self._current_batch_sync_loads = set()
+        self._current_batch_sync_loads = {}
         self._current_batch_sync_load_bytes = 0
         self._current_batch_jobs_to_flush = set()
         self._current_batch_allocated_block_ids = set()

@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import threading
+import time
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from types import SimpleNamespace
@@ -11,6 +12,13 @@ import numpy as np
 import pytest
 import torch
 
+from tests.distributed.aux_output_connector.utils import fake_store
+from tests.v1.core.test_kv_cache_planning import (
+    _as_draft,
+    _spec_decode_kv_cache_groups,
+)
+from tests.v1.core.test_prefix_caching import _make_hybrid_kv_cache_config
+from tests.v1.core.utils import new_kv_cache_group, new_kv_cache_layer
 from vllm.distributed.aux_output_connector import connector as connector_module
 from vllm.distributed.aux_output_connector import store as store_module
 from vllm.distributed.aux_output_connector.connector import (
@@ -20,11 +28,16 @@ from vllm.distributed.aux_output_connector.connector import (
     PackedBlockHashes,
     retained_objects,
 )
+from vllm.distributed.aux_output_connector.object_store import read_aux_rows
 from vllm.distributed.aux_output_connector.routed_experts import (
     RoutedExpertsBuffer,
     materialize_routed_experts,
     publish_routed_experts,
     routed_experts_keys,
+)
+from vllm.distributed.aux_output_connector.session_objects import (
+    SessionObjectWriter,
+    aux_object_key,
 )
 from vllm.distributed.aux_output_connector.store import (
     BackgroundBlockObjectStore,
@@ -35,7 +48,13 @@ from vllm.distributed.aux_output_connector.store import (
 from vllm.distributed.aux_output_connector.worker import (
     AuxOutputWorkerConnector,
 )
+from vllm.v1.core.kv_cache_manager import KVCacheManager
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
+from vllm.v1.core.single_type_kv_cache_manager import (
+    FullAttentionManager,
+    SlidingWindowManager,
+)
+from vllm.v1.kv_cache_interface import KVCacheConfig, MLAAttentionSpec
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.worker.gpu import async_utils
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
@@ -67,22 +86,35 @@ def test_background_store_publishes_without_blocking_caller():
     underlying.close.assert_called_once_with()
 
 
+class _RequestBlocks(dict):
+    def __missing__(self, request_id):
+        self[request_id] = [SimpleNamespace(block_id=(request_id, i)) for i in range(8)]
+        return self[request_id]
+
+
 def _kv_cache_manager(
     cached: dict, hashes_per_block: int = 1, num_blocks: int = 0
 ) -> SimpleNamespace:
     block_pool = SimpleNamespace(
         get_cached_block=lambda block_hash, _: cached.get(block_hash),
         hash_block_size=_BLOCK_SIZE,
+        num_hash_lookahead_tokens=0,
+        evict_blocks=lambda block_ids: None,
     )
-    manager = SimpleNamespace(
-        block_size=hashes_per_block * _BLOCK_SIZE, block_pool=block_pool
-    )
+    manager = object.__new__(FullAttentionManager)
+    manager.block_size = hashes_per_block * _BLOCK_SIZE
+    manager.manager_config = FullAttentionManager.config()
+    manager.block_pool = block_pool
+    manager.req_to_blocks = _RequestBlocks()
     return SimpleNamespace(
         coordinator=SimpleNamespace(
-            single_type_managers=[manager], scheduler_block_size=manager.block_size
+            single_type_managers=[manager], enable_partial_hash_hits=False
         ),
         block_pool=block_pool,
-        kv_cache_config=SimpleNamespace(num_blocks=num_blocks),
+        kv_cache_config=SimpleNamespace(
+            num_blocks=num_blocks,
+            kv_cache_groups=[SimpleNamespace(draft_only=False, prefix_replay_tokens=0)],
+        ),
     )
 
 
@@ -187,8 +219,9 @@ def _make_worker(
     max_num_batched_tokens: int | None = None,
     max_concurrent_batches: int = 2,
     max_store_blocks: int | None = None,
+    block_size: int = _BLOCK_SIZE,
 ) -> AuxOutputWorkerConnector:
-    object_nbytes = _BLOCK_SIZE * int(np.prod(_SHAPE))
+    object_nbytes = block_size * int(np.prod(_SHAPE))
     store = _make_store(
         max_bytes=(
             1 << 20 if max_store_blocks is None else max_store_blocks * object_nbytes
@@ -200,11 +233,13 @@ def _make_worker(
     worker._buffer = RoutedExpertsBuffer(
         _DTYPE,
         _SHAPE,
-        _BLOCK_SIZE,
+        block_size,
         max_num_seqs,
-        max_num_batched_tokens or max_num_seqs * _BLOCK_SIZE,
+        max_num_batched_tokens or max_num_seqs * block_size,
         max_concurrent_batches,
     )
+    worker._object_writer = None
+    worker._object_size = 0
     worker._requests = {}
     worker._generation = 0
     worker._step_metadata = None
@@ -2098,3 +2133,266 @@ def test_worker_retains_kv_cache_blocks_in_the_sending_generation():
     step.metadata.released_block_hashes = PackedBlockHashes(_HASHES[1], 32)
     _begin_step(worker, step)
     assert not store._references
+
+
+def _session_request(request_id, session="s"):
+    request = _scheduler_request(
+        request_id, [b"a" * 32], num_tokens=5, num_output_tokens=0
+    )
+    request.sampling_params.aux_session = session
+    request.num_computed_tokens = 0
+    return request
+
+
+def _position_rows(start, end):
+    return np.arange(start, end, dtype=np.uint8).repeat(6).reshape(-1, *_SHAPE)
+
+
+def _sample(request):
+    request.num_tokens += 1
+    request.num_output_tokens += 1
+
+
+def test_session_object_is_one_block_of_the_tracked_kv_group():
+    manager = _kv_cache_manager({})
+    manager.coordinator.scheduler_block_size = 2 * _BLOCK_SIZE
+    connector = AuxOutputSchedulerConnector(manager, 0, key_prefix="job")
+    request = _session_request("request")
+    connector.request_scheduled(request, 5)
+    metadata = connector.build_connector_meta(
+        _step_output(["request"], [0], [5]), {"request": request}
+    )
+    assert metadata.session_object_size == _BLOCK_SIZE
+    _sample(request)
+    request.finished = True
+    rows, keys = connector.take_rows_and_keys(
+        request, {"request": AuxRequestOutput(4, _position_rows(4, 5))}, True
+    )
+    assert keys == [aux_object_key("job", "s", (b"a" * 32).hex(), "default")]
+    assert rows[:, 0, 0].tolist() == [4]
+
+
+@pytest.mark.parametrize(
+    "groups,kwargs,error",
+    [
+        (["full"], {}, False),
+        (["full", "sliding_window"], {}, False),
+        (["full", "mamba"], {"hash_block_size": 8}, True),
+        (["full"], {"num_hash_lookahead_tokens": 2}, True),
+        (["sliding_window"], {}, True),
+        (["full", "replay"], {}, True),
+        (["full", "wide"], {"scheduler_block_size": 32}, True),
+    ],
+    ids=[
+        "full-attention",
+        "sliding-window",
+        "partial-hash-hits",
+        "hash-lookahead",
+        "no-full-attention",
+        "prefix-replay",
+        "block-not-dividing",
+    ],
+)
+def test_sessions_reject_kv_layouts_that_break_objects(groups, kwargs, error):
+    extra = {"replay": (16, True), "wide": (32, False)}
+    config = _make_hybrid_kv_cache_config(
+        16, 10, [group for group in groups if group not in extra]
+    )
+    for name in extra.keys() & set(groups):
+        block_size, bounded_replay = extra[name]
+        spec = MLAAttentionSpec(
+            block_size=block_size, num_kv_heads=1, head_size=64, dtype=torch.bfloat16
+        )
+        layer = SlidingWindowManager.layer_config(
+            spec, sliding_window=32, bounded_replay=bounded_replay
+        )
+        config.kv_cache_groups.append(new_kv_cache_group([name], layer))
+    kwargs = {"hash_block_size": 16, "scheduler_block_size": 16, **kwargs}
+    manager = KVCacheManager(config, max_model_len=8192, **kwargs)
+    AuxOutputSchedulerConnector(manager, 0)
+    if not error:
+        AuxOutputSchedulerConnector(manager, 0, key_prefix="job")
+        return
+    with pytest.raises(ValueError, match="object_key_prefix needs"):
+        AuxOutputSchedulerConnector(manager, 0, key_prefix="job")
+
+
+@pytest.mark.parametrize(
+    "specs,compared",
+    [
+        (
+            lambda: {
+                "layers.0": new_kv_cache_layer(),
+                "layers.1": new_kv_cache_layer(sliding_window=32),
+                "mtp.0": _as_draft(new_kv_cache_layer(sliding_window=64)),
+            },
+            [["layers.0"], ["layers.1"]],
+        ),
+        (
+            lambda: {
+                "layers.0": new_kv_cache_layer(),
+                "mtp.0": _as_draft(new_kv_cache_layer()),
+            },
+            [["layers.0", "mtp.0"]],
+        ),
+        (
+            lambda: {
+                "layers.0": new_kv_cache_layer(sliding_window=32),
+                "mtp.0": _as_draft(new_kv_cache_layer()),
+            },
+            None,
+        ),
+    ],
+    ids=["draft-only-group", "mixed-group", "draft-tracked-group"],
+)
+@pytest.mark.parametrize(
+    "use_eagle_block_drop", [False, True], ids=["no-block-drop", "block-drop"]
+)
+def test_session_versions_skip_kv_groups_of_draft_layers_only(
+    specs, compared, use_eagle_block_drop
+):
+    groups = _spec_decode_kv_cache_groups([specs()], use_eagle_block_drop)
+    config = KVCacheConfig(num_blocks=10, kv_cache_tensors=[], kv_cache_groups=groups)
+    manager = KVCacheManager(
+        config, max_model_len=8192, hash_block_size=16, scheduler_block_size=16
+    )
+    if compared is None:
+        with pytest.raises(ValueError, match="object_key_prefix needs"):
+            AuxOutputSchedulerConnector(manager, 0, key_prefix="job")
+        return
+    connector = AuxOutputSchedulerConnector(manager, 0, key_prefix="job")
+    assert sorted(sorted(groups[i].layer_names) for i in connector._groups) == compared
+
+
+def _session_worker(store):
+    worker = _make_worker(2)
+    worker._object_writer = SessionObjectWriter(
+        store, key_prefix="job", max_pending_batches=4
+    )
+    return worker
+
+
+def _session_step(worker, rows, start, end, hashes, *, sampled=0, object_blocks=1):
+    step = _metadata(
+        0, [_request_metadata("session", start, end - start, 0, hashes)], {}
+    )
+    step.metadata.session_object_size = object_blocks * _BLOCK_SIZE
+    if start == 0:
+        step.metadata.sessions = {"session": "s"}
+    _begin_step(worker, step)
+    worker._capturer = Mock()
+    worker._capturer.snapshot_routing_data.return_value = torch.from_numpy(
+        rows[start:end]
+    )
+    pending = worker.prepare_output(
+        _input_batch(["session"], np.array([start]), np.array([0, end - start]))
+    )
+    pending.enqueue_cpu_copy(np.array([sampled]), np.array([0]))
+    return pending
+
+
+def test_worker_writes_session_objects_under_the_weight_version_of_each_step():
+    client, store = fake_store()
+    worker = _session_worker(store)
+    rows = _position_rows(0, 2 * _BLOCK_SIZE)
+    for block, version in enumerate(["v1", "v2"]):
+        start = block * _BLOCK_SIZE
+        step = _metadata(
+            0,
+            [
+                _request_metadata(
+                    "session", start, _BLOCK_SIZE, 0, _HASHES[block : block + 1]
+                ),
+                _request_metadata(
+                    "plain", start, _BLOCK_SIZE, 0, _HASHES[block + 2 : block + 3]
+                ),
+            ],
+            {},
+        )
+        step.metadata.weight_version = version
+        step.metadata.session_object_size = _BLOCK_SIZE
+        if block == 0:
+            step.metadata.sessions = {"session": "s"}
+        _begin_step(worker, step)
+        worker._capturer = Mock()
+        worker._capturer.snapshot_routing_data.return_value = torch.from_numpy(
+            np.concatenate([rows[start : start + _BLOCK_SIZE]] * 2)
+        )
+        pending = worker.prepare_output(
+            _input_batch(
+                ["session", "plain"],
+                np.array([start, start]),
+                np.array([0, _BLOCK_SIZE, 2 * _BLOCK_SIZE]),
+            )
+        )
+        pending.enqueue_cpu_copy(np.array([0, 0]), np.array([0, 0]))
+        worker.process_output(pending)
+    local_store = worker._store
+    assert len(local_store.get_concatenated(routed_experts_keys(_HASHES[2:], "0")))
+    with pytest.raises(BlockObjectStoreError):
+        local_store.get_concatenated(routed_experts_keys(_HASHES[:1], "0"))
+    worker.close()
+
+    keys = [f"job/s/{_HASHES[0].hex()}@v1", f"job/s/{_HASHES[1].hex()}@v2"]
+    assert client.writes == [keys[:1], keys[1:]]
+    np.testing.assert_array_equal(read_aux_rows(store, keys, "routed_experts"), rows)
+
+
+@pytest.mark.parametrize(
+    "object_blocks,hashes,expected_start",
+    [(1, _HASHES[:1], _BLOCK_SIZE), (2, _HASHES[:1], 0), (1, [], 0)],
+    ids=["1", "2", "hash-not-sent"],
+)
+def test_worker_returns_session_rows_from_the_last_object_it_can_name(
+    object_blocks, hashes, expected_start
+):
+    worker = _session_worker(fake_store()[1])
+    rows = _position_rows(0, 7)
+    pending = _session_step(worker, rows, 0, 6, hashes, object_blocks=object_blocks)
+    assert worker.process_output(pending) == {}
+    pending = _session_step(
+        worker, rows, 6, 7, [], sampled=1, object_blocks=object_blocks
+    )
+    outputs = worker.process_output(pending)
+    worker.close()
+    assert outputs["session"].token_start == expected_start
+    np.testing.assert_array_equal(outputs["session"].rows, rows[expected_start:])
+
+
+@pytest.mark.parametrize(
+    "terminal_first", [True, False], ids=["terminal-first", "output-first"]
+)
+def test_worker_writes_an_object_of_two_hash_blocks_once(terminal_first):
+    client, store = fake_store()
+    worker = _session_worker(store)
+    rows = _position_rows(0, 2 * _BLOCK_SIZE)
+    pending = _session_step(worker, rows, 0, 2 * _BLOCK_SIZE, [], object_blocks=2)
+    terminal = _metadata(0, [], {"session": _HASHES[:2]})
+    terminal.metadata.session_object_size = 2 * _BLOCK_SIZE
+    if terminal_first:
+        _begin_step(worker, terminal)
+        worker.process_output(pending)
+    else:
+        worker.process_output(pending)
+        _begin_step(worker, terminal)
+    assert worker._requests == {}
+    worker.close()
+
+    key = f"job/s/{_HASHES[1].hex()}@default"
+    assert client.writes == [[key]]
+    np.testing.assert_array_equal(read_aux_rows(store, [key], "routed_experts"), rows)
+
+
+def test_worker_step_fails_after_a_session_object_write_failed():
+    client, store = fake_store(-1)
+    worker = _session_worker(store)
+    pending = _session_step(
+        worker, _position_rows(0, _BLOCK_SIZE), 0, _BLOCK_SIZE, _HASHES[:1]
+    )
+    worker.process_output(pending)
+    with pytest.raises(BlockObjectStoreError, match="write failed"):
+        for _ in range(500):
+            _begin_step(worker, _metadata(0, [], {}))
+            time.sleep(0.01)
+    worker.close()
+    assert client.closed and worker._store is None

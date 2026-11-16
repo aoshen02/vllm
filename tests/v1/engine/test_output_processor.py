@@ -71,6 +71,7 @@ def test_delta_output_without_new_tokens_returns_empty_logprobs(
     state.request_index = 0
     state.sampling_mask_chunks = []
     state.routed_experts_chunks = []
+    state.aux_output_keys = None
     state.spec_decode_metrics = None
 
     output = state._new_completion_output([], None, None)
@@ -96,6 +97,7 @@ def test_completion_output_preserves_each_sampling_mask_position() -> None:
         SamplingMaskLists(token_ids=np.array([30, 31, 32])),
     ]
     state.routed_experts_chunks = []
+    state.aux_output_keys = None
     state.spec_decode_metrics = None
     state.weight_version_starts = []
 
@@ -1592,6 +1594,45 @@ def test_routed_experts_are_accumulated_until_finish():
     )
 
 
+def test_aux_output_keys_of_the_terminal_engine_output_reach_the_final_output():
+    output_processor = OutputProcessor(tokenizer=None, log_stats=False)
+    request = EngineCoreRequest(
+        request_id="request-0-int",
+        external_req_id="request-0",
+        prompt_token_ids=[1, 2, 3],
+        mm_features=None,
+        arrival_time=0,
+        lora_request=None,
+        cache_salt=None,
+        data_parallel_rank=None,
+        sampling_params=SamplingParams(detokenize=False, max_tokens=2),
+        pooling_params=None,
+    )
+    output_processor.add_request(request, prompt=None)
+    outputs = [
+        output_processor.process_outputs(
+            [
+                EngineCoreOutput(
+                    request_id="request-0-int",
+                    new_token_ids=[token],
+                    finish_reason=finish_reason,
+                    aux_output_keys=keys,
+                )
+            ]
+        ).request_outputs[0]
+        for token, finish_reason, keys in (
+            (42, None, None),
+            (43, FinishReason.LENGTH, ["job/s/00@default"]),
+        )
+    ]
+    assert [output.outputs[0].aux_output_keys for output in outputs] == [
+        None,
+        ["job/s/00@default"],
+    ]
+    outputs[0].add(outputs[1], aggregate=True)
+    assert outputs[0].outputs[0].aux_output_keys == ["job/s/00@default"]
+
+
 @pytest.mark.asyncio
 async def test_cumulative_output_collector_n():
     """Test collector correctly handles multiple outputs by index."""
@@ -1909,6 +1950,7 @@ def test_sampling_masks_follow_output_kind(output_kind):
     state.request_index = 0
     state.sampling_mask_chunks = []
     state.routed_experts_chunks = []
+    state.aux_output_keys = None
     state.spec_decode_metrics = None
     state.weight_version_starts = []
 

@@ -1631,6 +1631,12 @@ def get_global_kv_cache_groups(
         for group in global_kv_cache_groups:
             group.is_eagle_group = not draft_layer_names.isdisjoint(group.layer_names)
         _warn_if_unannotated_eagle_mamba(spec_config, global_kv_cache_groups)
+    if spec_config is not None:
+        draft_layer_names = {
+            name for name, config in merged_layer_configs.items() if config.is_draft
+        }
+        for group in global_kv_cache_groups:
+            group.draft_only = draft_layer_names.issuperset(group.layer_names)
     return global_kv_cache_groups
 
 
