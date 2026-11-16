@@ -721,7 +721,7 @@ class KVConnectorBase_V1(ABC):
 
     def abort_exports(self) -> None:
         """Abort KV transfers that are not running: free the KV kept for remote
-        readers and fail reads that wait for a prefill."""
+        readers, fail reads that wait for a prefill, withdraw pending reads."""
         return
 
     def has_pending_push_work(self) -> bool:

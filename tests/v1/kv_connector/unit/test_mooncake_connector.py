@@ -1979,6 +1979,28 @@ def test_decode_lease_renewal_is_opt_in_and_throttled(kv_lease_duration):
     assert not scheduler.schedule().kv_connector_metadata.lease_heartbeats
 
 
+def test_decode_withdraws_pull_of_aborted_request():
+    """Without leases too, D withdraws the pull of a request it aborts."""
+    scheduler, block_size = _lease_decode_scheduler(None)
+    request = _remote_prefill_request(1, block_size)
+    scheduler.add_request(request)
+    scheduler.update_from_output(
+        scheduler.schedule(), create_model_runner_output(reqs=[])
+    )
+
+    scheduler.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)
+    meta = scheduler.schedule().kv_connector_metadata
+    assert meta.withdrawals == {
+        "my-engine-id": LeaseHeartbeat(
+            remote_bootstrap_addr="http://prefill:8998",
+            transfer_ids=["xfer-1"],
+            withdraw=True,
+        )
+    }
+    assert not meta.lease_heartbeats
+    assert not scheduler.schedule().kv_connector_metadata.withdrawals
+
+
 def _next_lease_heartbeats(scheduler, scheduler_output, timeout: float = 5.0):
     connector = scheduler.get_kv_connector()
     deadline = time.monotonic() + timeout

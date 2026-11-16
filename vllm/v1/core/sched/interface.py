@@ -218,6 +218,12 @@ class SchedulerInterface(ABC):
         raise NotImplementedError
 
     @abstractmethod
+    def abort_kv_transfers(self) -> "list[Request]":
+        """Drop the KV transfers that are not running and abort the waiting
+        requests that hold blocks for them, as a cache reset needs the blocks."""
+        raise NotImplementedError
+
+    @abstractmethod
     def reset_prefix_cache(
         self, reset_running_requests: bool = False, reset_connector: bool = False
     ) -> bool:

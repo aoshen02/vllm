@@ -689,13 +689,15 @@ class MooncakeLeaseHeartbeat(
     msgspec.Struct,
     omit_defaults=True,  # type: ignore[call-arg]
 ):
-    """Sent by D to renew P's lease on KV blocks that D has not pulled yet.
+    """Sent by D to renew P's lease on KV blocks that D has not pulled yet,
+    or with `withdraw` to drop transfers that D no longer waits for.
 
     It shares P's side channel with pulls. A pull decodes as a heartbeat with
     no transfer ids, because msgspec skips the fields it does not know.
     """
 
     lease_transfer_ids: list[TransferId] = msgspec.field(default_factory=list)
+    withdraw: bool = False
 
 
 @dataclass(slots=True)
@@ -704,6 +706,7 @@ class LeaseHeartbeat:
 
     remote_bootstrap_addr: str
     transfer_ids: list[TransferId]
+    withdraw: bool = False
 
 
 def _get_kv_lease_duration(kv_transfer_config: KVTransferConfig) -> float | None:
@@ -753,8 +756,9 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
         self.reqs_to_send: dict[ReqId, tuple[TransferId, list[list[int]]]] = {}
         self.reqs_not_processed: set[TransferId] = set()
         self.abort_exports = False
-        # D side: lease renewals to send this step, by remote P engine.
+        # D side: lease renewals and withdrawals to send, by remote P engine.
         self.lease_heartbeats: dict[EngineId, LeaseHeartbeat] = {}
+        self.withdrawals: dict[EngineId, LeaseHeartbeat] = {}
 
     def add_new_req(
         self,
@@ -1051,10 +1055,11 @@ class MooncakeConnectorScheduler:
         # remote prefill or aborted.
         self._reqs_not_processed: set[TransferId] = set()
         self.abort_exports = False
+        self.withdrawals: list[tuple[EngineId, str, TransferId]] = []
 
-        # D side: requests whose KV P still holds under a lease, from arrival
-        # until the pull settles. A request can wait in the queue for longer
-        # than the lease, so renewal cannot wait until it is scheduled.
+        # D side: requests whose KV P still holds, from arrival until the pull
+        # settles. A request can wait in the queue for longer than the lease,
+        # so renewal cannot wait until it is scheduled.
         self._kv_lease_duration = _get_kv_lease_duration(vllm_config.kv_transfer_config)
         self._lease_reqs: dict[ReqId, tuple[EngineId, str, TransferId]] = {}
         self._last_heartbeat_time = 0.0
@@ -1143,8 +1148,7 @@ class MooncakeConnectorScheduler:
             self._truncate_mamba_request_for_prefill(request)
 
         if (
-            self._kv_lease_duration is not None
-            and params is not None
+            params is not None
             and params.get("do_remote_prefill")
             and all(
                 params.get(p)
@@ -1290,6 +1294,12 @@ class MooncakeConnectorScheduler:
                         )
                     heartbeat.transfer_ids.append(transfer_id)
 
+            for engine_id, bootstrap_addr, transfer_id in self.withdrawals:
+                meta.withdrawals.setdefault(
+                    engine_id, LeaseHeartbeat(bootstrap_addr, [], withdraw=True)
+                ).transfer_ids.append(transfer_id)
+            self.withdrawals.clear()
+
         if not self.is_kv_consumer:
             for req_id, (req, block_ids) in self._reqs_need_send.items():
                 assert req.kv_transfer_params is not None
@@ -1323,7 +1333,9 @@ class MooncakeConnectorScheduler:
             request.status,
             params,
         )
-        self._lease_reqs.pop(request.request_id, None)
+        if (pull := self._lease_reqs.pop(request.request_id, None)) is not None:
+            # D gives up a pull that has not settled: P must not wait for it.
+            self.withdrawals.append(pull)
         if not params or not params.get("transfer_id"):
             return False, None
 
@@ -1704,7 +1716,13 @@ class MooncakeConnectorWorker:
                 # waiting for prefills, and the renewal must not wait.
                 heartbeat = self._decode_heartbeat(metadata_bytes)
                 if heartbeat is not None:
-                    response = self._renew_kv_leases(heartbeat.lease_transfer_ids)
+                    if heartbeat.withdraw:
+                        self._drop_transfers(heartbeat.lease_transfer_ids)
+                        response = MooncakeXferResponse(
+                            status=MooncakeXferResponseStatus.FINISH
+                        )
+                    else:
+                        response = self._renew_kv_leases(heartbeat.lease_transfer_ids)
                     await sock.send_multipart(
                         (identity, self._encoder.encode(response))
                     )
@@ -2952,7 +2970,9 @@ class MooncakeConnectorWorker:
                 )
                 return
         payload = self._encoder.encode(
-            MooncakeLeaseHeartbeat(lease_transfer_ids=heartbeat.transfer_ids)
+            MooncakeLeaseHeartbeat(
+                lease_transfer_ids=heartbeat.transfer_ids, withdraw=heartbeat.withdraw
+            )
         )
         selected_remote_pp = self._select_remote_workers(remote_engine_id)
         await asyncio.gather(
@@ -2965,13 +2985,13 @@ class MooncakeConnectorWorker:
         )
 
     async def _send_heartbeat_to_worker(self, worker_addr: str, payload: bytes):
-        assert self._kv_lease_duration is not None
+        timeout = self._kv_lease_duration / 6 if self._kv_lease_duration else 5
         try:
             with make_zmq_socket(
                 self.async_zmq_ctx, worker_addr, zmq.DEALER, bind=False, linger=0
             ) as sock:
                 # Wait for the reply: linger=0 drops a message still unsent.
-                sock.setsockopt(zmq.RCVTIMEO, int(self._kv_lease_duration / 6 * 1000))
+                sock.setsockopt(zmq.RCVTIMEO, int(timeout * 1000))
                 await sock.send(payload)
                 response = self._xfer_resp_decoder.decode(await sock.recv())
         except zmq.ContextTerminated:
@@ -3082,11 +3102,11 @@ class MooncakeConnectorWorker:
                 self._start_load_kv(metadata.reqs_to_recv), self.receiver_loop
             )
 
-        if not self.is_kv_producer and metadata.lease_heartbeats:
-            asyncio.run_coroutine_threadsafe(
-                self._send_lease_heartbeats(metadata.lease_heartbeats),
-                self.receiver_loop,
-            )
+        for heartbeats in (metadata.lease_heartbeats, metadata.withdrawals):
+            if not self.is_kv_producer and heartbeats:
+                asyncio.run_coroutine_threadsafe(
+                    self._send_lease_heartbeats(heartbeats), self.receiver_loop
+                )
 
         if not self.is_kv_consumer and (
             metadata.reqs_to_send
