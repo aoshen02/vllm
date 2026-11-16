@@ -34,7 +34,7 @@ A source implements `metadata` and one or both iteration modes:
 | `iter_full()` | `(name, full tensor)` for each name this rank owns |
 | `iter_local()` | `(name, this rank's piece)` for each name this rank owns |
 
-NCCL broadcast and IPC consume `iter_full()`; NCCL M2N consumes
+NCCL broadcast, IPC and sharded RDT consume `iter_full()`; NCCL M2N consumes
 `iter_local()`. Each engine checks at `trainer_init` that the source implements
 the mode it needs (`implements_iter_full()` / `implements_iter_local()`).
 
@@ -74,6 +74,9 @@ Both modes yield exactly `owned_names(rank)`, in metadata order,
 with the declared dtypes and shapes. Either may run collectives among a
 parameter's owners (an FSDP all-gather per tensor or per layer), as long as
 every owner iterates in that order. Each call starts a fresh pass.
+
+Keep names that share a layer index (`model.layers.3.*`) contiguous in
+`metadata`: sharded RDT transfers [a layer at a time](sharded_rdt.md).
 
 #### ModuleSource
 
@@ -401,7 +404,7 @@ Subclasses must implement five methods:
 The base class provides:
 
 1. `__init__`, taking `config` (`WeightTransferConfig`), `vllm_config` (`VllmConfig`), `device` (`torch.device`), and `model` (`nn.Module`).
-2. `update_weights(update_info_dict)`, a thin wrapper for `receive_weights`: it parses the dict into the typed dataclass, calls `receive_weights`, and synchronizes the device.
+2. `update_weights(update_info_dict)`, a thin wrapper for `receive_weights`: it parses the dict into the typed dataclass, calls `receive_weights`, and synchronizes the device — unless the engine sets `defers_processing`, below.
 3. `parse_init_info` / `parse_update_info`, which convert API-level dicts into the typed dataclasses and raise `ValueError` on a bad payload.
 4. `set_weight_update_target` / `reset_weight_update_target`, used to retarget an update at the speculative draft model.
 
@@ -411,6 +414,25 @@ The base class provides:
     `init_transfer_engine`, then read from `self` in `receive_weights`. Per-round
     update info carries only per-round metadata. This is what makes a
     trainer/worker mismatch unrepresentable.
+
+!!! note "`defers_processing`: when a returned update means queued, not applied"
+    An engine that pipelines its GPU post-processing onto background threads
+    cannot let `update_weights` synchronize the device — that would block on
+    those threads and serialize the pipeline. Such an engine sets the class
+    attribute `defers_processing = True`, omits the per-update sync, and
+    guarantees completion in `finish_weight_update` instead.
+
+    Callers that go through `finish_weight_update` need do nothing; the engine
+    drains there. A caller that drives the tail itself — running its own
+    `finish_reload`, say — must check the flag and call
+    `drain_pending()` first, because with it set a returned `update_weights`
+    means *queued*, not *applied*. `drain_pending()` is idempotent, and a no-op
+    on an engine that processes synchronously, so it is always safe to call.
+
+    [Sharded RDT](sharded_rdt.md) is the built-in engine that sets it: it
+    scatters on a background thread with its own CUDA stream, so its
+    `drain_pending()` joins that queue and syncs that stream before
+    `finish_reload` runs.
 
 ### Request Classes
 
@@ -526,7 +548,7 @@ Once registered, users select your backend via `WeightTransferConfig(backend="my
 
 ### WeightTransferEngineFactory
 
-The factory uses a registry pattern with lazy loading. Built-in engines (`nccl`, `ipc`, `sparse_nccl`, `nccl_m2n` and `modelexpress`) are registered at import time but their modules are only loaded when the backend is actually requested. This avoids importing heavy dependencies (like NCCL communicators) when they aren't needed.
+The factory uses a registry pattern with lazy loading. Built-in engines (`nccl`, `ipc`, `sparse_nccl` and `sharded_rdt`) are registered at import time but their modules are only loaded when the backend is actually requested. This avoids importing heavy dependencies (like NCCL communicators) when they aren't needed.
 
 ```python
 from vllm.distributed.weight_transfer import WeightTransferEngineFactory

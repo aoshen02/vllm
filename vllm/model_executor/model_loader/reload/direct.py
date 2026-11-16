@@ -15,12 +15,14 @@ of every `padding_fill_params()` parameter, which `begin` zero-fills whole.
 """
 
 from collections.abc import Iterator
+from contextlib import contextmanager
 
 import torch
 
 from vllm.config import ModelConfig
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
+from vllm.model_executor.model_loader.online_processing import SKIP_LOAD_TENSORS
 from vllm.model_executor.utils import (
     is_weights_pre_processed,
     storage_view,
@@ -33,6 +35,7 @@ __all__ = [
     "direct_reload_active",
     "finish_direct_reload",
     "loadable_tensors",
+    "meta_checkpoint_layout",
     "record_checkpoint_layout",
 ]
 
@@ -164,6 +167,40 @@ def _checkpoint_views(
             )
         views.append((t, storage_view(storage, offset, shape, stride, dtype)))
     return views
+
+
+@contextmanager
+def meta_checkpoint_layout(model: torch.nn.Module) -> Iterator[None]:
+    """Within, every tensor this model owns is a meta tensor in its checkpoint
+    layout (at the storage offset `begin` would view it at) with its checkpoint
+    loader metadata, so a dry-run `load_weights` records where each checkpoint
+    tensor lands after `begin` without touching the model. Restored on exit."""
+    if not hasattr(model, "_ckpt_param_names"):
+        raise RuntimeError("direct reload: no checkpoint layout was recorded")
+    saved: list[tuple[torch.Tensor, torch.Tensor, dict]] = []
+    try:
+        for name, t in loadable_tensors(model):
+            # loaders read expert maps; they stay real
+            if not _owned(model, t) or name.rpartition(".")[2] in SKIP_LOAD_TENSORS:
+                continue
+            shape, stride, dtype, offset = t._ckpt[1]
+            if t.untyped_storage().data_ptr() != t._ckpt[3]:
+                offset = t.storage_offset()  # moved, as in `_checkpoint_views`
+            span = (
+                0 if 0 in shape else 1 + sum((n - 1) * s for n, s in zip(shape, stride))
+            )
+            meta = torch.empty(offset + span, dtype=dtype, device="meta")
+            saved.append((t, t.data, dict(t.__dict__)))
+            t.data = meta.as_strided(shape, stride, offset)
+            for k in _LOADER_ATTRS:
+                t.__dict__.pop(k, None)
+            t.__dict__.update(t._ckpt[2])
+        yield
+    finally:
+        for t, data, attrs in saved:
+            t.data = data
+            t.__dict__.clear()
+            t.__dict__.update(attrs)
 
 
 @torch.no_grad()

@@ -44,6 +44,47 @@ steps:
       - pytest -v -s distributed/test_shm_buffer.py
       - pytest -v -s distributed/test_shm_storage.py
 
+- label: ":nvidia: (L4) Sharded RDT Weight Transfer"
+  key: sharded-rdt-weight-transfer
+  automatic_shard: true
+  device: l4
+  timeout_in_minutes: 20
+  working_dir: "/vllm-workspace/tests"
+  num_devices: 1
+  source_file_dependencies:
+  - vllm/distributed/weight_transfer/
+  - tests/distributed/test_sharded_rdt_plan.py
+  - tests/distributed/test_sharded_rdt_producer.py
+  - tests/distributed/test_sharded_rdt_trainer.py
+  commands:
+  - pytest -v -s distributed/test_sharded_rdt_plan.py
+  - pytest -v -s distributed/test_sharded_rdt_producer.py
+  - pytest -v -s distributed/test_sharded_rdt_trainer.py
+  mirror:
+    amd:
+      automatic_shard: true
+      label: ":amd: (MI355 DPX) Sharded RDT Weight Transfer"
+      dind: false
+      device: mi355_dpx
+      num_devices: 1
+      timeout_in_minutes: 45
+      working_dir: /vllm-workspace/tests
+      depends_on:
+      - image-build-amd
+      source_file_dependencies:
+      - vllm/distributed/weight_transfer/
+      - tests/distributed/test_sharded_rdt_plan.py
+      - tests/distributed/test_sharded_rdt_producer.py
+      - tests/distributed/test_sharded_rdt_trainer.py
+      - vllm/platforms/rocm.py
+      env:
+        VLLM_WORKER_MULTIPROC_METHOD: "spawn"
+      commands:
+      - uv pip install --system --no-deps 'ray==2.56.1'
+      - pytest -v -s distributed/test_sharded_rdt_plan.py
+      - pytest -v -s distributed/test_sharded_rdt_producer.py
+      - pytest -v -s distributed/test_sharded_rdt_trainer.py
+
 - label: ":nvidia: (L4) Distributed DP Basic"
   key: distributed-dp-tests-2-gpus
   automatic_shard: true
@@ -232,6 +273,14 @@ steps:
   # rlhf examples (each launches its own `vllm serve` and tears it down)
   - VLLM_ALLOW_INSECURE_SERIALIZATION=1 python3 examples/rl/rlhf_http_nccl.py
   - VLLM_ALLOW_INSECURE_SERIALIZATION=1 python3 examples/rl/rlhf_http_ipc.py
+  # sharded RDT: 2 FSDP2 trainer ranks -> 2 vLLM DP ranks with EP. Its data
+  # plane is NIXL, which ships only in the kv-connector set baked into the CI
+  # image; the check fails fast if it is missing. RDT_MODEL swaps
+  # the script's reference MoE for a tiny one: no weights are downloaded either
+  # way, but every trainer rank builds the model before sharding it, and the
+  # default does not fit an L4.
+  - bash /vllm-workspace/.buildkite/scripts/check-kv-connectors.sh
+  - RDT_MODEL=vllm-project/tiny-random-DeepseekV2ForCausalLM python3 examples/rl/rlhf_sharded_rdt_small_ep.py
   mirror:
     amd:
       # Run on PRs even when the L4 step is optional (nightly only).
@@ -249,10 +298,13 @@ steps:
       - tests/distributed/test_torchrun_example_moe.py
       - examples/rl/
       - examples/features/data_parallel/data_parallel_offline.py
+      - .buildkite/scripts/check-kv-connectors.sh
       - requirements/test/rocm.in
       - requirements/test/rocm.txt
       - vllm/platforms/rocm.py
       commands:
+      # Sharded RDT needs Ray >= 2.56; keep the ROCm image's dependencies.
+      - uv pip install --system --no-deps 'ray==2.56.1'
       - export NCCL_CUMEM_HOST_ENABLE=0
       - torchrun --nproc-per-node=4 tests/distributed/test_torchrun_example.py
       # tp=2 and pp=2 with torchrun: no longer supported with MRV2
@@ -264,6 +316,8 @@ steps:
       - python3 examples/features/data_parallel/data_parallel_offline.py --enforce-eager --timeout 900
       - VLLM_ALLOW_INSECURE_SERIALIZATION=1 python3 examples/rl/rlhf_http_nccl.py
       - VLLM_ALLOW_INSECURE_SERIALIZATION=1 python3 examples/rl/rlhf_http_ipc.py
+      - bash /vllm-workspace/.buildkite/scripts/check-kv-connectors.sh
+      - RDT_MODEL=vllm-project/tiny-random-DeepseekV2ForCausalLM python3 examples/rl/rlhf_sharded_rdt_small_ep.py
 
 - label: ":nvidia: (L4) [Nightly] Distributed DP Extended"
   key: distributed-dp-tests-4-gpus

@@ -15,7 +15,7 @@ The plan holds for every later update of the same model.
 
 `load_planned` loads full checkpoint tensors through `get_dest`; the NCCL
 engine uses it. `get_boxes` (with `get_dest`) is for engines that send or
-read only the slices a rank needs (NCCL M2N follow-ups).
+read only the slices a rank needs (sharded RDT, NCCL M2N follow-ups).
 """
 
 import heapq
@@ -71,8 +71,8 @@ class LoadPlan:
     def get_boxes(self, name: str) -> tuple[Box, ...] | None:
         """Parts of the checkpoint tensor this rank needs; `None`: nothing.
 
-        For engines that send or read only those slices (NCCL M2N
-        follow-ups); an engine that receives full tensors calls
+        For engines that send or read only those slices (sharded RDT, NCCL
+        M2N follow-ups); an engine that receives full tensors calls
         `load_planned` instead."""
         return self.entries[name].boxes
 
