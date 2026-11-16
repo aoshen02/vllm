@@ -91,21 +91,20 @@ def _check_supported_modules(model: torch.nn.Module) -> None:
         HummingLinearMethod,
         HummingMoEMethod,
     )
-    from vllm.model_executor.layers.quantization.online.fp8 import OnlineLinearBase
-    from vllm.model_executor.layers.quantization.online.moe_base import (
-        OnlineMoEMethodBase,
-    )
 
     for name, module in model.named_modules():
         method = getattr(module, "quant_method", None)
-        # also without an online config (experts_int8); fused shared experts
-        # quantize staging parameters that post-load processing deletes
-        if isinstance(method, (OnlineLinearBase, OnlineMoEMethodBase)) or (
-            getattr(module, "shared_expert_online_loader", None) is not None
+        # Post-load processing quantizes the checkpoint tensors (meta device),
+        # releases the ones it requantizes, or deletes the staging parameters
+        # of fused shared experts: a reload has nothing to load them into.
+        if (
+            getattr(method, "uses_meta_device", False)
+            or getattr(method, "requantization_source", None) is not None
+            or getattr(module, "shared_expert_online_loader", None) is not None
         ):
             raise RuntimeError(
-                f"direct reload: online quantization is not supported "
-                f"({name}: {type(method).__name__})"
+                f"direct reload: online quantization in post-load processing is "
+                f"not supported ({name}: {type(method).__name__})"
             )
         if isinstance(method, (HummingLinearMethod, HummingMoEMethod)):
             # its post-load processing runs once per quant method (a guard on

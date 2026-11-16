@@ -5,7 +5,10 @@ import torch
 from torch.nn import Module
 
 from vllm._custom_ops import scaled_fp4_quant
-from vllm.model_executor.layers.fused_moe import RoutedExperts
+from vllm.model_executor.layers.fused_moe import (
+    FusedMoeWeightScaleSupported,
+    RoutedExperts,
+)
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
     FusedMoEQuantConfig,
@@ -16,6 +19,7 @@ from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import (
     make_nvfp4_moe_quant_config,
     select_nvfp4_moe_backend,
 )
+from vllm.model_executor.layers.quantization.online.loading import quantize_on_load
 from vllm.model_executor.layers.quantization.online.moe_base import (
     OnlineMoEMethodBase,
 )
@@ -82,6 +86,21 @@ def _quantize_moe_weight_to_nvfp4(
     )
 
 
+def _quantize_nvfp4(
+    weight: torch.Tensor, amax: torch.Tensor | None = None
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """`weight` to NVFP4 (as `_quantize_moe_weight_to_nvfp4` does one expert),
+    its global scale from `amax`, by default its own."""
+    if amax is None:
+        amax = weight_amax(weight)
+    amax = amax.to(weight.device, torch.float32)
+    global_scale = (FLOAT4_E2M1_MAX * FLOAT8_E4M3_MAX) / amax.clamp_min(1e-8)
+    qweight, block_scale = scaled_fp4_quant(
+        weight.contiguous(), global_scale, is_sf_swizzled_layout=False
+    )
+    return qweight, block_scale, (1.0 / global_scale).reshape(1)
+
+
 class Nvfp4OnlineMoEMethod(OnlineMoEMethodBase):
     """Online NVFP4 MoE quantization with per-token activation scales.
 
@@ -91,6 +110,7 @@ class Nvfp4OnlineMoEMethod(OnlineMoEMethodBase):
     """
 
     activation_quant_key = kNvfp4DynamicToken
+    uses_meta_device = False
 
     def __init__(
         self,
@@ -112,8 +132,99 @@ class Nvfp4OnlineMoEMethod(OnlineMoEMethodBase):
     def per_token_activation(self) -> bool:
         return self.activation_quant_key == kNvfp4DynamicToken
 
+    def create_quantized_weights(
+        self,
+        layer,
+        num_experts,
+        hidden_size,
+        intermediate_size_per_partition,
+        **extra_weight_attrs,
+    ):
+        """As a ModelOpt NVFP4 checkpoint."""
+        inter = intermediate_size_per_partition
+        w13_rows = self.moe.w13_num_shards * inter
+        fp8 = torch.float8_e4m3fn
+        self.register_weights(
+            layer,
+            FusedMoeWeightScaleSupported.GROUP.value,
+            {
+                "w13_weight": torch.zeros(
+                    num_experts, w13_rows, hidden_size // 2, dtype=torch.uint8
+                ),
+                "w2_weight": torch.zeros(
+                    num_experts, hidden_size, inter // 2, dtype=torch.uint8
+                ),
+                "w13_weight_scale": torch.zeros(
+                    num_experts, w13_rows, hidden_size // 16, dtype=fp8
+                ),
+                "w2_weight_scale": torch.zeros(
+                    num_experts, hidden_size, inter // 16, dtype=fp8
+                ),
+            },
+            **extra_weight_attrs,
+        )
+        self.register_weights(
+            layer,
+            FusedMoeWeightScaleSupported.TENSOR.value,
+            {
+                "w13_weight_scale_2": torch.ones(
+                    num_experts, self.moe.w13_num_shards, dtype=torch.float32
+                ),
+                "w2_weight_scale_2": torch.ones(num_experts, dtype=torch.float32),
+            },
+            **extra_weight_attrs,
+        )
+        quantize_on_load(
+            layer, "w2_weight", _quantize_nvfp4, "w2_weight_scale", "w2_weight_scale_2"
+        )
+        # w1 and w3 of an expert share one global scale: the first to arrive
+        # waits for the other
+        amax = None
+        quantize_on_load(
+            layer,
+            "w13_weight",
+            lambda weight: _quantize_nvfp4(weight, amax),
+            "w13_weight_scale",
+            "w13_weight_scale_2",
+        )
+        load = layer.w13_weight.weight_loader
+        pending: dict[int, tuple[str, torch.Tensor]] = {}
+
+        def w13_loader(
+            param, loaded_weight, weight_name, shard_id, expert_id, return_success=False
+        ):
+            nonlocal amax
+            if not self.moe.is_act_and_mul:
+                pair = [(shard_id, loaded_weight)]
+            elif (other := pending.pop(expert_id, None)) is None:
+                pending[expert_id] = (shard_id, loaded_weight.clone())
+                return True if return_success else None
+            else:
+                pair = [other, (shard_id, loaded_weight)]
+            amax = max(weight_amax(w) for _, w in pair).to(layer.orig_dtype)
+            for shard, weight in pair:
+                ret = load(param, weight, weight_name, shard, expert_id, return_success)
+            return ret
+
+        layer.w13_weight.weight_loader = w13_loader
+
     def process_weights_after_loading(self, layer: Module) -> None:
         if getattr(layer, "_already_called_process_weights_after_loading", False):
+            return
+
+        if self.requantization_source is None:
+            replace_parameter(
+                layer,
+                "w13_weight_scale_2",
+                layer.w13_weight_scale_2[:, 0].contiguous(),
+            )
+            ones = torch.ones(
+                layer.num_experts, device=layer.w13_weight.device, dtype=torch.float32
+            )
+            replace_parameter(layer, "w13_input_scale", ones)
+            replace_parameter(layer, "w2_input_scale", ones.clone())
+            self._setup_kernel(layer)
+            layer._already_called_process_weights_after_loading = True
             return
 
         w13_weight, w2_weight = self.get_weights_for_quantization(layer)

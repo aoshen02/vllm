@@ -396,8 +396,15 @@ def test_online_moe_stages_quantized_weights_for_humming(
 
     def load(runner, factor):
         layer = runner.routed_experts
+        shapes = {"w13_weight": (2, 512, 256), "w2_weight": (2, 256, 256)}
         for name, parameter in list(layer.named_parameters()):
-            if "scale" in name:
+            if not requantize:  # a bf16 checkpoint: its scales come from loading
+                if "scale" in name:
+                    continue
+                weight = torch.full(
+                    shapes[name], 0.125 * factor, dtype=torch.bfloat16, device=DEVICE
+                )
+            elif "scale" in name:
                 weight = torch.full(
                     parameter.shape,
                     0.125 * factor,
@@ -770,7 +777,6 @@ def test_online_prequantized_compatibility(
             layer.quant_method.requantization_source, ModelOptLinearMethod
         )
     elif not raises_requantization_error:
-        assert layer.quant_method.uses_meta_device
         assert layer.quant_method.requantization_source is None
 
 

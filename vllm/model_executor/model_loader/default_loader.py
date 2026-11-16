@@ -570,7 +570,9 @@ class DefaultModelLoader(BaseModelLoader):
                     )
                 # ignore online quantization scales
                 quant_method = getattr(module, "quant_method", None)
-                has_online_quant = getattr(quant_method, "uses_meta_device", False)
+                has_online_quant = getattr(
+                    quant_method, "uses_meta_device", False
+                ) or getattr(module, "quantizes_on_load", False)
                 has_postprocess_quant = getattr(
                     quant_method, "process_weights_after_loading", None
                 )
@@ -580,9 +582,9 @@ class DefaultModelLoader(BaseModelLoader):
                     for param_name, param in module.named_parameters():
                         # On a quantized model, every parameter has to come from
                         # the checkpoint except those a checkpoint cannot carry:
-                        # - online quantization (uses_meta_device) quantizes the
-                        #   weights while loading, so its parameters do not map
-                        #   to checkpoint tensors;
+                        # - online quantization (uses_meta_device, quantizes_on_load)
+                        #   quantizes the weights while loading, so its
+                        #   parameters do not map to checkpoint tensors;
                         # - KV-cache quantization parameters (BaseKVCacheMethod)
                         #   fall back to defaults when a checkpoint has none;
                         # - empty placeholders hold no data, e.g. the qzeros

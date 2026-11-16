@@ -49,7 +49,7 @@ class InputHadamardLinearMethod(LinearMethodBase):
     `CompressedTensorsLinearTransformMethod`.
 
     With `rotate_weight`, the weight (`[out, in]`) is rotated the same way
-    right before the wrapped method processes it, for example before online
+    as it is loaded, before a loader that quantizes it, for example online
     quantization. Otherwise the checkpoint stores the weight already rotated,
     together with an int8 `input_rotation` tensor holding the unnormalized
     (+-1) Sylvester matrix, which is checked and then dropped.
@@ -98,7 +98,16 @@ class InputHadamardLinearMethod(LinearMethodBase):
             params_dtype,
             **extra_weight_attrs,
         )
-        if not self.rotate_weight:
+        if self.rotate_weight:
+            load = layer.weight.weight_loader
+
+            def rotate_and_load(param, loaded_weight, *args, **kwargs):
+                hadamard = hadamard_matrix(self.size, loaded_weight.device)
+                rotated = block_hadamard_rotate(loaded_weight, hadamard)
+                return load(param, rotated, *args, **kwargs)
+
+            layer.weight.weight_loader = rotate_and_load
+        else:
             input_rotation = torch.nn.Parameter(
                 torch.zeros(self.size, self.size, dtype=torch.int8),
                 requires_grad=False,
@@ -122,20 +131,17 @@ class InputHadamardLinearMethod(LinearMethodBase):
         param.data.copy_(loaded_weight)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        # Online methods may be called again after quantizing; rotate once.
-        weight: torch.Tensor = layer.weight
-        if not getattr(layer, "_already_called_process_weights_after_loading", False):
-            if self.rotate_weight:
-                hadamard = hadamard_matrix(self.size, weight.device)
-                weight.data.copy_(block_hadamard_rotate(weight.data, hadamard))
-            else:
-                input_rotation: torch.Tensor = layer.input_rotation
-                if not input_rotation.any():
-                    raise ValueError(
-                        "The checkpoint did not provide the input_rotation of an "
-                        "online-rotated layer."
-                    )
-                del layer.input_rotation
+        # Online methods may be called again after quantizing; check once.
+        if not self.rotate_weight and not getattr(
+            layer, "_already_called_process_weights_after_loading", False
+        ):
+            input_rotation: torch.Tensor = layer.input_rotation
+            if not input_rotation.any():
+                raise ValueError(
+                    "The checkpoint did not provide the input_rotation of an "
+                    "online-rotated layer."
+                )
+            del layer.input_rotation
         self.quant_method.process_weights_after_loading(layer)
         layer.input_hadamard = hadamard_matrix(self.size, layer.weight.device)
 

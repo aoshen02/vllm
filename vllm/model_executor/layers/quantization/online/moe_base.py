@@ -61,33 +61,43 @@ class OnlineMoEMethodBase(OnlineRequantizationMixin, FusedMoEMethodBase):
             layer.num_experts = num_experts
             return
 
-        # Fused gate_up_proj (column parallel) — full precision on meta device
-        w13_weight = torch.nn.Parameter(
-            torch.empty(
-                num_experts,
-                self.moe.w13_num_shards * intermediate_size_per_partition,
-                hidden_size,
-                device="meta",
-                dtype=params_dtype,
-            ),
-            requires_grad=False,
-        )
-        layer.register_parameter("w13_weight", w13_weight)
-        set_weight_attrs(w13_weight, extra_weight_attrs)
+        device = "meta" if self.uses_meta_device else None
+        if self.uses_meta_device:
+            # Fused gate_up_proj (column parallel) — full precision on meta device
+            w13_weight = torch.nn.Parameter(
+                torch.empty(
+                    num_experts,
+                    self.moe.w13_num_shards * intermediate_size_per_partition,
+                    hidden_size,
+                    device="meta",
+                    dtype=params_dtype,
+                ),
+                requires_grad=False,
+            )
+            layer.register_parameter("w13_weight", w13_weight)
+            set_weight_attrs(w13_weight, extra_weight_attrs)
 
-        # down_proj (row parallel) — full precision on meta device
-        w2_weight = torch.nn.Parameter(
-            torch.empty(
+            # down_proj (row parallel) — full precision on meta device
+            w2_weight = torch.nn.Parameter(
+                torch.empty(
+                    num_experts,
+                    hidden_size,
+                    intermediate_size_per_partition,
+                    device="meta",
+                    dtype=params_dtype,
+                ),
+                requires_grad=False,
+            )
+            layer.register_parameter("w2_weight", w2_weight)
+            set_weight_attrs(w2_weight, extra_weight_attrs)
+        else:
+            self.create_quantized_weights(
+                layer,
                 num_experts,
                 hidden_size,
                 intermediate_size_per_partition,
-                device="meta",
-                dtype=params_dtype,
-            ),
-            requires_grad=False,
-        )
-        layer.register_parameter("w2_weight", w2_weight)
-        set_weight_attrs(w2_weight, extra_weight_attrs)
+                **extra_weight_attrs,
+            )
 
         # BIASES (for models like GPT-OSS that have biased MoE)
         if self.moe.has_bias:
@@ -95,7 +105,7 @@ class OnlineMoEMethodBase(OnlineRequantizationMixin, FusedMoEMethodBase):
                 torch.zeros(
                     num_experts,
                     self.moe.w13_num_shards * intermediate_size_per_partition,
-                    device="meta",
+                    device=device,
                     dtype=layer.orig_dtype,
                 ),
                 requires_grad=False,
@@ -107,7 +117,7 @@ class OnlineMoEMethodBase(OnlineRequantizationMixin, FusedMoEMethodBase):
                 torch.zeros(
                     num_experts,
                     hidden_size,
-                    device="meta",
+                    device=device,
                     dtype=layer.orig_dtype,
                 ),
                 requires_grad=False,
@@ -118,7 +128,23 @@ class OnlineMoEMethodBase(OnlineRequantizationMixin, FusedMoEMethodBase):
         layer.w13_input_scale = None
         layer.w2_input_scale = None
 
-        initialize_online_processing(layer)
+        if self.uses_meta_device:
+            initialize_online_processing(layer)
+
+    @staticmethod
+    def register_weights(
+        layer: torch.nn.Module,
+        quant_method: str,
+        tensors: dict[str, torch.Tensor],
+        **extra_weight_attrs,
+    ) -> None:
+        """Register `tensors` as parameters, those named like a scale loaded
+        with `quant_method` (`FusedMoeWeightScaleSupported`)."""
+        for name, tensor in tensors.items():
+            param = torch.nn.Parameter(tensor, requires_grad=False)
+            layer.register_parameter(name, param)
+            scale = {"quant_method": quant_method} if "scale" in name else {}
+            set_weight_attrs(param, extra_weight_attrs | scale)
 
     def get_weights_for_quantization(
         self, layer: torch.nn.Module

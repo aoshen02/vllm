@@ -18,6 +18,7 @@ if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.utils.quant_utils import QuantKey
 
 from vllm.model_executor.kernels.linear import init_mxfp4_linear_kernel
+from vllm.model_executor.layers.fused_moe import FusedMoeWeightScaleSupported
 from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
 from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import (
     TRITON_BACKENDS,
@@ -29,9 +30,11 @@ from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import (
     mxfp4_round_up_hidden_size_and_intermediate_size,
     select_mxfp4_moe_backend,
 )
+from vllm.model_executor.layers.linear import register_weight_loader_v2_supported_method
 from vllm.model_executor.layers.quantization.online.fp8 import (
     OnlineLinearBase,
 )
+from vllm.model_executor.layers.quantization.online.loading import quantize_on_load
 from vllm.model_executor.layers.quantization.online.moe_base import (
     OnlineMoEMethodBase,
 )
@@ -39,6 +42,10 @@ from vllm.model_executor.layers.quantization.utils.mxfp4_utils import (
     mxfp4_quantize,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import kMxfp4Dynamic
+from vllm.model_executor.parameter import (
+    GroupQuantScaleParameter,
+    PackedvLLMParameter,
+)
 from vllm.model_executor.utils import replace_parameter
 
 # MXFP4 block size (elements per shared e8m0 scale), same as the checkpoint
@@ -76,6 +83,7 @@ def _quantize_mxfp4_moe_weight(
     return w_quant, w_scales
 
 
+@register_weight_loader_v2_supported_method
 class Mxfp4OnlineLinearMethod(OnlineLinearBase):
     """Online MXFP4 linear method.
     Loads bf16/fp16 checkpoints and quantizes weights to MXFP4 (microscaling
@@ -84,6 +92,7 @@ class Mxfp4OnlineLinearMethod(OnlineLinearBase):
 
     activation_quant_key: "QuantKey | None" = kMxfp4Dynamic
     accepts_activation_override = True
+    uses_meta_device = False
 
     def __init__(self, activation_quant_key: "QuantKey | None" = kMxfp4Dynamic):
         super().__init__()
@@ -121,16 +130,41 @@ class Mxfp4OnlineLinearMethod(OnlineLinearBase):
             **extra_weight_attrs,
         )
 
+    def create_quantized_weights(
+        self, layer, output_partition_sizes, input_size_per_partition, weight_loader
+    ):
+        rows = sum(output_partition_sizes)
+        weight = PackedvLLMParameter(
+            data=torch.empty(rows, input_size_per_partition // 2, dtype=torch.uint8),
+            input_dim=1,
+            output_dim=0,
+            packed_dim=1,
+            packed_factor=2,
+            weight_loader=weight_loader,
+        )
+        layer.register_parameter("weight", weight)
+        scale = GroupQuantScaleParameter(
+            data=torch.empty(
+                rows, input_size_per_partition // MXFP4_BLOCK_SIZE, dtype=torch.uint8
+            ),
+            input_dim=1,
+            output_dim=0,
+            weight_loader=weight_loader,
+        )
+        layer.register_parameter("weight_scale", scale)
+        quantize_on_load(layer, "weight", mxfp4_quantize, "weight_scale")
+
     def process_weights_after_loading(self, layer: Module) -> None:
         if getattr(layer, "_already_called_process_weights_after_loading", False):
             return
 
-        weight = self.get_weight_for_quantization(layer)
-        weight_fp4, weight_scale = mxfp4_quantize(weight.contiguous())
+        if self.requantization_source is not None:
+            weight = self.get_weight_for_quantization(layer)
+            weight_fp4, weight_scale = mxfp4_quantize(weight.contiguous())
+            replace_parameter(layer, "weight", weight_fp4.data)
+            replace_parameter(layer, "weight_scale", weight_scale.data)
 
         layer.input_scale = None
-        replace_parameter(layer, "weight", weight_fp4.data)
-        replace_parameter(layer, "weight_scale", weight_scale.data)
 
         self.kernel.process_weights_after_loading(layer)
         self.release_requantization_source_weights(layer)
@@ -173,6 +207,8 @@ class Mxfp4OnlineMoEMethod(OnlineMoEMethodBase):
         self.mxfp4_backend, self.experts_cls = select_mxfp4_moe_backend(
             config=self.moe, activation_key=self.activation_quant_key
         )
+        # kept in high precision
+        self.uses_meta_device = self.mxfp4_backend == Mxfp4MoeBackend.NONE
         # The oracle may fall back to a backend computing another activation
         # format (EMULATION computes MXFP4): reject an override it cannot honour.
         backend_key = (
@@ -235,6 +271,44 @@ class Mxfp4OnlineMoEMethod(OnlineMoEMethodBase):
         )
 
         layer.weight_block_size = [1, MXFP4_BLOCK_SIZE]
+
+    def create_quantized_weights(
+        self,
+        layer,
+        num_experts,
+        hidden_size,
+        intermediate_size_per_partition,
+        **extra_weight_attrs,
+    ):
+        w13_rows = self.moe.w13_num_shards * intermediate_size_per_partition
+        block = MXFP4_BLOCK_SIZE
+        self.register_weights(
+            layer,
+            FusedMoeWeightScaleSupported.GROUP.value,
+            {
+                "w13_weight": torch.zeros(
+                    num_experts, w13_rows, hidden_size // 2, dtype=torch.uint8
+                ),
+                "w2_weight": torch.zeros(
+                    num_experts,
+                    hidden_size,
+                    intermediate_size_per_partition // 2,
+                    dtype=torch.uint8,
+                ),
+                "w13_weight_scale": torch.zeros(
+                    num_experts, w13_rows, hidden_size // block, dtype=torch.uint8
+                ),
+                "w2_weight_scale": torch.zeros(
+                    num_experts,
+                    hidden_size,
+                    intermediate_size_per_partition // block,
+                    dtype=torch.uint8,
+                ),
+            },
+            **extra_weight_attrs,
+        )
+        for w in ("w13", "w2"):
+            quantize_on_load(layer, f"{w}_weight", mxfp4_quantize, f"{w}_weight_scale")
 
     def _setup_kernel(
         self,
@@ -342,7 +416,11 @@ class Mxfp4OnlineMoEMethod(OnlineMoEMethodBase):
                 *_quantize_mxfp4_moe_weight(w2_weight),
             )
 
-        w13, w13_scale, w2, w2_scale = self.quantize_weights(layer, quantize)
+        if self.requantization_source is None:
+            w13, w13_scale = layer.w13_weight, layer.w13_weight_scale
+            w2, w2_scale = layer.w2_weight, layer.w2_weight_scale
+        else:
+            w13, w13_scale, w2, w2_scale = self.quantize_weights(layer, quantize)
 
         self._setup_kernel(
             layer,

@@ -28,7 +28,7 @@ from vllm.model_executor.model_loader.reload.layerwise import (
     record_metadata_for_reloading,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
-from vllm.model_executor.utils import replace_parameter, set_weight_attrs
+from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import set_random_seed
 
@@ -84,7 +84,7 @@ def _make_layer(
     rotate_weight: bool, input_size: int = 128, output_size: int = 16, size: int = 32
 ) -> tuple[torch.nn.Module, InputHadamardLinearMethod]:
     layer = torch.nn.Module()
-    layer.weight_loader = "v1"
+    layer.weight_loader = default_weight_loader  # wrapped v1 methods get it
     method = InputHadamardLinearMethod(_DenseOnlineMethod(), size, rotate_weight)
     method.create_weights(
         layer,
@@ -98,14 +98,13 @@ def _make_layer(
     return layer, method
 
 
-def test_rotates_weight_once_and_input_on_apply():
+def test_rotates_weight_on_load_and_input_on_apply():
     layer, method = _make_layer(rotate_weight=True)
-    assert layer.weight.weight_loader == "v1", "wrapped v1 methods keep the v1 loader"
     assert not hasattr(layer, "input_rotation")
     set_random_seed(0)
     w = torch.randn(16, 128)
     x = torch.randn(4, 128)
-    layer.weight.data.copy_(w)
+    layer.weight.weight_loader(layer.weight, w)
 
     method.process_weights_after_loading(layer)
     method.process_weights_after_loading(layer)  # e.g. after layerwise loading
@@ -212,7 +211,7 @@ def _online_mxfp4(
         params_dtype=torch.bfloat16,
         weight_loader=default_weight_loader,
     )
-    replace_parameter(layer, "weight", weight.clone())
+    layer.weight.weight_loader(layer.weight, weight)
     method.process_weights_after_loading(layer)
     return method.apply(layer, x)
 

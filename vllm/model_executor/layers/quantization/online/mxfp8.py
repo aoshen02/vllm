@@ -20,22 +20,32 @@ if TYPE_CHECKING:
     from vllm.model_executor.layers.fused_moe.oracle.fp8 import Fp8MoeBackend
 
 from vllm.model_executor.kernels.linear import init_mxfp8_linear_kernel
+from vllm.model_executor.layers.fused_moe import FusedMoeWeightScaleSupported
 from vllm.model_executor.layers.fused_moe.oracle.mxfp8 import (
     select_mxfp8_moe_backend,
 )
+from vllm.model_executor.layers.linear import register_weight_loader_v2_supported_method
 from vllm.model_executor.layers.quantization.online.fp8 import (
     OnlineLinearBase,
 )
+from vllm.model_executor.layers.quantization.online.loading import quantize_on_load
 from vllm.model_executor.layers.quantization.online.moe_base import (
     OnlineMoEMethodBase,
 )
 from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
     MXFP8_BLOCK_SIZE,
+    MXFP8_SCALE_DTYPE,
+    MXFP8_VALUE_DTYPE,
     mxfp8_e4m3_quantize,
+)
+from vllm.model_executor.parameter import (
+    GroupQuantScaleParameter,
+    ModelWeightParameter,
 )
 from vllm.model_executor.utils import is_weights_pre_processed, replace_parameter
 
 
+@register_weight_loader_v2_supported_method
 class Mxfp8OnlineLinearMethod(OnlineLinearBase):
     """Online MXFP8 linear method.
     Loads bf16/fp16 checkpoints and quantizes weights to MXFP8 (microscaling
@@ -43,6 +53,7 @@ class Mxfp8OnlineLinearMethod(OnlineLinearBase):
     """
 
     activation_quant_key: QuantKey | None = None
+    uses_meta_device = False
 
     @property
     def supports_pre_processed_weights(self) -> bool:  # type: ignore[override]
@@ -82,6 +93,30 @@ class Mxfp8OnlineLinearMethod(OnlineLinearBase):
 
         self.kernel = init_mxfp8_linear_kernel(weight_shape=layer.weight.shape)
 
+    def create_quantized_weights(
+        self, layer, output_partition_sizes, input_size_per_partition, weight_loader
+    ):
+        rows = sum(output_partition_sizes)
+        weight = ModelWeightParameter(
+            data=torch.empty(rows, input_size_per_partition, dtype=MXFP8_VALUE_DTYPE),
+            input_dim=1,
+            output_dim=0,
+            weight_loader=weight_loader,
+        )
+        layer.register_parameter("weight", weight)
+        scale = GroupQuantScaleParameter(
+            data=torch.empty(
+                rows,
+                input_size_per_partition // MXFP8_BLOCK_SIZE,
+                dtype=MXFP8_SCALE_DTYPE,
+            ),
+            input_dim=1,
+            output_dim=0,
+            weight_loader=weight_loader,
+        )
+        layer.register_parameter("weight_scale", scale)
+        quantize_on_load(layer, "weight", mxfp8_e4m3_quantize, "weight_scale")
+
     def process_weights_after_loading(self, layer: Module) -> None:
         if is_weights_pre_processed():
             if not self.supports_pre_processed_weights:
@@ -95,12 +130,13 @@ class Mxfp8OnlineLinearMethod(OnlineLinearBase):
         if getattr(layer, "_already_called_process_weights_after_loading", False):
             return
 
-        weight = self.get_weight_for_quantization(layer)
-        weight_fp8, weight_scale = mxfp8_e4m3_quantize(weight.contiguous())
+        if self.requantization_source is not None:
+            weight = self.get_weight_for_quantization(layer)
+            weight_fp8, weight_scale = mxfp8_e4m3_quantize(weight.contiguous())
+            replace_parameter(layer, "weight", weight_fp8.data)
+            replace_parameter(layer, "weight_scale", weight_scale.data)
 
         layer.input_scale = None
-        replace_parameter(layer, "weight", weight_fp8.data)
-        replace_parameter(layer, "weight_scale", weight_scale.data)
 
         self.kernel.process_weights_after_loading(layer)
         self.release_requantization_source_weights(layer)
@@ -121,6 +157,7 @@ class Mxfp8OnlineMoEMethod(OnlineMoEMethodBase):
 
     fp8_backend: "Fp8MoeBackend"
     experts_cls: "type[mk.FusedMoEExperts] | None"
+    uses_meta_device = False
 
     def __init__(self, *, moe: FusedMoEConfig):
         super().__init__(moe)
@@ -157,6 +194,46 @@ class Mxfp8OnlineMoEMethod(OnlineMoEMethodBase):
         )
 
         layer.weight_block_size = [1, MXFP8_BLOCK_SIZE]
+
+    def create_quantized_weights(
+        self,
+        layer,
+        num_experts,
+        hidden_size,
+        intermediate_size_per_partition,
+        **extra_weight_attrs,
+    ):
+        w13_rows = self.moe.w13_num_shards * intermediate_size_per_partition
+        block = MXFP8_BLOCK_SIZE
+        self.register_weights(
+            layer,
+            FusedMoeWeightScaleSupported.GROUP.value,
+            {
+                "w13_weight": torch.zeros(
+                    num_experts, w13_rows, hidden_size, dtype=MXFP8_VALUE_DTYPE
+                ),
+                "w2_weight": torch.zeros(
+                    num_experts,
+                    hidden_size,
+                    intermediate_size_per_partition,
+                    dtype=MXFP8_VALUE_DTYPE,
+                ),
+                "w13_weight_scale": torch.zeros(
+                    num_experts, w13_rows, hidden_size // block, dtype=MXFP8_SCALE_DTYPE
+                ),
+                "w2_weight_scale": torch.zeros(
+                    num_experts,
+                    hidden_size,
+                    intermediate_size_per_partition // block,
+                    dtype=MXFP8_SCALE_DTYPE,
+                ),
+            },
+            **extra_weight_attrs,
+        )
+        for w in ("w13", "w2"):
+            quantize_on_load(
+                layer, f"{w}_weight", mxfp8_e4m3_quantize, f"{w}_weight_scale"
+            )
 
     def _quantize_mxfp8_moe_weight(
         self, weight: torch.Tensor
@@ -265,7 +342,11 @@ class Mxfp8OnlineMoEMethod(OnlineMoEMethodBase):
                 *self._quantize_mxfp8_moe_weight(w2_weight),
             )
 
-        w13, w13_scale, w2, w2_scale = self.quantize_weights(layer, quantize)
+        if self.requantization_source is None:
+            w13, w13_scale = layer.w13_weight, layer.w13_weight_scale
+            w2, w2_scale = layer.w2_weight, layer.w2_weight_scale
+        else:
+            w13, w13_scale, w2, w2_scale = self.quantize_weights(layer, quantize)
 
         self._setup_kernel(
             layer,
