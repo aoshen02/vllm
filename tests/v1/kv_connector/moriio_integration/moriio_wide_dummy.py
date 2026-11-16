@@ -22,8 +22,10 @@ from torch import nn
 from vllm.config import ModelConfig
 from vllm.model_executor.model_loader import register_model_loader
 from vllm.model_executor.model_loader.dummy_loader import DummyModelLoader
-from vllm.model_executor.model_loader.reload.layerwise import get_layerwise_info
-from vllm.model_executor.model_loader.reload.utils import get_layer_tensors
+from vllm.model_executor.model_loader.online_processing import (
+    finish_online_layer,
+    is_online_processing,
+)
 from vllm.model_executor.model_loader.weight_utils import (
     initialize_single_dummy_weight,
 )
@@ -36,12 +38,11 @@ class WideDummyModelLoader(DummyModelLoader):
     def load_weights(self, model: nn.Module, model_config: ModelConfig) -> None:
         # DummyModelLoader.load_weights with a wider init for 16/32-bit floats.
         for layer in model.modules():
-            info = get_layerwise_info(layer)
-            if info.can_load():
-                self._process_online_quant_layer(layer, info)
+            if is_online_processing(layer):
+                finish_online_layer(layer, fill=initialize_single_dummy_weight)
                 continue
-            for name, tensor in get_layer_tensors(layer).items():
-                if name in layer._non_persistent_buffers_set:
+            for name, tensor in (*layer._parameters.items(), *layer._buffers.items()):
+                if tensor is None or name in layer._non_persistent_buffers_set:
                     continue
                 if tensor.is_floating_point() and torch.finfo(tensor.dtype).bits >= 16:
                     initialize_single_dummy_weight(

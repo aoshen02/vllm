@@ -35,7 +35,6 @@ from vllm.model_executor.model_loader.reload.direct import (
     begin_direct_reload,
     finish_direct_reload,
 )
-from vllm.model_executor.model_loader.reload.meta import materialize_meta_tensor
 from vllm.model_executor.model_loader.utils import process_weights_after_loading
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.platforms import current_platform
@@ -55,7 +54,10 @@ def _load(layer: torch.nn.Module, names: list[str] | None = None) -> None:
         if names is not None and name not in names:
             continue
         if param.is_meta:
-            param = materialize_meta_tensor(param)
+            new = torch.zeros_like(param, device=torch.get_default_device())
+            new.__class__ = param.__class__
+            new.__dict__ = param.__dict__.copy()
+            param = new
             setattr(layer, name, param)
         if param.dtype == torch.uint8:  # packed FP4 values or E8M0 scales
             param.data.copy_(torch.randint(120, 130, param.shape))

@@ -338,7 +338,7 @@ class SentinelBroadcastGroup:
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 class TestPackedBroadcastDeferredConsumer:
     """Consumers that keep unpacked tensors and read them from a later pack's
-    callback, as layerwise reload does, on a different slot stream."""
+    callback, as a buffering weight loader does, on a different slot stream."""
 
     def test_deferred_read_is_ordered_after_receive(self):
         numel = 4
@@ -387,9 +387,8 @@ class TestPackedBroadcastDeferredConsumer:
     def test_freed_pack_not_reused_while_replay_pending(
         self, num_buffers, packs_per_layer
     ):
-        """Views dropped right after the replay is enqueued (as layerwise
-        reload's `info.reset()` does) must not let the next receive reuse a
-        buffer the replay still reads."""
+        """Views dropped right after the replay is enqueued must not let the
+        next receive reuse a buffer the replay still reads."""
         num_packs = packs_per_layer + 4
         # A size unique to this run keeps blocks cached by earlier tests from
         # being picked instead of the ones this layer frees.

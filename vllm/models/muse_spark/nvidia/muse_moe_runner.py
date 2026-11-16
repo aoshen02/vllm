@@ -811,8 +811,8 @@ class MuseSparkUnquantizedFusedMoE(UnquantizedFusedMoEMethod):
 
 def _reject_direct_reload(*args, **kwargs) -> None:
     raise RuntimeError(
-        "MuseSpark online FP8 experts already hold FP8 weights: reload them "
-        "through the layerwise reload, not a direct load_weights."
+        "MuseSpark online FP8 experts already hold FP8 weights: reloading "
+        "them is not supported."
     )
 
 
@@ -869,7 +869,7 @@ class MuseSparkFp8FusedMoE(Fp8PtpcOnlineMoEMethod):
         )
         _attach_post_expert_finalize(self)
         # A later direct load_weights would cast BF16 weights into these
-        # FP8 tensors unscaled; the layerwise reload restores its own loaders.
+        # FP8 tensors unscaled.
         layer.w13_weight.weight_loader = _reject_direct_reload
         layer.w2_weight.weight_loader = _reject_direct_reload
 

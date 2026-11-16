@@ -71,10 +71,6 @@ def layerwise_groups(names: list[str]) -> list[list[str]]:
     Stacks come out in first-appearance order of their prefix and ascending index
     within it, whatever order the source yielded them, so a source can normalize
     an arbitrary export order by flattening this partition.
-
-    Backends that gather and free per group (sharded RDT) also use it as the unit
-    of transfer, which bounds their buffer sizes: without it a whole model becomes
-    one chunk.
     """
     pre: list[str] = []
     post: list[str] = []
@@ -449,31 +445,6 @@ class WeightTransferEngine(ABC, Generic[TInitInfo, TUpdateInfo]):
     update_info_cls: type[TUpdateInfo]
 
     supports_draft_weight_update: bool = True
-
-    defers_processing: bool = False
-    """Whether `update_weights` returns before the weights are on the device.
-
-    An engine that pipelines its GPU post-processing onto background threads
-    cannot let `update_weights` synchronize the device — that would block on those
-    threads and serialize the pipeline. Such an engine sets this True, omits the
-    per-update sync, and guarantees completion in `finish_weight_update` instead.
-
-    Callers that go through `finish_weight_update` need do nothing: the engine
-    drains there. A caller that instead drives the tail itself — running its own
-    `finalize_layerwise_reload`, say — must read this flag and call
-    `drain_pending()` first, because with it set a returned `update_weights` means
-    "queued", not "applied".
-    """
-
-    def drain_pending(self) -> None:
-        """Block until every deferred update has been applied to the model.
-
-        The companion to `defers_processing`: a caller that has taken over the
-        update tail calls this to re-establish the guarantee that
-        `finish_weight_update` would otherwise have given it. Idempotent, and a
-        no-op by default — an engine that processes synchronously has nothing to
-        drain, so this is always safe to call.
-        """
 
     def __init__(
         self,

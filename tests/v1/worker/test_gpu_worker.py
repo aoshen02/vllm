@@ -873,7 +873,7 @@ def _weight_update_worker(
     from vllm.v1.worker.gpu_worker import Worker
 
     monkeypatch.setattr(
-        extensible_kv_cache, "max_layer_reload_bytes", lambda model: layer_bytes
+        extensible_kv_cache, "_max_layer_bytes", lambda model: layer_bytes
     )
     monkeypatch.setattr(extensible_kv_cache, "has_kv_transfer_group", lambda: False)
     monkeypatch.setattr(

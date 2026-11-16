@@ -66,7 +66,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
     cutlass_fp8_supported,
 )
-from vllm.model_executor.model_loader.reload.layerwise import (
+from vllm.model_executor.model_loader.online_processing import (
     initialize_online_processing,
 )
 from vllm.model_executor.parameter import ModelWeightParameter

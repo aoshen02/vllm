@@ -16,7 +16,6 @@ from vllm.config import (
 from vllm.forward_context import set_forward_context
 from vllm.model_executor.layers.fused_moe import FusedMoEFactory
 from vllm.model_executor.layers.quantization.modelopt import ModelOptNvFp4Config
-from vllm.model_executor.model_loader.reload import record_metadata_for_reloading
 from vllm.models.muse_spark.nvidia.muse_moe_runner import (
     MuseMoERunner,
     MusePostExpertFinalize,
@@ -85,9 +84,6 @@ def make_runner(
             runner_cls=MuseMoERunner,
             runner_args={"post_expert_norm": norm},
         )
-        # Record the BF16 layout before loading quantizes it, same as the model
-        # loader does: layerwise reload (RL weight sync) restores the layer from it.
-        record_metadata_for_reloading(runner)
     if ckpt is None:
         return router, runner, vllm_config
     # Online-quantized experts start on the meta device, which .cuda() cannot

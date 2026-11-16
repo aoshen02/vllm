@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Tests for GPUWorker weight-transfer pass-through behavior.
 
-The worker no longer contains transport, layerwise, or sparse logic: it only
+The worker no longer contains transport, reload, or sparse logic: it only
 delegates to the configured weight transfer engine and tracks whether an update
 session is active. These tests verify that delegation and the session guard.
 """

@@ -1660,7 +1660,7 @@ def initialize_single_dummy_weight(
     params are sampled from `[low, high]`, which defaults to +-1e-3.
     """
     if param.device.type == "meta":
-        return  # deferred to finalize_layerwise_processing (e.g. online quant)
+        return  # materialized by online processing (online quant)
 
     if (dummy_weight_value := getattr(param, "dummy_weight_value", None)) is not None:
         param.fill_(dummy_weight_value)

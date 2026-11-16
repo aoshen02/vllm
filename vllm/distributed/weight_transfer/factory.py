@@ -238,12 +238,6 @@ WeightTransferEngineFactory.register_engine(
 )
 
 WeightTransferEngineFactory.register_engine(
-    "sharded_rdt",
-    "vllm.distributed.weight_transfer.sharded_rdt_engine",
-    "ShardedRDTWeightTransferEngine",
-)
-
-WeightTransferEngineFactory.register_engine(
     "nccl_m2n",
     "vllm.distributed.weight_transfer.m2n_engine",
     "M2NWeightTransferEngine",
@@ -274,12 +268,6 @@ WeightTransferTrainerFactory.register_engine(
     "sparse_nccl",
     "vllm.distributed.weight_transfer.sparse_nccl_engine",
     "SparseNCCLTrainerWeightTransferEngine",
-)
-
-WeightTransferTrainerFactory.register_engine(
-    "sharded_rdt",
-    "vllm.distributed.weight_transfer.sharded_rdt_trainer",
-    "ShardedRDTTrainerWeightTransferEngine",
 )
 
 WeightTransferTrainerFactory.register_engine(

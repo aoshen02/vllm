@@ -142,7 +142,7 @@ class SparseNCCLWeightTransferEngine(
 
     Receives checkpoint-coordinate patches broadcast from the trainer and applies
     them through the model's native weight loader. Sparse updates modify initialized
-    model tensors in place, so the layerwise reload lifecycle is not used.
+    model tensors in place, so the reload lifecycle is not used.
     """
 
     init_info_cls = NCCLWeightTransferInitInfo
@@ -171,11 +171,11 @@ class SparseNCCLWeightTransferEngine(
             raise ValueError("use_load_plan is supported by the dense NCCL backend")
 
     def start_weight_update(self) -> None:
-        """No-op: sparse patches are applied in place, no layerwise reload."""
+        """No-op: sparse patches are applied in place, no reload."""
         pass
 
     def finish_weight_update(self) -> None:
-        """No layerwise reload; rebuild model-level derived state once."""
+        """No reload; rebuild model-level derived state once."""
         from vllm.model_executor.model_loader.weight_utils import (
             finalize_model_weights,
         )

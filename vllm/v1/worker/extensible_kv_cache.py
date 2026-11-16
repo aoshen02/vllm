@@ -20,7 +20,6 @@ from vllm.distributed.kv_transfer import (
     has_kv_transfer_group,
 )
 from vllm.logger import init_logger
-from vllm.model_executor.model_loader.reload.layerwise import max_layer_reload_bytes
 from vllm.multimodal.gpu_ipc_memory import reserve_mm_ipc_gpu_memory
 from vllm.platforms import current_platform
 from vllm.utils.extensible_tensor import ExtensibleTensor
@@ -709,9 +708,17 @@ def measure_kv_cache_blocks(
 
 
 # Rerunning a layer's weight processing (format conversion, padding, shuffles)
-# on a weight update allocates up to a few copies of its checkpoint-format
-# size before the result is copied into place.
+# on a weight update allocates up to a few copies of its size before the result
+# is copied into place.
 WEIGHT_UPDATE_PEAK_LAYER_FACTOR = 3
+
+
+def _max_layer_bytes(model: torch.nn.Module) -> int:
+    """Bytes of the largest module's own parameters."""
+    return max(
+        (sum(t.nbytes for t in m.parameters(recurse=False)) for m in model.modules()),
+        default=0,
+    )
 
 
 @contextmanager
@@ -766,7 +773,7 @@ def _release_for_weight_update(
     if not kv_cache.buffer.physical_bytes:
         # Released by sleep or release_kv_cache_memory(), which also restores it.
         return False
-    layer_bytes = max_layer_reload_bytes(model)
+    layer_bytes = _max_layer_bytes(model)
     needed = WEIGHT_UPDATE_PEAK_LAYER_FACTOR * layer_bytes
     free = (
         current_platform.free_device_memory()

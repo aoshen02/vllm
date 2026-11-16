@@ -12,7 +12,9 @@ import vllm.envs as envs
 from vllm.config import ModelConfig, VllmConfig
 from vllm.config.load import LoadConfig
 from vllm.logger import init_logger
-from vllm.model_executor.model_loader.reload import finalize_layerwise_processing
+from vllm.model_executor.model_loader.online_processing import (
+    finalize_online_processing,
+)
 from vllm.model_executor.model_loader.utils import (
     initialize_model,
     process_weights_after_loading,
@@ -116,8 +118,7 @@ class BaseModelLoader(ABC):
 
             # Process weights into kernel format. Note that when using online
             # quantization, weights are (typically) quantized as they are loaded.
-            if _has_online_quant(model):
-                finalize_layerwise_processing(model, model_config)
+            finalize_online_processing(model)
 
             process_weights_after_loading(model, model_config, target_device)
             log_online_quantization_time(vllm_config)
@@ -178,12 +179,3 @@ def log_online_quantization_time(vllm_config: VllmConfig) -> None:
         "Online quantization as part of model loading took %.2f seconds",
         quant_config.online_quantization_time,
     )
-
-
-def _has_online_quant(model: nn.Module):
-    for module in model.modules():
-        quant_method = getattr(module, "quant_method", None)
-        if getattr(quant_method, "uses_meta_device", False):
-            return True
-
-    return False

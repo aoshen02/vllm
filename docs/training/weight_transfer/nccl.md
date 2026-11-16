@@ -307,8 +307,7 @@ Sparse NCCL sends only `O(nnz)` indices and values, in batches of at most 512 Mi
   [Broadcasting ranks](#broadcasting-ranks).
 - **Full tensors on the wire.** Each broadcaster materializes its parameters in full and
   every worker receives all of it, whatever its tensor-parallel shard. For
-  large or expert-parallel models, see [sharded RDT](sharded_rdt.md) or
-  [NCCL M2N](m2n.md).
+  large or expert-parallel models, see [NCCL M2N](m2n.md).
 - Sparse NCCL's pipeline-parallel behavior is untested.
 
 ## Examples

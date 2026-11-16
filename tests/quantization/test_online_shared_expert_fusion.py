@@ -54,11 +54,6 @@ from vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils import 
     dequantize_to_dtype,
 )
 from vllm.model_executor.model_loader.dummy_loader import DummyModelLoader
-from vllm.model_executor.model_loader.reload.layerwise import (
-    finalize_layerwise_reload,
-    initialize_layerwise_reload,
-    record_metadata_for_reloading,
-)
 from vllm.model_executor.model_loader.utils import get_model_architecture
 from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
 from vllm.platforms import current_platform
@@ -432,79 +427,6 @@ def test_online_shared_expert_loads_bf16_weights_into_mxfp4_slot(
         (layer.w2_weight_scale[2], expected_down_scale),
     ):
         assert torch.equal(_unpadded_block(actual, expected), expected)
-
-
-def test_online_shared_expert_reload_compatibility(
-    default_vllm_config,
-    single_rank_parallel_state,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Reload a BF16 shared weight into its MXFP4 slot via meta staging."""
-    default_vllm_config.model_config = ModelConfig()
-    online_config = OnlineQuantizationConfig(
-        QuantizationConfigArgs(targets={"*shared_expert*": "mxfp4"})
-    )
-    quant_config = QuarkConfig(_QUARK_MXFP4_CONFIG)
-    quant_config.online_quantization_config = online_config
-
-    with torch.device(current_platform.device_type):
-        layer = FusedMoEFactory(
-            num_experts=2,
-            top_k=1,
-            hidden_size=64,
-            intermediate_size=64,
-            n_shared_experts=1,
-            fuse_shared_experts=True,
-            shared_expert_prefix="model.layers.0.mlp.shared_expert",
-            prefix="model.layers.0.mlp.experts",
-            quant_config=quant_config,
-        ).routed_experts
-        monkeypatch.setattr(
-            layer.quant_method, "process_weights_after_loading", lambda _: None
-        )
-
-        routed_weights = []
-        for expert_id in range(2):
-            for projection in ("gate_proj", "up_proj", "down_proj"):
-                weight, scale = mxfp4_quantize(
-                    torch.randn(64, 64, dtype=torch.bfloat16)
-                )
-                prefix = f"{expert_id}.{projection}"
-                routed_weights.extend(
-                    [(f"{prefix}.weight", weight), (f"{prefix}.weight_scale", scale)]
-                )
-
-        shared_gate = torch.randn(64, 64, dtype=torch.bfloat16)
-        shared_up = torch.randn(64, 64, dtype=torch.bfloat16)
-        shared_down = torch.randn(64, 64, dtype=torch.bfloat16)
-
-        def checkpoint_weights(gate: torch.Tensor):
-            return [
-                *routed_weights,
-                ("2.gate_proj.weight", gate),
-                ("2.up_proj.weight", shared_up),
-                ("2.down_proj.weight", shared_down),
-            ]
-
-        list(layer.load_weights(checkpoint_weights(shared_gate)))
-        reloaded_gate = shared_gate + 1
-        expected_weight, expected_scale = mxfp4_quantize(reloaded_gate)
-        old_weight = _unpadded_block(layer.w13_weight[2], expected_weight).clone()
-        assert not torch.equal(old_weight, expected_weight)
-
-        record_metadata_for_reloading(layer)
-        initialize_layerwise_reload(layer)
-
-        assert layer.w13_weight.is_meta
-        list(layer.load_weights(checkpoint_weights(reloaded_gate)))
-        finalize_layerwise_reload(layer, default_vllm_config.model_config)
-        assert not layer.w13_weight.is_meta
-        assert torch.equal(
-            _unpadded_block(layer.w13_weight[2], expected_weight), expected_weight
-        )
-        assert torch.equal(
-            _unpadded_block(layer.w13_weight_scale[2], expected_scale), expected_scale
-        )
 
 
 # TODO: Add DeepseekV4ForConditionalGeneration once it uses
@@ -1001,8 +923,8 @@ def test_fse_online_quantization_routed_shared(
                 routed_experts.moe_config.num_logical_experts,
             )
     if fse_requested and source_cls is None:
-        # Requantized routed experts parameters are replaced after processing, and
-        # are restored for reloads by the layerwise reload machinery only.
+        # Requantized routed experts parameters are replaced after processing, so
+        # reloading the fused shared expert is refused.
         shared_prefix = routed_experts.moe_config.shared_expert_prefix
         with pytest.raises(NotImplementedError, match="Reloading fused shared"):
             model.load_weights(

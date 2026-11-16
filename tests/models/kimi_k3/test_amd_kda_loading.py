@@ -26,7 +26,9 @@ def test_padded_kda_load_completes_and_clears_padding(
     from vllm.model_executor.layers.quantization.online.base import (
         OnlineQuantizationConfig,
     )
-    from vllm.model_executor.model_loader.reload.layerwise import get_layerwise_info
+    from vllm.model_executor.model_loader.online_processing import (
+        is_online_processing,
+    )
 
     default_vllm_config.model_config = ModelConfig(
         model="facebook/opt-125m", dtype="bfloat16"
@@ -62,7 +64,7 @@ def test_padded_kda_load_completes_and_clears_padding(
             param.weight_loader(param, shards[i], i)
         if online:
             assert layer.weight.device.type == "cuda"
-            assert not get_layerwise_info(layer).loaded_weights
+            assert not is_online_processing(layer)
         else:
             expected = torch.cat(
                 shards + [torch.zeros(padding, 256, dtype=torch.bfloat16)]

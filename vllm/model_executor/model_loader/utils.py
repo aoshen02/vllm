@@ -24,7 +24,6 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
-from vllm.model_executor.model_loader.reload import record_metadata_for_reloading
 from vllm.model_executor.model_loader.weight_cache.utils import (
     is_draft_model_cacheable,
 )
@@ -95,9 +94,7 @@ def initialize_model(
     if "vllm_config" in all_params and "prefix" in all_params:
         # new-style model class
         with set_current_vllm_config(vllm_config, check_compile=True, prefix=prefix):
-            model = model_class(vllm_config=vllm_config, prefix=prefix)
-            record_metadata_for_reloading(model)
-            return model
+            return model_class(vllm_config=vllm_config, prefix=prefix)
 
     msg = (
         "vLLM model class should accept `vllm_config` and `prefix` as "
@@ -128,7 +125,6 @@ def initialize_model(
         kwargs["scheduler_config"] = vllm_config.scheduler_config
     with set_current_vllm_config(vllm_config, check_compile=True, prefix=prefix):
         model = model_class(**kwargs)
-        record_metadata_for_reloading(model)
 
     return model
 
@@ -272,8 +268,7 @@ def online_quantization_timing_context(
         if isinstance(quant_config, OnlineQuantizationConfig)
         else quant_config.online_quantization_config
     )
-    # reload/layerwise.py's _layerwise_process calls this for experts_int8,
-    # whose online MoE method has no OnlineQuantizationConfig.
+    # experts_int8's online MoE method has no OnlineQuantizationConfig.
     if online_quantization_config is None:
         yield
         return

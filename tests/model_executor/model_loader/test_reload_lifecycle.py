@@ -10,7 +10,6 @@ import torch
 
 from vllm.model_executor.model_loader.reload import (
     finish_reload,
-    record_metadata_for_reloading,
     start_reload,
     weight_update_active,
 )
@@ -51,7 +50,6 @@ def _checkpoint(scale: float = 1.0) -> dict[str, torch.Tensor]:
 
 def test_active_only_between_start_and_finish():
     model = _TinyModel()
-    record_metadata_for_reloading(model)  # as the loader does at cold start
     model.load_weights(_checkpoint().items())
     process_weights_after_loading(model, _MODEL_CONFIG, _DEVICE)
     assert model.observed == [False, False]  # cold start keeps its checks
@@ -83,7 +81,6 @@ class _Outer(torch.nn.Module):
 
 def test_nested_module_sees_the_update():
     model = _Outer()
-    record_metadata_for_reloading(model)
     model.load_weights(
         (f"language_model.{name}", w) for name, w in _checkpoint().items()
     )

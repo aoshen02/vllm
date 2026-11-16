@@ -221,8 +221,8 @@ class Qwen4ExpMegaMoEExperts(DeepGemmMegaMoEExperts):
         self.quant_method = _CheckLoaded()
         self.checkpoint_format = checkpoint_format
         self._shard_tensors = _SHARD_TENSORS[checkpoint_format]
-        # Parameters may sit on meta (weight-cache IPC loading, layerwise
-        # reload), so requantize on the current GPU.
+        # Parameters may sit on meta (weight-cache IPC loading), so
+        # requantize on the current GPU.
         self._device = torch.device(
             current_platform.device_type, torch.accelerator.current_device_index()
         )
@@ -300,7 +300,7 @@ class Qwen4ExpMegaMoEExperts(DeepGemmMegaMoEExperts):
     ) -> str:
         name = f"{'w2' if shard_id == 'w2' else 'w13'}_{suffix}"
         param = getattr(self, name)
-        # The parameter's own loader: layerwise reload wraps it.
+        # The parameter's own loader, which a weight update may wrap.
         param.weight_loader(param, tensor, name, shard_id=shard_id, expert_id=expert_id)
         return name
 

@@ -401,7 +401,7 @@ def test_deep_sleep_async(gpu_memory_cleared):
 
 
 def _load_weights(worker) -> None:
-    # Not reload_weights(): its layerwise finalize re-derives the KV scales.
+    # Not reload_weights(): its finish re-derives the KV scales.
     model = worker.model_runner.get_model()
     loader = get_model_loader(worker.load_config)
     model.load_weights(loader.get_all_weights(worker.model_config, model))

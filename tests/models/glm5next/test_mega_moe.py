@@ -14,7 +14,6 @@ from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
 )
 from vllm.model_executor.model_loader.reload import (
     finish_reload,
-    record_metadata_for_reloading,
     start_reload,
 )
 from vllm.model_executor.model_loader.utils import process_weights_after_loading
@@ -252,7 +251,6 @@ def test_reload_requantizes_into_the_kernel_tensors():
     device = torch.get_default_device()
     model = _Model()
     experts = model.experts
-    record_metadata_for_reloading(model)
     ckpt, shared_ckpt = _checkpoint(seed=0), _shared_checkpoint(seed=0)
     _load_shuffled(experts, ckpt, seed=0)
     _load_shared(experts, shared_ckpt)
