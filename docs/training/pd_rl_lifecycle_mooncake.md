@@ -34,12 +34,12 @@ RDMA, 32 lifecycle cases (pause/sleep/abort/reset/weight-update orders).
    first. A connector hook `abort_exports()` drops every transfer that is not
    running; an abort of all requests (pause/sleep in abort mode,
    `/abort_requests {}`) calls it.
-2. **Keep pause with cache clear.** When the pause starts, D withdraws its
-   pending pulls with the existing lease heartbeat (`withdraw` flag), and P
-   drops them as above. The pause completes once these loads settle; a load
-   that fails meanwhile is recomputed, as the request is kept. The reset also
-   preempts waiting requests whose load settled, and returns False instead of
-   raising while transfers hold blocks.
+2. **Keep pause with cache clear.** The pause drops the transfers that are not
+   running and aborts the waiting requests that hold blocks for them; the RL
+   framework resubmits them, as in abort mode. D withdraws its pending pulls
+   with the existing lease heartbeat (`withdraw` flag), and P drops them as
+   above, so the aborted loads settle quickly and the reset gets all blocks.
+   The reset returns False instead of raising while transfers hold blocks.
 
 ## Results (cases passing out of 32)
 
@@ -48,8 +48,6 @@ RDMA, 32 lifecycle cases (pause/sleep/abort/reset/weight-update orders).
 | 1 | 23 | 30 |
 
 Fix 1 was measured together with the change of `reset_prefix_cache` to
-return False.
-
-The two remaining failures mix modes: P pauses with keep or wait, D with
-abort. D's abort drops the request before its withdrawal is built, so the
-pull waits for the paused P.
+return False. "Fixes 1 and 2" was measured with an earlier version of fix 2
+that kept and recomputed the requests in transfer instead of aborting them;
+the abort version is being measured.
