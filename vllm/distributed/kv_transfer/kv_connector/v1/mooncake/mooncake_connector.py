@@ -9,7 +9,7 @@ import secrets
 import threading
 import time
 from collections import OrderedDict, defaultdict
-from collections.abc import Collection
+from collections.abc import Collection, Iterable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from enum import IntEnum
@@ -752,6 +752,7 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
         self.reqs_to_recv: dict[EngineId, dict[ReqId, PullReqMeta]] = defaultdict(dict)
         self.reqs_to_send: dict[ReqId, tuple[TransferId, list[list[int]]]] = {}
         self.reqs_not_processed: set[TransferId] = set()
+        self.abort_exports = False
         # D side: lease renewals to send this step, by remote P engine.
         self.lease_heartbeats: dict[EngineId, LeaseHeartbeat] = {}
 
@@ -876,6 +877,10 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
     def on_new_request(self, request: "Request") -> None:
         assert self.connector_scheduler is not None
         self.connector_scheduler.on_new_request(request)
+
+    def abort_exports(self) -> None:
+        assert self.connector_scheduler is not None
+        self.connector_scheduler.abort_exports = True
 
     def update_connector_output(self, connector_output: KVConnectorOutput):
         assert self.connector_scheduler is not None
@@ -1045,6 +1050,7 @@ class MooncakeConnectorScheduler:
         # Reqs to remove from processed set because they're not to send after
         # remote prefill or aborted.
         self._reqs_not_processed: set[TransferId] = set()
+        self.abort_exports = False
 
         # D side: requests whose KV P still holds under a lease, from arrival
         # until the pull settles. A request can wait in the queue for longer
@@ -1296,6 +1302,8 @@ class MooncakeConnectorScheduler:
             self._reqs_need_send.clear()
             meta.reqs_not_processed = self._reqs_not_processed
             self._reqs_not_processed = set()
+            meta.abort_exports = self.abort_exports
+            self.abort_exports = False
 
         return meta
 
@@ -1985,6 +1993,11 @@ class MooncakeConnectorWorker:
                     and self.reqs_need_send.pop(send_meta.transfer_id, None) is not None
                 ):
                     self.finished_sending_reqs.add(send_meta.p_req_id)
+                    # A late pull, e.g. a release for a rejected request, must
+                    # not wait for a prefill that already ran.
+                    self._expired_transfer_ids[send_meta.transfer_id] = (
+                        time.perf_counter()
+                    )
 
             response = MooncakeXferResponse(
                 status=response_status,
@@ -3010,7 +3023,11 @@ class MooncakeConnectorWorker:
         for p_req_id, (transfer_id, block_ids) in metadata.reqs_to_send.items():
             if block_ids:
                 # Already gone through request_finished()
-                send_meta = self.reqs_need_send[transfer_id]
+                send_meta = self.reqs_need_send.get(transfer_id)
+                if send_meta is None:
+                    # Dropped by abort_exports while in prefill: free it now.
+                    self.finished_sending_reqs.add(p_req_id)
+                    continue
                 send_meta.p_req_id = p_req_id
                 send_meta.local_block_ids = block_ids
                 send_meta.expire_time = time.perf_counter() + (
@@ -3022,17 +3039,36 @@ class MooncakeConnectorWorker:
                 # but not reach request_finished() yet
                 # This may be already created by send_kv_to_decode()
                 # when D is sending MooncakeXferMetadata.
-                if transfer_id not in self.reqs_need_send:
+                if (
+                    transfer_id not in self.reqs_need_send
+                    and transfer_id not in self._expired_transfer_ids
+                ):
                     self.reqs_need_send[transfer_id] = SendBlockMeta(
                         p_req_id=p_req_id,
                         transfer_id=transfer_id,
                         local_block_ids=[],
                         ready=asyncio.Event(),
                     )
-        for transfer_id in metadata.reqs_not_processed:
-            send_meta = self.reqs_need_send.pop(transfer_id)
-            if send_meta:
-                assert not send_meta.ready.is_set()
+        # Requests finished before export.
+        self._drop_transfers(metadata.reqs_not_processed)
+        if metadata.abort_exports:
+            self._drop_transfers(list(self.reqs_need_send))
+
+    def _drop_transfers(self, transfer_ids: Iterable[TransferId]) -> None:
+        """Fail the pulls that wait for these transfers or come later, and free
+        their prefilled KV once no send reads it."""
+        now = time.perf_counter()
+        for transfer_id in transfer_ids:
+            self._expired_transfer_ids[transfer_id] = now
+            send_meta = self.reqs_need_send.get(transfer_id)
+            if send_meta is None:
+                continue
+            if send_meta.ready.is_set():
+                # fetch_finished_sending_reqs frees it.
+                send_meta.expire_time = 0
+            else:
+                del self.reqs_need_send[transfer_id]
+                send_meta.ready.set()
 
     async def _send_lease_heartbeats(
         self, lease_heartbeats: dict[EngineId, LeaseHeartbeat]
@@ -3053,7 +3089,9 @@ class MooncakeConnectorWorker:
             )
 
         if not self.is_kv_consumer and (
-            metadata.reqs_to_send or metadata.reqs_not_processed
+            metadata.reqs_to_send
+            or metadata.reqs_not_processed
+            or metadata.abort_exports
         ):
             asyncio.run_coroutine_threadsafe(
                 self.record_send_reqs(metadata), self.sender_loop

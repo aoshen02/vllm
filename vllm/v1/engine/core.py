@@ -602,6 +602,11 @@ class EngineCore:
         # (i.e. client-aborted vs stop criteria met).
         self.scheduler.finish_requests(request_ids, RequestStatus.FINISHED_ABORTED)
 
+    def abort_kv_exports(self) -> None:
+        """Stop keeping the KV of finished requests for remote readers."""
+        if (connector := self.scheduler.get_kv_connector()) is not None:
+            connector.abort_exports()
+
     @contextmanager
     def log_error_detail(self, scheduler_output: SchedulerOutput):
         """Execute the model and log detailed info on failure."""
