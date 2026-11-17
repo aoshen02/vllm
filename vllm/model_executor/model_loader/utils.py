@@ -169,7 +169,13 @@ def process_weights_after_loading(
 
     record_checkpoint_layout(model)  # cold start only; reloads reuse it
 
+    from vllm.lora.layers.base import BaseLayerWithLoRA
+
     for name, module in model.named_modules():
+        if isinstance(module, BaseLayerWithLoRA):
+            # LoRA wraps layers after cold start and forwards `quant_method`;
+            # its base layer is processed on its own (a reload reruns this)
+            continue
         quant_method = getattr(module, "quant_method", None)
         if isinstance(quant_method, QuantizeMethodBase):
             if (
