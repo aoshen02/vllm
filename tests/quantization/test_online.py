@@ -524,12 +524,29 @@ def test_online_moe_stages_quantized_weights_for_humming(
                 rtol=0,
                 atol=0,
             )
-        # The Humming conversion does not rerun on the converted experts, and
-        # requantization keeps the online method: a direct weight update
-        # refuses both.
-        refusal = "online quantization" if requantize else "[Hh]umming"
-        with pytest.raises(RuntimeError, match=refusal):
-            start_reload(model)
+        if requantize:
+            # requantization keeps the online method, which a reload refuses
+            with pytest.raises(RuntimeError, match="online quantization"):
+                start_reload(model)
+            return
+        # a direct reload reruns the Humming conversion: as a fresh cold start
+        first = dict(model.named_parameters())
+        expected = dict(cold_start(2.0).named_parameters())
+        start_reload(model)
+        assert set(model.runner.routed_experts.load_weights(checkpoint(2.0)))
+        finish_reload(model, config.model_config, device)
+        actual = dict(model.named_parameters())
+        assert actual.keys() == expected.keys()
+        for name, tensor in actual.items():
+            assert tensor is first[name]
+            if tensor.is_meta:
+                continue  # checkpoint-only stand-in
+            torch.testing.assert_close(
+                tensor.reshape(-1).view(torch.uint8),
+                expected[name].reshape(-1).view(torch.uint8),
+                rtol=0,
+                atol=0,
+            )
 
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="Humming requires CUDA.")
