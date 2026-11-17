@@ -341,48 +341,30 @@ class TestRefusals:
             begin_direct_reload(model)
         _assert_same(_state(model), before, addresses=True)
 
-    def test_online_quantization_refused(self, monkeypatch):
+    # refused at `begin`, the first time the method is in a reload: the
+    # methods below are set after cold start, which they would not survive
+    def test_online_quantization_refused(self):
         # finish clears the guard that keeps online quantization from
         # quantizing its converted bytes again
-        online = object.__new__(Fp8PerTensorOnlineLinearMethod)
-        init = _ToyModel.__init__
-
-        def with_online_layer(self):
-            init(self)
-            self.proj.quant_method = online
-
-        monkeypatch.setattr(_ToyModel, "__init__", with_online_layer)
-        model = _cold_start(_checkpoint())  # cold start is unaffected
+        model = _cold_start(_checkpoint())
+        model.proj.quant_method = object.__new__(Fp8PerTensorOnlineLinearMethod)
         with pytest.raises(RuntimeError, match="online quantization"):
             begin_direct_reload(model)
 
-    def test_online_shared_experts_refused(self, monkeypatch):
+    def test_online_shared_experts_refused(self):
         # post-load processing deletes the staging parameters a reload loads
-        init = _ToyModel.__init__
-
-        def with_online_shared_experts(self):
-            init(self)
-            self.proj.shared_expert_online_loader = object()
-
-        monkeypatch.setattr(_ToyModel, "__init__", with_online_shared_experts)
-        model = _cold_start(_checkpoint())  # cold start is unaffected
+        model = _cold_start(_checkpoint())
+        model.proj.shared_expert_online_loader = object()
         with pytest.raises(RuntimeError, match="online quantization"):
             begin_direct_reload(model)
 
     @pytest.mark.parametrize("method_cls", ["HummingLinearMethod", "HummingMoEMethod"])
-    def test_humming_refused(self, monkeypatch, method_cls):
+    def test_humming_refused(self, method_cls):
         # its post-load processing runs only once per quant method
         from vllm.model_executor.layers.quantization import humming as humming_mod
 
-        humming = object.__new__(getattr(humming_mod, method_cls))
-        init = _ToyModel.__init__
-
-        def with_humming_layer(self):
-            init(self)
-            self.proj.quant_method = humming
-
-        monkeypatch.setattr(_ToyModel, "__init__", with_humming_layer)
-        model = _cold_start(_checkpoint())  # cold start is unaffected
+        model = _cold_start(_checkpoint())
+        model.proj.quant_method = object.__new__(getattr(humming_mod, method_cls))
         with pytest.raises(RuntimeError, match="humming"):
             begin_direct_reload(model)
 
