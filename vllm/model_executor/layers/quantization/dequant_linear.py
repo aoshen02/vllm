@@ -67,9 +67,7 @@ class DequantLinearMethod(LinearMethodBase):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if layer.weight.dtype == torch.float8_e4m3fn and not is_weights_pre_processed():
             # into the loaded storage (allocated BF16-sized): one allocation
-            layer.weight.data = _in_own_storage(
-                layer.weight, _dequantize(layer), whole_storage=True
-            )
+            layer.weight.data = _in_own_storage(layer.weight, _dequantize(layer))
         for name, _ in layer.named_parameters(recurse=False):
             if name not in ("weight", "bias"):
                 retire_parameter(layer, name)
