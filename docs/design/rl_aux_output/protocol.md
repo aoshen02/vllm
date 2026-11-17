@@ -58,7 +58,7 @@ Requests without `aux_session` keep the inline behavior: routed experts and inde
 
 ## 4. Names
 
-A name is fixed when its hash block is hashed and does not change afterwards. Three moments set the salts that go into the hashes.
+A name is fixed when its hash block is hashed. Four moments set the salts that go into the hashes.
 
 ### 4.1 Preprocessing: session salt
 
@@ -76,11 +76,24 @@ Positions `[0, 256)` carry `v1`, `[256, 512)` carry `v2`. `end` is where the cov
 
 The engine clips `end` to the position of the prompt's last token and rounds it down to an object boundary. Positions below it are salted with the client's versions, every later position with the current weight version. The salts are applied at preprocessing, before the request's first hashing, and again at admission with the then-current version; if they differ, the scheduler drops the prompt hashes from the cut on and hashes again.
 
-The client's versions decide which stored KV the request can hit: KV computed with `v1` for `[0, 256)` is found only by a request that states `v1` there. They also name the stated positions the request misses and computes (section 12). Segments sent with an edited history (a chat template that drops earlier reasoning, truncation, compaction) cost the hits after the first changed token, which could not exist anyway. A request without segments names its whole prompt with the current version and computes it as if new to the session.
+The client's versions decide which stored KV the request can hit: KV computed with `v1` for `[0, 256)` is found only by a request that states `v1` there. They do not decide the names of what the request computes: positions it does not hit are named with the current version when it is scheduled (section 4.4). Segments sent with an edited history (a chat template that drops earlier reasoning, truncation, compaction) therefore cost nothing but the hits after the first changed token, which could not exist anyway. A request without segments names its whole prompt with the current version and computes it as if new to the session.
 
 ### 4.3 Weight update: unhashed positions
 
 `update_weight_version(v)` sets the version of later steps; with `object_key_prefix` set it must be a non-empty string. Call it only while no step is in flight, that is while the engine is paused. For each live session request the engine calls `Request.add_cache_salt_segment(num_computed_tokens, v)`: the new segment starts at the first position that is neither computed nor hashed, replaces any segments from there on, and is skipped if the last segment already has `v`. Blocks hashed afterwards carry `v` for those positions; a block filled across the update states both versions, each for its own positions.
+
+### 4.4 Scheduling: positions a waiting request computes
+
+The stated versions are right for the positions a request reuses, but a waiting request also computes positions that are already hashed: the part of its prompt that missed the prefix cache and the connectors, everything after a preemption, and the positions after KV it loaded asynchronously. Just before such a request is scheduled, the scheduler passes the number of positions it will not compute, `H`, to the aux connector:
+
+- at admission, `H` is the final prefix-cache hit (local and external, after any adjustment that drops part of the hit);
+- when the request leaves the wait for an asynchronous KV load, `H` is the KV that arrived. A load that failed in part leaves a smaller `H`.
+
+The connector looks for the first segment that states a version other than the current one and ends after `H`. If there is none, nothing changes. Otherwise it cuts the block hashes back to `max(H, start of that segment)`, adds a segment there with the current version, and hashes again. Positions before the cut keep their hashes, including those after `H` whose stated version is already current.
+
+Hashes before `H` never change, so everything the scheduler took from the lookup (the hit blocks, the external token count) stays valid. The GPU prefix cache and every connector read the request's hashes afresh when they allocate, store or look up. The offloading connector, which keeps a list of keys derived from the hashes, notices the changed hash and derives its keys again from the first chunk whose hash changed.
+
+A running request is not salted again (section 12).
 
 ## 5. Objects
 
@@ -141,9 +154,9 @@ Writes are asynchronous: a response can arrive before its objects land. The read
 
 A session request may hit up to the last KV block boundary below its last token, from the GPU prefix cache or from any KV connector that keys KV by vLLM's block hashes: the offloading connector (CPU and tiering specs), simple CPU, HiSparse, Mooncake store, UMBP, and the multi connector over them. None of them has session code: they store and look up KV by hash, and the hash contains the session and the versions. LMCache, LMCache-MP and HF3FS are out of scope.
 
-**Why a hit lists the right object.** A KV block with a session's hash was computed by a request of that session that stated the same tokens and versions. That request wrote the object under the same name. The hitting request lists that name and gets the rows of the computation whose KV it uses, across tiers, replicas and weight updates.
+**Why a hit lists the right object.** A KV block with a session's hash was computed by a request of that session that stated the same tokens and versions, and was named by the version that computed it (section 4.4). That request wrote the object under the same name. The hitting request lists that name and gets the rows of the computation whose KV it uses, across tiers, replicas and weight updates.
 
-**What a miss costs.** When the KV of a stated prefix is gone (evicted from every tier, tiers cleared, another replica without a shared KV store), the request computes those positions again with the current weights under the names it states, and the store keeps the earlier rows for them (section 12).
+**What a miss costs.** When the KV of a stated prefix is gone (evicted from every tier, tiers cleared, another replica without a shared KV store), the request computes those positions again under the current version and writes new objects under new names. The trajectory's names stay true; only compute and pool space are spent.
 
 **Decode blocks.** A KV connector must store the blocks that decoding completes, or the last block of every turn is missing from it and the next turn computes it again on a replica that does not hold it. For `MooncakeStoreConnector` set `save_decode_cache: true`.
 
@@ -158,15 +171,15 @@ An RL loop pauses the engine, may release GPU memory, loads new weights, calls `
 The deployment chooses whether the prefix cache is reset, whether the reset also clears connector tiers, and what happens to in-flight requests (pause mode `keep`, `wait` or `abort`).
 
 - **Kept KV.** The next turn of a session sends the previous response's segments, hits its prefix under the old versions, and computes only its new positions with the new version.
-- **Reset.** A prefix-cache reset with `reset_running_requests` preempts the running requests. The objects they completed before the reset are still written, and so are the objects of session requests that finished before it. A preempted request computes its positions again under the names it already has (section 12).
-- **Tiers cleared.** The next turn misses its prefix and computes it again with the new weights under the versions it states (section 7).
+- **Reset.** A prefix-cache reset with `reset_running_requests` preempts the running requests. The objects they completed before the reset are still written, and so are the objects of session requests that finished before it. A preempted request is scheduled again as in section 4.4.
+- **Tiers cleared.** The next turn misses its prefix and computes it again with the new weights under the new version (section 7).
 
 ## 9. Engine events
 
 - **Chunked prefill and async scheduling.** Names are fixed when blocks are hashed; the step in which a position runs does not change them. A position computed past the last sampled token is not listed.
-- **Preemption.** The request waits again with its block hashes; the positions it computes again keep their names (section 12).
-- **Speculative decoding.** Supported. When EAGLE-style drafting drops the trailing block of a hit to compute it again, that block keeps its name. Draft KV that multi-module MTP computes again after a weight update carries the target positions' versions; the target rows are not affected.
-- **`prompt_logprobs` and `skip_reading_prefix_cache`.** The request computes its prompt again from position 0 under the names it states.
+- **Preemption.** The request waits again and is salted when it is scheduled (section 4.4). At the same version its hashes stay as they are.
+- **Speculative decoding.** Supported. When EAGLE-style drafting drops the trailing block of a hit to compute it again, that block is named by the current version. Draft KV that multi-module MTP computes again after a weight update carries the target positions' versions; the target rows are not affected.
+- **`prompt_logprobs` and `skip_reading_prefix_cache`.** The request computes its prompt again from position 0 and names it with the current version.
 - **Abort.** An aborted request lists no keys. Full objects of the blocks it computed whose hashes reached the worker are still written; other requests of the session can hit them.
 - **Write failure.** The engine stops (section 5). Size the pool for every object written between two releases ([scenarios](scenarios.md)).
 
@@ -195,9 +208,9 @@ Do not send another request with a released `aux_session`: the engine still lets
 
 ## 12. Limits
 
-A key names the tokens and the weight versions a request states for them, and the store keeps the first object written under it. A hash does not change after it is computed, so in the cases below a position computed after a weight update is named with the earlier version and the store keeps the earlier rows. The engine does not detect or count them.
+A key names the tokens and the weight versions a request states for them, and the store keeps the first object written under it. Names are salted again only when a request is scheduled from the waiting state (section 4.4). A running request keeps its names, so in the cases below a position computed after a weight update is named with the earlier version and the store keeps the earlier rows. The engine does not detect or count them.
 
-- **Recomputed positions.** A position computed again keeps its name: after its KV was lost (evicted from every tier, tiers cleared, `aux_version_segments` from a replica whose KV is not here), after a preemption, a prefix-cache reset or a failed KV load, when EAGLE-style drafting drops the trailing block of a hit, and with `prompt_logprobs` or `skip_reading_prefix_cache`. Provision KV storage so session prefixes stay cached.
+- **A failed synchronous KV load.** A load that runs inside a step and fails makes the running request compute those positions again under the names it was scheduled with. A failed asynchronous load is salted again as in section 4.4.
 - **Hashed before an update, computed after it, while running.** A partly prefilled request, and a decoding request whose last sampled token completes a block, name positions hashed before a weight update and computed after it with the earlier version. So do concurrent siblings with the same prompt whose prefill progress differs at the update; the store keeps the object written first.
 - **MTP draft KV** computed again after an update carries the target positions' versions (section 9).
 

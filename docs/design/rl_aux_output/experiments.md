@@ -39,7 +39,7 @@ The same properties are checked in unit tests against an in-memory store: a test
 
 ### Results
 
-All runs are on the full stack, including its last layer, which names recomputed positions by the version that computes them.
+All runs are on this branch.
 
 | ID | Result |
 | --- | --- |
@@ -60,8 +60,8 @@ Two sessions-off runs of one build differed by 4.1% in TTFT, and an earlier comp
 
 - **Prefix-cache collapse under backlog.** Under a backlog of requests the prefix-hit rate collapses, with aux outputs on and off. The offloading connector's tier holds only about 1M tokens for DeepSeek-V4-Flash, because each key takes the slot of a full block.
 - **Sleep during connector loads.** A sleep while KV connector loads are in flight raises; callers must retry it.
-- **A full object store** stops the engine.
-- **Cost of a reset.** Sending the hashes of live requests again, and the `begin_step` work that follows (V4).
+- **A full object store** stops the engine. Renaming after a pause that clears the cache multiplies the footprint: the objects computed again are written under new names, and the old ones stay until their session is released.
+- **Cost of a reset.** Sending the hashes of live requests again, and the `begin_step` and `salt_from_hit` work that follows (V4).
 - **Late decode blocks in the Mooncake store.** With `save_decode_cache`, session requests and asynchronous scheduling, in runs with two engines per node, the next turn of an earlier revision missed the last block of the previous turn in 7 of 11 runs. Without aux outputs 0 of 3 runs missed; with asynchronous scheduling off, or 60 s between turns, every run hit. The blocks were stored and their hashes at store and lookup were equal; they became visible late. The V1 runs with the decode cache hit every token.
 
 ## Earlier measurements

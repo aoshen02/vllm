@@ -347,6 +347,25 @@ class AuxOutputSchedulerConnector:
         num_hit = max(num_blocks * self._block_size, self._emit_start(request))
         return min(num_hit, request.num_tokens - 1)
 
+    def salt_from_hit(self, request: Request, num_hit: int) -> None:
+        if self._session(request) is None:
+            return
+        segments = request.cache_salt_segments
+        ends = [start for start, _ in segments[1:]]
+        start = next(
+            (
+                max(begin, num_hit)
+                for (begin, salt), end in zip(segments, [*ends, request.num_tokens])
+                if salt != self._weight_version and end > num_hit
+            ),
+            None,
+        )
+        if start is not None:
+            hash_size = self._hash_block_size
+            del request.block_hashes[start // hash_size :]
+            request.add_cache_salt_segment(start, self._weight_version, hash_size)
+            request.update_block_hashes()
+
     def cap_external_hit(
         self, request: Request, num_local: int, num_external: int
     ) -> int:

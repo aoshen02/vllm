@@ -37,7 +37,7 @@ Reuse across turns keeps these numbers per trajectory rather than per turn: a tu
 
 ## 3. KV tier capacity across weight updates
 
-When GPU memory is released at a weight update, the GPU prefix cache is empty afterwards. A session continues on its stored KV only if a KV connector tier holds it, including the blocks that decoding completed. When the tier has lost it, the next turn computes the prefix again with the new weights under the names it states, and the store keeps the earlier rows for them ([protocol §12](protocol.md#12-limits)). The recompute also costs time:
+When GPU memory is released at a weight update, the GPU prefix cache is empty afterwards. A session continues on its stored KV only if a KV connector tier holds it, including the blocks that decoding completed. When the tier has lost it, the next turn computes the prefix again with the new weights and writes it again under new names ([protocol §7](protocol.md#7-prefix-cache-hits-and-kv-connectors)). The names stay true, but the recompute costs time and the second copy costs pool space:
 
 ```text
 tier capacity per replica ≥ live session positions per replica × KV bytes per position
@@ -56,7 +56,7 @@ Objects are hard-pinned and stay until the consumer releases them, so the pool h
 | indexer, 12 layers | — | 1.0 TB | 2.2 PB |
 | indexer, 61 layers | — | 5.2 TB | 11.3 PB |
 
-The single-node model has no indexer. Tails add one object per request, about half a block of positions on average. R3 and top-k fit in host memory at frontier scale; an uncompressed indexer or hidden states at every position need pool nodes sized in terabytes per replica. Enable only the outputs the trainer uses.
+The single-node model has no indexer. Tails add one object per request, about half a block of positions on average. Prefixes computed again after a KV loss (section 3) add a second copy under new names. R3 and top-k fit in host memory at frontier scale; an uncompressed indexer or hidden states at every position need pool nodes sized in terabytes per replica. Enable only the outputs the trainer uses.
 
 ## 5. Object counts and write rate (frontier scale)
 
