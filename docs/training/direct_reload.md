@@ -1,9 +1,7 @@
 # Direct Weight Reload
 
-Direct reload updates a running model's weights in place. It is the default
-(`VLLM_RELOAD_MODE=direct`); set `VLLM_RELOAD_MODE=layerwise` for
-[Layerwise (Re)loading](layerwise.md) instead, e.g. for the configurations
-direct reload refuses (see below).
+Direct reload updates a running model's weights in place. It is how every
+weight reload runs.
 
 ## How It Works
 
@@ -43,8 +41,7 @@ arrives, and an update that delivers only one of them fails at finish.
 
 ## Refused Configurations
 
-A weight reload raises an error for the following (cold start is unaffected);
-use `VLLM_RELOAD_MODE=layerwise` for them instead:
+A weight reload raises an error for the following (cold start is unaffected):
 
 - Online quantization not in the table above: `mxfp4` and `mxfp4_hadamard32`
   linear layers, `int8_per_channel_weight_only`, `lut_b_moe`, a quantized

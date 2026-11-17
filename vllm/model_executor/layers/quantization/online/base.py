@@ -8,7 +8,6 @@ from typing import Any
 
 import torch
 
-import vllm.envs as envs
 from vllm.config.quantization import (
     _ONLINE_SHORTHANDS,
     QuantizationConfigArgs,
@@ -234,7 +233,7 @@ class OnlineQuantizationConfig(QuantizationConfig):
         self.ignored_layers: list[str] = args.ignore
         self.quantized_layers: dict[str, tuple[str, str, str | None]] = {}
         self.online_quantization_time = 0.0
-        # under direct reload, quantize each tensor in its weight loader
+        # quantize each tensor in its weight loader (direct reload)
         self.quantize_on_load = True
 
     @property
@@ -519,7 +518,7 @@ class OnlineQuantizationConfig(QuantizationConfig):
             )
             assert issubclass(quant_method_cls, (OnlineMoEMethodBase, OnlineLinearBase))
             default = getattr(quant_method_cls, "activation_quant_key", None)
-            if envs.VLLM_RELOAD_MODE == "direct" and self.quantize_on_load:
+            if self.quantize_on_load:
                 method = checkpoint_method(layer, quant_spec, default)
                 if method is not None:
                     return method

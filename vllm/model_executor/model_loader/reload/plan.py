@@ -32,7 +32,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.utils import storage_view
 
 from .bake import Copy, Targets, Traced, trace_loads
-from .direct import direct_reload_active, direct_reload_enabled
+from .direct import direct_reload_active
 from .geometry import (
     Box,
     Fallback,
@@ -168,18 +168,15 @@ def load_planned(
 
 
 def check_plannable(model: torch.nn.Module) -> None:
-    """Refuse a configuration no load plan supports: a reload mode other than
-    direct, EPLB, and online quantization (its loaders quantize what they
-    load). Reads only configuration, so an engine can call it
-    before `start_reload` changes the model. Direct reload's own refusals
-    run in `begin_direct_reload`.
+    """Refuse a configuration no load plan supports: EPLB and online
+    quantization (its loaders quantize what they load). Reads only
+    configuration, so an engine can call it before `start_reload` changes
+    the model. Direct reload's own refusals run in `begin_direct_reload`.
 
     Raises:
         RuntimeError: the configuration cannot be planned.
 
     """
-    if not direct_reload_enabled():
-        raise RuntimeError("load plan: requires VLLM_RELOAD_MODE=direct")
     for name, module in model.named_modules():
         moe_config = getattr(module, "moe_config", None)
         parallel = getattr(moe_config, "moe_parallel_config", None)

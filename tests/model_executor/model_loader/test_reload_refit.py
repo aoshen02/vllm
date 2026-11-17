@@ -1,13 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Refit equals fresh for direct weight reload (`VLLM_RELOAD_MODE=direct`).
+"""Refit equals fresh for direct weight reload.
 
 An engine that cold-started on checkpoint A, with CUDA graphs captured,
 reloads B and then A through the worker's weight-update session, in
 device-tensor chunks, optionally inside a level-2 sleep. After each reload,
 on every rank:
 - every tensor and scalar reachable from the model equals the reference
-  (B: a fresh engine started in layerwise mode; A: its own cold start);
+  (B: a fresh engine; A: its own cold start);
 - no tensor moved; cold-start storages are kept alive, so a free and
   reallocation shows as a move;
 - no allocator block appeared or disappeared, and the peak stays bounded;
@@ -318,8 +318,7 @@ ENGINE_KWARGS = dict(
 
 
 @asynccontextmanager
-async def _engine(model: str, case: "RefitCase", mode: str, monkeypatch):
-    monkeypatch.setenv("VLLM_RELOAD_MODE", mode)
+async def _engine(model: str, case: "RefitCase"):
     engine = AsyncLLM.from_engine_args(
         AsyncEngineArgs(
             model=model,
@@ -513,7 +512,7 @@ async def test_refit_equals_fresh(
     folder_a, folder_b, unchanged = checkpoints(case)
 
     if case.reference_key not in references:
-        async with _engine(folder_b, case, "layerwise", monkeypatch) as fresh:
+        async with _engine(folder_b, case) as fresh:
             # generate first: lazily cached attributes are then set everywhere
             fresh_tokens = await _generate(fresh, case)
             fresh_digests, _, _ = zip(*await _rpc(fresh, _inspect))
@@ -521,7 +520,7 @@ async def test_refit_equals_fresh(
     fresh_b, fresh_b_tokens = references[case.reference_key]
 
     result: dict[str, object] = {"unchanged_in_b": unchanged}
-    async with _engine(folder_a, case, "direct", monkeypatch) as engine:
+    async with _engine(folder_a, case) as engine:
         cold_a_tokens = await _generate(engine, case)
         cold_a, ptrs, walked = zip(*await _rpc(engine, _inspect, True))
         result["walk_found_off_registry"] = list(walked)
