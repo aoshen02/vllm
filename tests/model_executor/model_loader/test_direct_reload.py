@@ -380,7 +380,12 @@ class TestRefusals:
                 self.proj.quant_method = method
 
         monkeypatch.setattr(_ToyModel, "__init__", with_unsupported_layer)
-        model = _cold_start(_checkpoint())  # cold start does not refuse
+        with _DEVICE:
+            model = _ToyModel()
+        model.load_weights(_checkpoint().items())
+        # cold start records the reasons instead of refusing (the stub methods
+        # cannot run post-load processing)
+        record_checkpoint_layout(model)
         assert not uses_direct_reload(model)
         assert match in "; ".join(model._direct_reload_refusals)
         assert not hasattr(model, "_ckpt_param_names")  # not recorded
