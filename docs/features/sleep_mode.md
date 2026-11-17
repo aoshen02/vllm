@@ -272,6 +272,15 @@ curl -X POST 'http://localhost:8000/wake_up?tags=kv_cache'
 !!! note
     These endpoints are only available when passing `VLLM_SERVER_DEV_MODE=1`.
 
+## Weight listeners
+
+A component that exposes the weights' GPU memory outside the forward pass, such as a loader serving them to peers over RDMA, registers a `WeightListener` with `vllm.model_executor.model_loader.weight_listeners.add_weight_listener`:
+
+- `weights_invalidated()` runs before the weights are rewritten or their memory is freed: at sleep (any level) and at the start of every weight update (`reload_weights`, the weight-transfer engines).
+- `weights_ready()` runs once the weights are final again: at the end of every weight update, and at wake-up when the weights come back with their content (level 1, or a level 2 sleep that preserved every parameter). After a level 2 sleep it waits for the weight update that follows.
+
+A loader that writes final weights into the model itself, rather than streaming checkpoint tensors through `get_all_weights`, overrides `BaseModelLoader.reload_weights`, which `reload_weights` without weights calls, and brackets its writes with `weights_updating()`.
+
 ## Limitation
 
 On ROCm, the virtual memory allocation on ROCm is done through chunked memory allocation. You can control the chunk size through `VLLM_ROCM_SLEEP_MEM_CHUNK_SIZE` (in MB). The default value is set at 256MB. The larger the chunk size the faster the performance. However, setting it too large will cause OOM. So if you encounter OOM when using sleep mode. Try reducing the chunk size. It is recommended to define the chunk size as a power of 2.

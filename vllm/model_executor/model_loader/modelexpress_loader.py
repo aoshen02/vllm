@@ -10,6 +10,10 @@ from torch import nn
 from vllm.config import ModelConfig, VllmConfig
 from vllm.config.load import LoadConfig
 from vllm.model_executor.model_loader.base_loader import BaseModelLoader
+from vllm.model_executor.model_loader.weight_listeners import (
+    WeightListener,
+    add_weight_listener,
+)
 from vllm.tracing import instrument
 
 _MODELEXPRESS_LOADER_MODULE = "modelexpress.engines.vllm.loader"
@@ -55,6 +59,11 @@ class ModelExpressModelLoader(BaseModelLoader):
     def load_weights(self, model: nn.Module, model_config: ModelConfig) -> None:
         self._loader.load_weights(model, model_config)
 
+    def reload_weights(
+        self, vllm_config: VllmConfig, model: nn.Module
+    ) -> set[str] | None:
+        return self._loader.reload_weights(vllm_config, model)
+
     @instrument(span_name="Load model")
     def load_model(
         self,
@@ -67,4 +76,8 @@ class ModelExpressModelLoader(BaseModelLoader):
             model_config=model_config,
             prefix=prefix,
         )
+        # Serving weights to peers out of GPU memory, it must stop while they
+        # are rewritten or freed.
+        if isinstance(self._loader, WeightListener):
+            add_weight_listener(self._loader)
         return model.eval()

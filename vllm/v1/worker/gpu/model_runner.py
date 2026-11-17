@@ -61,6 +61,7 @@ from vllm.model_executor.layers.quantization.online.lm_head import (
     refresh_quantized_lm_heads,
 )
 from vllm.model_executor.model_loader import get_model_loader
+from vllm.model_executor.model_loader.base_loader import BaseModelLoader
 from vllm.model_executor.model_loader.reload.inplace import reload_weights
 from vllm.model_executor.models.interfaces import requires_raw_input_tokens
 from vllm.model_executor.offloader import (
@@ -213,6 +214,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.compilation_config = vllm_config.compilation_config
         self.lora_config = vllm_config.lora_config
         self.load_config = vllm_config.load_config
+        # The loader that loaded the model, which also reloads it.
+        self.model_loader: BaseModelLoader | None = None
         self.parallel_config = vllm_config.parallel_config
         self.scheduler_config = vllm_config.scheduler_config
         self.speculative_config = vllm_config.speculative_config
@@ -411,6 +414,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         eplb_models_added = False
         with DeviceMemoryProfiler() as m:
             model_loader = get_model_loader(self.vllm_config.load_config)
+            self.model_loader = model_loader
             logger.info_once("Loading model from scratch...")
 
             # Capture warmup providers selected while constructing the model.
@@ -637,8 +641,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         """Reload weights in place."""
         vllm_config = self.vllm_config
         model = self.get_model()
+        # Reuse the loader that loaded the model unless the load config was
+        # overridden since, e.g. dummy weights reloaded from the checkpoint.
+        model_loader = self.model_loader
+        if model_loader and model_loader.load_config is not vllm_config.load_config:
+            model_loader = None
         reload_weights(
-            vllm_config, model, weights_iterator, weights_path, is_checkpoint_format
+            vllm_config,
+            model,
+            weights_iterator,
+            weights_path,
+            is_checkpoint_format,
+            model_loader=model_loader,
         )
         self.on_target_weights_replaced()
         self.reset_encoder_cache()

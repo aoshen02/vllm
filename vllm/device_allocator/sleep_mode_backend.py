@@ -53,6 +53,9 @@ class SleepModeBackend(ABC):
     def suspend(self, discardable: Collection[int] = ()) -> None:
         """Free GPU state, so that `resume` restores it at the same addresses.
 
+        Notifies weight listeners (`weight_listeners`) before the weights'
+        memory is freed, and again from `resume` once it holds their content.
+
         `discardable` holds the storage addresses of the tensors the caller
         rewrites after `resume`, so they need no backup: the parameters not
         selected for preservation at level 2, nothing at level 1. A backend
@@ -123,21 +126,35 @@ class CuMemBackend(SleepModeBackend):
     host, with NCCL buffers left untouched (they are outside the allocator pool).
     """
 
+    # Whether the last suspend dropped weight contents: they stay invalid after
+    # resume, until the weight update that follows.
+    _weights_discarded = False
+
     def suspend(self, discardable: Collection[int] = ()) -> None:
         from vllm.device_allocator import get_mem_allocator_instance
+        from vllm.model_executor.model_loader.weight_listeners import (
+            notify_weights_invalidated,
+        )
 
+        notify_weights_invalidated()
         self._state = "SUSPENDED"
+        self._weights_discarded = bool(discardable)
         get_mem_allocator_instance().sleep(
             ("weights", "runtime", "cudagraph"), discardable
         )
 
     def resume(self, tags: list[str] | None = None) -> None:
         from vllm.device_allocator import get_mem_allocator_instance
+        from vllm.model_executor.model_loader.weight_listeners import (
+            notify_weights_ready,
+        )
 
         self._state = "RESUMING"
         allocator = get_mem_allocator_instance()
         allocator.wake_up(tags)
         self._state = "RUNNING"
+        if (tags is None or "weights" in tags) and not self._weights_discarded:
+            notify_weights_ready()
 
     def discard(self, tags: tuple[str, ...]) -> None:
         from vllm.device_allocator import get_mem_allocator_instance

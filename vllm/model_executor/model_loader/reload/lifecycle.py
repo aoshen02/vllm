@@ -6,6 +6,10 @@
 import torch
 
 from vllm.config import ModelConfig
+from vllm.model_executor.model_loader.weight_listeners import (
+    notify_weights_invalidated,
+    notify_weights_ready,
+)
 
 from .direct import begin_direct_reload, direct_reload_enabled, finish_direct_reload
 from .layerwise import finalize_layerwise_reload, initialize_layerwise_reload
@@ -26,6 +30,7 @@ def weight_update_active() -> bool:
 def start_reload(model: torch.nn.Module) -> None:
     """Begin a weight update in the configured mode."""
     global _weight_update_active
+    notify_weights_invalidated()
     if direct_reload_enabled():
         begin_direct_reload(model)
     else:
@@ -43,3 +48,4 @@ def finish_reload(
         finish_direct_reload(model, model_config, device)
     else:
         finalize_layerwise_reload(model, model_config)
+    notify_weights_ready()

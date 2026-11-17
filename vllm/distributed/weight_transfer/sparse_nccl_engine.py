@@ -171,16 +171,24 @@ class SparseNCCLWeightTransferEngine(
             raise ValueError("use_load_plan is supported by the dense NCCL backend")
 
     def start_weight_update(self) -> None:
-        """No-op: sparse patches are applied in place, no layerwise reload."""
-        pass
+        """Sparse patches are applied in place, no reload."""
+        from vllm.model_executor.model_loader.weight_listeners import (
+            notify_weights_invalidated,
+        )
+
+        notify_weights_invalidated()
 
     def finish_weight_update(self) -> None:
-        """No layerwise reload; rebuild model-level derived state once."""
+        """No reload; rebuild model-level derived state once."""
+        from vllm.model_executor.model_loader.weight_listeners import (
+            notify_weights_ready,
+        )
         from vllm.model_executor.model_loader.weight_utils import (
             finalize_model_weights,
         )
 
         finalize_model_weights(self.model)
+        notify_weights_ready()
 
     def receive_weights(self, update_info: SparseNCCLWeightTransferUpdateInfo) -> None:
         """Receive sparse flat-index patches from the trainer and apply them."""
