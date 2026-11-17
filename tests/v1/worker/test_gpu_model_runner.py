@@ -485,10 +485,8 @@ def test_reload_weights_path_replaces_object_storage_source(monkeypatch):
     # model_config.model. A new weights_path must replace it, or the loader
     # silently re-streams the original checkpoint.
     loader = Mock()
-    loader.get_all_weights.return_value = iter(())
+    loader.reload_weights.return_value = None
     monkeypatch.setattr(reload_inplace_module, "get_model_loader", lambda _: loader)
-    monkeypatch.setattr(reload_inplace_module, "start_reload", Mock())
-    monkeypatch.setattr(reload_inplace_module, "finish_reload", Mock())
 
     vllm_config = SimpleNamespace(
         lora_config=None,
@@ -513,7 +511,7 @@ def test_reload_weights_path_replaces_object_storage_source(monkeypatch):
         is_checkpoint_format=True,
     )
 
-    loader.get_all_weights.assert_called_once_with(vllm_config.model_config, model)
+    loader.reload_weights.assert_called_once_with(vllm_config, model)
     cfg = vllm_config.model_config
     assert (cfg.model, cfg.model_weights, cfg.revision) == ("org/new-model", "", None)
 

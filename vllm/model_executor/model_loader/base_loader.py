@@ -12,7 +12,11 @@ import vllm.envs as envs
 from vllm.config import ModelConfig, VllmConfig
 from vllm.config.load import LoadConfig
 from vllm.logger import init_logger
-from vllm.model_executor.model_loader.reload import finalize_layerwise_processing
+from vllm.model_executor.model_loader.reload import (
+    finalize_layerwise_processing,
+    finish_reload,
+    start_reload,
+)
 from vllm.model_executor.model_loader.utils import (
     initialize_model,
     process_weights_after_loading,
@@ -71,6 +75,27 @@ class BaseModelLoader(ABC):
             f"load_format={self.load_config.load_format!r} does not support "
             "iterating weights by checkpoint name"
         )
+
+    def reload_weights(
+        self, vllm_config: VllmConfig, model: nn.Module
+    ) -> set[str] | None:
+        """Reload `model`'s weights in place from the checkpoint
+        `vllm_config.model_config` names. Returns the names of the loaded
+        parameters, or None if not tracked.
+
+        Streams `get_all_weights` through the model's checkpoint loaders.
+        A loader that writes final weights into the model itself overrides it,
+        bracketing its writes with `weight_listeners.weights_updating`.
+        """
+        model_config = vllm_config.model_config
+        device = torch.device(
+            self.load_config.device or vllm_config.device_config.device
+        )
+        weights = self.get_all_weights(model_config, model)
+        start_reload(model)
+        loaded_weights = model.load_weights(weights)
+        finish_reload(model, model_config, device)
+        return loaded_weights
 
     @instrument(span_name="Load model")
     def load_model(

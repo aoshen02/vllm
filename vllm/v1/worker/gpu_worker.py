@@ -84,6 +84,10 @@ from vllm.model_executor.model_loader.weight_checksum import (
     compute_tensor_digests,
     zero_weights,
 )
+from vllm.model_executor.model_loader.weight_listeners import (
+    notify_weights_invalidated,
+    notify_weights_ready,
+)
 from vllm.model_executor.warmup.kernel_warmup import kernel_warmup
 from vllm.multimodal.gpu_ipc_memory import reserve_mm_ipc_gpu_memory
 from vllm.platforms import current_platform
@@ -261,6 +265,9 @@ class Worker(WorkerBase):
         self._weight_update_active = False
         # Update targets (is_draft) whose weights may be incomplete.
         self._incomplete_weight_updates: set[bool] = set()
+        # Whether the last sleep dropped weight contents: waking up then leaves
+        # them invalid until the weight update that follows.
+        self._weights_discarded = False
         self._weight_update_is_draft = False
         # Set by the engine while a pause has emptied the KV cache.
         self._kv_cache_reclaimable = False
@@ -349,6 +356,8 @@ class Worker(WorkerBase):
             if level == 2
             else set()
         )
+        self._weights_discarded = bool(discardable)
+        notify_weights_invalidated()
 
         if has_kv_transfer_group():
             get_kv_transfer_group().unregister_kv_caches()
@@ -391,6 +400,8 @@ class Worker(WorkerBase):
             resume_device_comms()
 
         self.synchronize_device()
+        if (tags is None or "weights" in tags) and not self._weights_discarded:
+            notify_weights_ready()
 
     def discard(self, tags: tuple[str, ...]) -> None:
         if has_kv_transfer_group() and "kv_cache" in tags:

@@ -9,7 +9,7 @@ from torch import nn
 
 from vllm.config import VllmConfig
 from vllm.config.load import LoadConfig
-from vllm.model_executor.model_loader import get_model_loader
+from vllm.model_executor.model_loader import get_model_loader, weight_listeners
 from vllm.model_executor.model_loader.modelexpress_loader import (
     ModelExpressModelLoader,
 )
@@ -87,6 +87,51 @@ def test_modelexpress_loader_delegates_to_modelexpress(monkeypatch):
                 "prefix": "model",
             },
         ),
+    ]
+
+
+class ServingModelexpressLoader(FakeModelexpressLoader):
+    def weights_invalidated(self):
+        self.calls.append(("weights_invalidated", (), {}))
+
+    def weights_ready(self):
+        self.calls.append(("weights_ready", (), {}))
+
+    def reload_weights(self, *args, **kwargs):
+        self.calls.append(("reload_weights", args, kwargs))
+        return {"weight"}
+
+
+@pytest.mark.parametrize(
+    "inner_cls,registered",
+    [(ServingModelexpressLoader, True), (FakeModelexpressLoader, False)],
+    ids=["weight-listener", "no-listener"],
+)
+def test_modelexpress_loader_registers_weight_listener(
+    monkeypatch, inner_cls, registered
+):
+    _install_fake_modelexpress(monkeypatch)
+    module = sys.modules["modelexpress.engines.vllm.loader"]
+    module.__dict__["MxModelLoader"] = inner_cls
+    monkeypatch.setattr(weight_listeners, "_listeners", [])
+    loader = ModelExpressModelLoader(LoadConfig(load_format="modelexpress"))
+
+    loader.load_model(vllm_config=SimpleNamespace(), model_config=SimpleNamespace())
+
+    assert weight_listeners._listeners == ([loader._loader] if registered else [])
+
+
+def test_modelexpress_loader_reloads_weights(monkeypatch):
+    _install_fake_modelexpress(monkeypatch)
+    module = sys.modules["modelexpress.engines.vllm.loader"]
+    module.__dict__["MxModelLoader"] = ServingModelexpressLoader
+    loader = ModelExpressModelLoader(LoadConfig(load_format="modelexpress"))
+    model = nn.Module()
+    vllm_config = SimpleNamespace()
+
+    assert loader.reload_weights(vllm_config, model) == {"weight"}
+    assert FakeModelexpressLoader.calls == [
+        ("reload_weights", (vllm_config, model), {})
     ]
 
 
