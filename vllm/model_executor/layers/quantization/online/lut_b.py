@@ -246,8 +246,8 @@ def _quantize_lut_b_on_load(layer: torch.nn.Module, prefix: str) -> None:
     names = [prefix + name for name in ("weight", "codebooks", "scales")]
     layer.quantizes_on_load = True
     # shards waiting for the rest of their expert, by local expert
-    pending: dict[int, dict[str, torch.Tensor]] = layer.__dict__.setdefault(
-        "lut_b_pending", {}
+    pending: dict[int, dict[str, tuple[torch.Tensor, torch.Event]]] = (
+        layer.__dict__.setdefault("lut_b_pending", {})
     )
 
     def padded(name: str) -> torch.Tensor:
@@ -264,19 +264,28 @@ def _quantize_lut_b_on_load(layer: torch.nn.Module, prefix: str) -> None:
             return False  # skip the costly fit for another rank's expert
         moe = layer.moe_config
         inter = moe.intermediate_size_per_partition_unpadded
-        weight = loaded_weight.to(param.device, layer.orig_dtype)
         dim = 1 if shard_id == "w2" else 0  # the TP-sharded dim
-        if weight.shape[dim] != inter:
-            weight = weight.narrow(dim, moe.tp_rank * inter, inter)
+        if loaded_weight.shape[dim] != inter:
+            loaded_weight = loaded_weight.narrow(dim, moe.tp_rank * inter, inter)
+        # a copy: the loaded tensor may be a reused transfer buffer
+        weight = loaded_weight.to(param.device, layer.orig_dtype, copy=True)
+        copied = torch.Event()
+        copied.record()
         shards = pending.setdefault(expert, {})
-        shards[shard_id] = weight
+        shards[shard_id] = (weight, copied)
         if len(shards) == 3:
             del pending[expert]
+            stream = torch.accelerator.current_stream()
+            for staged, event in shards.values():
+                # held from other loads, which may have run on other streams
+                event.wait()
+                staged.record_stream(stream)
             w13, w2 = padded("w13_"), padded("w2_")
             offset = moe.intermediate_size_per_partition
-            for row, part in ((0, shards["w1"]), (offset, shards["w3"])):
+            for row, shard in ((0, "w1"), (offset, "w3")):
+                part = shards[shard][0]
                 w13[row : row + part.shape[0], : part.shape[1]] = part
-            down = shards["w2"]
+            down = shards["w2"][0]
             w2[: down.shape[0], : down.shape[1]] = down
             tiles = [_as_tiles(w13), _as_tiles(w2)]
             num_tiles = sum(t.shape[0] for t in tiles) // LUT_B_BLOCK_N
