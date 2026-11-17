@@ -81,7 +81,6 @@ def test_legacy_routed_experts_flag_updates_aux_output_config():
             {"adaptive_verification": True},
             "adaptive speculative verification",
         ),
-        ({"pp": 2}, "pipeline parallelism"),
         ({"dcp": 2}, "context parallelism"),
         ({"pcp": 2}, "context parallelism"),
     ],
@@ -97,6 +96,10 @@ def test_aux_output_connector_rejects_unsupported_configuration(kwargs, error):
 )
 def test_aux_output_config_defers_attention_layout_to_kv_config(kwargs):
     VllmConfig._verify_aux_output_compatibility(_config(**kwargs))
+
+
+def test_routed_experts_capture_accepts_pipeline_parallelism():
+    VllmConfig._verify_aux_output_compatibility(_config(pp=2))
 
 
 def test_aux_output_guards_are_inactive_when_capture_is_disabled():
