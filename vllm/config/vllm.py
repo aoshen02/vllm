@@ -1284,14 +1284,14 @@ class VllmConfig:
         """Reject configurations that direct weight reload cannot support.
         Checked when a reload begins; cold start is unaffected."""
         offload = self.offload_config
-        if (
-            offload.offload_backend != "auto"
-            or offload.prefetch.offload_group_size > 0
-            or offload.uva.cpu_offload_gb > 0
+        if offload.offload_backend == "prefetch" or (
+            offload.offload_backend == "auto"
+            and offload.prefetch.offload_group_size > 0
         ):
-            # CPU/UVA offload gives parameters new storage on every post-load
-            # processing; prefetch offload shares one buffer between layers
-            raise ValueError("Direct reload does not support weight offloading.")
+            # prefetch offload shares one device buffer between layers
+            raise ValueError(
+                "Direct reload does not support prefetch weight offloading."
+            )
         model_config = self.model_config
         if model_config is not None and model_config.quantization == "torchao":
             # its load_weights runs a layerwise reload, and its post-load
