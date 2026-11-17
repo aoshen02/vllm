@@ -357,8 +357,9 @@ class TestRefusals:
             self.proj.quant_method = online
 
         monkeypatch.setattr(_ToyModel, "__init__", with_online_layer)
+        model = _cold_start(_checkpoint())  # cold start is unaffected
         with pytest.raises(RuntimeError, match="online quantization"):
-            _cold_start(_checkpoint())
+            begin_direct_reload(model)
 
     def test_online_shared_experts_refused(self, monkeypatch):
         # post-load processing deletes the staging parameters a reload loads
@@ -369,8 +370,9 @@ class TestRefusals:
             self.proj.shared_expert_online_loader = object()
 
         monkeypatch.setattr(_ToyModel, "__init__", with_online_shared_experts)
+        model = _cold_start(_checkpoint())  # cold start is unaffected
         with pytest.raises(RuntimeError, match="online quantization"):
-            _cold_start(_checkpoint())
+            begin_direct_reload(model)
 
     @pytest.mark.parametrize("method_cls", ["HummingLinearMethod", "HummingMoEMethod"])
     def test_humming_refused(self, monkeypatch, method_cls):
@@ -385,8 +387,9 @@ class TestRefusals:
             self.proj.quant_method = humming
 
         monkeypatch.setattr(_ToyModel, "__init__", with_humming_layer)
+        model = _cold_start(_checkpoint())  # cold start is unaffected
         with pytest.raises(RuntimeError, match="humming"):
-            _cold_start(_checkpoint())
+            begin_direct_reload(model)
 
     def test_replaced_param_refused(self):
         # a new Parameter under a checkpoint name has no checkpoint layout:
@@ -555,18 +558,15 @@ def _config(**overrides) -> SimpleNamespace:
         quant_config=None,
         lora_config=None,
         speculative_config=None,
-        weight_transfer_config=None,
     )
     return SimpleNamespace(**(fields | overrides))
 
 
 @pytest.mark.parametrize(
-    "mode,overrides,match",
+    "overrides,match",
     [
-        ("direct", {}, None),
-        ("layerwise", {"lora_config": object()}, None),
+        ({}, None),
         (
-            "direct",
             {
                 "offload_config": SimpleNamespace(
                     offload_backend="uva",
@@ -577,7 +577,6 @@ def _config(**overrides) -> SimpleNamespace:
             "weight offloading",
         ),
         (
-            "direct",
             {
                 "offload_config": SimpleNamespace(
                     offload_backend="auto",
@@ -588,7 +587,6 @@ def _config(**overrides) -> SimpleNamespace:
             "weight offloading",
         ),
         (
-            "direct",
             {
                 "offload_config": SimpleNamespace(
                     offload_backend="auto",
@@ -599,36 +597,26 @@ def _config(**overrides) -> SimpleNamespace:
             "weight offloading",
         ),
         (
-            "direct",
             {"model_config": SimpleNamespace(quantization="torchao")},
             "torchao",
         ),
-        ("direct", {"lora_config": object()}, "LoRA"),
+        ({"lora_config": object()}, "LoRA"),
         (
-            "direct",
             {"speculative_config": SimpleNamespace(draft_lm_head_quantization="fp8")},
             "draft_lm_head_quantization",
-        ),
-        (
-            "direct",
-            {"weight_transfer_config": SimpleNamespace(backend="sharded_rdt")},
-            "sharded_rdt",
         ),
     ],
     ids=[
         "defaults",
-        "layerwise-lora",
         "offload-backend",
         "offload-prefetch",
         "offload-uva",
         "torchao",
         "lora",
         "draft-lm-head-quant",
-        "sharded-rdt",
     ],
 )
-def test_verify_direct_reload_compat(monkeypatch, mode, overrides, match):
-    monkeypatch.setenv("VLLM_RELOAD_MODE", mode)
+def test_verify_direct_reload_compat(overrides, match):
     config = _config(**overrides)
     if match is None:
         VllmConfig._verify_direct_reload_compat(config)

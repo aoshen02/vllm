@@ -1281,11 +1281,8 @@ class VllmConfig:
             )
 
     def _verify_direct_reload_compat(self) -> None:
-        """Reject configurations that direct weight reload cannot support."""
-        # not `direct_reload_enabled()`: importing it would load the model
-        # loaders into every process that builds a config
-        if envs.VLLM_RELOAD_MODE != "direct":
-            return
+        """Reject configurations that direct weight reload cannot support.
+        Checked when a reload begins; cold start is unaffected."""
         offload = self.offload_config
         if (
             offload.offload_backend != "auto"
@@ -1310,13 +1307,6 @@ class VllmConfig:
             # lm_head's storage: post-load processing would write it there
             raise ValueError(
                 "Direct reload does not support draft_lm_head_quantization."
-            )
-        transfer = self.weight_transfer_config
-        if transfer is not None and transfer.backend == "sharded_rdt":
-            # its replay plan is baked by a layerwise (meta) dry run
-            raise ValueError(
-                "Direct reload does not support the sharded_rdt weight-transfer "
-                "backend. Use VLLM_RELOAD_MODE=layerwise or another backend."
             )
 
     def _verify_kv_transfer_compat(self) -> None:
@@ -1673,7 +1663,6 @@ class VllmConfig:
             self.quant_config = VllmConfig._get_quantization_config(
                 self.model_config, self.load_config
             )
-        self._verify_direct_reload_compat()
 
         # "dummy" reads no weights at all, and the sharded formats read a vLLM
         # state dict, which stores tied word embeddings under the lm_head only.
