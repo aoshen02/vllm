@@ -51,3 +51,8 @@ class TestReadAuxRows:
         store, keys = self._store([_rows(0, 4)])
         with pytest.raises(BlockObjectStoreError, match="'s/gone' is missing"):
             read_aux_rows(store, keys + ["s/gone"], "routed_experts", timeout_s=0.05)
+
+    def test_missing_field_is_named(self):
+        store, keys = self._store([_rows(0, 4), _rows(4, 4)])
+        with pytest.raises(BlockObjectStoreError, match="'s/0' has no field 'hidden"):
+            read_aux_rows(store, keys, "hidden_states")
