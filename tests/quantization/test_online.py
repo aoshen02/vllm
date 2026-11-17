@@ -181,7 +181,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm.model_executor.model_loader import weight_utils
 from vllm.model_executor.model_loader.base_loader import log_online_quantization
 from vllm.model_executor.model_loader.dummy_loader import DummyModelLoader
-from vllm.model_executor.model_loader.reload import start_reload
+from vllm.model_executor.model_loader.reload import finish_reload, start_reload
 from vllm.model_executor.model_loader.utils import process_weights_after_loading
 from vllm.model_executor.models.granitemoe import (
     GraniteMoeModel,
@@ -481,18 +481,21 @@ def test_online_moe_stages_quantized_weights_for_humming(
         )
         return _expert_checkpoint(tensors, 2)
 
-    def cold_start(name: str, factor: float) -> torch.nn.Module:
+    def cold_start(factor: float) -> torch.nn.Module:
         model = torch.nn.Module()
-        model.runner = create(name)
-        set(model.runner.routed_experts.load_weights(checkpoint(factor)))
+        # weight names resolve under `...experts`; a new layer name each
+        model.runner = create(f"model.layers.{next(_REQUANT_LAYERS)}.mlp.experts")
+        weights = checkpoint(factor)
+        loaded = set(model.runner.routed_experts.load_weights(weights))
+        assert loaded, "no checkpoint tensor reached the experts"
         process_weights_after_loading(model, config.model_config, device)
         return model
 
     device = torch.device(DEVICE)
     with set_current_vllm_config(config), torch.device(DEVICE):
-        model = cold_start("humming.loaded", 1.0)
+        model = cold_start(1.0)
         assert model.runner.routed_experts.quantizes_on_load
-        expected = dict(cold_start("humming.fresh", 1.0).named_parameters())
+        expected = dict(cold_start(1.0).named_parameters())
         actual = dict(model.named_parameters())
         assert actual.keys() == expected.keys()
         for name, tensor in actual.items():
@@ -508,6 +511,71 @@ def test_online_moe_stages_quantized_weights_for_humming(
         # direct weight update refuses it.
         with pytest.raises(RuntimeError, match="[Hh]umming"):
             start_reload(model)
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="Humming requires CUDA.")
+@pytest.mark.parametrize(
+    "scheme", ["fp8_per_block", "mxfp8", "mxfp4", "nvfp4_weight_only"]
+)
+def test_online_linear_humming_reload(scheme, tmp_path, dist_init) -> None:
+    """A direct reload of a Humming linear layer matches a fresh one, or is
+    refused where the kernel cannot rerun its post-load conversion."""
+    from vllm.config import set_current_vllm_config
+
+    _write_minimal_llama_config(tmp_path)
+    config = VllmConfig(
+        model_config=ModelConfig(
+            model=str(tmp_path), dtype="bfloat16", skip_tokenizer_init=True
+        ),
+        kernel_config=KernelConfig(linear_backend="humming"),
+    )
+    if scheme == "nvfp4_weight_only":
+        args = resolve_quantization_config(scheme, None)
+    else:
+        args = quant_config_args(linear=scheme)
+    device = torch.device(DEVICE)
+
+    def cold_start(seed: int) -> torch.nn.Module:
+        model = torch.nn.Module()
+        model.proj = ColumnParallelLinear(
+            512,
+            512,
+            bias=False,
+            params_dtype=torch.bfloat16,
+            quant_config=OnlineQuantizationConfig(args),
+            prefix=f"model.layers.0.humming_proj{seed}",
+            disable_tp=True,
+        )
+        torch.manual_seed(seed)
+        weight = torch.randn(512, 512, dtype=torch.bfloat16)
+        model.proj.weight.weight_loader(model.proj.weight, weight)
+        process_weights_after_loading(model, config.model_config, device)
+        return model
+
+    with set_current_vllm_config(config), torch.device(DEVICE):
+        model = cold_start(1)
+        if scheme == "nvfp4_weight_only":
+            # the kernel renames the weight and inverts the global scale in
+            # place after loading, so a direct reload refuses it
+            with pytest.raises(RuntimeError, match="[Hh]umming"):
+                start_reload(model)
+            return
+        fresh = cold_start(2)
+        start_reload(model)
+        torch.manual_seed(2)
+        weight = torch.randn(512, 512, dtype=torch.bfloat16)
+        model.proj.weight.weight_loader(model.proj.weight, weight)
+        finish_reload(model, config.model_config, device)
+        expected = dict(fresh.named_parameters())
+        for name, tensor in model.named_parameters():
+            torch.testing.assert_close(
+                tensor.view(torch.uint8),
+                expected[name].view(torch.uint8),
+                rtol=0,
+                atol=0,
+            )
+        x = torch.randn(4, 512, dtype=torch.bfloat16)
+        torch.testing.assert_close(model.proj(x)[0], fresh.proj(x)[0], rtol=0, atol=0)
 
 
 @pytest.mark.parametrize(
