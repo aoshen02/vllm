@@ -99,50 +99,39 @@ class TestWeightUpdates:
         assert recorder.events == ["invalidated", "written", "ready"]
 
 
-class TestWorkerSleepWake:
+class TestSleepWake:
     @pytest.mark.parametrize(
-        "level,discardable,wake_tags,expected",
+        "discardable,wake_tags,expected",
         [
-            (1, set(), None, ["invalidated", "ready"]),
-            (1, set(), ["weights"], ["invalidated", "ready"]),
-            (1, set(), ["kv_cache"], ["invalidated"]),
-            (2, {1}, None, ["invalidated"]),
-            (2, set(), None, ["invalidated", "ready"]),
+            (set(), None, ["invalidated", "ready"]),
+            (set(), ["weights"], ["invalidated", "ready"]),
+            (set(), ["kv_cache"], ["invalidated"]),
+            ({1}, None, ["invalidated"]),
         ],
         ids=[
-            "level1",
-            "level1-wake-weights",
-            "level1-wake-kv-only",
-            "level2-reload-makes-ready",
-            "level2-all-preserved",
+            "weights-preserved",
+            "wake-weights",
+            "wake-kv-only",
+            "weights-discarded-reload-makes-ready",
         ],
     )
-    def test_events(
-        self, recorder, monkeypatch, level, discardable, wake_tags, expected
-    ):
-        from vllm.v1.worker.gpu_worker import Worker
+    def test_events(self, recorder, monkeypatch, discardable, wake_tags, expected):
+        import vllm.device_allocator as device_allocator
+        from vllm.device_allocator.sleep_mode_backend import CuMemBackend
 
-        class Backend:
-            def suspend(self, discardable=()) -> None:
+        class Allocator:
+            def sleep(self, offload_tags, discardable) -> None:
                 assert recorder.events == ["invalidated"]
 
-            def resume(self, tags=None) -> None:
+            def wake_up(self, tags) -> None:
                 pass
 
-        worker = object.__new__(Worker)
-        worker._sleep_mode_backend = Backend()
-        worker.model_runner = SimpleNamespace(extensible_kv_cache=None, model=None)
-        worker.vllm_config = SimpleNamespace(
-            model_config=SimpleNamespace(enable_nccl_comm_suspend=False)
-        )
         monkeypatch.setattr(
-            Worker, "_discardable_parameters", lambda self, model: discardable
+            device_allocator, "get_mem_allocator_instance", lambda: Allocator()
         )
-        monkeypatch.setattr("torch.accelerator.synchronize", lambda: None)
-        monkeypatch.setattr("torch.accelerator.get_memory_info", lambda: (0, 0))
-        monkeypatch.setattr(Worker, "synchronize_device", lambda self: None)
+        backend = CuMemBackend()
 
-        worker.sleep(level=level)
-        worker.wake_up(tags=wake_tags)
+        backend.suspend(discardable)
+        backend.resume(wake_tags)
 
         assert recorder.events == expected
