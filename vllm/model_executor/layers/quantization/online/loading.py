@@ -59,6 +59,14 @@ def _quantize_fp8_per_channel(weight: torch.Tensor) -> tuple:
     return online_fp8._fp8_quant_per_channel(weight, scale), scale
 
 
+def _quantize_int8_per_channel(weight: torch.Tensor) -> tuple:
+    vmax = torch.iinfo(torch.int8).max
+    amax = weight_amax(weight, dim=-1, keepdim=True).float()
+    scale = (amax / vmax).clamp_min(torch.finfo(torch.float32).tiny)
+    values = weight.float().div(scale).round().clamp(-vmax, vmax).to(torch.int8)
+    return values, scale
+
+
 def _nvfp4_on_load(layer: torch.nn.Module, method: Any) -> None:
     """w1 and w3 of an expert share one global scale: the first waits."""
     pending: dict[int, tuple[str, torch.Tensor, torch.Event]] = {}
@@ -112,6 +120,7 @@ def checkpoint_method(layer: torch.nn.Module, spec: Any, default: Any) -> Any:
     from compressed_tensors.quantization import QuantizationArgs
 
     import vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w8a8_fp8 as ct_fp8  # noqa: E501
+    import vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w8a8_int8 as ct_int8  # noqa: E501
     import vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w8a8_mxfp8 as ct_mxfp8  # noqa: E501
     from vllm.config.quantization import QuantSpec
     from vllm.model_executor.layers.fused_moe import RoutedExperts
@@ -148,6 +157,11 @@ def checkpoint_method(layer: torch.nn.Module, spec: Any, default: Any) -> Any:
             values, scales = _quantize_fp8_per_channel(w)
             return values, scales.flatten()
 
+    elif weight == qu.kInt8StaticChannelSym and is_moe:
+        channel = QuantizationArgs(type="int", num_bits=8, strategy="channel")
+        token = QuantizationArgs(type="int", strategy="token", dynamic=True)
+        method = ct_int8.CompressedTensorsW8A8Int8MoEMethod(channel, token, moe)
+        quantize = _quantize_int8_per_channel
     elif weight == qu.kMxfp8Static and is_moe:
         method = ct_mxfp8.CompressedTensorsW8A8Mxfp8MoEMethod(moe)
         quantize = mxfp8_utils.mxfp8_e4m3_quantize

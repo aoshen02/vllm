@@ -5,6 +5,7 @@ from typing import Any
 
 import torch
 
+from vllm.config.quantization import QuantSpec
 from vllm.model_executor.layers.fused_moe import (
     RoutedExperts,
 )
@@ -14,8 +15,12 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
-from vllm.model_executor.layers.quantization.online.int8 import (
-    Int8OnlineMoEMethod,
+from vllm.model_executor.layers.quantization.online.loading import (
+    checkpoint_method,
+)
+from vllm.model_executor.layers.quantization.utils.quant_utils import (
+    kInt8DynamicTokenSym,
+    kInt8StaticChannelSym,
 )
 
 
@@ -56,5 +61,8 @@ class ExpertsInt8Config(QuantizationConfig):
         if isinstance(layer, LinearBase):
             return UnquantizedLinearMethod()
         elif isinstance(layer, RoutedExperts):
-            return Int8OnlineMoEMethod(moe=layer.moe_config)
+            spec = QuantSpec(
+                weight=kInt8StaticChannelSym, activation=kInt8DynamicTokenSym
+            )
+            return checkpoint_method(layer, spec, kInt8DynamicTokenSym)
         return None
