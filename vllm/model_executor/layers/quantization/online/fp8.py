@@ -183,7 +183,8 @@ class OnlineLinearBase(OnlineRequantizationMixin, LinearMethodBase):
         layer.weight_block_size = None
 
         weight = ModelWeightParameter(
-            data=torch.empty(
+            # zeros: rows no checkpoint tensor fills (a padded vocab) stay zero
+            data=torch.zeros(
                 output_size_per_partition,
                 input_size_per_partition,
                 dtype=params_dtype,

@@ -5,10 +5,7 @@
 import torch
 
 from vllm.logger import init_logger
-from vllm.model_executor.layers.fused_moe import (
-    FusedMoeWeightScaleSupported,
-    RoutedExperts,
-)
+from vllm.model_executor.layers.fused_moe import RoutedExperts
 from vllm.model_executor.layers.fused_moe.config import (
     FUSED_MOE_UNQUANTIZED_CONFIG,
     FusedMoEConfig,
@@ -22,7 +19,6 @@ from vllm.model_executor.layers.fused_moe.experts.lut_b_moe import (
 from vllm.model_executor.layers.fused_moe.modular_kernel import (
     FusedMoEActivationFormat,
 )
-from vllm.model_executor.layers.quantization.online.loading import _load_quantized
 from vllm.model_executor.layers.quantization.online.moe_base import (
     OnlineMoEMethodBase,
 )
@@ -144,11 +140,7 @@ class LutBOnlineMoEMethod(OnlineMoEMethodBase):
                     torch.zeros(shape, dtype=dtype), requires_grad=False
                 )
                 layer.register_parameter(prefix + name, param)
-                attrs = extra_weight_attrs
-                if name == "scales":  # per row and 32 inputs: sharded as a weight
-                    group = FusedMoeWeightScaleSupported.GROUP.value
-                    attrs = {**extra_weight_attrs, "quant_method": group}
-                set_weight_attrs(param, attrs)
+                set_weight_attrs(param, extra_weight_attrs)
             _quantize_lut_b_on_load(layer, prefix)
 
     def get_fused_moe_quant_config(self, layer: torch.nn.Module) -> FusedMoEQuantConfig:
@@ -204,16 +196,38 @@ class LutBOnlineMoEMethod(OnlineMoEMethodBase):
 
 
 def _quantize_lut_b_on_load(layer: torch.nn.Module, prefix: str) -> None:
-    """Make `layer.<prefix>weight` load an fp16/bf16 expert tensor as LUT-B."""
-    load = _load_quantized(
-        layer, prefix + "weight", prefix + "codebooks", prefix + "scales"
-    )
+    """Make `layer.<prefix>weight` load an fp16/bf16 expert tensor as LUT-B.
+
+    The tiled parameters are 4D, which the MoE loader does not shard: this
+    loader takes the rank's shard (gate/up rows, down columns) itself and
+    writes it at its offset, leaving the zero padding tiles untouched."""
+    names = [prefix + name for name in ("weight", "codebooks", "scales")]
+    layer.quantizes_on_load = True
 
     def loader(param, loaded_weight, weight_name, shard_id, expert_id, **kwargs):
-        if layer._map_global_expert_id_to_local_expert_id(expert_id) == -1:
+        expert = layer._map_global_expert_id_to_local_expert_id(expert_id)
+        if expert == -1:
             return False  # skip the costly fit for another rank's expert
+        moe = layer.moe_config
+        inter = moe.intermediate_size_per_partition_unpadded
         weight = loaded_weight.to(param.device, layer.orig_dtype)
-        quantized = quantize_lut_b(weight.contiguous())
-        return load(param, quantized, weight_name, shard_id, expert_id, **kwargs)
+        dim = 1 if shard_id == "w2" else 0  # the TP-sharded dim
+        if weight.shape[dim] != inter:
+            weight = weight.narrow(dim, moe.tp_rank * inter, inter)
+        row = moe.intermediate_size_per_partition if shard_id == "w3" else 0
+        n, k = weight.shape
+        # whole tiles: zero rows/columns, as the padding tiles hold
+        pad_k = -k % LUT_B_BLOCK_K
+        pad_n = -n % LUT_B_BLOCK_N
+        weight = torch.nn.functional.pad(weight, (0, pad_k, 0, pad_n))
+        packed, codebooks, scales = quantize_lut_b(weight.contiguous())
+        tile_rows = slice(row // LUT_B_BLOCK_N, row // LUT_B_BLOCK_N + packed.shape[0])
+        tile_cols = slice(0, packed.shape[1])
+        for name, value in zip(names[:2], (packed, codebooks)):
+            getattr(layer, name).data[expert, tile_rows, tile_cols].copy_(value)
+        getattr(layer, names[2]).data[
+            expert, row : row + scales.shape[0], : scales.shape[1]
+        ].copy_(scales)
+        return True if kwargs.get("return_success") else None
 
-    getattr(layer, prefix + "weight").weight_loader = loader
+    getattr(layer, names[0]).weight_loader = loader

@@ -282,6 +282,18 @@ def checkpoint_method(layer: torch.nn.Module, spec: Any, default: Any) -> Any:
 
     def create_weights_quantized_on_load(layer, *args, **kwargs):
         create_weights(layer, *args, **kwargs)
+        if not is_moe:
+            # kernels read the partition sizes, which online methods set and
+            # some layers (the MoE router gate) do not
+            if not hasattr(layer, "input_size_per_partition"):
+                layer.input_size_per_partition = kwargs.get(
+                    "input_size_per_partition", args[0] if args else None
+                )
+            if not hasattr(layer, "output_size_per_partition"):
+                sizes: list[int] = kwargs.get(
+                    "output_partition_sizes", args[1] if len(args) > 1 else []
+                )
+                layer.output_size_per_partition = sum(sizes)
         if weight == qu.kNvfp4Static and is_moe:
             return _nvfp4_on_load(layer, method)
         if weight == qu.kNvfp4Static:

@@ -60,9 +60,10 @@ class OnlineMoEMethodBase(OnlineRequantizationMixin, FusedMoEMethodBase):
             layer.num_experts = num_experts
             return
 
-        # Fused gate_up_proj (column parallel) — full precision
+        # Fused gate_up_proj (column parallel) — full precision; zeros: padding
+        # no checkpoint tensor fills stays zero
         w13_weight = torch.nn.Parameter(
-            torch.empty(
+            torch.zeros(
                 num_experts,
                 self.moe.w13_num_shards * intermediate_size_per_partition,
                 hidden_size,
@@ -75,7 +76,7 @@ class OnlineMoEMethodBase(OnlineRequantizationMixin, FusedMoEMethodBase):
 
         # down_proj (row parallel) — full precision
         w2_weight = torch.nn.Parameter(
-            torch.empty(
+            torch.zeros(
                 num_experts,
                 hidden_size,
                 intermediate_size_per_partition,
