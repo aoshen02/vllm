@@ -39,6 +39,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kMxfp8Dynamic,
 )
 from vllm.model_executor.utils import (
+    _in_own_storage,
     replace_parameter,
     retire_parameter,
     set_weight_attrs,
@@ -159,7 +160,17 @@ class LutBOnlineMoEMethod(OnlineMoEMethodBase):
                 weight = lut_b_to_sm107_tiles(packed, codebooks, scales)
             else:
                 weight = dequantize_lut_b(packed, codebooks, scales, layer.orig_dtype)
-            replace_parameter(layer, name, weight)
+            param = getattr(layer, name)
+            # A reload writes the kernel weight back into the storage cold
+            # start allocated for it: no new allocation per update (sleep
+            # mode keeps the old one), and captured CUDA graphs keep its
+            # address. `replace_parameter` would rebind it here, as for an
+            # online method that frees its full-precision source.
+            kept = _in_own_storage(param, weight)
+            if kept is weight:
+                replace_parameter(layer, name, weight)
+            else:
+                param.data = kept
         self.release_requantization_source_weights(layer)
 
         quant_config = self.get_fused_moe_quant_config(layer)
