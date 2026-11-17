@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
+from functools import cached_property
 from threading import Lock
 from typing import TYPE_CHECKING, Any
 
@@ -28,16 +29,38 @@ from vllm.distributed.aux_output_connector.store import (
     BackgroundBlockObjectStore,
     BlockObjectStore,
 )
-from vllm.distributed.parallel_state import get_tp_group
+from vllm.distributed.parallel_state import get_pp_group, get_tp_group
+from vllm.distributed.utils import get_pp_indices
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
     RoutedExpertsCapturer,
+    _get_routed_experts_shape,
     bind_routed_experts_capturer,
 )
+from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import round_up
 
 if TYPE_CHECKING:
     from vllm.v1.kv_cache_interface import KVCacheConfig
     from vllm.v1.worker.gpu.input_batch import InputBatch
+
+
+PP_ROUTED_EXPERTS_KEY = "routed_experts"
+
+
+def add_pp_routes_buffer(
+    intermediate_tensors: IntermediateTensors,
+    vllm_config: VllmConfig,
+    max_num_tokens: int,
+    device: torch.device,
+) -> None:
+    if not vllm_config.aux_output_config.enable_return_routed_experts:
+        return
+    num_layers, _, num_experts_per_tok = _get_routed_experts_shape(vllm_config)
+    intermediate_tensors[PP_ROUTED_EXPERTS_KEY] = torch.zeros(
+        (max_num_tokens, num_layers, num_experts_per_tok),
+        dtype=torch.int32,
+        device=device,
+    )
 
 
 @dataclass(slots=True)
@@ -114,7 +137,7 @@ class AuxOutputWorkerConnector:
         """Create the output data plane once the KV cache layout is resolved."""
         # Every TP rank participates in capture collectives, but only the
         # executor output rank owns the auxiliary output data plane.
-        if not get_tp_group().is_first_rank:
+        if not get_tp_group().is_first_rank or not get_pp_group().is_last_rank:
             return
 
         vllm_config = self._vllm_config
@@ -134,6 +157,36 @@ class AuxOutputWorkerConnector:
             vllm_config.scheduler_config.max_num_seqs,
             vllm_config.scheduler_config.max_num_batched_tokens,
             vllm_config.max_concurrent_batches,
+        )
+
+    @cached_property
+    def _pp_start_layer(self) -> int:
+        pp_group = get_pp_group()
+        num_layers = self._capturer.shape_per_token[0]
+        start_layer, _ = get_pp_indices(
+            num_layers, pp_group.rank_in_group, pp_group.world_size
+        )
+        return start_layer
+
+    def receive_pp_routes(
+        self, intermediate_tensors: IntermediateTensors, num_tokens: int
+    ) -> None:
+        if not self._vllm_config.aux_output_config.enable_return_routed_experts:
+            return
+        start = self._pp_start_layer
+        received = intermediate_tensors[PP_ROUTED_EXPERTS_KEY]
+        self._capturer.device_buffer[:num_tokens, :start] = received[
+            :num_tokens, :start
+        ]
+
+    def send_pp_routes(
+        self, output_intermediate_tensors: IntermediateTensors
+    ) -> IntermediateTensors:
+        if not self._vllm_config.aux_output_config.enable_return_routed_experts:
+            return output_intermediate_tensors
+        return IntermediateTensors(
+            output_intermediate_tensors.tensors
+            | {PP_ROUTED_EXPERTS_KEY: self._capturer.device_buffer}
         )
 
     def prepare_output(self, input_batch: InputBatch) -> PendingAuxOutput | None:
