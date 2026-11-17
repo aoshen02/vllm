@@ -11,6 +11,7 @@ from vllm import _custom_ops as ops
 from vllm.model_executor.layers.quantization.online import fp8 as online_fp8
 from vllm.model_executor.layers.quantization.online.nvfp4 import (
     _quantize_moe_weight_to_nvfp4,
+    _quantize_nvfp4,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import weight_amax
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
@@ -109,6 +110,46 @@ def _nvfp4_on_load(layer: torch.nn.Module, method: Any) -> None:
             raise RuntimeError(
                 f"{layer.layer_name}: NVFP4 experts {experts} got only one of "
                 "w1/w3; both must be loaded in the same update"
+            )
+        process(layer)
+
+    method.process_weights_after_loading = process_weights_after_loading
+
+
+def _nvfp4_linear_on_load(layer: torch.nn.Module, method: Any) -> None:
+    """The fused shards of a layer (q/k/v, gate/up) share one global scale:
+    all but the last wait."""
+    load = _load_quantized(layer, "weight", "weight_scale", "weight_scale_2")
+    num_shards = len(layer.logical_widths)
+    pending: dict[Any, tuple[torch.Tensor, tuple, dict]] = {}
+
+    def loader(param, loaded_weight, *args, **kwargs):
+        weight = loaded_weight.to(param.device, layer.params_dtype, copy=True)
+        shard_id = args[0] if args else kwargs.get("loaded_shard_id")
+        if shard_id is None or num_shards == 1:
+            return load(
+                param, _quantize_nvfp4(weight, weight_amax(weight)), *args, **kwargs
+            )
+        pending[shard_id] = (weight, args, kwargs)
+        if len(pending) < num_shards:
+            return None
+        shards = list(pending.values())
+        pending.clear()
+        amax = torch.stack([weight_amax(w).float() for w, _, _ in shards]).max()
+        for w, a, kw in shards:
+            ret = load(param, _quantize_nvfp4(w, amax), *a, **kw)
+        return ret
+
+    layer.weight.weight_loader = loader
+    process = method.process_weights_after_loading
+
+    def process_weights_after_loading(layer: torch.nn.Module) -> None:
+        if pending:
+            shards = sorted(map(str, pending))
+            pending.clear()
+            raise RuntimeError(
+                f"NVFP4 linear got only shards {shards} of a fused layer; all "
+                "of them must be loaded in the same update"
             )
         process(layer)
 
@@ -219,6 +260,11 @@ def checkpoint_method(layer: torch.nn.Module, spec: Any, default: Any) -> Any:
                 rotation = hadamard_matrix(hadamard, w.device)
                 return mxfp4_utils.mxfp4_quantize(block_hadamard_rotate(w, rotation))
 
+    elif weight == qu.kNvfp4Static and not is_moe:  # weight-only (W4A16)
+        nvfp4_spec = QuantSpec(weight=weight, activation=None)
+        method = modelopt.ModelOptLinearMethod(
+            nvfp4_spec, modelopt.CkptCtx(group_size=16)
+        )
     elif weight == qu.kNvfp4Static and is_moe:
         config = modelopt.ModelOptNvFp4Config(is_checkpoint_nvfp4_serialized=True)
         config.moe_activation_override = spec.activation
@@ -230,8 +276,10 @@ def checkpoint_method(layer: torch.nn.Module, spec: Any, default: Any) -> Any:
 
     def create_weights_quantized_on_load(layer, *args, **kwargs):
         create_weights(layer, *args, **kwargs)
-        if weight == qu.kNvfp4Static:
+        if weight == qu.kNvfp4Static and is_moe:
             return _nvfp4_on_load(layer, method)
+        if weight == qu.kNvfp4Static:
+            return _nvfp4_linear_on_load(layer, method)
         for p in ("w13_", "w2_") if is_moe else ("",):
             quantize_on_load(layer, f"{p}weight", quantize, f"{p}{scale}")
 
