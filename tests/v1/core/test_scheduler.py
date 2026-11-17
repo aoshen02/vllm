@@ -2771,6 +2771,107 @@ def test_kv_cache_release_after_keep_pause_preserves_requests():
     assert resumed.num_scheduled_tokens == {running.request_id: running.num_tokens}
 
 
+def _engine_core_proc_loading_kv():
+    """An EngineCoreProc with a running request and one whose KV a connector
+    is loading."""
+    from tests.v1.kv_connector.unit.utils import create_model_runner_output
+    from vllm.v1.engine.core import EngineCoreProc
+
+    scheduler = create_scheduler(
+        enable_prefix_caching=True,
+        use_kv_connector=mock_kv(matched_tokens=32, is_async=True),
+    )
+    running, loading = create_requests(
+        num_requests=2, num_tokens=48, max_tokens=20, req_ids=["running", "loading"]
+    )
+    scheduler.add_request(running)
+    scheduler.add_request(loading)
+    output = scheduler.schedule()
+    scheduler.update_from_output(
+        output, create_model_runner_output([], finished_recving={"running"})
+    )
+    output = scheduler.schedule()
+    scheduler.update_from_output(output, create_model_runner_output([running]))
+    assert running.status == RequestStatus.RUNNING
+    assert loading.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+
+    core = object.__new__(EngineCoreProc)
+    core.scheduler = scheduler
+    core.batch_queue = None
+    core.engines_running = False
+    core._idle_state_callbacks = []
+    core._checkpoint_state = CheckpointState.RUNNING
+    core._kv_cache_reclaimable = False
+    core.mm_receiver_cache = None
+    core.model_executor = Mock()
+    return core, running, loading
+
+
+@pytest.mark.parametrize("sleep", [False, True], ids=["pause", "sleep"])
+def test_cache_clearing_pause_waits_for_connector_kv_loads(sleep):
+    """A paused engine keeps stepping while a KV connector loads into the blocks
+    of a waiting request; once the load is done, the pause preempts it with the
+    running requests and the prefix cache reset frees every block."""
+    from tests.v1.kv_connector.unit.utils import create_model_runner_output
+
+    core, running, loading = _engine_core_proc_loading_kv()
+    scheduler = core.scheduler
+    if sleep:
+        future = core.sleep(level=1, mode="keep", reset_connector=False)
+    else:
+        future = core.pause_scheduler(mode="keep", clear_cache=True)
+
+    for step in range(3):
+        assert core.has_work() and not future.done()
+        output = scheduler.schedule()
+        assert output.total_num_scheduled_tokens == 0
+        finished = {"loading"} if step == 2 else None
+        scheduler.update_from_output(
+            output, create_model_runner_output([], finished_recving=finished)
+        )
+    assert not core.has_work()
+    core._notify_idle_state_callbacks()
+    future.result()
+    assert scheduler.kv_cache_manager.usage == 0
+    assert running.status == RequestStatus.PREEMPTED
+    assert loading.status == RequestStatus.WAITING
+    assert running.num_computed_tokens == loading.num_computed_tokens == 0
+
+
+def test_cache_clearing_pause_waits_for_a_failed_kv_load_to_finish():
+    """A connector reports a failed load before the transfer finishes; the
+    pause keeps stepping until it does, so no block is freed under a write."""
+    from tests.v1.kv_connector.unit.utils import create_model_runner_output
+
+    core, running, loading = _engine_core_proc_loading_kv()
+    scheduler = core.scheduler
+    scheduler.recompute_kv_load_failures = True
+    future = core.pause_scheduler(mode="keep", clear_cache=True)
+    for transfer in ({"failed_recving": {"loading"}}, {}):
+        assert core.has_work() and not future.done()
+        output = scheduler.schedule()
+        scheduler.update_from_output(output, create_model_runner_output([], **transfer))
+    assert core.has_work() and not future.done()
+    output = scheduler.schedule()
+    scheduler.update_from_output(
+        output, create_model_runner_output([], finished_recving={"loading"})
+    )
+    assert not core.has_work()
+    core._notify_idle_state_callbacks()
+    future.result()
+    assert scheduler.kv_cache_manager.usage == 0
+    assert loading.status == RequestStatus.WAITING
+    assert loading.num_computed_tokens == running.num_computed_tokens == 0
+
+
+def test_pause_that_keeps_the_kv_cache_does_not_wait_for_kv_loads():
+    core, running, loading = _engine_core_proc_loading_kv()
+    assert core.pause_scheduler(mode="keep", clear_cache=False) is None
+    assert not core.has_work()
+    assert running.status == RequestStatus.RUNNING
+    assert loading.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+
+
 @pytest.mark.parametrize("extensible", [True, False])
 def test_pause_that_clears_the_kv_cache_lets_weight_updates_borrow_it(extensible):
     """Workers learn that their extensible KV cache holds nothing to keep from
