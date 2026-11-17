@@ -503,7 +503,7 @@ class OnlineQuantizationConfig(QuantizationConfig):
         )
 
     def get_quant_method(
-        self, layer: torch.nn.Module, prefix: str
+        self, layer: torch.nn.Module, prefix: str, requantize: bool = False
     ) -> "QuantizeMethodBase | None":
         # `targets` takes precedence over `moe` and `linear` and is exclusive.
         resolved = self.resolve_quant_method_cls(type(layer), prefix)
@@ -518,7 +518,14 @@ class OnlineQuantizationConfig(QuantizationConfig):
             )
             assert issubclass(quant_method_cls, (OnlineMoEMethodBase, OnlineLinearBase))
             default = getattr(quant_method_cls, "activation_quant_key", None)
-            if self.quantize_on_load:
+            # not for requantization (the checkpoint is quantized) or fused
+            # shared experts (their loader quantizes them itself)
+            fused_shared = getattr(
+                getattr(layer, "expert_map_manager", None),
+                "num_fused_shared_experts",
+                0,
+            )
+            if self.quantize_on_load and not requantize and not fused_shared:
                 method = checkpoint_method(layer, quant_spec, default)
                 if method is not None:
                     return method
