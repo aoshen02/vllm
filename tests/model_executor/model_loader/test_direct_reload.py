@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Direct weight reload (`VLLM_RELOAD_MODE=direct`) on a toy model whose
+"""Direct weight reload on a toy model whose
 post-load processing has the hazards found on real models:
 
 (a) a parent derives a separate tensor from a child's weight (MLA W_UK/W_UV
@@ -262,11 +262,6 @@ def _runs(model: _ToyModel) -> dict[str, int]:
         for name, m in model.named_modules()
         if getattr(m, "quant_method", None) is not None
     }
-
-
-@pytest.fixture(autouse=True)
-def _direct_mode(monkeypatch):
-    monkeypatch.setenv("VLLM_RELOAD_MODE", "direct")
 
 
 class TestReloadEqualsColdStart:

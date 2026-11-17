@@ -93,8 +93,7 @@ class NCCLTrainerInitInfo(TrainerInitInfo):
     every trainer rank before contacting the workers. The check stays until
     re-init, even if planning failed and the workers fell back to
     `load_weights`. The inference server
-    must run with `VLLM_RELOAD_MODE=direct` and without EPLB; the workers
-    refuse otherwise at init."""
+    must run without EPLB; the workers refuse otherwise at init."""
 
 
 @dataclass
@@ -173,7 +172,8 @@ class NCCLWeightTransferEngine(
     """Weight transfer engine using NCCL for communication between trainer and workers.
 
     Receives dense checkpoint-format weights broadcast from the trainer ranks
-    below `rank_offset` and loads them with the layerwise reload lifecycle.
+    below `rank_offset` and loads them with the reload lifecycle
+    (`start_reload` / `finish_reload`).
     """
 
     # Define backend-specific dataclass types
