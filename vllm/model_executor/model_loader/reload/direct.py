@@ -210,30 +210,52 @@ def meta_checkpoint_layout(model: torch.nn.Module) -> Iterator[None]:
     tensor lands after `begin` without touching the model. Restored on exit."""
     if not hasattr(model, "_ckpt_param_names"):
         raise RuntimeError("direct reload: no checkpoint layout was recorded")
-    saved: list[tuple[torch.Tensor, torch.Tensor, dict]] = []
+    # swapped into the modules, not assigned to `.data`: a real tensor's data
+    # cannot become a meta tensor; one stand-in per tensor keeps ties
+    stand_ins: dict[int, torch.Tensor] = {}
+    saved: list[tuple[dict, str, torch.Tensor]] = []
     try:
-        for name, t in loadable_tensors(model):
-            # loaders read expert maps; they stay real
-            if not _owned(model, t) or name.rpartition(".")[2] in SKIP_LOAD_TENSORS:
-                continue
-            shape, stride, dtype, offset = t._ckpt[1]
-            if t.untyped_storage().data_ptr() != t._ckpt[3]:
-                offset = t.storage_offset()  # moved, as in `_checkpoint_views`
-            span = (
-                0 if 0 in shape else 1 + sum((n - 1) * s for n, s in zip(shape, stride))
+        for module in model.modules():
+            persistent = (
+                (module._buffers, n)
+                for n in module._buffers
+                if n not in module._non_persistent_buffers_set
             )
-            meta = torch.empty(offset + span, dtype=dtype, device="meta")
-            saved.append((t, t.data, dict(t.__dict__)))
-            t.data = meta.as_strided(shape, stride, offset)
-            for k in _LOADER_ATTRS:
-                t.__dict__.pop(k, None)
-            t.__dict__.update(t._ckpt[2])
+            slots = [
+                *((module._parameters, n) for n in module._parameters),
+                *persistent,
+            ]
+            for slot, name in slots:
+                t = slot[name]
+                # loaders read expert maps; they stay real
+                if t is None or not _owned(model, t) or name in SKIP_LOAD_TENSORS:
+                    continue
+                if id(t) not in stand_ins:
+                    stand_ins[id(t)] = _meta_stand_in(t)
+                saved.append((slot, name, t))
+                slot[name] = stand_ins[id(t)]
         yield
     finally:
-        for t, data, attrs in saved:
-            t.data = data
-            t.__dict__.clear()
-            t.__dict__.update(attrs)
+        for slot, name, t in saved:
+            slot[name] = t
+
+
+def _meta_stand_in(t: torch.Tensor) -> torch.Tensor:
+    """A meta tensor of `t`'s class in its checkpoint layout (at the storage
+    offset `begin` would view it at), with its checkpoint loader metadata."""
+    shape, stride, dtype, offset = t._ckpt[1]
+    if t.untyped_storage().data_ptr() != t._ckpt[3]:
+        offset = t.storage_offset()  # moved, as in `_checkpoint_views`
+    span = 0 if 0 in shape else 1 + sum((n - 1) * s for n, s in zip(shape, stride))
+    meta = torch.empty(offset + span, dtype=dtype, device="meta")
+    meta = meta.as_strided(shape, stride, offset)
+    if isinstance(t, torch.nn.Parameter):
+        meta = torch.Tensor._make_subclass(type(t), meta, t.requires_grad)
+    meta.__dict__.update(
+        {k: v for k, v in t.__dict__.items() if k not in _LOADER_ATTRS}
+    )
+    meta.__dict__.update(t._ckpt[2])
+    return meta
 
 
 @torch.no_grad()
