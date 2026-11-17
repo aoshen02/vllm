@@ -24,7 +24,6 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from vllm.config import VllmConfig
 from vllm.model_executor.layers.linear import MergedColumnParallelLinear
 from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
 from vllm.model_executor.layers.quantization.online.fp8 import (
@@ -33,9 +32,11 @@ from vllm.model_executor.layers.quantization.online.fp8 import (
 from vllm.model_executor.layers.quantization.online.loading import quantize_on_load
 from vllm.model_executor.model_loader.reload import finish_reload, start_reload
 from vllm.model_executor.model_loader.reload.direct import (
+    _config_refusals,
     begin_direct_reload,
     finish_direct_reload,
     record_checkpoint_layout,
+    uses_direct_reload,
 )
 from vllm.model_executor.model_loader.utils import process_weights_after_loading
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
@@ -346,47 +347,55 @@ class TestRefusals:
             begin_direct_reload(model)
         _assert_same(_state(model), before, addresses=True)
 
-    def test_online_quantization_refused(self, monkeypatch):
-        # finish clears the guard that keeps online quantization from
-        # quantizing its converted bytes again
-        online = object.__new__(Fp8PerTensorOnlineLinearMethod)
-        init = _ToyModel.__init__
-
-        def with_online_layer(self):
-            init(self)
-            self.proj.quant_method = online
-
-        monkeypatch.setattr(_ToyModel, "__init__", with_online_layer)
-        with pytest.raises(RuntimeError, match="online quantization"):
-            _cold_start(_checkpoint())
-
-    def test_online_shared_experts_refused(self, monkeypatch):
-        # post-load processing deletes the staging parameters a reload loads
-        init = _ToyModel.__init__
-
-        def with_online_shared_experts(self):
-            init(self)
-            self.proj.shared_expert_online_loader = object()
-
-        monkeypatch.setattr(_ToyModel, "__init__", with_online_shared_experts)
-        with pytest.raises(RuntimeError, match="online quantization"):
-            _cold_start(_checkpoint())
-
-    @pytest.mark.parametrize("method_cls", ["HummingLinearMethod", "HummingMoEMethod"])
-    def test_humming_refused(self, monkeypatch, method_cls):
-        # its post-load processing runs only once per quant method
+    @pytest.mark.parametrize(
+        "unsupported,match",
+        [
+            # finish clears the guard that keeps online quantization from
+            # quantizing its converted bytes again
+            ("online", "online quantization"),
+            # post-load processing deletes the staging parameters a reload loads
+            ("online-shared-experts", "online quantization"),
+            # its post-load processing runs only once per quant method
+            ("HummingLinearMethod", "humming"),
+            ("HummingMoEMethod", "humming"),
+        ],
+    )
+    def test_unsupported_module_reloads_layerwise(
+        self, monkeypatch, unsupported, match
+    ):
         from vllm.model_executor.layers.quantization import humming as humming_mod
+        from vllm.model_executor.model_loader.reload import lifecycle
 
-        humming = object.__new__(getattr(humming_mod, method_cls))
         init = _ToyModel.__init__
 
-        def with_humming_layer(self):
+        def with_unsupported_layer(self):
             init(self)
-            self.proj.quant_method = humming
+            if unsupported == "online":
+                method = object.__new__(Fp8PerTensorOnlineLinearMethod)
+                self.proj.quant_method = method
+            elif unsupported == "online-shared-experts":
+                self.proj.shared_expert_online_loader = object()
+            else:
+                method = object.__new__(getattr(humming_mod, unsupported))
+                self.proj.quant_method = method
 
-        monkeypatch.setattr(_ToyModel, "__init__", with_humming_layer)
-        with pytest.raises(RuntimeError, match="humming"):
-            _cold_start(_checkpoint())
+        monkeypatch.setattr(_ToyModel, "__init__", with_unsupported_layer)
+        model = _cold_start(_checkpoint())  # cold start does not refuse
+        assert not uses_direct_reload(model)
+        assert match in "; ".join(model._direct_reload_refusals)
+        assert not hasattr(model, "_ckpt_param_names")  # not recorded
+        calls = []
+        monkeypatch.setattr(
+            lifecycle, "initialize_layerwise_reload", lambda m: calls.append("init")
+        )
+        monkeypatch.setattr(
+            lifecycle,
+            "finalize_layerwise_reload",
+            lambda m, config: calls.append("finalize"),
+        )
+        start_reload(model)
+        finish_reload(model, _MODEL_CONFIG, _DEVICE)
+        assert calls == ["init", "finalize"]
 
     def test_replaced_param_refused(self):
         # a new Parameter under a checkpoint name has no checkpoint layout:
@@ -561,12 +570,10 @@ def _config(**overrides) -> SimpleNamespace:
 
 
 @pytest.mark.parametrize(
-    "mode,overrides,match",
+    "overrides,match",
     [
-        ("direct", {}, None),
-        ("layerwise", {"lora_config": object()}, None),
+        ({}, None),
         (
-            "direct",
             {
                 "offload_config": SimpleNamespace(
                     offload_backend="uva",
@@ -577,7 +584,6 @@ def _config(**overrides) -> SimpleNamespace:
             "weight offloading",
         ),
         (
-            "direct",
             {
                 "offload_config": SimpleNamespace(
                     offload_backend="auto",
@@ -588,7 +594,6 @@ def _config(**overrides) -> SimpleNamespace:
             "weight offloading",
         ),
         (
-            "direct",
             {
                 "offload_config": SimpleNamespace(
                     offload_backend="auto",
@@ -599,25 +604,21 @@ def _config(**overrides) -> SimpleNamespace:
             "weight offloading",
         ),
         (
-            "direct",
             {"model_config": SimpleNamespace(quantization="torchao")},
             "torchao",
         ),
-        ("direct", {"lora_config": object()}, "LoRA"),
+        ({"lora_config": object()}, "LoRA"),
         (
-            "direct",
             {"speculative_config": SimpleNamespace(draft_lm_head_quantization="fp8")},
             "draft_lm_head_quantization",
         ),
         (
-            "direct",
             {"weight_transfer_config": SimpleNamespace(backend="sharded_rdt")},
             "sharded_rdt",
         ),
     ],
     ids=[
         "defaults",
-        "layerwise-lora",
         "offload-backend",
         "offload-prefetch",
         "offload-uva",
@@ -627,11 +628,9 @@ def _config(**overrides) -> SimpleNamespace:
         "sharded-rdt",
     ],
 )
-def test_verify_direct_reload_compat(monkeypatch, mode, overrides, match):
-    monkeypatch.setenv("VLLM_RELOAD_MODE", mode)
-    config = _config(**overrides)
+def test_config_refusals(overrides, match):
+    reasons = _config_refusals(_config(**overrides))
     if match is None:
-        VllmConfig._verify_direct_reload_compat(config)
+        assert reasons == []
     else:
-        with pytest.raises(ValueError, match=match):
-            VllmConfig._verify_direct_reload_compat(config)
+        assert any(match in reason for reason in reasons)

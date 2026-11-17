@@ -9,6 +9,9 @@ which must keep addresses (captured CUDA graphs) and refill derived tensors.
 Between `begin` and a successful `finish` the model must not run; there is
 no rollback, the next full update repairs it.
 
+A model direct reload cannot update (`_refusals`) is not recorded, and its
+weight updates use layerwise reload (`uses_direct_reload`).
+
 Delivery contract (not checked here): an update delivers every checkpoint
 tensor of each module whose PWAL changes its layout or is not idempotent, and
 of every `padding_fill_params()` parameter, which `begin` zero-fills whole.
@@ -36,6 +39,7 @@ __all__ = [
     "finish_direct_reload",
     "loadable_tensors",
     "record_checkpoint_layout",
+    "uses_direct_reload",
 ]
 
 
@@ -58,6 +62,14 @@ _LOADER_ATTRS = (
 def direct_reload_enabled() -> bool:
     """Whether weight updates reload in place (`VLLM_RELOAD_MODE=direct`)."""
     return envs.VLLM_RELOAD_MODE == "direct"
+
+
+def uses_direct_reload(model: torch.nn.Module) -> bool:
+    """Whether `model`'s weight updates reload directly: in direct mode, unless
+    cold start found a setup direct reload cannot update (layerwise then)."""
+    return direct_reload_enabled() and not getattr(
+        model, "_direct_reload_refusals", None
+    )
 
 
 def direct_reload_active(model: torch.nn.Module) -> bool:
@@ -85,8 +97,41 @@ def loadable_tensors(model: torch.nn.Module) -> Iterator[tuple[str, torch.Tensor
             yield (f"{module_name}.{name}" if module_name else name), tensor
 
 
-def _check_supported_modules(model: torch.nn.Module) -> None:
-    # config-level refusals: VllmConfig._verify_direct_reload_compat
+def _config_refusals(config) -> list[str]:
+    """Setups direct reload cannot update, by configuration."""
+    reasons = []
+    offload = config.offload_config
+    if (
+        offload.offload_backend != "auto"
+        or offload.prefetch.offload_group_size > 0
+        or offload.uva.cpu_offload_gb > 0
+    ):
+        # CPU/UVA offload gives parameters new storage on every post-load
+        # processing; prefetch offload shares one buffer between layers
+        reasons.append("weight offloading")
+    model_config = config.model_config
+    if model_config is not None and model_config.quantization == "torchao":
+        # its load_weights runs a layerwise reload, and its post-load
+        # processing replaces the weight parameter
+        reasons.append("torchao quantization")
+    if config.lora_config is not None:
+        # LoRA wraps layers after cold start; their wrappers forward
+        # `quant_method`, so a rerun would process each base layer twice
+        reasons.append("LoRA")
+    spec = config.speculative_config
+    if spec is not None and spec.draft_lm_head_quantization is not None:
+        # after `begin` the draft's quantized lm_head is a view of the target
+        # lm_head's storage: post-load processing would write it there
+        reasons.append("draft_lm_head_quantization")
+    transfer = config.weight_transfer_config
+    if transfer is not None and transfer.backend == "sharded_rdt":
+        # its replay plan is baked by a layerwise (meta) dry run
+        reasons.append("the sharded_rdt weight-transfer backend")
+    return reasons
+
+
+def _module_refusals(model: torch.nn.Module) -> list[str]:
+    """Setups direct reload cannot update, by module."""
     from vllm.model_executor.layers.quantization.humming import (
         HummingLinearMethod,
         HummingMoEMethod,
@@ -98,19 +143,28 @@ def _check_supported_modules(model: torch.nn.Module) -> None:
 
     for name, module in model.named_modules():
         method = getattr(module, "quant_method", None)
-        # also without an online config (experts_int8); fused shared experts
-        # quantize staging parameters that post-load processing deletes
-        if isinstance(method, (OnlineLinearBase, OnlineMoEMethodBase)) or (
-            getattr(module, "shared_expert_online_loader", None) is not None
+        # also without an online config (experts_int8), and wrapped online
+        # methods; fused shared experts quantize staging parameters that
+        # post-load processing deletes
+        if (
+            isinstance(method, (OnlineLinearBase, OnlineMoEMethodBase))
+            or getattr(method, "uses_meta_device", False)
+            or getattr(module, "shared_expert_online_loader", None) is not None
         ):
-            raise RuntimeError(
-                f"direct reload: online quantization is not supported "
-                f"({name}: {type(method).__name__})"
-            )
+            return [f"online quantization ({name}: {type(method).__name__})"]
         if isinstance(method, (HummingLinearMethod, HummingMoEMethod)):
             # its post-load processing runs once per quant method (a guard on
             # the method, not the module): a reload would keep checkpoint bytes
-            raise RuntimeError(f"direct reload: humming is not supported ({name})")
+            return [f"humming ({name})"]
+    return []
+
+
+def _refusals(model: torch.nn.Module) -> list[str]:
+    from vllm.config import get_current_vllm_config_or_none
+
+    config = get_current_vllm_config_or_none()
+    reasons = _config_refusals(config) if config is not None else []
+    return reasons + _module_refusals(model)
 
 
 def record_checkpoint_layout(model: torch.nn.Module) -> None:
@@ -121,7 +175,16 @@ def record_checkpoint_layout(model: torch.nn.Module) -> None:
     Runs once; reloads reuse the cold-start record."""
     if hasattr(model, "_ckpt_param_names") or is_weights_pre_processed():
         return  # pre-processed weights are already in runtime layout
-    _check_supported_modules(model)
+    reasons = _refusals(model)
+    if reasons:
+        # not recorded (torchao tensors have no plain storage, for one)
+        model._direct_reload_refusals = reasons
+        logger.info(
+            "Direct reload does not support %s: weight updates of this model "
+            "use layerwise reload.",
+            "; ".join(reasons),
+        )
+        return
     # a model owns the tensors it records first; `begin` refuses a shared one
     # (a target lm_head in a draft) whose post-load processing re-laid it out
     model._ckpt_owner = object()  # tags owned tensors (ids of freed ones recur)
