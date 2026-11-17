@@ -84,9 +84,6 @@ def _check_supported(model: torch.nn.Module) -> None:
     config = get_current_vllm_config_or_none()
     if config is not None:
         config._verify_direct_reload_compat()
-    from vllm.model_executor.kernels.linear.nvfp4.humming import (
-        HummingNvFp4LinearKernel,
-    )
     from vllm.model_executor.layers.quantization.humming import (
         HummingLinearMethod,
         HummingMoEMethod,
@@ -112,23 +109,6 @@ def _check_supported(model: torch.nn.Module) -> None:
             # its post-load processing runs once per quant method (a guard on
             # the method, not the module): a reload would keep checkpoint bytes
             raise RuntimeError(f"direct reload: humming is not supported ({name})")
-        kernel = getattr(method, "kernel", None) or getattr(
-            getattr(method, "scheme", None), "kernel", None
-        )
-        if isinstance(kernel, HummingNvFp4LinearKernel):
-            # its post-load processing renames the weight and inverts the
-            # global scale in place, so it cannot rerun on a reload
-            raise RuntimeError(
-                f"direct reload: the humming NVFP4 linear kernel is not "
-                f"supported ({name})"
-            )
-        if getattr(module, "humming_configs", None) is not None:
-            # experts converted to the humming kernel layout through the oracle
-            # (any quant method): the conversion renames and consumes the
-            # checkpoint parameters, so it cannot rerun on a reload
-            raise RuntimeError(
-                f"direct reload: the humming MoE kernel is not supported ({name})"
-            )
 
 
 def record_checkpoint_layout(model: torch.nn.Module) -> None:
@@ -160,6 +140,11 @@ def record_checkpoint_layout(model: torch.nn.Module) -> None:
         for name, p in model.named_parameters(remove_duplicate=False)
         if hasattr(p, "_ckpt")
     )
+    # every module's parameters by name before post-load processing (stand-ins
+    # included), which `begin` restores for the rerun
+    model._ckpt_param_objects = {
+        module: dict(module._parameters) for module in model.modules()
+    }
 
 
 def _check_params_kept(model: torch.nn.Module) -> None:
@@ -219,6 +204,31 @@ def _checkpoint_views(
     return views
 
 
+def _undo_parameter_renames(model: torch.nn.Module) -> None:
+    """Undo `move_parameter` and `retire_parameter`, so the rerun of post-load
+    processing sees the parameters as cold start did: each under its names
+    from before processing (a stand-in's included) and live. Names processing
+    registered for a checkpoint tensor are dropped, and retired flags and
+    runtime names are cleared, also on tensors processing created."""
+    recorded = model._ckpt_param_objects
+    for module in model.modules():
+        before = recorded.get(module, {})
+        for name, p in list(module._parameters.items()):
+            if p is None or (hasattr(p, "_ckpt") and not _owned(model, p)):
+                continue
+            p.__dict__.pop("retired", None)
+            p.__dict__.pop("runtime_name", None)
+            if name not in before and _owned(model, p):
+                del module._parameters[name]
+        for name, p in before.items():
+            if (
+                module._parameters.get(name) is not p
+                and p is not None
+                and (p.is_meta or _owned(model, p))
+            ):
+                module._parameters[name] = p
+
+
 @torch.no_grad()
 def begin_direct_reload(model: torch.nn.Module) -> None:
     """Make every tensor writable by its checkpoint weight loader.
@@ -242,6 +252,7 @@ def begin_direct_reload(model: torch.nn.Module) -> None:
         for k in _LOADER_ATTRS:
             t.__dict__.pop(k, None)
         t.__dict__.update(t._ckpt[2])
+    _undo_parameter_renames(model)
     # Reset padding the loaders skip; erases the checkpoint region, so all is resent.
     for module, name in model._ckpt_padding_fill:
         t = module._parameters.get(name)
