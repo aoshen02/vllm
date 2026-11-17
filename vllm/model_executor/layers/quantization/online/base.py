@@ -8,7 +8,6 @@ from typing import Any
 
 import torch
 
-import vllm.envs as envs
 from vllm.config.quantization import (
     _ONLINE_SHORTHANDS,
     QuantizationConfigArgs,
@@ -234,6 +233,8 @@ class OnlineQuantizationConfig(QuantizationConfig):
         self.ignored_layers: list[str] = args.ignore
         self.quantized_layers: dict[str, tuple[str, str, str | None]] = {}
         self.online_quantization_time = 0.0
+        # quantize each tensor in its weight loader (direct reload)
+        self.quantize_on_load = True
 
     @property
     def quantized_layer_summaries(self) -> list[str]:
@@ -502,7 +503,7 @@ class OnlineQuantizationConfig(QuantizationConfig):
         )
 
     def get_quant_method(
-        self, layer: torch.nn.Module, prefix: str
+        self, layer: torch.nn.Module, prefix: str, requantize: bool = False
     ) -> "QuantizeMethodBase | None":
         # `targets` takes precedence over `moe` and `linear` and is exclusive.
         resolved = self.resolve_quant_method_cls(type(layer), prefix)
@@ -517,14 +518,18 @@ class OnlineQuantizationConfig(QuantizationConfig):
             )
             assert issubclass(quant_method_cls, (OnlineMoEMethodBase, OnlineLinearBase))
             default = getattr(quant_method_cls, "activation_quant_key", None)
-            if envs.VLLM_RELOAD_MODE == "direct":
+            # not for requantization (the checkpoint is quantized) or fused
+            # shared experts (their loader quantizes them itself)
+            fused_shared = getattr(
+                getattr(layer, "expert_map_manager", None),
+                "num_fused_shared_experts",
+                0,
+            )
+            if self.quantize_on_load and not requantize and not fused_shared:
                 method = checkpoint_method(layer, quant_spec, default)
-                if method is None:
-                    raise NotImplementedError(
-                        f"{prefix}: online {quant_key_str} does not support "
-                        "VLLM_RELOAD_MODE=direct"
-                    )
-                return method
+                if method is not None:
+                    return method
+                # no quantize-on-load method: cold start only, reload refuses
             kwargs = {}
             if quant_method_cls.accepts_activation_override:
                 kwargs["activation_quant_key"] = quant_spec.activation

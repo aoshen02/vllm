@@ -165,16 +165,20 @@ def process_weights_after_loading(
         OnlineMoEMethodBase,
     )
     from vllm.model_executor.model_loader.reload.direct import (
-        direct_reload_enabled,
         record_checkpoint_layout,
     )
 
     maybe_retie_word_embeddings(model, model_config)
 
-    if direct_reload_enabled():
-        record_checkpoint_layout(model)  # cold start only; reloads reuse it
+    record_checkpoint_layout(model)  # cold start only; reloads reuse it
+
+    from vllm.lora.layers.base import BaseLayerWithLoRA
 
     for name, module in model.named_modules():
+        if isinstance(module, BaseLayerWithLoRA):
+            # LoRA wraps layers after cold start and forwards `quant_method`;
+            # its base layer is processed on its own (a reload reruns this)
+            continue
         quant_method = getattr(module, "quant_method", None)
         if isinstance(quant_method, QuantizeMethodBase):
             if (

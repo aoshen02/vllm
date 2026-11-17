@@ -78,7 +78,6 @@ from vllm.model_executor.layers.quantization.online.lm_head import (
     share_source_lm_heads,
 )
 from vllm.model_executor.model_loader import get_model_loader
-from vllm.model_executor.model_loader.reload.direct import direct_reload_enabled
 from vllm.model_executor.model_loader.weight_cache.utils import ExternalWeightCharges
 from vllm.model_executor.model_loader.weight_checksum import (
     compute_tensor_digests,
@@ -1127,6 +1126,9 @@ class Worker(WorkerBase):
             # nearly all the memory warmup may commit: release them, so the
             # sizing steps run beside only the blocks they address.
             kv_cache.commit(kv_cache.min_committed_blocks, shrink=True)
+            # Null stale ids past each row's last block, which the shrink unmapped:
+            # some kernels load whole KV tiles (e.g. AITER on gfx950, ROCm/aiter#8033).
+            self.model_runner.block_tables.clear_input_block_tables()
             run_kv_cache_sizing_warmup(
                 self.model_runner, self.execute_model, self.sample_tokens
             )
@@ -1716,7 +1718,7 @@ class Worker(WorkerBase):
     def start_weight_update(self) -> None:
         """Start a new weight update session.
 
-        Delegates engine-specific preparation (e.g. layerwise reload setup) to
+        Delegates engine-specific preparation (e.g. `start_reload`) to
         the configured weight transfer engine. The worker only tracks that a
         session is active.
         """
@@ -1846,10 +1848,9 @@ class Worker(WorkerBase):
             try:
                 self.weight_transfer_engine.finish_weight_update()
             except BaseException:
-                if direct_reload_enabled():
-                    # a failed direct finish cannot be retried: end the
-                    # session so that a new full update can start
-                    self._end_weight_update(refresh=False)
+                # a failed finish cannot be retried: end the session so
+                # that a new full update can start
+                self._end_weight_update(refresh=False)
                 raise
             finally:
                 self._weight_update_kv_cache_loan.close()

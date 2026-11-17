@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Direct weight reload (`VLLM_RELOAD_MODE=direct`) on a toy model whose
+"""Direct weight reload on a toy model whose
 post-load processing has the hazards found on real models:
 
 (a) a parent derives a separate tensor from a child's weight (MLA W_UK/W_UV
@@ -13,7 +13,9 @@ post-load processing has the hazards found on real models:
 (f) post-load processing grows a weight (padding): a reload writes it into
     the existing storage to keep its address;
 (g) online quantization: the kernel dtype cannot hold the checkpoint tensor,
-    which its loader quantizes as it arrives.
+    which its loader quantizes as it arrives;
+(h) post-load processing registers a checkpoint tensor under its runtime name
+    and retires a tensor it created, then looks both up by name (Humming).
 
 Invariant: a reload equals a cold start on the new weights, at the startup
 addresses.
@@ -39,7 +41,13 @@ from vllm.model_executor.model_loader.reload.direct import (
 )
 from vllm.model_executor.model_loader.utils import process_weights_after_loading
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
-from vllm.model_executor.utils import replace_parameter, retire_parameter
+from vllm.model_executor.utils import (
+    kernel_parameters,
+    move_parameter,
+    replace_parameter,
+    retire_parameter,
+    set_kernel_parameter,
+)
 
 _MODEL_CONFIG = SimpleNamespace(
     word_embeddings_untied_by_checkpoint=False, quantization=None, dtype=torch.bfloat16
@@ -129,6 +137,17 @@ def _pad(layer):  # (f): kernel layout larger than the checkpoint's
     replace_parameter(layer, "weight", torch.nn.functional.pad(layer.weight, (0, 4)))
 
 
+def _rename_scale(layer):  # (h): Humming-like renames, by name
+    params = kernel_parameters(layer)
+    inv = params["weight_scale_inv"]  # its checkpoint name
+    replace_parameter(layer, "amax", layer.weight.float().abs().amax().reshape(1))
+    amax = kernel_parameters(layer)["amax"]  # created here, live while processing
+    replace_parameter(layer, "weight", (layer.weight * inv / amax).to(torch.bfloat16))
+    move_parameter(layer, "weight_scale_inv", "weight_scale")
+    set_kernel_parameter(layer, "weight_scale", 1.0 / inv)
+    retire_parameter(layer, "amax")
+
+
 def _quantize_int8(weight):  # (g): bf16 checkpoint tensor, int8 kernel tensor
     scale = weight.float().abs().amax() / 127
     return (weight / scale).round().to(torch.int8), scale
@@ -143,6 +162,8 @@ _SHAPES = {
     "engram.weight": ((3, 5), torch.bfloat16),
     "pad.weight": ((4, 4), torch.bfloat16),
     "online.weight": ((4, 6), torch.bfloat16),
+    "rename.weight": ((4, 4), torch.bfloat16),
+    "rename.weight_scale_inv": ((1,), torch.float32),
 }
 _PWAL = {
     "attn.kv_b": None,
@@ -152,6 +173,7 @@ _PWAL = {
     "engram": _pack,
     "pad": _pad,
     "online": _transpose,
+    "rename": _rename_scale,
 }
 
 
@@ -264,11 +286,6 @@ def _runs(model: _ToyModel) -> dict[str, int]:
     }
 
 
-@pytest.fixture(autouse=True)
-def _direct_mode(monkeypatch):
-    monkeypatch.setenv("VLLM_RELOAD_MODE", "direct")
-
-
 class TestReloadEqualsColdStart:
     def test_same_checkpoint_is_bit_identical(self):
         model = _cold_start(_checkpoint())
@@ -296,6 +313,7 @@ class TestReloadEqualsColdStart:
             ["engram.weight"],
             ["pad.weight"],
             ["online.weight", "online.weight_scale"],
+            ["rename.weight", "rename.weight_scale_inv"],
         ],
         ids=[
             "a-parent-derived",
@@ -305,6 +323,7 @@ class TestReloadEqualsColdStart:
             "e-not-idempotent",
             "f-grows",
             "g-online-quant",
+            "h-renamed",
         ],
     )
     def test_new_checkpoint_hazard(self, names):
@@ -346,47 +365,32 @@ class TestRefusals:
             begin_direct_reload(model)
         _assert_same(_state(model), before, addresses=True)
 
-    def test_online_quantization_refused(self, monkeypatch):
+    # refused at `begin`, the first time the method is in a reload: the
+    # methods below are set after cold start, which they would not survive
+    def test_online_quantization_refused(self):
         # finish clears the guard that keeps online quantization from
         # quantizing its converted bytes again
-        online = object.__new__(Fp8PerTensorOnlineLinearMethod)
-        init = _ToyModel.__init__
-
-        def with_online_layer(self):
-            init(self)
-            self.proj.quant_method = online
-
-        monkeypatch.setattr(_ToyModel, "__init__", with_online_layer)
+        model = _cold_start(_checkpoint())
+        model.proj.quant_method = object.__new__(Fp8PerTensorOnlineLinearMethod)
         with pytest.raises(RuntimeError, match="online quantization"):
-            _cold_start(_checkpoint())
+            begin_direct_reload(model)
 
-    def test_online_shared_experts_refused(self, monkeypatch):
+    def test_online_shared_experts_refused(self):
         # post-load processing deletes the staging parameters a reload loads
-        init = _ToyModel.__init__
-
-        def with_online_shared_experts(self):
-            init(self)
-            self.proj.shared_expert_online_loader = object()
-
-        monkeypatch.setattr(_ToyModel, "__init__", with_online_shared_experts)
+        model = _cold_start(_checkpoint())
+        model.proj.shared_expert_online_loader = object()
         with pytest.raises(RuntimeError, match="online quantization"):
-            _cold_start(_checkpoint())
+            begin_direct_reload(model)
 
     @pytest.mark.parametrize("method_cls", ["HummingLinearMethod", "HummingMoEMethod"])
-    def test_humming_refused(self, monkeypatch, method_cls):
+    def test_humming_refused(self, method_cls):
         # its post-load processing runs only once per quant method
         from vllm.model_executor.layers.quantization import humming as humming_mod
 
-        humming = object.__new__(getattr(humming_mod, method_cls))
-        init = _ToyModel.__init__
-
-        def with_humming_layer(self):
-            init(self)
-            self.proj.quant_method = humming
-
-        monkeypatch.setattr(_ToyModel, "__init__", with_humming_layer)
+        model = _cold_start(_checkpoint())
+        model.proj.quant_method = object.__new__(getattr(humming_mod, method_cls))
         with pytest.raises(RuntimeError, match="humming"):
-            _cold_start(_checkpoint())
+            begin_direct_reload(model)
 
     def test_replaced_param_refused(self):
         # a new Parameter under a checkpoint name has no checkpoint layout:
@@ -555,18 +559,15 @@ def _config(**overrides) -> SimpleNamespace:
         quant_config=None,
         lora_config=None,
         speculative_config=None,
-        weight_transfer_config=None,
     )
     return SimpleNamespace(**(fields | overrides))
 
 
 @pytest.mark.parametrize(
-    "mode,overrides,match",
+    "overrides,match",
     [
-        ("direct", {}, None),
-        ("layerwise", {"lora_config": object()}, None),
+        ({}, None),
         (
-            "direct",
             {
                 "offload_config": SimpleNamespace(
                     offload_backend="uva",
@@ -574,10 +575,9 @@ def _config(**overrides) -> SimpleNamespace:
                     uva=SimpleNamespace(cpu_offload_gb=0),
                 )
             },
-            "weight offloading",
+            None,
         ),
         (
-            "direct",
             {
                 "offload_config": SimpleNamespace(
                     offload_backend="auto",
@@ -588,7 +588,6 @@ def _config(**overrides) -> SimpleNamespace:
             "weight offloading",
         ),
         (
-            "direct",
             {
                 "offload_config": SimpleNamespace(
                     offload_backend="auto",
@@ -596,39 +595,29 @@ def _config(**overrides) -> SimpleNamespace:
                     uva=SimpleNamespace(cpu_offload_gb=1),
                 )
             },
-            "weight offloading",
+            None,
         ),
         (
-            "direct",
             {"model_config": SimpleNamespace(quantization="torchao")},
             "torchao",
         ),
-        ("direct", {"lora_config": object()}, "LoRA"),
+        ({"lora_config": object()}, None),
         (
-            "direct",
             {"speculative_config": SimpleNamespace(draft_lm_head_quantization="fp8")},
             "draft_lm_head_quantization",
-        ),
-        (
-            "direct",
-            {"weight_transfer_config": SimpleNamespace(backend="sharded_rdt")},
-            "sharded_rdt",
         ),
     ],
     ids=[
         "defaults",
-        "layerwise-lora",
-        "offload-backend",
+        "uva-backend-allowed",
         "offload-prefetch",
-        "offload-uva",
+        "uva-offload-allowed",
         "torchao",
-        "lora",
+        "lora-allowed",
         "draft-lm-head-quant",
-        "sharded-rdt",
     ],
 )
-def test_verify_direct_reload_compat(monkeypatch, mode, overrides, match):
-    monkeypatch.setenv("VLLM_RELOAD_MODE", mode)
+def test_verify_direct_reload_compat(overrides, match):
     config = _config(**overrides)
     if match is None:
         VllmConfig._verify_direct_reload_compat(config)

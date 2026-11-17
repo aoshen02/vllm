@@ -34,6 +34,9 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.layers.quantization.online.base import (
+    OnlineQuantizationConfig,
+)
 from vllm.model_executor.layers.quantization.utils.ocp_mx_utils import OCP_MX_BLOCK_SIZE
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.utils import rocm_unquantized_gemm
@@ -483,6 +486,15 @@ class GptOssModel(nn.Module, EagleModelMixin):
         super().__init__()
         self.config = vllm_config.model_config.hf_config
         self.quant_config = vllm_config.quant_config
+        online_config = (
+            self.quant_config
+            if isinstance(self.quant_config, OnlineQuantizationConfig)
+            else getattr(self.quant_config, "online_quantization_config", None)
+        )
+        if online_config is not None:
+            # its expert loading writes BF16 into the experts outside their
+            # loaders, so they cannot quantize on load
+            online_config.quantize_on_load = False
         self.parallel_config = vllm_config.parallel_config
         self.embedding = VocabParallelEmbedding(
             self.config.vocab_size,
@@ -498,12 +510,6 @@ class GptOssModel(nn.Module, EagleModelMixin):
             prefix=f"{prefix}.layers",
         )
         self.norm = RMSNorm(self.config.hidden_size, eps=1e-5)
-        # its expert loading writes BF16 into the experts outside their loaders
-        if any(getattr(m, "quantizes_on_load", False) for m in self.modules()):
-            raise NotImplementedError(
-                "gpt-oss does not support online quantization with "
-                "VLLM_RELOAD_MODE=direct"
-            )
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states", "residual"], self.config.hidden_size
         )

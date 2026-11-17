@@ -1,16 +1,7 @@
 # Direct Weight Reload
 
-Direct reload updates a running model's weights in place. Set the
-`VLLM_RELOAD_MODE` environment variable to `direct`; the default is
-`layerwise` (see [Layerwise (Re)loading](layerwise.md)).
-
-!!! tip
-    Prefer direct reload for RL weight updates. Use layerwise reload only for
-    the configurations direct reload refuses (see below).
-
-```bash
-VLLM_RELOAD_MODE=direct vllm serve <model>
-```
+Direct reload updates a running model's weights in place. It is how every
+weight reload runs.
 
 ## How It Works
 
@@ -33,7 +24,7 @@ matching pre-quantized checkpoint; the trainer keeps sending BF16 weights under
 their checkpoint names.
 
 ```bash
-VLLM_RELOAD_MODE=direct vllm serve Qwen/Qwen3-30B-A3B --quantization fp8_per_block
+vllm serve Qwen/Qwen3-30B-A3B --quantization fp8_per_block
 ```
 
 | `--quantization` | Linear layers | MoE layers |
@@ -50,8 +41,7 @@ arrives, and an update that delivers only one of them fails at finish.
 
 ## Refused Configurations
 
-Direct reload raises an error for the following; use
-`VLLM_RELOAD_MODE=layerwise` for them instead:
+A weight reload raises an error for the following (cold start is unaffected):
 
 - Online quantization not in the table above: `mxfp4` and `mxfp4_hadamard32`
   linear layers, `int8_per_channel_weight_only`, `lut_b_moe`, a quantized

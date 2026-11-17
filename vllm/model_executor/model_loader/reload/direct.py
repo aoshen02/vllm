@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Direct weight reload (`VLLM_RELOAD_MODE=direct`).
+"""Direct weight reload.
 
 Cold start records each tensor's checkpoint layout before post-load processing
 (PWAL). `begin` views re-laid-out tensors back to that layout on their
@@ -18,7 +18,6 @@ from collections.abc import Iterator
 
 import torch
 
-import vllm.envs as envs
 from vllm.config import ModelConfig
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
@@ -32,7 +31,6 @@ logger = init_logger(__name__)
 __all__ = [
     "begin_direct_reload",
     "direct_reload_active",
-    "direct_reload_enabled",
     "finish_direct_reload",
     "loadable_tensors",
     "record_checkpoint_layout",
@@ -53,11 +51,6 @@ _LOADER_ATTRS = (
     "packed_factor",
     "pack_factor",
 )
-
-
-def direct_reload_enabled() -> bool:
-    """Whether weight updates reload in place (`VLLM_RELOAD_MODE=direct`)."""
-    return envs.VLLM_RELOAD_MODE == "direct"
 
 
 def direct_reload_active(model: torch.nn.Module) -> bool:
@@ -85,8 +78,12 @@ def loadable_tensors(model: torch.nn.Module) -> Iterator[tuple[str, torch.Tensor
             yield (f"{module_name}.{name}" if module_name else name), tensor
 
 
-def _check_supported_modules(model: torch.nn.Module) -> None:
-    # config-level refusals: VllmConfig._verify_direct_reload_compat
+def _check_supported(model: torch.nn.Module) -> None:
+    from vllm.config import get_current_vllm_config_or_none
+
+    config = get_current_vllm_config_or_none()
+    if config is not None:
+        config._verify_direct_reload_compat()
     from vllm.model_executor.layers.quantization.humming import (
         HummingLinearMethod,
         HummingMoEMethod,
@@ -121,7 +118,6 @@ def record_checkpoint_layout(model: torch.nn.Module) -> None:
     Runs once; reloads reuse the cold-start record."""
     if hasattr(model, "_ckpt_param_names") or is_weights_pre_processed():
         return  # pre-processed weights are already in runtime layout
-    _check_supported_modules(model)
     # a model owns the tensors it records first; `begin` refuses a shared one
     # (a target lm_head in a draft) whose post-load processing re-laid it out
     model._ckpt_owner = object()  # tags owned tensors (ids of freed ones recur)
@@ -143,6 +139,11 @@ def record_checkpoint_layout(model: torch.nn.Module) -> None:
         for name, p in model.named_parameters(remove_duplicate=False)
         if hasattr(p, "_ckpt")
     )
+    # every module's parameters by name before post-load processing (stand-ins
+    # included), which `begin` restores for the rerun
+    model._ckpt_param_objects = {
+        module: dict(module._parameters) for module in model.modules()
+    }
 
 
 def _check_params_kept(model: torch.nn.Module) -> None:
@@ -202,6 +203,31 @@ def _checkpoint_views(
     return views
 
 
+def _undo_parameter_renames(model: torch.nn.Module) -> None:
+    """Undo `move_parameter` and `retire_parameter`, so the rerun of post-load
+    processing sees the parameters as cold start did: each under its names
+    from before processing (a stand-in's included) and live. Names processing
+    registered for a checkpoint tensor are dropped, and retired flags and
+    runtime names are cleared, also on tensors processing created."""
+    recorded = model._ckpt_param_objects
+    for module in model.modules():
+        before = recorded.get(module, {})
+        for name, p in list(module._parameters.items()):
+            if p is None or (hasattr(p, "_ckpt") and not _owned(model, p)):
+                continue
+            p.__dict__.pop("retired", None)
+            p.__dict__.pop("runtime_name", None)
+            if name not in before and _owned(model, p):
+                del module._parameters[name]
+        for name, p in before.items():
+            if (
+                module._parameters.get(name) is not p
+                and p is not None
+                and (p.is_meta or _owned(model, p))
+            ):
+                module._parameters[name] = p
+
+
 @torch.no_grad()
 def begin_direct_reload(model: torch.nn.Module) -> None:
     """Make every tensor writable by its checkpoint weight loader.
@@ -211,6 +237,7 @@ def begin_direct_reload(model: torch.nn.Module) -> None:
     bytes until a finish succeeds."""
     if not hasattr(model, "_ckpt_param_names"):
         raise RuntimeError("direct reload: no checkpoint layout was recorded")
+    _check_supported(model)
     _check_params_kept(model)
     views = _checkpoint_views(model)
 
@@ -224,6 +251,7 @@ def begin_direct_reload(model: torch.nn.Module) -> None:
         for k in _LOADER_ATTRS:
             t.__dict__.pop(k, None)
         t.__dict__.update(t._ckpt[2])
+    _undo_parameter_renames(model)
     # Reset padding the loaders skip; erases the checkpoint region, so all is resent.
     for module, name in model._ckpt_padding_fill:
         t = module._parameters.get(name)

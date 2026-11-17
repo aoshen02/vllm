@@ -1281,42 +1281,28 @@ class VllmConfig:
             )
 
     def _verify_direct_reload_compat(self) -> None:
-        """Reject configurations that direct weight reload cannot support."""
-        # not `direct_reload_enabled()`: importing it would load the model
-        # loaders into every process that builds a config
-        if envs.VLLM_RELOAD_MODE != "direct":
-            return
+        """Reject configurations that direct weight reload cannot support.
+        Checked when a reload begins; cold start is unaffected."""
         offload = self.offload_config
-        if (
-            offload.offload_backend != "auto"
-            or offload.prefetch.offload_group_size > 0
-            or offload.uva.cpu_offload_gb > 0
+        if offload.offload_backend == "prefetch" or (
+            offload.offload_backend == "auto"
+            and offload.prefetch.offload_group_size > 0
         ):
-            # CPU/UVA offload gives parameters new storage on every post-load
-            # processing; prefetch offload shares one buffer between layers
-            raise ValueError("Direct reload does not support weight offloading.")
+            # prefetch offload shares one device buffer between layers
+            raise ValueError(
+                "Direct reload does not support prefetch weight offloading."
+            )
         model_config = self.model_config
         if model_config is not None and model_config.quantization == "torchao":
             # its load_weights runs a layerwise reload, and its post-load
             # processing replaces the weight parameter
             raise ValueError("Direct reload does not support torchao quantization.")
-        if self.lora_config is not None:
-            # LoRA wraps layers after cold start; their wrappers forward
-            # `quant_method`, so a rerun would process each base layer twice
-            raise ValueError("Direct reload does not support LoRA.")
         spec = self.speculative_config
         if spec is not None and spec.draft_lm_head_quantization is not None:
             # after `begin` the draft's quantized lm_head is a view of the target
             # lm_head's storage: post-load processing would write it there
             raise ValueError(
                 "Direct reload does not support draft_lm_head_quantization."
-            )
-        transfer = self.weight_transfer_config
-        if transfer is not None and transfer.backend == "sharded_rdt":
-            # its replay plan is baked by a layerwise (meta) dry run
-            raise ValueError(
-                "Direct reload does not support the sharded_rdt weight-transfer "
-                "backend. Use VLLM_RELOAD_MODE=layerwise or another backend."
             )
 
     def _verify_kv_transfer_compat(self) -> None:
@@ -1673,7 +1659,6 @@ class VllmConfig:
             self.quant_config = VllmConfig._get_quantization_config(
                 self.model_config, self.load_config
             )
-        self._verify_direct_reload_compat()
 
         # "dummy" reads no weights at all, and the sharded formats read a vLLM
         # state dict, which stores tied word embeddings under the lm_head only.
