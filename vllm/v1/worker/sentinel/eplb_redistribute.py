@@ -11,7 +11,6 @@ recovery.
 
 from __future__ import annotations
 
-from collections.abc import Generator
 from inspect import signature
 from itertools import zip_longest
 from typing import TYPE_CHECKING
@@ -150,10 +149,14 @@ def reload_experts_from_disk(
     reload_set: set[tuple[int, int]],
     physical_to_logical_map: torch.Tensor,
 ) -> None:
-    """Reload complete MoE layers affected by expert reassignment from disk.
+    """Reload the model from disk after expert reassignment.
+
+    A weight update reruns post-load processing for the whole model, so the
+    whole checkpoint is reloaded; the expert weights of affected MoE layers
+    are written to every physical slot that now hosts their logical expert.
 
     Args:
-        model: The model whose FusedMoE layers receive the reloaded weights.
+        model: The model whose weights are reloaded.
         vllm_config: Engine config, used for the model loader and model config.
         reload_set: {(moe_layer_idx, logical_expert_id), ...} from
             redistribute_expert_placement.
@@ -164,61 +167,26 @@ def reload_experts_from_disk(
         return
 
     from vllm.model_executor.model_loader import get_model_loader
-    from vllm.model_executor.model_loader.reload import (
-        finalize_layerwise_reload,
-        initialize_layerwise_reload,
-    )
-    from vllm.model_executor.model_loader.reload.utils import get_layer_tensors
+    from vllm.model_executor.model_loader.reload import finish_reload, start_reload
 
     moe_layers = list(model.moe_layers)
-    prefix_renames = getattr(
-        getattr(model, "hf_to_vllm_mapper", None), "orig_to_new_prefix", {}
-    )
-
-    def ckpt_prefix(layer_idx: int) -> str:
-        prefix = moe_layers[layer_idx].layer_name + "."
-        for orig, new in prefix_renames.items():
-            if new and prefix.startswith(new):
-                return orig + prefix[len(new) :]
-        return prefix
-
-    # Runtime-format expert reload: processing can merge scales or repack weights.
-    # Reload every expert in an affected layer so finalization never consumes
-    # uninitialized checkpoint storage for unchanged local experts.
     layer_indices = sorted({i for i, _ in reload_set})
-    prefixes = tuple(ckpt_prefix(i) for i in layer_indices)
     layers = [
         getattr(moe_layers[i], "routed_experts", moe_layers[i]) for i in layer_indices
     ]
-    loader = get_model_loader(vllm_config.load_config)
-    all_weights = loader.get_all_weights(vllm_config.model_config, model)
-    matched: set[int] = set()
-    rename_checkpoint_weight = getattr(
-        model, "_rename_weight_for_modelopt_checkpoint", lambda name: name
-    )
-
-    def filtered_iter() -> Generator[tuple[str, torch.Tensor], None, None]:
-        for name, tensor in all_weights:
-            # Honor model-specific checkpoint renaming before filtering, while
-            # passing the original name to load_weights for its normal conversion.
-            renamed = rename_checkpoint_weight(name)
-            for layer_idx, prefix in zip(layer_indices, prefixes):
-                runtime_prefix = moe_layers[layer_idx].layer_name + "."
-                if name.startswith(prefix) or renamed.startswith(runtime_prefix):
-                    matched.add(layer_idx)
-                    yield name, tensor
-                    break
-
-    # Reload recovered placement: remap before the layerwise loader buffers its
-    # arguments, so deferred processing replays physical IDs against runtime maps.
-    for layer_idx, layer in zip(layer_indices, layers):
+    for layer in layers:
         if getattr(layer, "quant_config", None) is not None and (
             layer.quant_config.get_name() == "gpt_oss_mxfp4"
         ):
             raise NotImplementedError(
                 "Scale-down reload of fused GPT-OSS MXFP4 weights"
             )
-        initialize_layerwise_reload(layer, defer_processing=True)
+
+    device = next(model.parameters()).device
+    start_reload(model)
+    # Reload recovered placement: map checkpoint expert IDs to physical slots.
+    original_loaders: list[tuple[torch.Tensor, object]] = []
+    for layer_idx, layer in zip(layer_indices, layers):
         quant_method = layer.quant_method
         quant_method = (
             getattr(quant_method, "requantization_source", None) or quant_method
@@ -232,12 +200,13 @@ def reload_experts_from_disk(
                 and layer._map_global_expert_id_to_local_expert_id(physical_id) >= 0
             ):
                 local_ids.setdefault(logical_id, []).append(physical_id)
-        for param in get_layer_tensors(layer).values():
+        for param in layer.parameters(recurse=False):
             weight_loader = getattr(param, "weight_loader", None)
             if (
                 weight_loader is not None
                 and "expert_id" in signature(weight_loader).parameters
             ):
+                original_loaders.append((param, weight_loader))
                 param.weight_loader = _placement_weight_loader(
                     weight_loader,
                     local_ids,
@@ -247,16 +216,15 @@ def reload_experts_from_disk(
                 )
 
     logger.info("[FT] Reloading %d (layer, expert) pair(s) from disk.", len(reload_set))
-
-    loaded = model.load_weights(filtered_iter())
-
-    unmatched = set(layer_indices) - matched
-    if unmatched:
-        raise RuntimeError(
-            f"[FT] MoE layers {sorted(unmatched)} had no matching checkpoint weights."
+    loader = get_model_loader(vllm_config.load_config)
+    try:
+        loaded = model.load_weights(
+            loader.get_all_weights(vllm_config.model_config, model)
         )
-    for layer in layers:
-        finalize_layerwise_reload(layer, vllm_config.model_config)
+    finally:
+        for param, weight_loader in original_loaders:
+            param.weight_loader = weight_loader
+    finish_reload(model, vllm_config.model_config, device)
 
     logger.info(
         "[FT] Expert weight reload complete: loaded=%d tensors.",

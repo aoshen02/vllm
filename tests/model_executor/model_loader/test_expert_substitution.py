@@ -164,33 +164,6 @@ def test_direct_reload_updates_values_incrementally():
         model.load_weights([(_approx_value(0, 0), torch.ones(2))])
 
 
-def test_layerwise_reload_is_rejected_and_keeps_weights():
-    from vllm.model_executor.model_loader.reload import (
-        initialize_layerwise_reload,
-        record_metadata_for_reloading,
-    )
-
-    model = _cpu_model(local_layers=(0,))
-    record_metadata_for_reloading(model)
-    loaded = [
-        ("weight", torch.tensor([3.0, 4.0])),
-        (_approx_value(0, 1), torch.zeros(2)),
-        (_approx_value(0, 2), torch.ones(2)),
-    ]
-    model.load_weights(loaded)
-    substitution = model.model.layers[0].mlp.experts
-    values = substitution.values
-
-    initialize_layerwise_reload(model)
-    with pytest.raises(NotImplementedError, match="layerwise weight reload"):
-        model.load_weights([(name, weight + 1) for name, weight in loaded])
-
-    assert substitution.values is values
-    torch.testing.assert_close(values, torch.tensor([[0.0, 0.0], [1.0, 1.0]]))
-    torch.testing.assert_close(model.weight, torch.tensor([3.0, 4.0]))
-    assert substitution.expert_substitution_routes.tolist() == [0, -1, -2]
-
-
 def _write_tiny_deepseek_mone_checkpoint(
     model_dir: Path, explicit_names: bool
 ) -> tuple[dict[str, torch.Tensor], str]:

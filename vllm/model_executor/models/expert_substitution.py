@@ -14,7 +14,6 @@ from vllm.model_executor.layers.fused_moe.expert_substitution import (
     decoder_layer_index,
     get_expert_substitution_spec,
 )
-from vllm.model_executor.model_loader.reload import finalize_layerwise_processing
 
 _T = TypeVar("_T", bound=nn.Module)
 
@@ -67,12 +66,6 @@ def as_expert_substitution_model(model_cls: type[_T], model_config: Any) -> type
             self._expert_substitutions = _collect_expert_substitutions(self)
 
         def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
-            if any(s.values.is_meta for _, s in self._expert_substitutions.values()):
-                # Put the previous weights back so the model stays usable.
-                finalize_layerwise_processing(self, model_config)
-                raise NotImplementedError(
-                    "expert substitution does not support layerwise weight reload"
-                )
             loaded_substitutions: set[str] = set()
 
             def remaining_weights():
