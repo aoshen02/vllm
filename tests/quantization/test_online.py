@@ -181,11 +181,13 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm.model_executor.model_loader import weight_utils
 from vllm.model_executor.model_loader.base_loader import log_online_quantization
 from vllm.model_executor.model_loader.dummy_loader import DummyModelLoader
+from vllm.model_executor.model_loader.reload import finish_reload, start_reload
 from vllm.model_executor.model_loader.reload.layerwise import (
     finalize_layerwise_reload,
     initialize_layerwise_reload,
     record_metadata_for_reloading,
 )
+from vllm.model_executor.model_loader.utils import process_weights_after_loading
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.granitemoe import (
     GraniteMoeModel,
@@ -424,6 +426,25 @@ def test_online_hadamard_target_wraps_resolved_method(default_vllm_config) -> No
     assert method.size == 32
 
 
+# a new layer name each: layers register in the forward context by name
+_REQUANT_LAYERS = iter(range(1 << 30))
+
+
+def _expert_checkpoint(tensors: dict[str, torch.Tensor], num_experts: int) -> list:
+    """`(name, tensor)` per expert projection, as models load them."""
+    checkpoint = []
+    for name, tensor in tensors.items():
+        stem, suffix = name.split("_", 1)
+        projections = ("gate_proj", "up_proj") if stem == "w13" else ("down_proj",)
+        for expert in range(num_experts):
+            parts = (
+                tensor[expert].chunk(2, dim=0) if stem == "w13" else (tensor[expert],)
+            )
+            for projection, part in zip(projections, parts, strict=True):
+                checkpoint.append((f"{expert}.{projection}.{suffix}", part))
+    return checkpoint
+
+
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="Humming requires CUDA.")
 @pytest.mark.parametrize(
     "scheme", ["fp8_per_block", "fp8_per_channel", "mxfp8", "mxfp4"]
@@ -459,65 +480,120 @@ def test_online_moe_stages_quantized_weights_for_humming(
             prefix=prefix,
         )
 
-    def load(runner, factor):
-        layer = runner.routed_experts
-        for name, parameter in list(layer.named_parameters()):
-            if "scale" in name:
-                weight = torch.full(
-                    parameter.shape,
-                    0.125 * factor,
-                    dtype=parameter.dtype,
-                    device=DEVICE,
-                )
-            elif parameter.dtype == torch.uint8:
-                weight = torch.full_like(parameter, 0x22, device=DEVICE)
-            else:
-                weight = torch.full(
-                    parameter.shape,
-                    0.125 * factor,
-                    dtype=parameter.dtype,
-                    device=DEVICE,
-                )
-            for expert in range(2):
-                if name.startswith("w13"):
-                    if weight[expert].ndim == 0:
-                        gate = up = weight[expert]
-                    else:
-                        gate, up = weight[expert].chunk(2, dim=0)
-                    for shard, tensor in (("w1", gate), ("w3", up)):
-                        parameter.weight_loader(parameter, tensor, name, shard, expert)
-                else:
-                    parameter.weight_loader(
-                        parameter, weight[expert], name, "w2", expert
-                    )
-        runner._quant_method.process_weights_after_loading(layer)
-        finalize_layerwise_reload(runner, config.model_config)
+    def checkpoint(factor: float) -> list:
+        torch.manual_seed(0)
+        w13 = torch.randn(2, 512, 256, dtype=torch.bfloat16) * factor
+        w2 = torch.randn(2, 256, 256, dtype=torch.bfloat16) * factor
+        if not requantize:
+            return _expert_checkpoint({"w13_weight": w13, "w2_weight": w2}, 2)
+        w1, w3 = w13.chunk(2, dim=1)
+        global_scales = [
+            torch.tensor([448.0 * 6.0 / x.abs().max().item()] * 2) for x in (w1, w3, w2)
+        ]
+        tensors, _, _ = _nvfp4_moe_checkpoint_tensors(
+            "modelopt", w1, w3, w2, *global_scales
+        )
+        return _expert_checkpoint(tensors, 2)
 
+    def cold_start(factor: float) -> torch.nn.Module:
+        model = torch.nn.Module()
+        # weight names resolve under `...experts`; a new layer name each
+        model.runner = create(f"model.layers.{next(_REQUANT_LAYERS)}.mlp.experts")
+        weights = checkpoint(factor)
+        loaded = set(model.runner.routed_experts.load_weights(weights))
+        assert loaded, "no checkpoint tensor reached the experts"
+        process_weights_after_loading(model, config.model_config, device)
+        return model
+
+    device = torch.device(DEVICE)
     with set_current_vllm_config(config), torch.device(DEVICE):
-        runner = create("humming.loaded")
-        record_metadata_for_reloading(runner)
-        load(runner, 1.0)
-        parameters = dict(runner.named_parameters())
-        first = {name: tensor.clone() for name, tensor in parameters.items()}
-        initialize_layerwise_reload(runner)
-        load(runner, 2.0)
-        fresh = create("humming.fresh")
-        record_metadata_for_reloading(fresh)
-        load(fresh, 2.0)
-        expected = dict(fresh.named_parameters())
-        assert parameters.keys() == expected.keys()
-        for name, tensor in runner.named_parameters():
-            assert tensor is parameters[name]
+        model = cold_start(1.0)
+        # requantization keeps the online method (no quantize-on-load)
+        assert getattr(model.runner.routed_experts, "quantizes_on_load", False) == (
+            not requantize
+        )
+        expected = dict(cold_start(1.0).named_parameters())
+        actual = dict(model.named_parameters())
+        assert actual.keys() == expected.keys()
+        for name, tensor in actual.items():
+            if tensor.is_meta:
+                continue  # checkpoint-only stand-in
             torch.testing.assert_close(
                 tensor.view(torch.uint8),
                 expected[name].view(torch.uint8),
                 rtol=0,
                 atol=0,
             )
-        assert any(
-            not torch.equal(tensor.view(torch.uint8), first[name].view(torch.uint8))
-            for name, tensor in runner.named_parameters()
+        # The Humming conversion does not rerun on the converted experts, and
+        # requantization keeps the online method: a direct weight update
+        # refuses both.
+        refusal = "online quantization" if requantize else "[Hh]umming"
+        with pytest.raises(RuntimeError, match=refusal):
+            start_reload(model)
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="Humming requires CUDA.")
+@pytest.mark.parametrize(
+    "scheme", ["fp8_per_block", "mxfp8", "mxfp4", "nvfp4_weight_only"]
+)
+def test_online_linear_humming_reload(scheme, tmp_path, dist_init) -> None:
+    """A direct reload of a Humming linear layer matches a fresh one, or is
+    refused where the layer keeps the online method."""
+    from vllm.config import set_current_vllm_config
+
+    _write_minimal_llama_config(tmp_path)
+    config = VllmConfig(
+        model_config=ModelConfig(
+            model=str(tmp_path), dtype="bfloat16", skip_tokenizer_init=True
+        ),
+        kernel_config=KernelConfig(linear_backend="humming"),
+    )
+    if scheme == "nvfp4_weight_only":
+        args = resolve_quantization_config(scheme, None)
+    else:
+        args = quant_config_args(linear=scheme)
+    device = torch.device(DEVICE)
+
+    def cold_start(seed: int) -> torch.nn.Module:
+        model = torch.nn.Module()
+        model.proj = ColumnParallelLinear(
+            512,
+            512,
+            bias=False,
+            params_dtype=torch.bfloat16,
+            quant_config=OnlineQuantizationConfig(args),
+            prefix=f"model.layers.0.humming_proj{seed}",
+            disable_tp=True,
         )
+        torch.manual_seed(seed)
+        weight = torch.randn(512, 512, dtype=torch.bfloat16)
+        model.proj.weight.weight_loader(model.proj.weight, weight)
+        process_weights_after_loading(model, config.model_config, device)
+        return model
+
+    with set_current_vllm_config(config), torch.device(DEVICE):
+        model = cold_start(1)
+        if scheme in ("mxfp4", "nvfp4_weight_only"):
+            # still the online method, which a direct reload refuses
+            with pytest.raises(RuntimeError, match="online quantization"):
+                start_reload(model)
+            return
+        fresh = cold_start(2)
+        start_reload(model)
+        torch.manual_seed(2)
+        weight = torch.randn(512, 512, dtype=torch.bfloat16)
+        model.proj.weight.weight_loader(model.proj.weight, weight)
+        finish_reload(model, config.model_config, device)
+        expected = dict(fresh.named_parameters())
+        for name, tensor in model.named_parameters():
+            torch.testing.assert_close(
+                tensor.view(torch.uint8),
+                expected[name].view(torch.uint8),
+                rtol=0,
+                atol=0,
+            )
+        x = torch.randn(4, 512, dtype=torch.bfloat16)
+        torch.testing.assert_close(model.proj(x)[0], fresh.proj(x)[0], rtol=0, atol=0)
 
 
 @pytest.mark.parametrize(
