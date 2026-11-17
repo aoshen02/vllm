@@ -126,6 +126,15 @@ def checkpoint_method(layer: torch.nn.Module, spec: Any, default: Any) -> Any:
     from vllm.model_executor.layers.fused_moe import RoutedExperts
     from vllm.model_executor.layers.linear import LinearBase
     from vllm.model_executor.layers.quantization import fp8, modelopt, mxfp4
+    from vllm.model_executor.layers.quantization.input_hadamard import (
+        InputHadamardLinearMethod,
+        block_hadamard_rotate,
+        hadamard_matrix,
+    )
+    from vllm.model_executor.layers.quantization.quark.quark import QuarkLinearMethod
+    from vllm.model_executor.layers.quantization.quark.schemes.quark_ocp_mx import (
+        QuarkOCP_MX,
+    )
     from vllm.model_executor.layers.quantization.utils import mxfp4_utils, mxfp8_utils
     from vllm.model_executor.layers.quantization.utils import quant_utils as qu
     from vllm.utils.deep_gemm import per_block_cast_to_fp8
@@ -134,11 +143,12 @@ def checkpoint_method(layer: torch.nn.Module, spec: Any, default: Any) -> Any:
     moe: Any = getattr(layer, "moe_config", None)
     method: Any  # the checkpoint method of the matching pre-quantized scheme
     quantize: Callable[..., Any]
-    if spec.activation != default or spec.hadamard_size is not None:
-        return None
+    weight, ckpt, hadamard = spec.weight, modelopt.CkptCtx(), spec.hadamard_size
     if not (is_moe or isinstance(layer, LinearBase)):
         return None
-    weight, ckpt = spec.weight, modelopt.CkptCtx()
+    mxfp4_linear = weight == qu.kMxfp4Static and not is_moe
+    if (spec.activation != default or hadamard is not None) and not mxfp4_linear:
+        return None
     block = weight == qu.kFp8Static128BlockSym
     if weight in (qu.kFp8StaticTensorSym, qu.kFp8Static128BlockSym):
         cfg = fp8.Fp8Config(weight_block_size=[128, 128] if block else None)
@@ -172,6 +182,18 @@ def checkpoint_method(layer: torch.nn.Module, spec: Any, default: Any) -> Any:
     elif weight == qu.kMxfp4Static and is_moe:
         method = mxfp4.Mxfp4MoEMethod(moe, spec.activation)
         quantize = mxfp4_utils.mxfp4_quantize
+    elif mxfp4_linear:
+        if spec.activation not in QuarkOCP_MX.supported_activation_quant_keys:
+            return None
+        layer.scheme = QuarkOCP_MX(weight, spec.activation)
+        method = QuarkLinearMethod(None)  # type: ignore[arg-type]
+        quantize = mxfp4_utils.mxfp4_quantize
+        if hadamard is not None:
+
+            def quantize(w):  # the input is rotated by the same matrix
+                rotation = hadamard_matrix(hadamard, w.device)
+                return mxfp4_utils.mxfp4_quantize(block_hadamard_rotate(w, rotation))
+
     elif weight == qu.kNvfp4Static and is_moe:
         config = modelopt.ModelOptNvFp4Config(is_checkpoint_nvfp4_serialized=True)
         config.moe_activation_override = spec.activation
@@ -189,4 +211,8 @@ def checkpoint_method(layer: torch.nn.Module, spec: Any, default: Any) -> Any:
             quantize_on_load(layer, f"{p}weight", quantize, f"{p}{scale}")
 
     method.create_weights = create_weights_quantized_on_load  # type: ignore[method-assign]
+    if hadamard is not None:
+        return InputHadamardLinearMethod(
+            method, hadamard, rotate_weight=False, checkpoint_rotation=False
+        )
     return method

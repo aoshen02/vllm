@@ -64,20 +64,26 @@ class InputHadamardLinearMethod(LinearMethodBase):
 
     With `rotate_weight`, the weight (`[out, in]`) is rotated the same way
     right before the wrapped method processes it, for example before online
-    quantization. Otherwise the checkpoint stores the weight already rotated,
-    together with an int8 `input_rotation` tensor holding the unnormalized
-    (+-1) Sylvester matrix, which is checked and then dropped.
+    quantization. Otherwise the weight arrives already rotated: with
+    `checkpoint_rotation` the checkpoint stores it so, together with an int8
+    `input_rotation` tensor holding the unnormalized (+-1) Sylvester matrix,
+    which is checked and then dropped; without, the weight loaders rotate it.
 
     The activation rotation runs in PyTorch unless the wrapped method takes it
     over through `InputHadamardFusable`.
     """
 
     def __init__(
-        self, quant_method: LinearMethodBase, size: int, rotate_weight: bool
+        self,
+        quant_method: LinearMethodBase,
+        size: int,
+        rotate_weight: bool,
+        checkpoint_rotation: bool = True,
     ) -> None:
         self.quant_method = quant_method
         self.size = size
         self.rotate_weight = rotate_weight
+        self.checkpoint_rotation = checkpoint_rotation and not rotate_weight
 
     @property
     def uses_meta_device(self) -> bool:  # type: ignore[override]
@@ -111,7 +117,7 @@ class InputHadamardLinearMethod(LinearMethodBase):
             params_dtype,
             **extra_weight_attrs,
         )
-        if not self.rotate_weight:
+        if self.checkpoint_rotation:
             input_rotation = torch.nn.Parameter(
                 torch.zeros(self.size, self.size, dtype=torch.int8),
                 requires_grad=False,
@@ -141,7 +147,7 @@ class InputHadamardLinearMethod(LinearMethodBase):
             if self.rotate_weight:
                 hadamard = hadamard_matrix(self.size, weight.device)
                 weight.data.copy_(block_hadamard_rotate(weight.data, hadamard))
-            else:
+            elif self.checkpoint_rotation:
                 input_rotation: torch.Tensor = layer.input_rotation
                 if not input_rotation.any():
                     raise ValueError(
