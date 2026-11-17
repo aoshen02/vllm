@@ -503,7 +503,7 @@ class OnlineQuantizationConfig(QuantizationConfig):
         )
 
     def get_quant_method(
-        self, layer: torch.nn.Module, prefix: str
+        self, layer: torch.nn.Module, prefix: str, quantize_on_load: bool = True
     ) -> "QuantizeMethodBase | None":
         # `targets` takes precedence over `moe` and `linear` and is exclusive.
         resolved = self.resolve_quant_method_cls(type(layer), prefix)
@@ -518,7 +518,7 @@ class OnlineQuantizationConfig(QuantizationConfig):
             )
             assert issubclass(quant_method_cls, (OnlineMoEMethodBase, OnlineLinearBase))
             default = getattr(quant_method_cls, "activation_quant_key", None)
-            if self.quantize_on_load:
+            if self.quantize_on_load and quantize_on_load:
                 method = checkpoint_method(layer, quant_spec, default)
                 if method is not None:
                     return method
@@ -537,7 +537,11 @@ class OnlineQuantizationConfig(QuantizationConfig):
                     quant_spec.hadamard_size,
                     rotate_weight=True,
                 )
-            return quant_method_cls(**kwargs)
+            method = quant_method_cls(**kwargs)
+            if isinstance(layer, ParallelLMHead):
+                # a real fp16/bf16 weight, quantized after loading in place
+                method.supports_direct_reload = True
+            return method
 
         if isinstance(layer, LinearBase):
             return UnquantizedLinearMethod()

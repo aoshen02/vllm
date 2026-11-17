@@ -97,7 +97,8 @@ def _check_supported(model: torch.nn.Module) -> None:
         method = getattr(module, "quant_method", None)
         # also without an online config (experts_int8); fused shared experts
         # quantize staging parameters that post-load processing deletes
-        if isinstance(method, (OnlineLinearBase, OnlineMoEMethodBase)) or (
+        online = isinstance(method, (OnlineLinearBase, OnlineMoEMethodBase))
+        if (online and not getattr(method, "supports_direct_reload", False)) or (
             getattr(module, "shared_expert_online_loader", None) is not None
         ):
             raise RuntimeError(

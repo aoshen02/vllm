@@ -218,8 +218,7 @@ class Fp8BlockExpertsAsMxfp4FusedMoE(Mxfp4OnlineMoEMethod):
                 f"{layer.layer_name}: FP8 experts {unpaired} got only one of their "
                 "weight and weight_scale_inv; both must be loaded in the same update"
             )
-        delattr(layer, "w13_weight_scale_inv")
-        delattr(layer, "w2_weight_scale_inv")
+        # the meta block-scale parameters stay: a reload loads into them again
         layer.w13_input_scale = None
         layer.w2_input_scale = None
         # The kernel-format conversion replaces or deletes them per backend.

@@ -5,7 +5,10 @@
 import torch
 
 from vllm.logger import init_logger
-from vllm.model_executor.layers.fused_moe import RoutedExperts
+from vllm.model_executor.layers.fused_moe import (
+    FusedMoeWeightScaleSupported,
+    RoutedExperts,
+)
 from vllm.model_executor.layers.fused_moe.config import (
     FUSED_MOE_UNQUANTIZED_CONFIG,
     FusedMoEConfig,
@@ -39,7 +42,11 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kLutBStatic,
     kMxfp8Dynamic,
 )
-from vllm.model_executor.utils import replace_parameter, set_weight_attrs
+from vllm.model_executor.utils import (
+    replace_parameter,
+    retire_parameter,
+    set_weight_attrs,
+)
 
 logger = init_logger(__name__)
 
@@ -55,6 +62,8 @@ class LutBOnlineMoEMethod(OnlineMoEMethodBase):
     layout (`<w>_weight` packed indices, `<w>_codebooks`, `<w>_scales`), which
     TP shards like the weight since tiles never straddle a shard.
     """
+
+    supports_direct_reload = True  # unless set_requantization_source
 
     def __init__(self, *, moe: FusedMoEConfig):
         super().__init__(moe)
@@ -135,7 +144,11 @@ class LutBOnlineMoEMethod(OnlineMoEMethodBase):
                     torch.zeros(shape, dtype=dtype), requires_grad=False
                 )
                 layer.register_parameter(prefix + name, param)
-                set_weight_attrs(param, extra_weight_attrs)
+                attrs = extra_weight_attrs
+                if name == "scales":  # per row and 32 inputs: sharded as a weight
+                    group = FusedMoeWeightScaleSupported.GROUP.value
+                    attrs = {**extra_weight_attrs, "quant_method": group}
+                set_weight_attrs(param, attrs)
             _quantize_lut_b_on_load(layer, prefix)
 
     def get_fused_moe_quant_config(self, layer: torch.nn.Module) -> FusedMoEQuantConfig:
@@ -184,9 +197,9 @@ class LutBOnlineMoEMethod(OnlineMoEMethodBase):
                     ),
                 )
             )
-            # folded into the kernel weight below
-            delattr(layer, prefix + "codebooks")
-            delattr(layer, prefix + "scales")
+            # folded into the kernel weight below; kept for a reload to load
+            retire_parameter(layer, prefix + "codebooks")
+            retire_parameter(layer, prefix + "scales")
         return weights
 
 

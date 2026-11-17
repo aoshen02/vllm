@@ -24,14 +24,20 @@ def _rename(arg: Any, old: str, new: str) -> Any:
 def _load_quantized(layer: torch.nn.Module, name: str, *scale_names: str):
     """Load `(values, *scales)` as a checkpoint of that layout is loaded."""
     load = getattr(getattr(layer, name), "weight_loader", default_weight_loader)
+    # the loaders as created: requantization stages checkpoint tensors through
+    # the parameters' own `weight_loader` attributes afterwards
+    scale_loaders = [
+        getattr(getattr(layer, s), "weight_loader", default_weight_loader)
+        for s in scale_names
+    ]
     layer.quantizes_on_load = True
 
     def load_quantized(param, quantized, *args, **kwargs):
         values, *scales = quantized
-        for scale_name, scale in zip(scale_names, scales):
+        for scale_name, scale_load, scale in zip(scale_names, scale_loaders, scales):
             scale_param = getattr(layer, scale_name)
             # the MoE loader picks how to load a scale by its parameter name
-            getattr(scale_param, "weight_loader", default_weight_loader)(
+            scale_load(
                 scale_param,
                 scale,
                 *(_rename(a, name, scale_name) for a in args),
@@ -289,3 +295,221 @@ def checkpoint_method(layer: torch.nn.Module, spec: Any, default: Any) -> Any:
             method, hadamard, rotate_weight=False, checkpoint_rotation=False
         )
     return method
+
+
+def _requant_roles(
+    source: Any, source_scheme: Any
+) -> tuple[dict[str, tuple[str, str]], Callable] | None:
+    """`(roles, dequantize)` for a checkpoint method that can be requantized on
+    load: `roles` maps each checkpoint tensor the dequantization reads to `(the
+    high-precision parameter it becomes, its part)`, and `dequantize(parts,
+    dtype)` rebuilds one unsharded high-precision tensor from the parts."""
+    from vllm.model_executor.layers.quantization import modelopt
+    from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4a4_nvfp4 import (  # noqa: E501
+        CompressedTensorsW4A4Nvfp4MoEMethod,
+    )
+    from vllm.model_executor.layers.quantization.quark.quark import QuarkLinearMethod
+    from vllm.model_executor.layers.quantization.quark.quark_moe import (
+        QuarkNvfp4MoEMethod,
+    )
+    from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
+        dequant_mxfp8_to_bf16,
+    )
+    from vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils import (
+        dequantize_to_dtype,
+    )
+    from vllm.model_executor.layers.quantization.utils.quant_utils import (
+        kMxfp8Static,
+    )
+
+    # class: (packed values, global scale); compressed-tensors stores the
+    # global encode scale, the others its reciprocal
+    nvfp4_moe: dict[type, tuple[str, str]] = {
+        CompressedTensorsW4A4Nvfp4MoEMethod: ("weight_packed", "weight_global_scale"),
+        modelopt.ModelOptNvFp4FusedMoE: ("weight", "weight_scale_2"),
+        QuarkNvfp4MoEMethod: ("weight", "weight_scale_2"),
+    }
+    if type(source) in nvfp4_moe:
+        packed, global_name = nvfp4_moe[type(source)]
+        invert = isinstance(source, CompressedTensorsW4A4Nvfp4MoEMethod)
+        group_size = getattr(source, "group_size", None) or (
+            source.quant_config.group_size
+        )
+        roles = {
+            f"{p}{name}": (f"{p}weight", part)
+            for p in ("w13_", "w2_")
+            for name, part in (
+                (packed, "values"),
+                ("weight_scale", "scale"),
+                (global_name, "global"),
+            )
+        }
+
+        def dequantize_nvfp4(parts: dict, dtype: torch.dtype) -> torch.Tensor:
+            global_scale = parts["global"].float().reshape(1)
+            if invert:
+                global_scale = 1.0 / global_scale
+            return dequantize_to_dtype(
+                parts["values"][None],
+                parts["scale"][None],
+                global_scale,
+                dtype,
+                block_size=group_size,
+                swizzle=False,
+            )[0]
+
+        return roles, dequantize_nvfp4
+
+    if (
+        isinstance(source, modelopt.ModelOptLinearMethod)
+        and source.wkey.key is kMxfp8Static
+    ) or (
+        isinstance(source, QuarkLinearMethod)
+        and getattr(source_scheme, "weight_quant_key", None) == kMxfp8Static
+    ):
+        roles = {"weight": ("weight", "values"), "weight_scale": ("weight", "scale")}
+
+        def dequantize_mxfp8(parts: dict, dtype: torch.dtype) -> torch.Tensor:
+            return dequant_mxfp8_to_bf16(
+                parts["values"].contiguous(), parts["scale"].contiguous()
+            ).to(dtype)
+
+        return roles, dequantize_mxfp8
+    return None
+
+
+def _moe_args(args: tuple, kwargs: dict) -> tuple:
+    """`(weight_name, shard_id, expert_id)` of a MoE weight loader call."""
+    names = ("weight_name", "shard_id", "expert_id")
+    return tuple(args[i] if i < len(args) else kwargs[n] for i, n in enumerate(names))
+
+
+def requantize_on_load(source: Any, target: Any, source_scheme: Any = None) -> Any:
+    """`target`, a method quantizing high-precision weights on load, made to
+    load the checkpoint tensors of `source`, a pre-quantized checkpoint method,
+    or None if `source` cannot be dequantized on load.
+
+    The tensors one dequantization needs (an expert shard's packed values,
+    block scales and global scale; a linear shard's values and scales) arrive
+    in separate loads: all but the last wait, then they are dequantized and
+    loaded as one high-precision tensor. Checkpoint tensors the target does not
+    hold stay meta parameters, never written. `source_scheme` is the layer
+    scheme `source` creates its weights with."""
+    from vllm.model_executor.layers.quantization.online.requantization import (
+        skip_checkpoint_backend_selection,
+    )
+
+    found = _requant_roles(source, source_scheme)
+    if found is None:
+        return None
+    roles, dequantize = found
+    num_parts = len({part for _, part in roles.values()})
+    is_moe = hasattr(target, "moe")
+    create_weights = target.create_weights
+    pending: dict[tuple, dict[str, tuple]] = {}
+    # checkpoint-only names the target holds as attributes (a None activation
+    # scale): the checkpoint loads the parameter, post-load processing reads
+    # the attribute
+    shadowed: dict[str, Any] = {}
+
+    def create_weights_requantized_on_load(layer, *args, **kwargs):
+        before = dict(layer._parameters)
+        target_scheme = getattr(layer, "scheme", None)
+        if source_scheme is not None:
+            layer.scheme = source_scheme
+        # the checkpoint method names the tensors the checkpoint loads
+        with torch.device("meta"), skip_checkpoint_backend_selection():
+            source.create_weights(layer, *args, **kwargs)
+        checkpoint = {
+            name: param
+            for name, param in layer._parameters.items()
+            if param is not None and before.get(name) is not param
+        }
+        for name in checkpoint:
+            delattr(layer, name)
+        if source_scheme is not None:
+            layer.scheme = target_scheme
+        create_weights(layer, *args, **kwargs)
+        high_precision = {
+            name: getattr(layer, name).weight_loader for name, _ in roles.values()
+        }
+
+        def stage(name: str, part: str, param, loaded_weight, *args, **kwargs):
+            if is_moe:
+                args = _moe_args(args, kwargs)
+                shard_id, expert_id = args[1:]
+                if layer._map_global_expert_id_to_local_expert_id(expert_id) == -1:
+                    return False
+                key: tuple = (name, shard_id, expert_id)
+                kwargs = {"return_success": True}
+            else:
+                key = (name, args[0] if args else kwargs.get("loaded_shard_id"))
+            copied = torch.Event()
+            tensor = loaded_weight.to(getattr(layer, name).device, copy=True)
+            copied.record()
+            got = pending.setdefault(key, {})
+            got[part] = (tensor, copied, args, kwargs)
+            if len(got) < num_parts:
+                return True
+            del pending[key]
+            for _, event, _, _ in got.values():
+                # held from another load, which may have run on another stream
+                event.wait()
+            weight = dequantize(
+                {part: tensor for part, (tensor, _, _, _) in got.items()},
+                layer.params_dtype,
+            )
+            _, _, args, kwargs = got["values"]
+            if is_moe:  # the MoE loader tells weights from scales by name
+                args = (name, *args[1:])
+            return high_precision[name](getattr(layer, name), weight, *args, **kwargs)
+
+        def drop(param, loaded_weight, *args, **kwargs):
+            # e.g. calibrated activation scales: the target computes its own
+            if is_moe:
+                expert_id = _moe_args(args, kwargs)[2]
+                return layer._map_global_expert_id_to_local_expert_id(expert_id) != -1
+            return None
+
+        for name, param in checkpoint.items():
+            if name in roles:
+                loader: Callable = partial(stage, *roles[name])
+            elif name in layer._parameters:
+                continue  # the target loads it as it is (e.g. a bias)
+            else:
+                loader = drop
+            if name not in layer._parameters:
+                if hasattr(layer, name):
+                    shadowed[name] = getattr(layer, name)
+                    delattr(layer, name)
+                layer.register_parameter(name, param)
+            getattr(layer, name).weight_loader = loader
+
+    process = target.process_weights_after_loading
+
+    def process_weights_after_loading(layer: torch.nn.Module) -> None:
+        if pending:
+            incomplete = sorted(map(str, pending))
+            pending.clear()
+            raise RuntimeError(
+                f"requantization got only part of the checkpoint tensors of "
+                f"{incomplete}; all of them must be loaded in the same update"
+            )
+        placeholders = {name: layer._parameters.pop(name) for name in shadowed}
+        for name, value in shadowed.items():
+            setattr(layer, name, value)
+        try:
+            process(layer)
+        finally:
+            for name, param in placeholders.items():
+                if getattr(layer, name, None) is not None:
+                    raise RuntimeError(
+                        f"requantization: the target sets {name}, which the "
+                        "checkpoint also loads"
+                    )
+                delattr(layer, name)
+                layer.register_parameter(name, param)
+
+    target.create_weights = create_weights_requantized_on_load
+    target.process_weights_after_loading = process_weights_after_loading
+    return target
