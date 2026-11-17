@@ -126,10 +126,19 @@ def checkpoint_method(layer: torch.nn.Module, spec: Any, default: Any) -> Any:
     from vllm.model_executor.layers.fused_moe import RoutedExperts
     from vllm.model_executor.layers.linear import LinearBase
     from vllm.model_executor.layers.quantization import fp8, modelopt, mxfp4
+    from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (  # noqa: E501
+        CompressedTensorsLinearMethod,
+    )
+    from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compressed_tensors_w8a16_fp8 import (  # noqa: E501
+        CompressedTensorsW8A16Fp8,
+    )
     from vllm.model_executor.layers.quantization.input_hadamard import (
         InputHadamardLinearMethod,
         block_hadamard_rotate,
         hadamard_matrix,
+    )
+    from vllm.model_executor.layers.quantization.online.mxfp4 import (
+        select_online_mxfp4_moe_backend,
     )
     from vllm.model_executor.layers.quantization.quark.quark import QuarkLinearMethod
     from vllm.model_executor.layers.quantization.quark.schemes.quark_ocp_mx import (
@@ -146,8 +155,15 @@ def checkpoint_method(layer: torch.nn.Module, spec: Any, default: Any) -> Any:
     weight, ckpt, hadamard = spec.weight, modelopt.CkptCtx(), spec.hadamard_size
     if not (is_moe or isinstance(layer, LinearBase)):
         return None
-    mxfp4_linear = weight == qu.kMxfp4Static and not is_moe
-    if (spec.activation != default or hadamard is not None) and not mxfp4_linear:
+    is_mxfp4 = weight == qu.kMxfp4Static
+    mxfp4_linear = is_mxfp4 and not is_moe
+    # PTPC's only override is `activation: null`, weight-only FP8
+    fp8_weight_only = (
+        weight == qu.kFp8StaticChannelSym and spec.activation is None and not is_moe
+    )
+    if hadamard is not None and not mxfp4_linear:
+        return None
+    if spec.activation != default and not (is_mxfp4 or fp8_weight_only):
         return None
     block = weight == qu.kFp8Static128BlockSym
     if weight in (qu.kFp8StaticTensorSym, qu.kFp8Static128BlockSym):
@@ -158,6 +174,11 @@ def checkpoint_method(layer: torch.nn.Module, spec: Any, default: Any) -> Any:
         channel = QuantizationArgs(type="float", strategy="channel")
         token = QuantizationArgs(type="float", strategy="token", dynamic=True)
         method = ct_fp8.CompressedTensorsW8A8Fp8MoEMethod(channel, token, moe)
+        quantize = _quantize_fp8_per_channel
+    elif fp8_weight_only:
+        channel = QuantizationArgs(type="float", strategy="channel")
+        layer.scheme = CompressedTensorsW8A16Fp8(channel, is_static_input_scheme=False)
+        method = CompressedTensorsLinearMethod(None)  # type: ignore[arg-type]
         quantize = _quantize_fp8_per_channel
     elif weight == qu.kFp8StaticChannelSym:
         token_spec = QuantSpec(weight=qu.kFp8StaticTokenSym, activation=spec.activation)
@@ -181,6 +202,10 @@ def checkpoint_method(layer: torch.nn.Module, spec: Any, default: Any) -> Any:
         quantize = mxfp8_utils.mxfp8_e4m3_quantize
     elif weight == qu.kMxfp4Static and is_moe:
         method = mxfp4.Mxfp4MoEMethod(moe, spec.activation)
+        # the online backend choice, which honours the activation key
+        method.mxfp4_backend, method.experts_cls = select_online_mxfp4_moe_backend(
+            moe, spec.activation
+        )
         quantize = mxfp4_utils.mxfp4_quantize
     elif mxfp4_linear:
         if spec.activation not in QuarkOCP_MX.supported_activation_quant_keys:
