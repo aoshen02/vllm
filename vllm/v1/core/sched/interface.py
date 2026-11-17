@@ -214,7 +214,12 @@ class SchedulerInterface(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def set_pause_state(self, pause_state: PauseState) -> None:
+    def set_pause_state(
+        self, pause_state: PauseState, wait_for_kv_loads: bool = False
+    ) -> None:
+        """Set the pause state. With `wait_for_kv_loads`, requests that a KV
+        connector is loading into keep the scheduler stepping until the loads
+        end, as a following prefix cache reset needs."""
         raise NotImplementedError
 
     @abstractmethod

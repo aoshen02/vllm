@@ -2453,7 +2453,7 @@ class EngineCoreProc(EngineCore):
             self._send_abort_outputs(aborted_reqs)
 
         pause_state = PauseState.PAUSED_ALL if mode == "keep" else PauseState.PAUSED_NEW
-        self.scheduler.set_pause_state(pause_state)
+        self.scheduler.set_pause_state(pause_state, wait_for_kv_loads=clear_cache)
 
         if self._pause_complete():
             self._finish_pause(clear_cache, reset_connector)

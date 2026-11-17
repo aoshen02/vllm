@@ -472,6 +472,7 @@ class Scheduler(SchedulerInterface):
         self.return_sampling_mask = vllm_config.model_config.return_sampling_mask
 
         self._pause_state: PauseState = PauseState.UNPAUSED
+        self._wait_for_kv_loads = False
 
         # Remaining-block reservations of in-flight prefills gate async loads.
         # Parked async KV loads can number thousands, so theirs are cached until
@@ -3157,9 +3158,12 @@ class Scheduler(SchedulerInterface):
     def pause_state(self) -> PauseState:
         return self._pause_state
 
-    def set_pause_state(self, pause_state: PauseState) -> None:
+    def set_pause_state(
+        self, pause_state: PauseState, wait_for_kv_loads: bool = False
+    ) -> None:
         logger.info("setting pause state to %s", pause_state.name)
         self._pause_state = pause_state
+        self._wait_for_kv_loads = wait_for_kv_loads
 
     def _request_blocks_can_be_freed(self, request: Request) -> bool:
         # We must defer freeing blocks if an async kv connector may
@@ -3262,6 +3266,7 @@ class Scheduler(SchedulerInterface):
             self.has_unfinished_requests()
             or self.has_finished_requests()
             or (self.connector is not None and self.connector.has_pending_push_work())
+            or (self._wait_for_kv_loads and self._has_kv_loads_in_flight())
             or (
                 self.ec_connector is not None
                 and self.ec_connector.has_pending_push_work()
@@ -3289,6 +3294,13 @@ class Scheduler(SchedulerInterface):
             while self.running:
                 request = self.running.pop()
                 self._preempt_request(request, timestamp, drop_stale_output=True)
+            for request in list(self.kv_holding_waiting):
+                if request.status in (
+                    RequestStatus.WAITING,
+                    RequestStatus.PREEMPTED,
+                    RequestStatus.WAITING_FOR_REMOTE_KVS,
+                ) and not self._kv_load_in_flight(request):
+                    self._release_waiting_blocks(request)
 
         reset_successful = self.kv_cache_manager.reset_prefix_cache()
         if reset_running_requests and not reset_successful:
@@ -3306,6 +3318,41 @@ class Scheduler(SchedulerInterface):
             self.aux_output_connector.reset()
 
         return reset_successful
+
+    def _kv_load_in_flight(self, request: Request) -> bool:
+        """Whether a KV connector is loading into the request's blocks."""
+        return (
+            request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+            and request.request_id not in self.finished_recving_kv_req_ids
+            and request.request_id not in self.deferred_loads
+        )
+
+    def _has_kv_loads_in_flight(self) -> bool:
+        """Whether a KV connector is loading into the blocks of a waiting
+        request."""
+        return any(map(self._kv_load_in_flight, self.kv_holding_waiting))
+
+    def _release_waiting_blocks(self, request: Request) -> None:
+        """Free the KV blocks of a waiting request that no KV connector loads
+        into, as a preemption does, and queue it to compute them again."""
+        request_id = request.request_id
+        self.kv_holding_waiting.remove_request(request)
+        self.deferred_waiting.discard(request)
+        self.finished_recving_kv_req_ids.discard(request_id)
+        self.failed_recving_kv_req_ids.discard(request_id)
+        self.deferred_loads.pop(request_id, None)
+        self._unreserve_parked(request)
+        self._inflight_prefills.discard(request)
+        self._set_kv_fetch_stage(request, None)
+        self._free_request_blocks(request)
+        request.num_computed_tokens = 0
+        if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
+            request.status = (
+                RequestStatus.PREEMPTED
+                if request.num_preemptions
+                else RequestStatus.WAITING
+            )
+        self._enqueue_waiting_request(request)
 
     def reset_connector_cache(self) -> bool:
         if self.connector is None:
