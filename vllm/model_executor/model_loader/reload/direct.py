@@ -112,6 +112,13 @@ def _check_supported(model: torch.nn.Module) -> None:
             # its post-load processing runs once per quant method (a guard on
             # the method, not the module): a reload would keep checkpoint bytes
             raise RuntimeError(f"direct reload: humming is not supported ({name})")
+        if getattr(module, "humming_configs", None) is not None:
+            # experts converted to the humming kernel layout through the oracle
+            # (any quant method): the conversion renames and consumes the
+            # checkpoint parameters, so it cannot rerun on a reload
+            raise RuntimeError(
+                f"direct reload: the humming MoE kernel is not supported ({name})"
+            )
 
 
 def record_checkpoint_layout(model: torch.nn.Module) -> None:
