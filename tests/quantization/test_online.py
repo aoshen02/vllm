@@ -105,12 +105,16 @@ from vllm.model_executor.layers.quantization.online.fp8 import (
     Fp8PerTensorOnlineMoEMethod,
     Fp8PtpcOnlineLinearMethod,
     Fp8PtpcOnlineMoEMethod,
+    OnlineLinearBase,
     _fp8_channel_scale,
     _fp8_quant_per_channel,
     _fp8_scale,
     _is_tp_sharded,
 )
 from vllm.model_executor.layers.quantization.online.int8 import Int8OnlineMoEMethod
+from vllm.model_executor.layers.quantization.online.moe_base import (
+    OnlineMoEMethodBase,
+)
 from vllm.model_executor.layers.quantization.online.mxfp4 import (
     Mxfp4OnlineLinearMethod,
     Mxfp4OnlineMoEMethod,
@@ -254,6 +258,8 @@ def test_online_linear_methods_resolve_activation_quant_key(
     )
 
     config = OnlineQuantizationConfig(args)
+    # the online class itself, not the checkpoint method quantizing on load
+    config.quantize_on_load = False
     method = config.get_quant_method(_TestLinear(), "linear")
     assert method is not None
     assert isinstance(method, method_cls)
@@ -803,7 +809,7 @@ def test_online_prequantized_compatibility(
     }
 
     layer = ColumnParallelLinear(**layer_kwargs)
-    assert isinstance(layer.quant_method, Mxfp8OnlineLinearMethod)
+    _assert_online_method(layer, Mxfp8OnlineLinearMethod)
 
     if layer.weight.is_meta:
         # Weight loading.
@@ -829,8 +835,8 @@ def test_online_prequantized_compatibility(
             layer.quant_method.requantization_source, ModelOptLinearMethod
         )
     elif not raises_requantization_error:
-        assert layer.quant_method.uses_meta_device
-        assert layer.quant_method.requantization_source is None
+        # quantized as the checkpoint tensors load
+        assert layer.quantizes_on_load
 
 
 @pytest.mark.skipif(
@@ -1974,6 +1980,28 @@ def test_nvfp4_one_sided_rejects_unsupported_input_dtype(input_dtype: torch.dtyp
         )
 
 
+_ONLINE_METHODS = (OnlineLinearBase, OnlineMoEMethodBase)
+
+
+def _fp8_kernel(method):
+    """The FP8 linear kernel of an online or a checkpoint method."""
+    kernel = getattr(method, "fp8_linear", None)
+    return kernel if kernel is not None else method.kernel
+
+
+def _assert_online_method(layer, expected_cls, method=None) -> None:
+    """`layer` runs `expected_cls`, or, for an online class, the checkpoint
+    method that quantizes on load in its stead."""
+    method = layer.quant_method if method is None else method
+    layer = getattr(layer, "routed_experts", layer)  # a MoE runner's experts
+    if issubclass(expected_cls, _ONLINE_METHODS) and getattr(
+        layer, "quantizes_on_load", False
+    ):
+        assert not isinstance(method, _ONLINE_METHODS)
+    else:
+        assert isinstance(method, expected_cls)
+
+
 @pytest.mark.skipif(
     not is_quant_method_supported("fp8"),
     reason="FP8 is not supported on this GPU type.",
@@ -2287,14 +2315,11 @@ def test_online_quantization(
             vllm_config_kwargs=vllm_config_kwargs,
             model_loader_cls=DummyModelLoader,
         )
-        assert isinstance(
-            model.model.layers[1].self_attn.o_proj.quant_method,
-            expected_linear_cls,
+        _assert_online_method(
+            model.model.layers[1].self_attn.o_proj, expected_linear_cls
         )
-        assert isinstance(
-            model.model.layers[0].mlp.experts._quant_method,
-            expected_moe_cls,
-        )
+        experts = model.model.layers[0].mlp.experts
+        _assert_online_method(experts, expected_moe_cls, experts._quant_method)
         assert isinstance(
             model.model.layers[0].self_attn.o_proj.quant_method,
             CompressedTensorsLinearMethod,
@@ -2339,10 +2364,10 @@ def test_online_quantization(
         o_proj = model.model.layers[0].self_attn.o_proj
         moe = model.model.layers[0].block_sparse_moe.experts
 
-    assert isinstance(o_proj.quant_method, expected_linear_cls)
+    _assert_online_method(o_proj, expected_linear_cls)
 
     if moe is not None:
-        assert isinstance(moe._quant_method, expected_moe_cls)
+        _assert_online_method(moe, expected_moe_cls, moe._quant_method)
 
     moe_args = (
         online_quant_args.get("moe") if isinstance(online_quant_args, dict) else None
@@ -2385,12 +2410,12 @@ def test_online_quantization(
         if current_platform.supports_fp8() and not force_marlin:
             assert o_proj.weight.dtype == torch.float8_e4m3fn
             assert not isinstance(
-                o_proj.quant_method.fp8_linear, MarlinFP8ScaledMMLinearKernel
+                _fp8_kernel(o_proj.quant_method), MarlinFP8ScaledMMLinearKernel
             )
         else:
             assert o_proj.weight.dtype == torch.int32
             assert isinstance(
-                o_proj.quant_method.fp8_linear, MarlinFP8ScaledMMLinearKernel
+                _fp8_kernel(o_proj.quant_method), MarlinFP8ScaledMMLinearKernel
             )
     elif current_platform.is_rocm():
         assert o_proj.weight.dtype == current_platform.fp8_dtype()
@@ -2398,9 +2423,9 @@ def test_online_quantization(
         pytest.skip("Only runs on CUDA and ROCm.")
 
     if quant_scheme == "fp8_per_channel":
-        assert o_proj.weight_scale.ndim == 2
-        assert o_proj.weight_scale.shape[-1] == 1
-        assert o_proj.input_scale is None
+        # one scale per output channel, dynamic activations
+        assert o_proj.weight_scale.numel() == o_proj.output_size_per_partition
+        assert getattr(o_proj, "input_scale", None) is None
 
     if isinstance(online_quant_args, dict) and "ignore" in online_quant_args:
         for layer_idx in range(len(model.model.layers)):
@@ -2408,7 +2433,7 @@ def test_online_quantization(
             if layer_idx == 1:
                 assert isinstance(o_proj.quant_method, UnquantizedLinearMethod)
             else:
-                assert isinstance(o_proj.quant_method, expected_linear_cls)
+                _assert_online_method(o_proj, expected_linear_cls)
 
         for layer in model.model.layers:
             assert isinstance(
@@ -2486,21 +2511,19 @@ def test_online_quantization_loads_real_weights(
 
             def check_model(model):
                 layer = model.model.layers[0]
-                assert isinstance(
-                    layer.self_attn.o_proj.quant_method,
-                    Fp8PerTensorOnlineLinearMethod,
+                experts = layer.block_sparse_moe.experts
+                _assert_online_method(
+                    layer.self_attn.o_proj, Fp8PerTensorOnlineLinearMethod
                 )
-                assert isinstance(
-                    layer.block_sparse_moe.experts._quant_method,
-                    Fp8PerTensorOnlineMoEMethod,
+                _assert_online_method(
+                    experts, Fp8PerTensorOnlineMoEMethod, experts._quant_method
                 )
 
         else:
 
             def check_model(model):
-                assert isinstance(
-                    model.model.layers[1].self_attn.o_proj.quant_method,
-                    Mxfp8OnlineLinearMethod,
+                _assert_online_method(
+                    model.model.layers[1].self_attn.o_proj, Mxfp8OnlineLinearMethod
                 )
                 assert isinstance(
                     model.model.layers[0].self_attn.o_proj.quant_method,
@@ -2568,6 +2591,7 @@ def test_online_quantization_targets(
         disable_tp=True,
     )
 
+    config.quantize_on_load = False  # the online class itself
     method = config.get_quant_method(layer, prefix)
     assert isinstance(method, expected_method_cls)
     assert config.quantized_layers == {prefix: expected_metadata}
@@ -2594,6 +2618,7 @@ def test_online_quantization_records_global_config(
         disable_tp=True,
     )
 
+    config.quantize_on_load = False  # the online class itself
     method = config.get_quant_method(layer, prefix)
 
     assert isinstance(method, Fp8PerBlockOnlineLinearMethod)
@@ -2816,9 +2841,8 @@ def test_online_nvfp4_per_token_moe(vllm_runner, monkeypatch) -> None:
 
         def check_model(model):
             layer = model.model.layers[0]
-            assert isinstance(
-                layer.block_sparse_moe.experts._quant_method, Nvfp4OnlineMoEMethod
-            )
+            experts = layer.block_sparse_moe.experts
+            _assert_online_method(experts, Nvfp4OnlineMoEMethod, experts._quant_method)
             assert isinstance(
                 layer.self_attn.o_proj.quant_method, UnquantizedLinearMethod
             )
