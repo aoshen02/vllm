@@ -486,10 +486,15 @@ class GptOssModel(nn.Module, EagleModelMixin):
         super().__init__()
         self.config = vllm_config.model_config.hf_config
         self.quant_config = vllm_config.quant_config
-        if isinstance(self.quant_config, OnlineQuantizationConfig):
+        online_config = (
+            self.quant_config
+            if isinstance(self.quant_config, OnlineQuantizationConfig)
+            else getattr(self.quant_config, "online_quantization_config", None)
+        )
+        if online_config is not None:
             # its expert loading writes BF16 into the experts outside their
             # loaders, so they cannot quantize on load
-            self.quant_config.quantize_on_load = False
+            online_config.quantize_on_load = False
         self.parallel_config = vllm_config.parallel_config
         self.embedding = VocabParallelEmbedding(
             self.config.vocab_size,

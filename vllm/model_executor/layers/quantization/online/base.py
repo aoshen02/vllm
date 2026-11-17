@@ -518,7 +518,13 @@ class OnlineQuantizationConfig(QuantizationConfig):
             )
             assert issubclass(quant_method_cls, (OnlineMoEMethodBase, OnlineLinearBase))
             default = getattr(quant_method_cls, "activation_quant_key", None)
-            if self.quantize_on_load and quantize_on_load:
+            # not for fused shared experts (their loader quantizes them itself)
+            fused_shared = getattr(
+                getattr(layer, "expert_map_manager", None),
+                "num_fused_shared_experts",
+                0,
+            )
+            if self.quantize_on_load and quantize_on_load and not fused_shared:
                 method = checkpoint_method(layer, quant_spec, default)
                 if method is not None:
                     return method
