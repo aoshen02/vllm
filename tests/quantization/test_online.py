@@ -524,12 +524,29 @@ def test_online_moe_stages_quantized_weights_for_humming(
                 rtol=0,
                 atol=0,
             )
-        # The Humming conversion does not rerun on the converted experts, and
-        # requantization keeps the online method: a direct weight update
-        # refuses both.
-        refusal = "online quantization" if requantize else "[Hh]umming"
-        with pytest.raises(RuntimeError, match=refusal):
-            start_reload(model)
+        if requantize:
+            # requantization keeps the online method, which a reload refuses
+            with pytest.raises(RuntimeError, match="online quantization"):
+                start_reload(model)
+            return
+        # a direct reload reruns the Humming conversion: as a fresh cold start
+        first = dict(model.named_parameters())
+        expected = dict(cold_start(2.0).named_parameters())
+        start_reload(model)
+        assert set(model.runner.routed_experts.load_weights(checkpoint(2.0)))
+        finish_reload(model, config.model_config, device)
+        actual = dict(model.named_parameters())
+        assert actual.keys() == expected.keys()
+        for name, tensor in actual.items():
+            assert tensor is first[name]
+            if tensor.is_meta:
+                continue  # checkpoint-only stand-in
+            torch.testing.assert_close(
+                tensor.reshape(-1).view(torch.uint8),
+                expected[name].reshape(-1).view(torch.uint8),
+                rtol=0,
+                atol=0,
+            )
 
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="Humming requires CUDA.")
@@ -3329,11 +3346,16 @@ def test_online_int8_moe_w2_scale_matches_unsharded(monkeypatch) -> None:
     ),
     reason="NVFP4 weight quantization needs a Blackwell (SM100) GPU.",
 )
-def test_online_nvfp4_quantizes_original_expert_weights() -> None:
+@pytest.mark.parametrize("staging_device", ["cuda", "cpu"])
+def test_online_nvfp4_quantizes_original_expert_weights(staging_device: str) -> None:
+    """CPU-staged experts (CPU weight offloading) quantize on the GPU."""
     torch.manual_seed(0)
     weight = torch.randn(2, 32, 32, device="cuda", dtype=torch.bfloat16)
 
-    quantized, block_scale, global_decode_scale = _quantize_moe_weight_to_nvfp4(weight)
+    quantized, block_scale, global_decode_scale = _quantize_moe_weight_to_nvfp4(
+        weight.to(staging_device)
+    )
+    assert quantized.is_cuda and block_scale.is_cuda and global_decode_scale.is_cuda
     global_encode_scale = 1.0 / global_decode_scale
     expected = [
         scaled_fp4_quant(
