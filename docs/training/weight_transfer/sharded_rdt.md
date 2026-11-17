@@ -22,13 +22,13 @@ A weight loader normally receives a full HF-format tensor and slices out the par
 
 That chain is the wire format. `("model.layers.0.w", (("narrow", (0, 512, 512), ()), ("t", (), ())))` tells the trainer: take this tensor, `narrow` it, transpose it, send the result. The trainer replays it with `getattr(tensor, op)(*args, **kwargs)`.
 
-Discovery is expensive, so it happens **once**, at `init_transfer_engine`, as a dry run over `model.load_weights` with every parameter on meta. Nothing is transferred; the engine just records, per leaf module, which slice feeds which destination region. Every later sync is pure replay.
+Discovery is expensive, so it happens **once**, at `init_transfer_engine`, as a dry run over `model.load_weights` with every parameter on meta, in the checkpoint layout a weight update views it back to. Nothing is transferred; the engine just records, per leaf module, which slice feeds which destination region. Every later sync is pure replay.
 
 Anything a loader does that needs real data — arithmetic, `.to()`, `.float()`, `.item()`, `.data`, bool-mask indexing — falls outside the allowlist and raises at init. That is deliberate: failing loudly during setup beats silently transferring the wrong bytes. `SUPPORTED_OPS` in `sharded_rdt_common.py` is the single table both sides derive from, so the recorder and the replayer cannot drift.
 
-### Received slices land directly in the layerwise reload buffers
+### Received slices land directly in the parameters
 
-The engine drives [layerwise reload](../layerwise.md) itself, in `start_weight_update` / `finish_weight_update`. Because the dry run already recorded each destination as an `as_strided` region of its parameter, an arriving slice is copied straight into the layer being reloaded — no full HF tensor is ever materialized on the worker, and no second pass over `load_weights` runs. Each layer is quantized and copied into its persistent kernel storage as soon as its last slice lands.
+The engine drives the weight update itself: `start_weight_update` calls `start_reload`, which views every parameter back to its checkpoint layout, and `finish_weight_update` calls `finish_reload`, which reruns post-load processing (quantization, kernel layouts). Because the dry run already recorded each destination as an `as_strided` region of its parameter in that layout, an arriving slice is copied straight into the parameter; no full HF tensor is ever materialized on the worker, and no second pass over `load_weights` runs.
 
 ### Gathers and pulls are pipelined, which is what `gather_lookahead` bounds
 

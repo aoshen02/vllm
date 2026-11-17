@@ -10,12 +10,13 @@ against `FakeRDTTensor` placeholders and record, per leaf module, how each
 destination slice is fetched (an op chain) and where it lands (an `as_strided`
 descriptor). REPLAY, every sync: no `load_weights`, no `FakeRDTTensor`
 dispatch, no discovery — pull the recorded slices in packed chunks over a ring
-of receive buffers, scatter them into freshly materialized params, then quant
-and kernel-copy. A live name with no recorded plan fails the plan build: there
-is no fallback load.
+of receive buffers and scatter them into the params, which `start_reload` viewed
+back to their checkpoint layout; `finish_reload` then reruns post-load
+processing. A live name with no recorded plan fails the plan build: there is no
+fallback load.
 
-Weights arrive in checkpoint format: the engine drives layerwise reload itself,
-in `start_weight_update` / `finish_weight_update`.
+Weights arrive in checkpoint format: the engine drives the reload itself, in
+`start_weight_update` / `finish_weight_update`.
 
 Data flow
 ---------
@@ -31,8 +32,8 @@ everything else is bookkeeping around it.
 
     PLAN      once, cached, _build_call_plan
       _Chunk    one packed pull: its scatters, deduped keys, the byte-exact
-                pack_layout, which producer serves it, and what to run after
-                (materialize / quant / free).  One per (group, owner class).
+                pack_layout, which producer serves it, and which gather groups
+                it frees.  One per (group, owner class).
       _CallPlan all chunks + pre_free.
 
     RUN       per chunk, per sync, _run_chunk_pipeline
@@ -222,20 +223,14 @@ _InitState: TypeAlias = "_InitCandidate | ShardedRDTWeightTransferEngine"
 
 @dataclass(slots=True)
 class _Chunk:
-    """One packed pull plus its post-processing (see Data flow).
-
-    A module's copies span chunks when its experts sit in several owner classes,
-    so `materialize` fires on its FIRST chunk and `quant` on its LAST --
-    materialize-once by construction, not by a runtime counter. `pack_layout`
-    mirrors the producer's rule byte-exactly.
+    """One packed pull (see Data flow). `pack_layout` mirrors the producer's
+    rule byte-exactly.
     """
 
     scatters: "list[_Scatter]"
     keys: "list[FetchKey]"
     pack_layout: "list[tuple[int, torch.dtype, int, tuple[int, ...]]]"  # off,dt,n,shape
     pack_bytes: int
-    materialize: "list[Any]"
-    quant: "list[Any]"
     free: "list[int]"
     # Trainer rank serving this chunk, resolved at plan time. One per chunk:
     # every name in it shares an owner class, so one producer holds them all.
@@ -547,18 +542,12 @@ class ShardedRDTWeightTransferEngine(
         self._completed_syncs = 0
 
         # ---- Background post-processing thread (pull/process pipelining) -------
-        # The RPC thread hands pulled buffer views to this worker, which runs
-        # materialize/scatter/quant/kernel_copy on its own stream while the next
-        # pull proceeds. drain_pending() joins it before finalize.
+        # The RPC thread hands pulled buffer views to this worker, which scatters
+        # them on its own stream while the next pull proceeds. drain_pending()
+        # joins it before finish_reload.
         self._proc_queue: Any | None = None
         self._proc_thread: Any | None = None
         self._proc_stream: Any | None = None
-        # Dedicated quant thread (pass 2): own queue + stream so quant never
-        # sits between two items' scatters on the scatter thread (measured to
-        # stall the RPC thread's slot handshake ~0.5-0.75s/iter).
-        self._quant_queue: Any | None = None
-        self._quant_thread: Any | None = None
-        self._quant_stream: Any | None = None
         self._proc_error: BaseException | None = None
 
     def init_transfer_engine(self, init_info: ShardedRDTWeightTransferInitInfo) -> None:
@@ -1042,23 +1031,19 @@ class ShardedRDTWeightTransferEngine(
         return self.parallel_config.world_size_across_dp
 
     def start_weight_update(self) -> None:
-        """Put the model's params on meta so layerwise reload streams them in
-        as each layer's slices land. Baked replay uses checkpoint format."""
-        from vllm.model_executor.model_loader.reload import (
-            initialize_layerwise_reload,
-        )
+        """View the params back to the checkpoint layout the baked replay
+        scatters into."""
+        from vllm.model_executor.model_loader.reload import start_reload
 
-        initialize_layerwise_reload(self.model)
+        start_reload(self.model)
 
     def finish_weight_update(self) -> None:
-        """Drain the deferred pull/process pipeline (so every layer is fully
-        loaded) before finalizing the layerwise reload."""
-        from vllm.model_executor.model_loader.reload import (
-            finalize_layerwise_reload,
-        )
+        """Drain the deferred pull/scatter pipeline (so every slice landed)
+        before rerunning post-load processing."""
+        from vllm.model_executor.model_loader.reload import finish_reload
 
         self.drain_pending()
-        finalize_layerwise_reload(self.model, self.model_config)
+        finish_reload(self.model, self.model_config, self.device)
 
     def update_weights(self, update_info: dict[str, Any]) -> None:
         """Receive one update. Unlike the base, does NOT issue a per-update
@@ -1236,24 +1221,18 @@ class ShardedRDTWeightTransferEngine(
         """Bake the replay plan once, as a self-driven meta dry run, into
         `state` (the engine itself when omitted).
 
-        Puts the params on meta, then drives `model.load_weights` over
-        `init_info.names` through the model's ORIGINAL loaders (the stamps
-        bypass `online_process_loader`, so `_layerwise_process` is never in
-        the path). Nothing materializes or pulls; the fake's `copy_` records
-        the source op chain and the meta destination's geometry. Afterwards one
-        scatter list per fully-loaded leaf module (copied numel == loadable
-        size) is indexed by source name; a partial or unrecordable module fails
-        the plan build. The model is restored.
-
-        This leans on layerwise internals a public API should expose first-class:
-        a currently-loading hook instead of monkeypatched stamps, a dry-run mode
-        instead of bypassing `online_process_loader`, and an
-        `abort_layerwise_reload` instead of `_restore_after_dry_run`.
+        Puts the params on meta in their checkpoint layout
+        (`meta_checkpoint_layout`), then drives `model.load_weights` over
+        `init_info.names` through stamped loaders. Nothing materializes or
+        pulls; the fake's `copy_` records the source op chain and the meta
+        destination's geometry, which is where the slice lands after
+        `start_reload`. Afterwards one scatter list per fully-loaded leaf module
+        (copied numel == loadable size) is indexed by source name; a partial or
+        unrecordable module fails the plan build. The model is restored.
         """
-        from vllm.model_executor.model_loader.reload.layerwise import (
-            initialize_layerwise_reload,
+        from vllm.model_executor.model_loader.reload.direct import (
+            meta_checkpoint_layout,
         )
-        from vllm.model_executor.model_loader.reload.utils import get_layer_size
 
         into: _InitState = self if state is None else state
         names, dtype_names, shapes = (
@@ -1271,33 +1250,32 @@ class ShardedRDTWeightTransferEngine(
         recorder = BakeSink()
 
         _t0 = time.perf_counter()
-        with torch.device(self.device):
-            # Meta-restore params + save kernel tensors (we bypass the loader
-            # wrapping it installs, below).
-            initialize_layerwise_reload(model)
-            # Stamp the *original* loaders (bypassing online_process_loader), so
-            # the single load pass runs the loaders on meta and records via the
-            # fake's copy_ — with no inline _layerwise_process, no deferral.
+        with torch.device(self.device), meta_checkpoint_layout(model):
+            # Stamp the loaders so the single load pass runs them on meta and
+            # records via the fake's copy_.
             self._install_recording_stamps(model, recorder)
-            model.load_weights(
-                self._build_fake_weights(names, recorder, self.device, into._name_meta)
-            )
-            # Keep only fully-loaded modules (copied numel >= loadable size, the
-            # test online_process_loader uses): a partial module leaves unwritten
-            # regions that finalize would init, so baking it scatters garbage.
+            try:
+                model.load_weights(
+                    self._build_fake_weights(
+                        names, recorder, self.device, into._name_meta
+                    )
+                )
+            finally:
+                self._remove_recording_stamps(model)
+            # Keep only fully-loaded modules (copied numel >= loadable size): a
+            # partial module leaves regions of the checkpoint layout unwritten.
             for module, recorded in recorder.copies_by_layer.items():
                 if not recorded or any(c is None for c in recorded):
                     continue  # unrecordable copy_ -> slow path
                 # Guard above guarantees every entry is a real _Scatter.
                 copies = cast("list[_Scatter]", recorded)
                 copied = sum(prod(c.shape) for c in copies)
-                if copied < get_layer_size(module):
+                if copied < _loadable_numel(module):
                     continue  # partial -> slow path
                 for c in copies:
                     # Every name of the module shares ONE list, so identity
                     # dedups them back to one module at plan time.
                     into._name_to_plan[c.src[0]] = copies
-            self._restore_after_dry_run(model)
 
         # Names whose copy_ fired during the bake. Names not in here no-op for
         # this worker (e.g. foreign-EP experts) and are skipped; live names that
@@ -1321,16 +1299,11 @@ class ShardedRDTWeightTransferEngine(
         """Wrap each loadable param's `weight_loader` to stamp
         `recorder.current = (leaf_module, param_name)` before delegating to the
         original loader, so the fake's `copy_` can attribute each recorded copy.
-        `functools.wraps` keeps the loader's real signature (so vLLM's
-        `_layerwise_process` `param` redirect still works if a stamp leaks),
-        and `_rdt_stamp_inner` tags it so `_restore_after_dry_run` can unwrap it.
+        `functools.wraps` keeps the loader's real signature, and
+        `_rdt_stamp_inner` tags it so `_remove_recording_stamps` can unwrap it.
         """
         import functools
 
-        from vllm.model_executor.model_loader.reload.layerwise import (
-            _get_original_loader,
-        )
-        from vllm.model_executor.model_loader.reload.utils import get_layer_tensors
         from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
         def _make_stamp(layer, name, inner, added=False):
@@ -1342,14 +1315,14 @@ class ShardedRDTWeightTransferEngine(
                 finally:
                     recorder.current = None
 
-            # Tag so _restore_after_dry_run can detect and unwrap leaked stamps,
+            # Tag so _remove_recording_stamps can detect and unwrap leaked stamps,
             # and so a second bake doesn't double-wrap.
             stamp._rdt_stamp_inner = inner  # type: ignore[attr-defined]
             stamp._rdt_stamp_added = added  # type: ignore[attr-defined]
             return stamp
 
         for module in model.modules():
-            for name, tensor in get_layer_tensors(module).items():
+            for name, tensor in _tensors(module).items():
                 if getattr(tensor, "weight_loader", None) is None:
                     # A param with NO loader (e.g. GLM's router bias, a plain
                     # nn.Parameter) is still loaded by the model's load_weights
@@ -1362,34 +1335,14 @@ class ShardedRDTWeightTransferEngine(
                         module, name, default_weight_loader, added=True
                     )
                     continue
-                # Bypass online_process_loader: stamp the *original* loader.
-                original = _get_original_loader(tensor)
-                tensor.weight_loader = _make_stamp(module, name, original)
+                tensor.weight_loader = _make_stamp(module, name, tensor.weight_loader)
 
-    def _restore_after_dry_run(self, model: torch.nn.Module) -> None:
-        """Restore each layerwise layer's saved kernel tensors without pulling
-        (a real `finalize_layerwise_reload` would materialize/load) and reset
-        its info. Also unwrap any recording `stamp` left on the params, since a
-        leaked stamp would sit under the next sync's `online_process_loader` and
-        silently break `_layerwise_process`'s `param` redirect.
-        """
-        from vllm.model_executor.model_loader.reload.layerwise import (
-            LAYERWISE_INFO,
-            _place_kernel_tensors,
-        )
-        from vllm.model_executor.model_loader.reload.utils import get_layer_tensors
-
-        for layer in model.modules():
-            info = LAYERWISE_INFO.get(layer)
-            if info is not None and info.can_load():
-                if info.kernel_tensors is not None:
-                    _place_kernel_tensors(layer, info)
-                info.reset()
-        # Unwrap any recording stamps left on the (now-restored) params so they
-        # never leak into a later update_weights. ``_rdt_stamp_inner`` is set by
-        # ``_install_recording_stamps``; unwrap repeatedly in case of nesting.
+    def _remove_recording_stamps(self, model: torch.nn.Module) -> None:
+        """Unwrap the recording stamps so they never leak into a later
+        update_weights. `_rdt_stamp_inner` is set by
+        `_install_recording_stamps`; unwrap repeatedly in case of nesting."""
         for module in model.modules():
-            for _name, tensor in get_layer_tensors(module).items():
+            for _name, tensor in _tensors(module).items():
                 loader = getattr(tensor, "weight_loader", None)
                 added = False
                 while loader is not None and hasattr(loader, "_rdt_stamp_inner"):
@@ -1400,8 +1353,6 @@ class ShardedRDTWeightTransferEngine(
                     # The stamp was ATTACHED to a param that had no loader
                     # (see _install_recording_stamps); leave none behind.
                     del tensor.weight_loader
-        if hasattr(model, "_original_do_torchao_reload"):
-            model._do_torchao_reload = model._original_do_torchao_reload
 
     # ---------------- Background post-processing (pull/process pipeline) -------
 
@@ -1432,13 +1383,6 @@ class ShardedRDTWeightTransferEngine(
         )
         self._proc_thread = t
         t.start()
-        self._quant_stream = torch.cuda.Stream(device=self.device)
-        self._quant_queue = queue.Queue()
-        qt = threading.Thread(
-            target=self._quant_worker_loop, name="rdt-quant", daemon=True
-        )
-        self._quant_thread = qt
-        qt.start()
 
     def _proc_worker_loop(self) -> None:
         """Single persistent thread: run each queued item's process phase on the
@@ -1482,19 +1426,11 @@ class ShardedRDTWeightTransferEngine(
     def drain_pending(self) -> None:
         """Block until the background thread has processed every queued item and
         its stream work is complete, then re-raise any error it hit. Called from
-        the worker's `finish_weight_update` before `finalize_layerwise_reload`
-        so every baked layer is fully loaded (and `info.reset()`-ed) first."""
+        `finish_weight_update` before `finish_reload` so every slice landed."""
         if self._proc_queue is not None:
             self._proc_queue.join()  # every put() item task_done()'d
-        # The scatter thread feeds the quant thread, so join it SECOND (all
-        # completed-group batches have been put by now), then sync both streams
-        # so finalize sees fully-materialized, quanted, reset layers.
-        if self._quant_queue is not None:
-            self._quant_queue.join()
         if self._proc_stream is not None:
             self._proc_stream.synchronize()
-        if self._quant_stream is not None:
-            self._quant_stream.synchronize()
         self._raise_proc_error()
         # Ensure every fired free_group signal has EXECUTED on
         # the producer before the sync ends: ``begin_sync`` resets the producer's
@@ -1537,8 +1473,7 @@ class ShardedRDTWeightTransferEngine(
         which is exactly what an owner class is. The cut is a pure function of
         the bake and the ownership table (the router in `state`, the engine's
         when omitted). Copy order within a chunk is bake order, and a module's
-        copies may span chunks (materialize/quant fire on its first/last chunk;
-        see `_build_call_plan`)."""
+        copies may span chunks."""
         router = (self if state is None else state)._router
         assert router is not None
         by_class: dict[int, list[_Scatter]] = {}
@@ -1557,17 +1492,14 @@ class ShardedRDTWeightTransferEngine(
         router in `state` (the engine's own when omitted).
 
         Pure — no pulls, no engine state touched — so the result is cached and
-        reused every sync. Three passes:
+        reused every sync. Two passes:
           1. Split `names` into gather groups, one chunk per owner class
              present in this worker's baked copies, recording each group's last
              chunk for its `free_group` signal (or `pre_free` when this worker
              pulls nothing from it). Every group is signaled exactly once by
              construction. The stream has no per-group call boundaries, so group
              L+1's first chunk issues while L's still stream.
-          2. Per leaf module, find its FIRST and LAST chunk — materialize on the
-             first, quant/kernel/reset on the last, correct by construction
-             instead of by runtime counters.
-          3. Assemble `_Chunk`s: dedup keys and precompute the packed layout.
+          2. Assemble `_Chunk`s: dedup keys and precompute the packed layout.
         """
         baked: _InitState = self if state is None else state
         router = baked._router
@@ -1612,24 +1544,7 @@ class ShardedRDTWeightTransferEngine(
                 "the synced set."
             )
 
-        # --- pass 2: per-module first/last chunk -> materialize/quant ----------
-        first_at: dict[int, int] = {}
-        last_at: dict[int, int] = {}
-        layer_by_id: dict[int, Any] = {}
-        for ci, scatters in enumerate(raw_chunks):
-            for sc in scatters:
-                lid = id(sc.layer)
-                layer_by_id[lid] = sc.layer
-                first_at.setdefault(lid, ci)
-                last_at[lid] = ci
-        materialize_at: dict[int, list[Any]] = {}
-        quant_at: dict[int, list[Any]] = {}
-        for lid, ci in first_at.items():
-            materialize_at.setdefault(ci, []).append(layer_by_id[lid])
-        for lid, ci in last_at.items():
-            quant_at.setdefault(ci, []).append(layer_by_id[lid])
-
-        # --- pass 3: assemble _Chunks (dedup keys + precompute pack layout) ----
+        # --- pass 2: assemble _Chunks (dedup keys + precompute pack layout) ----
         from collections import defaultdict
 
         chunks: list[_Chunk] = []
@@ -1657,8 +1572,6 @@ class ShardedRDTWeightTransferEngine(
                     keys=keys,
                     pack_layout=pack_layout,
                     pack_bytes=cur,
-                    materialize=materialize_at.get(ci, []),
-                    quant=quant_at.get(ci, []),
                     free=free_at.get(ci, []),
                     # Every name of a chunk shares an owner class and a group,
                     # so any of them resolves the same producer.
@@ -1746,18 +1659,16 @@ class ShardedRDTWeightTransferEngine(
         )
 
     def _process_item(self, item: "_ProcItem") -> None:
-        """Scatter-thread half: materialize this chunk's first-seen modules,
-        scatter its slices on the process stream, publish the slot, then hand the
-        modules it COMPLETES to the quant thread.
+        """Scatter-thread half: scatter this chunk's slices into the params on
+        the process stream, then publish the slot.
 
-        Mirrors `_layerwise_process` minus the loader replay. Once every scatter
-        reading `item.slot` is enqueued, records the slot's read-done event so
-        the RPC thread can block on it before overwriting the slot.
+        Once every scatter reading `item.slot` is enqueued, records the slot's
+        read-done event so the RPC thread can block on it before overwriting
+        the slot.
         """
-        from vllm.model_executor.model_loader.reload.layerwise import (
-            LAYERWISE_INFO,
+        from vllm.model_executor.model_loader.reload.direct import (
+            direct_reload_active,
         )
-        from vllm.model_executor.model_loader.reload.meta import materialize_layer
 
         results = item.results
         chunk = item.chunk
@@ -1766,23 +1677,12 @@ class ShardedRDTWeightTransferEngine(
             torch.cuda.stream(self._proc_stream),
             torch.device(self.device),
         ):
-            # PASS 1 — slot readers: materialize the modules whose FIRST scatter
-            # is in this chunk (empty HF params, once per module by construction)
-            # then scatter this chunk's copies. The scatter copies are the ONLY
-            # reads of the receive buffer; quant and kernel-copy operate on the
-            # scattered params. Releasing the slot right after the scatters lets
-            # the NEXT chunk's RDMA overwrite the buffer while quant still runs.
             try:
-                for layer in chunk.materialize:
-                    info = LAYERWISE_INFO.get(layer)
-                    if info is None or not info.can_load():
-                        raise RuntimeError(
-                            f"Baked replay: layer {type(layer).__name__} "
-                            "was not set up for reload this sync "
-                            "(start_weight_update must run before "
-                            "update_weights)."
-                        )
-                    materialize_layer(layer, info)
+                if not direct_reload_active(self.model):
+                    raise RuntimeError(
+                        "Baked replay: the model is not being reloaded "
+                        "(start_weight_update must run before update_weights)."
+                    )
                 for sc in chunk.scatters:
                     param = getattr(sc.layer, sc.param_name)
                     # Through .data, exactly like default_weight_loader: params
@@ -1802,71 +1702,6 @@ class ShardedRDTWeightTransferEngine(
                 # Publish even on error so the RPC thread's generation wait
                 # unblocks (the failure itself surfaces via _raise_proc_error).
                 self._mark_slot_done(item.slot)
-
-            # PASS 2 — param readers only: quant / kernel-copy / reset for the
-            # modules whose LAST scatter is in this chunk. Handed to the
-            # DEDICATED quant thread (own CUDA stream, event-chained after this
-            # chunk's scatters) so it never delays this thread's next pass-1.
-            # Running it in order here stalls the RPC thread's slot handshake by
-            # ~0.5-0.75s/iter, since every group's quant delays the next publish.
-            if chunk.quant:
-                ready = torch.Event()
-                ready.record(self._proc_stream)
-                if self._quant_queue is None:
-                    self._run_quant(chunk.quant, ready)
-                else:
-                    self._quant_queue.put((chunk.quant, ready))
-
-    def _run_quant(self, layers: "list[Any]", ready: "torch.Event") -> None:
-        """Quant/kernel-copy/reset the given COMPLETED leaf modules through the
-        same `_process_loaded_layer` as _layerwise_process. Runs on the quant
-        thread's own stream, ordered after the modules' scatters via `ready`;
-        touches only the scattered params (never a receive slot), so it can
-        overlap subsequent chunks' RDMA and scatters. The `info.reset()` in
-        there is what makes finalize skip the layer — drain_pending joins the
-        quant queue before finalize runs."""
-        from vllm.model_executor.model_loader.reload.layerwise import (
-            LAYERWISE_INFO,
-            _process_loaded_layer,
-        )
-        from vllm.model_executor.model_loader.reload.utils import get_layer_tensors
-
-        stream = self._quant_stream or self._proc_stream
-        assert stream is not None  # created in _ensure_proc_worker before use
-        with (
-            torch.accelerator.device_index(self.device.index),
-            torch.cuda.stream(stream),
-            torch.device(self.device),
-        ):
-            stream.wait_event(ready)
-            for layer in layers:
-                info = LAYERWISE_INFO.get(layer)
-                assert info is not None  # completed leaf module is set up for reload
-                # The layer tensors were allocated on the process stream, but
-                # this stream reads and then drops them. Keep their storage live
-                # until those reads complete.
-                for tensor in get_layer_tensors(layer).values():
-                    if tensor.is_cuda:
-                        tensor.record_stream(stream)
-                _process_loaded_layer(layer, info)
-
-    def _quant_worker_loop(self) -> None:
-        """Dedicated quant thread: drains (completed_modules, scatter-done event)
-        batches. Errors surface via _proc_error like the scatter thread's."""
-        torch.accelerator.set_device_index(self.device.index)
-        q = self._quant_queue
-        assert q is not None
-        while True:
-            batch = q.get()
-            try:
-                if batch is None:
-                    return
-                self._run_quant(*batch)
-            except BaseException as e:  # noqa: BLE001 - surfaced on the RPC thread
-                self._proc_error = e
-                logger.exception("RDT quant thread failed")
-            finally:
-                q.task_done()
 
     def shutdown(self) -> None:
         # Stop the background post-processing thread (drain, then sentinel + join)
@@ -1891,13 +1726,6 @@ class ShardedRDTWeightTransferEngine(
             self._proc_thread = None
             self._proc_queue = None
             self._proc_stream = None
-        if self._quant_thread is not None:
-            assert self._quant_queue is not None
-            self._quant_queue.put(None)  # sentinel
-            self._quant_thread.join(timeout=30)
-            self._quant_thread = None
-            self._quant_queue = None
-            self._quant_stream = None
         # Give every host slot back (NIXL deregistration, then cudaHostUnregister)
         # before the pool is dropped below; GPU slots keep their process-lifetime
         # NIXL registration as before.
@@ -1927,6 +1755,27 @@ class ShardedRDTWeightTransferEngine(
         # process lifetime (dropping the tensors just drops our strong refs);
         # host slots were released above.
         self._dest_buffers = [{} for _ in range(self._num_slots)]
+
+
+def _tensors(module: torch.nn.Module) -> dict[str, torch.Tensor]:
+    """A module's own parameters and buffers."""
+    return {
+        name: t
+        for name, t in (*module._parameters.items(), *module._buffers.items())
+        if t is not None
+    }
+
+
+def _loadable_numel(module: torch.nn.Module) -> int:
+    """Checkpoint elements the module's loaders write, excluding declared
+    padding and tensors no loader writes (expert maps)."""
+    from vllm.model_executor.model_loader.reload.meta import SKIP_LOAD_TENSORS
+
+    return sum(
+        getattr(t, "weight_loader_numel", t.numel())
+        for name, t in _tensors(module).items()
+        if name not in SKIP_LOAD_TENSORS
+    )
 
 
 def _stage_components(
@@ -1960,9 +1809,9 @@ def _stage_components(
 
 
 def _check_streams(chunks: "list[_Chunk]") -> None:
-    """Refuse streams that split a leaf module's loading, which would break its
-    materialize-first, quant-last order. Owners and gather groups need no check:
-    `_build_call_plan` gives each owner component one stream by construction.
+    """Refuse streams that split a leaf module's loading. Owners and gather
+    groups need no check: `_build_call_plan` gives each owner component one
+    stream by construction.
     """
     seen: dict[int, tuple[int, str]] = {}
     for chunk in chunks:

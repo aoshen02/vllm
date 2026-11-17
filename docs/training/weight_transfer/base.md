@@ -396,8 +396,8 @@ Subclasses must implement five methods:
 | Method | Description |
 | ------ | ----------- |
 | `init_transfer_engine(init_info)` | Initialize the communication channel on each inference worker, and record the trainer-supplied wire params |
-| `start_weight_update()` | Prepare for an update (e.g. begin layerwise reload); no-op for in-place engines |
-| `finish_weight_update()` | Finalize the update (e.g. finalize layerwise reload); no-op for in-place engines |
+| `start_weight_update()` | Prepare for an update (e.g. `start_reload`); no-op for in-place engines |
+| `finish_weight_update()` | Finalize the update (e.g. `finish_reload`); no-op for in-place engines |
 | `receive_weights(update_info)` | Receive weights and load them into `self.model` |
 | `shutdown()` | Clean up resources |
 
@@ -424,15 +424,15 @@ The base class provides:
 
     Callers that go through `finish_weight_update` need do nothing; the engine
     drains there. A caller that drives the tail itself — running its own
-    `finalize_layerwise_reload`, say — must check the flag and call
+    `finish_reload`, say — must check the flag and call
     `drain_pending()` first, because with it set a returned `update_weights`
     means *queued*, not *applied*. `drain_pending()` is idempotent, and a no-op
     on an engine that processes synchronously, so it is always safe to call.
 
     [Sharded RDT](sharded_rdt.md) is the built-in engine that sets it: it
-    scatters and quantizes on background threads with their own CUDA streams, so
-    its `drain_pending()` joins both queues and syncs both streams before
-    `finalize_layerwise_reload` runs.
+    scatters on a background thread with its own CUDA stream, so its
+    `drain_pending()` joins that queue and syncs that stream before
+    `finish_reload` runs.
 
 ### Request Classes
 
@@ -501,12 +501,12 @@ class MyWeightTransferEngine(WeightTransferEngine[MyInitInfo, MyUpdateInfo]):
         ...
 
     def start_weight_update(self) -> None:
-        # Checkpoint-format engines: run initialize_layerwise_reload(self.model).
+        # Checkpoint-format engines: run start_reload(self.model).
         # In-place engines: no-op
         ...
 
     def finish_weight_update(self) -> None:
-        # Checkpoint-format engines: run finalize_layerwise_reload(...).
+        # Checkpoint-format engines: run finish_reload(...).
         # In-place engines: no-op
         ...
 
