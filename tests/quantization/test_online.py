@@ -1412,6 +1412,7 @@ def test_online_requantized_moe_padding(
         "mxfp4",
         "mxfp8",
         {"weight": "int8_per_channel_static"},
+        "lut_b",
     ],
     ids=[
         "fp8_per_tensor",
@@ -1420,6 +1421,7 @@ def test_online_requantized_moe_padding(
         "mxfp4",
         "mxfp8",
         "int8",
+        "lut_b",
     ],
 )
 def test_online_requantized_moe_reload(

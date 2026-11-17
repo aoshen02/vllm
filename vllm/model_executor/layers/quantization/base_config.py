@@ -417,8 +417,12 @@ def resolve_quant_method(
         # the checkpoint scheme, before an online method sets its own
         source_scheme = getattr(layer, "scheme", None)
         online_quant_method = online_config.get_quant_method(layer, prefix)
-        if not isinstance(online_quant_method, (OnlineLinearBase, OnlineMoEMethodBase)):
-            # quantizes on load: dequantize the checkpoint tensors as they load
+        if not isinstance(
+            online_quant_method, (OnlineLinearBase, OnlineMoEMethodBase)
+        ) or getattr(online_quant_method, "supports_direct_reload", False):
+            # quantizes on load (a checkpoint method, or an online method that
+            # loads full precision tensors itself): dequantize the checkpoint
+            # tensors as they load
             from vllm.model_executor.layers.quantization.online.loading import (
                 requantize_on_load,
             )
