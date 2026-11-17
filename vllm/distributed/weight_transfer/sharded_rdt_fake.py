@@ -71,15 +71,12 @@ class _Scatter:
 def _meta_copy_(dest: torch.Tensor, src: "FakeRDTTensor") -> torch.Tensor:
     """Fire `dest.copy_` from a zero-storage meta source of `src`'s geometry.
 
-    Moves no data but still counts against the layer's loaded numel, which drives
-    `_layerwise_process`; skipping it would leave the layer looking unloaded
-    forever.
+    Moves no data; the loader sees the copy happen as on a real load.
 
-    A non-meta `dest` is one the layerwise reload never moved there (the
-    `SKIP_LOAD_TENSORS` set, e.g. GLM's router bias). Torch forbids
-    `real.copy_(meta)`, and skipping the count is consistent -- `get_layer_size`
-    excludes the same set. The caller still RECORDS the copy, so the replay writes
-    the real param.
+    A non-meta `dest` is one the bake left real (a tensor shared from another
+    model, or an expert map). Torch forbids `real.copy_(meta)`, so nothing is
+    copied. The caller still RECORDS the copy, so the replay writes the real
+    param.
     """
     if not dest.is_meta:
         return dest

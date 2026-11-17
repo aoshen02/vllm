@@ -68,8 +68,6 @@ from vllm.distributed.weight_transfer.sharded_rdt_trainer import (
     ShardedRDTTrainerInitInfo,
     ShardedRDTTrainerWeightTransferEngine,
 )
-from vllm.model_executor.model_loader.reload.layerwise import LAYERWISE_INFO
-from vllm.model_executor.model_loader.reload.types import LayerReloadingInfo
 from vllm.platforms import current_platform
 
 META = torch.device("meta")
@@ -957,34 +955,6 @@ class TestBuildCallPlan:
         plan = eng._build_call_plan(names, [4])
         assert len(plan.chunks) == 3  # replicated, w2's class, w3's class
 
-    def test_materialize_fires_on_a_modules_first_chunk_only(self):
-        """Empty HF params are allocated once per module, by construction —
-        including a FusedMoE-like module whose copies span owner-class chunks."""
-        layer = _FakeLayer("spanning")
-        names = [f"w{i}" for i in range(4)]
-        copies = [_copy(n, shape=(4,)) for n in names]
-        mod_plan = _module(layer, copies)
-        eng = _planner(
-            {n: mod_plan for n in names},
-            name_meta={n: ("bfloat16", [4]) for n in names},
-            held_by={"w0": [0], "w1": [0], "w2": [1], "w3": [1]},
-        )
-        plan = eng._build_call_plan(names, [4])
-        assert [c.materialize for c in plan.chunks] == [[layer], []]
-
-    def test_quant_defers_to_a_modules_last_chunk(self):
-        layer = _FakeLayer("spanning")
-        names = [f"w{i}" for i in range(4)]
-        copies = [_copy(n, shape=(4,)) for n in names]
-        mod_plan = _module(layer, copies)
-        eng = _planner(
-            {n: mod_plan for n in names},
-            name_meta={n: ("bfloat16", [4]) for n in names},
-            held_by={"w0": [0], "w1": [0], "w2": [1], "w3": [1]},
-        )
-        plan = eng._build_call_plan(names, [4])
-        assert [c.quant for c in plan.chunks] == [[], [layer]]
-
     def test_free_signal_fires_on_each_groups_last_chunk(self):
         baked, name_meta, names, group_lens = _one_module_per_layer(2)
         eng = _planner(baked, name_meta=name_meta)
@@ -1060,7 +1030,6 @@ class TestBuildCallPlan:
         )
         plan = eng._build_call_plan(names, [3])
         (chunk,) = plan.chunks
-        assert chunk.materialize == [layer]
         assert len(chunk.scatters) == 3
 
     def test_plan_is_a_pure_function_of_its_inputs(self):
@@ -1307,9 +1276,9 @@ class TestSignalCompleteness:
         assert len(plans["round_robin"].chunks) == 2 + 2 * 5  # 2 layers x (1 + 4)
         assert self._signals(plans["linear"]) == self._signals(plans["round_robin"])
 
-    def test_the_fused_module_materializes_first_and_quants_last_across_chunks(self):
+    def test_the_fused_module_spans_every_owner_class_chunk(self):
         """The FusedMoE shape: one module's copies span every owner-class chunk of
-        its group; materialize on its first, quant on its last."""
+        its group."""
         eng, names, group_lens = self._moe_planner(
             worker_experts=[0, 2, 4, 6], n_layers=1
         )
@@ -1321,10 +1290,8 @@ class TestSignalCompleteness:
             if any("experts" in sc.src[0] for sc in c.scatters)
         ]
         assert len(fused_chunks) == 4
-        (fused_layer,) = fused_chunks[0].materialize
-        assert fused_layer.tag == "moe0"
-        assert fused_chunks[0].quant == []
-        assert fused_chunks[-1].quant == [fused_layer]
+        layers = {sc.layer.tag for c in fused_chunks for sc in c.scatters}
+        assert "moe0" in layers
 
 
 # ---------------------------------------------------------------------------
@@ -1639,8 +1606,10 @@ def _bake_probe(self, model_name):  # noqa: PLR0915  (runs in the vLLM worker)
         ShardedRDTWeightTransferEngine,
         ShardedRDTWeightTransferInitInfo,
     )
-    from vllm.model_executor.model_loader.reload.layerwise import LAYERWISE_INFO
-    from vllm.model_executor.model_loader.reload.utils import get_layer_tensors
+
+    def get_layer_tensors(mod):
+        tensors = {**mod._parameters, **mod._buffers}
+        return {n: t for n, t in tensors.items() if t is not None}
 
     model = self.model_runner.model
     device = next(model.parameters()).device
@@ -1764,32 +1733,9 @@ def _bake_probe(self, model_name):  # noqa: PLR0915  (runs in the vLLM worker)
     # (3) replaying the recorded op chains reproduces that same load
     scatters = {id(v): v for v in eng._name_to_plan.values()}
 
-    # No deferred-attention layer may be a plan target. The engine's quant
-    # thread calls `info.reset()` on every module it processes, which makes
-    # finalize_layerwise_reload SKIP that module -- and finalize is the only
-    # thing that calls the LAYER's process_weights_after_loading, which is where
-    # MLA derives W_UK_T/W_UV from kv_b_proj. An attention layer in the plan
-    # would therefore leave those derived weights stale after a sync, silently.
-    from vllm.model_executor.layers.attention import is_deferred_attention_layer
-
-    attn_in_plan = sorted(
-        {
-            type(c.layer).__name__
-            for plan in scatters.values()
-            for c in plan
-            if is_deferred_attention_layer(c.layer)
-        }
-    )
-    assert not attn_in_plan, (
-        f"plan targets deferred-attention layer(s) {attn_in_plan}; the quant "
-        f"thread would reset them and finalize would skip their "
-        f"process_weights_after_loading, staling any derived weights"
-    )
-
-    # Regions address each param's layout during the bake: the reload metadata's
-    # checkpoint format (what a sync materializes), which the live kernel-format
-    # param may not share, e.g. under ROCm MoE padding. Tensors never put on
-    # meta were baked against the live param itself.
+    # Regions address each param's checkpoint layout (what `start_reload` views
+    # it back to), which the live kernel-format param may not share, e.g. under
+    # ROCm MoE padding. Tensors without one were baked against the live param.
     touched = set()
     restrided = 0
     _poison()
@@ -1805,17 +1751,19 @@ def _bake_probe(self, model_name):  # noqa: PLR0915  (runs in the vLLM worker)
                 key = (id(c.layer), c.param_name)
                 if key not in staged:
                     dest = getattr(c.layer, c.param_name)
-                    params, buffers = LAYERWISE_INFO[c.layer].restore_metadata
-                    fmt = {**params, **buffers}.get(c.param_name)
+                    recorded = getattr(dest, "_ckpt", None)
                     scratch = dest
-                    if fmt is not None:
-                        scratch = torch.empty_strided(
-                            fmt.shape,
-                            fmt.stride(),
-                            dtype=dest.dtype,
-                            device=dest.device,
-                        ).copy_(dest)
-                        restrided += fmt.stride() != dest.stride()
+                    if recorded is not None:
+                        shape, stride, _, offset = recorded[1]
+                        span = 1 + sum((n - 1) * s for n, s in zip(shape, stride))
+                        scratch = (
+                            torch.empty(
+                                offset + span, dtype=dest.dtype, device=dest.device
+                            )
+                            .as_strided(shape, stride, offset)
+                            .copy_(dest)
+                        )
+                        restrided += tuple(stride) != dest.stride()
                     staged[key] = (dest, scratch)
                 staged[key][1].as_strided(c.shape, c.stride, c.offset).copy_(t)
                 touched.add(param_name_of[key])
@@ -1827,9 +1775,9 @@ def _bake_probe(self, model_name):  # noqa: PLR0915  (runs in the vLLM worker)
     # The plan owns everything with a checkpoint source. Anything else the model
     # ends up holding is DERIVED -- under MLA, `process_weights_after_loading`
     # splits kv_b_proj into W_UK_T/W_UV via `replace_parameter` -- and belongs to
-    # finalize_layerwise_reload, which `finish_weight_update` runs after the
-    # replay. So the uncovered set must contain only params owned by a module
-    # that post-processes; a plain loadable weight going missing still fails.
+    # finish_reload, which `finish_weight_update` runs after the replay. So the
+    # uncovered set must contain only params owned by a module that
+    # post-processes; a plain loadable weight going missing still fails.
     post_processed = {
         id(mod)
         for mod in model.modules()
@@ -1888,8 +1836,6 @@ def _chunk(
         keys=[(key, ())],
         pack_layout=[(0, torch.uint8, nbytes, (nbytes,))],
         pack_bytes=nbytes,
-        materialize=[],
-        quant=[],
         free=list(free or []),
         owner=owner,
         seq=seq,
@@ -2744,7 +2690,7 @@ def test_ray_floor_depends_on_staging_mode(
 
 
 # ---------------------------------------------------------------------------
-# CUDA: host-staged scatter copies, receive-slot lifetime, quant-stream lifetime
+# CUDA: host-staged scatter copies, receive-slot lifetime
 # ---------------------------------------------------------------------------
 
 SLICE = 64 << 20
@@ -2788,6 +2734,7 @@ def host_scatter(monkeypatch):
     )
 
     engine = consumer_engine(device=device)
+    engine.model._direct_reload_begun = True  # as start_weight_update leaves it
 
     layer = torch.nn.Module()
     layer.weight = torch.nn.Parameter(
@@ -2808,8 +2755,6 @@ def host_scatter(monkeypatch):
         keys=[("w", ())],
         pack_layout=[(0, torch.uint8, SLICE, (SLICE,))],
         pack_bytes=SLICE,
-        materialize=[],
-        quant=[],
         free=[],
         owner=0,
     )
@@ -2911,53 +2856,6 @@ def test_the_slot_is_pulled_into_again_only_after_its_copy_ran(
     host_scatter.slot.zero_()
     host_scatter.engine._proc_stream.synchronize()
     assert torch.equal(host_scatter.layer.weight.cpu(), host_scatter.pattern)
-
-
-@requires_cuda
-def test_a_layers_kernel_copy_is_not_overwritten_by_the_next_layer():
-    device = torch.device("cuda", 0)
-    torch.accelerator.set_device_index(device)
-    engine = consumer_engine(device=device)
-    engine._proc_stream = torch.cuda.Stream(device=device)
-    engine._quant_stream = torch.cuda.Stream(device=device)
-    kernel = torch.nn.Parameter(
-        torch.zeros(NUMEL, dtype=torch.bfloat16, device=device),
-        requires_grad=False,
-    )
-    torch.accelerator.synchronize()
-
-    # The layer as materialize_layer leaves it and the scatter fills it.
-    layer = torch.nn.Module()
-    with torch.cuda.stream(engine._proc_stream):
-        loaded = torch.full((NUMEL,), 1.0, dtype=torch.bfloat16, device=device)
-        layer.weight = torch.nn.Parameter(loaded, requires_grad=False)
-        ready = torch.cuda.Event()
-        ready.record(engine._proc_stream)
-    loaded_ptr = loaded.data_ptr()
-    del loaded
-    LAYERWISE_INFO[layer] = LayerReloadingInfo(
-        restore_metadata=({}, {}),
-        restore_device=device,
-        kernel_tensors=({"weight": kernel}, {}),
-    )
-    engine._proc_stream.synchronize()
-
-    _hold(engine._quant_stream, HOLD_SECONDS)
-    engine._run_quant([layer], ready)
-
-    # The next layer, materialized and scattered on the process stream.
-    with torch.cuda.stream(engine._proc_stream):
-        following = torch.empty(NUMEL, dtype=torch.bfloat16, device=device)
-        following.fill_(2.0)
-    reused = following.data_ptr() == loaded_ptr
-    engine._quant_stream.synchronize()
-    engine._proc_stream.synchronize()
-
-    assert layer.weight is kernel
-    assert torch.equal(kernel, torch.full_like(kernel, 1.0)), (
-        "the kernel tensor holds the next layer's bytes: its source was reused "
-        f"before the quant stream's copy read it (memory reused: {reused})"
-    )
 
 
 @pytest.mark.skipif(
