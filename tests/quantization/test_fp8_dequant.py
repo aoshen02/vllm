@@ -79,10 +79,9 @@ def _ptrs(model: torch.nn.Module) -> dict[str, int]:
     return {n: p.data_ptr() for n, p in model.named_parameters()}
 
 
-def _reload(model, ckpt, mode, model_config, monkeypatch, reverse=False):
+def _reload(model, ckpt, model_config, reverse=False):
     """Send every tensor in its own `load_weights` call, as RL updates do
     (`reverse`: weights before their scales)."""
-    monkeypatch.setenv("VLLM_RELOAD_MODE", mode)
     start_reload(model)
     items = list(ckpt.items())
     for item in reversed(items) if reverse else items:
@@ -187,19 +186,17 @@ def test_mla_cold_start_separate_calls(model_config, scheme, scales_first):
 
 
 @pytest.mark.parametrize("scheme", list(_SCALE))
-@pytest.mark.parametrize("mode", ["direct", "layerwise"])
-def test_mla_reload_equals_cold_start(monkeypatch, model_config, scheme, mode):
+def test_mla_reload_equals_cold_start(model_config, scheme):
     """Direct reload views the BF16 storage back to the FP8 checkpoint layout
     (a dtype and size change); layerwise reload restages the FP8 layer. Both
     dequantize the new tensors at the cold-start addresses. An update may
     send the weights in BF16 instead, without scales."""
-    monkeypatch.setenv("VLLM_RELOAD_MODE", mode)
     model = _mla_cold_start(_mla_checkpoint(1, scheme), scheme, model_config)
     ptrs = _ptrs(model)
     for seed, bf16 in ((2, False), (3, True), (4, False)):
         new = _mla_checkpoint(seed, scheme)
         expected = _mla_expected(new)
-        _reload(model, _as_bf16(new) if bf16 else new, mode, model_config, monkeypatch)
+        _reload(model, _as_bf16(new) if bf16 else new, model_config)
         _assert_mla(model, expected)
         assert _ptrs(model) == ptrs
 
@@ -359,12 +356,10 @@ def test_indexer_fused_weight(model_config, layout, scales_first):
         if lay != "bf16" or cold == "fp8"
     ],
 )
-@pytest.mark.parametrize("mode", ["direct", "layerwise"])
-def test_indexer_reload_fp8_or_bf16(monkeypatch, model_config, layout, cold, mode):
+def test_indexer_reload_fp8_or_bf16(model_config, layout, cold):
     """Each load sends `wk` whole, either in the checkpoint's FP8 layout or
     in BF16 without a scale (as RL trainers do). Every reload ends with the
     dequantized weight in the fused rows, at the cold-start addresses."""
-    monkeypatch.setenv("VLLM_RELOAD_MODE", mode)
     sent = [layout, "bf16", layout] if cold == "fp8" else ["bf16", layout, "bf16"]
     old, _ = _indexer_checkpoint(11, sent[0])
     model = _indexer_cold_start(old, layout, model_config)
@@ -372,7 +367,7 @@ def test_indexer_reload_fp8_or_bf16(monkeypatch, model_config, layout, cold, mod
     ptrs = _ptrs(model)
     for seed, fmt in enumerate(sent[1:] * 2, start=12):
         new, expected = _indexer_checkpoint(seed, fmt)
-        _reload(model, new, mode, model_config, monkeypatch, reverse=seed % 2 == 1)
+        _reload(model, new, model_config, reverse=seed % 2 == 1)
         fused = model.indexer.wk_weights_proj.weight
         torch.testing.assert_close(fused, expected, rtol=0, atol=0)
         assert fused.data_ptr() == fused_ptr

@@ -123,34 +123,20 @@ def storage_view(
     return view.set_(storage, offset, shape, stride)
 
 
-def _in_own_storage(
-    old: torch.Tensor, new: torch.Tensor, whole_storage: bool = False
-) -> torch.Tensor:
-    """`new` copied into the bytes `old` spans if it fits, so the loaded
-    storage is kept (with its `data_ptr`); else `new` itself. An equal-size
-    result fits too: a repack to the same byte count (e.g. FP8 → Marlin int32)
-    then keeps the address captured CUDA graphs read.
-
-    With `whole_storage` (direct reload), `new` may use the rest of
-    `old`'s storage, so a weight that post-load processing grew keeps its
-    address on a reload too, as do a padded view with gaps (ROCm FP8 padding)
-    and an emptied weight (the checkpoint bytes stay for the next reload)."""
+def _in_own_storage(old: torch.Tensor, new: torch.Tensor) -> torch.Tensor:
+    """`new` copied into `old`'s storage from `old`'s offset if it fits, so
+    the loaded storage is kept (with its `data_ptr`); else `new` itself. A
+    repack to the same or a larger byte count (e.g. FP8 → Marlin int32) then
+    keeps the address captured CUDA graphs read, on a reload too, as do a
+    padded view with gaps (ROCm FP8 padding) and an emptied weight (the
+    checkpoint bytes stay for the next reload)."""
     storage = old.untyped_storage()
     offset, size = old.storage_offset() * old.element_size(), new.element_size()
     span = _extent(new)
-    if whole_storage:
-        fits = (
-            span >= new.numel()  # not overlapping
-            and offset + span * size <= storage.nbytes()
-        )
-    else:
-        fits = (
-            new.numel() > 0
-            and span == new.numel()  # neither overlapping nor with gaps
-            # its gaps may hold another tensor's data
-            and _extent(old) == old.numel()
-            and new.numel() * size <= old.numel() * old.element_size()
-        )
+    fits = (
+        span >= new.numel()  # not overlapping
+        and offset + span * size <= storage.nbytes()
+    )
     if (
         not fits
         or old.device != new.device
@@ -236,13 +222,7 @@ def replace_parameter(
         elif getattr(getattr(layer, "quant_method", None), "uses_meta_device", False):
             old_param.data = new_tensor  # online quantization frees the source
         else:
-            from vllm.model_executor.model_loader.reload.direct import (
-                direct_reload_enabled,
-            )
-
-            old_param.data = _in_own_storage(
-                old_param, new_tensor, whole_storage=direct_reload_enabled()
-            )
+            old_param.data = _in_own_storage(old_param, new_tensor)
         for attr_name, attr in new_tensor_attrs.items():
             setattr(old_param, attr_name, attr)
         return

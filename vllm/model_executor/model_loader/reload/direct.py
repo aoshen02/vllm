@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Direct weight reload (`VLLM_RELOAD_MODE=direct`).
+"""Direct weight reload.
 
 Cold start records each tensor's checkpoint layout before post-load processing
 (PWAL). `begin` views re-laid-out tensors back to that layout on their
@@ -18,7 +18,6 @@ from collections.abc import Iterator
 
 import torch
 
-import vllm.envs as envs
 from vllm.config import ModelConfig
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
@@ -32,7 +31,6 @@ logger = init_logger(__name__)
 __all__ = [
     "begin_direct_reload",
     "direct_reload_active",
-    "direct_reload_enabled",
     "finish_direct_reload",
     "loadable_tensors",
     "record_checkpoint_layout",
@@ -53,11 +51,6 @@ _LOADER_ATTRS = (
     "packed_factor",
     "pack_factor",
 )
-
-
-def direct_reload_enabled() -> bool:
-    """Whether weight updates reload in place (`VLLM_RELOAD_MODE=direct`)."""
-    return envs.VLLM_RELOAD_MODE == "direct"
 
 
 def direct_reload_active(model: torch.nn.Module) -> bool:

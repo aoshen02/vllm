@@ -6,7 +6,6 @@ cold start, where completeness checks must run."""
 
 from types import SimpleNamespace
 
-import pytest
 import torch
 
 from vllm.model_executor.model_loader.reload import (
@@ -50,9 +49,7 @@ def _checkpoint(scale: float = 1.0) -> dict[str, torch.Tensor]:
     }
 
 
-@pytest.mark.parametrize("mode", ["direct", "layerwise"], ids=["direct", "layerwise"])
-def test_active_only_between_start_and_finish(monkeypatch, mode):
-    monkeypatch.setenv("VLLM_RELOAD_MODE", mode)
+def test_active_only_between_start_and_finish():
     model = _TinyModel()
     record_metadata_for_reloading(model)  # as the loader does at cold start
     model.load_weights(_checkpoint().items())
@@ -84,9 +81,7 @@ class _Outer(torch.nn.Module):
         )
 
 
-@pytest.mark.parametrize("mode", ["direct", "layerwise"], ids=["direct", "layerwise"])
-def test_nested_module_sees_the_update(monkeypatch, mode):
-    monkeypatch.setenv("VLLM_RELOAD_MODE", mode)
+def test_nested_module_sees_the_update():
     model = _Outer()
     record_metadata_for_reloading(model)
     model.load_weights(
