@@ -253,7 +253,9 @@ class AuxOutputWorkerConnector:
         key_prefix = vllm_config.aux_output_config.object_key_prefix
         if key_prefix is not None:
             self._object_writer = SessionObjectWriter(
-                MooncakeAuxObjectStore.create(),
+                MooncakeAuxObjectStore.create(
+                    vllm_config.aux_output_config.mooncake_config_path
+                ),
                 key_prefix=key_prefix,
                 max_pending_batches=2 * vllm_config.scheduler_config.max_num_seqs,
                 fields=self._object_fields,

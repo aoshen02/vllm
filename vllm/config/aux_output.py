@@ -41,11 +41,22 @@ class AuxOutputConfig:
     be reused: choose a new one for every engine start. Any one enabled output
     suffices, so dense models can deliver hidden states and top-k logprobs."""
 
+    mooncake_config_path: str | None = None
+    """Mooncake configuration file of the store that holds the objects of
+    `object_key_prefix`, in the format `MOONCAKE_CONFIG_PATH` names; `None`
+    reads `MOONCAKE_CONFIG_PATH`. Use a master and pool separate from any
+    Mooncake KV store: objects are hard-pinned, while a KV store evicts and can
+    be reset. Requires `object_key_prefix`."""
+
     @model_validator(mode="after")
     def _check_object_key_prefix(self) -> Self:
         prefix = self.object_key_prefix
         if prefix is None:
-            for name in ("enable_return_hidden_states", "return_topk_logprobs"):
+            for name in (
+                "enable_return_hidden_states",
+                "return_topk_logprobs",
+                "mooncake_config_path",
+            ):
                 if getattr(self, name):
                     raise ValueError(f"{name} requires object_key_prefix.")
         if prefix is not None and not (prefix and "/" not in prefix):
@@ -68,6 +79,7 @@ class AuxOutputConfig:
         ignored_factors = {
             "enable_return_hidden_states",
             "max_bytes",
+            "mooncake_config_path",
             "object_key_prefix",
             "return_topk_logprobs",
         }

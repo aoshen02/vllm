@@ -25,8 +25,9 @@ class MooncakeAuxObjectStore:
         self._replicate_config = replicate_config
 
     @classmethod
-    def create(cls) -> MooncakeAuxObjectStore:
-        """Connect with the configuration at `MOONCAKE_CONFIG_PATH`."""
+    def create(cls, config_path: str | None = None) -> MooncakeAuxObjectStore:
+        """Connect with the Mooncake configuration file `config_path`, or the
+        one at `MOONCAKE_CONFIG_PATH` if it is `None`."""
         from mooncake.store import MooncakeDistributedStore, ReplicateConfig
 
         from vllm.distributed.kv_transfer.kv_connector.v1.mooncake_store import (
@@ -38,7 +39,11 @@ class MooncakeAuxObjectStore:
         )
         from vllm.utils.network_utils import get_ip
 
-        config = MooncakeStoreConfig.load_from_config()
+        config = (
+            MooncakeStoreConfig.load_from_config()
+            if config_path is None
+            else MooncakeStoreConfig.from_file(config_path)
+        )
         if config.mode != "standalone-store":
             raise ValueError(
                 "Auxiliary-output objects must outlive the clients that write "
