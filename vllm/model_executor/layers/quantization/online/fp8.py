@@ -66,9 +66,6 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
     cutlass_fp8_supported,
 )
-from vllm.model_executor.model_loader.reload.layerwise import (
-    initialize_online_processing,
-)
 from vllm.model_executor.parameter import ModelWeightParameter
 from vllm.model_executor.utils import is_weights_pre_processed, replace_parameter
 from vllm.platforms import current_platform
@@ -129,8 +126,10 @@ def _is_tp_sharded(layer: Module, *, reduces_output_dim: bool = True) -> bool:
 
 
 class OnlineLinearBase(OnlineRequantizationMixin, LinearMethodBase):
-    """Shared base for online FP8 linear methods. Loads fp16/bf16 checkpoint
-    weights onto meta device and materializes them just-in-time."""
+    """Shared base for online linear methods: loads the fp16/bf16 weight and
+    quantizes it in `process_weights_after_loading`. Linear layers quantize on
+    load instead (`online.loading.checkpoint_method`); this serves the lm_head,
+    a single layer."""
 
     uses_meta_device: bool = True
     activation_quant_key: QuantKey | None
@@ -187,7 +186,6 @@ class OnlineLinearBase(OnlineRequantizationMixin, LinearMethodBase):
             data=torch.empty(
                 output_size_per_partition,
                 input_size_per_partition,
-                device="meta",  # materialized and processed during loading
                 dtype=params_dtype,
             ),
             input_dim=1,
@@ -195,8 +193,6 @@ class OnlineLinearBase(OnlineRequantizationMixin, LinearMethodBase):
             weight_loader=weight_loader,
         )
         layer.register_parameter("weight", weight)
-
-        initialize_online_processing(layer)
 
 
 class Fp8PerTensorOnlineLinearMethod(OnlineLinearBase):
