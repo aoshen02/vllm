@@ -152,6 +152,13 @@ class LutBOnlineMoEMethod(OnlineMoEMethodBase):
     def process_weights_after_loading(self, layer: RoutedExperts) -> None:
         if getattr(layer, "_already_called_process_weights_after_loading", False):
             return
+        pending = getattr(layer, "lut_b_pending", None)
+        if pending:
+            experts = sorted(pending)
+            pending.clear()
+            raise RuntimeError(
+                f"LUT-B: w1 or w3 of local experts {experts[:8]} never arrived"
+            )
 
         for prefix, weight in self._lut_b_weights(layer):
             packed, codebooks, scales = weight
@@ -206,14 +213,50 @@ class LutBOnlineMoEMethod(OnlineMoEMethodBase):
         return weights
 
 
+def _as_tiles(weight: torch.Tensor) -> torch.Tensor:
+    """`[N, K]` as its LUT-B tiles, one per `[8, 64]` row group."""
+    n, k = weight.shape
+    tiles = weight.view(n // LUT_B_BLOCK_N, LUT_B_BLOCK_N, k // LUT_B_BLOCK_K, -1)
+    return tiles.transpose(1, 2).reshape(-1, LUT_B_BLOCK_K)
+
+
+def _from_tiles(
+    quantized: tuple[torch.Tensor, ...], n: int, k: int
+) -> tuple[torch.Tensor, ...]:
+    """`quantize_lut_b(_as_tiles(w))` laid out as `quantize_lut_b(w)`."""
+    packed, codebooks, scales = quantized
+    n_tiles, k_tiles = n // LUT_B_BLOCK_N, k // LUT_B_BLOCK_K
+    scales = scales.view(n_tiles, k_tiles, LUT_B_BLOCK_N, -1).transpose(1, 2)
+    return (
+        packed.view(n_tiles, k_tiles, -1),
+        codebooks.view(n_tiles, k_tiles, -1),
+        scales.reshape(n, -1),
+    )
+
+
 def _quantize_lut_b_on_load(layer: torch.nn.Module, prefix: str) -> None:
     """Make `layer.<prefix>weight` load an fp16/bf16 expert tensor as LUT-B.
 
     The tiled parameters are 4D, which the MoE loader does not shard: this
-    loader takes the rank's shard (gate/up rows, down columns) itself and
-    writes it at its offset, leaving the zero padding tiles untouched."""
+    loader takes the rank's shard (gate/up rows, down columns) itself. An
+    expert's w1, w3 and w2 are staged until all three arrived, then fitted in
+    one call: the fit costs about the same per call at any size up to a
+    chunk, and its tiles are independent, so the bytes are those of fitting
+    the whole layer after loading, zero padding included."""
     names = [prefix + name for name in ("weight", "codebooks", "scales")]
     layer.quantizes_on_load = True
+    # shards waiting for the rest of their expert, by local expert
+    pending: dict[int, dict[str, torch.Tensor]] = layer.__dict__.setdefault(
+        "lut_b_pending", {}
+    )
+
+    def padded(name: str) -> torch.Tensor:
+        target = getattr(layer, name + "weight")
+        return target.new_zeros(
+            target.shape[1] * LUT_B_BLOCK_N,
+            target.shape[2] * LUT_B_BLOCK_K,
+            dtype=layer.orig_dtype,
+        )
 
     def loader(param, loaded_weight, weight_name, shard_id, expert_id, **kwargs):
         expert = layer._map_global_expert_id_to_local_expert_id(expert_id)
@@ -225,20 +268,35 @@ def _quantize_lut_b_on_load(layer: torch.nn.Module, prefix: str) -> None:
         dim = 1 if shard_id == "w2" else 0  # the TP-sharded dim
         if weight.shape[dim] != inter:
             weight = weight.narrow(dim, moe.tp_rank * inter, inter)
-        row = moe.intermediate_size_per_partition if shard_id == "w3" else 0
-        n, k = weight.shape
-        # whole tiles: zero rows/columns, as the padding tiles hold
-        pad_k = -k % LUT_B_BLOCK_K
-        pad_n = -n % LUT_B_BLOCK_N
-        weight = torch.nn.functional.pad(weight, (0, pad_k, 0, pad_n))
-        packed, codebooks, scales = quantize_lut_b(weight.contiguous())
-        tile_rows = slice(row // LUT_B_BLOCK_N, row // LUT_B_BLOCK_N + packed.shape[0])
-        tile_cols = slice(0, packed.shape[1])
-        for name, value in zip(names[:2], (packed, codebooks)):
-            getattr(layer, name).data[expert, tile_rows, tile_cols].copy_(value)
-        getattr(layer, names[2]).data[
-            expert, row : row + scales.shape[0], : scales.shape[1]
-        ].copy_(scales)
+        shards = pending.setdefault(expert, {})
+        shards[shard_id] = weight
+        if len(shards) == 3:
+            del pending[expert]
+            w13, w2 = padded("w13_"), padded("w2_")
+            offset = moe.intermediate_size_per_partition
+            for row, part in ((0, shards["w1"]), (offset, shards["w3"])):
+                w13[row : row + part.shape[0], : part.shape[1]] = part
+            down = shards["w2"]
+            w2[: down.shape[0], : down.shape[1]] = down
+            tiles = [_as_tiles(w13), _as_tiles(w2)]
+            num_tiles = sum(t.shape[0] for t in tiles) // LUT_B_BLOCK_N
+            quantized = quantize_lut_b(torch.cat(tiles), max_tiles_per_chunk=num_tiles)
+            split = tiles[0].shape[0] // LUT_B_BLOCK_N
+            for name, w in (("w13_", w13), ("w2_", w2)):
+                part = tuple(
+                    q[:split] if name == "w13_" else q[split:]
+                    for q in (
+                        quantized[0],
+                        quantized[1],
+                        quantized[2].view(-1, LUT_B_BLOCK_N, quantized[2].shape[-1]),
+                    )
+                )
+                values = _from_tiles(
+                    (part[0], part[1], part[2].reshape(-1, part[2].shape[-1])),
+                    *w.shape,
+                )
+                for suffix, value in zip(("weight", "codebooks", "scales"), values):
+                    getattr(layer, name + suffix).data[expert].copy_(value)
         return True if kwargs.get("return_success") else None
 
     getattr(layer, names[0]).weight_loader = loader
