@@ -551,7 +551,7 @@ def _config(**overrides) -> SimpleNamespace:
                     uva=SimpleNamespace(cpu_offload_gb=0),
                 )
             },
-            "weight offloading",
+            None,
         ),
         (
             {
@@ -571,7 +571,7 @@ def _config(**overrides) -> SimpleNamespace:
                     uva=SimpleNamespace(cpu_offload_gb=1),
                 )
             },
-            "weight offloading",
+            None,
         ),
         (
             {"model_config": SimpleNamespace(quantization="torchao")},
@@ -585,9 +585,9 @@ def _config(**overrides) -> SimpleNamespace:
     ],
     ids=[
         "defaults",
-        "offload-backend",
+        "uva-backend-allowed",
         "offload-prefetch",
-        "offload-uva",
+        "uva-offload-allowed",
         "torchao",
         "lora",
         "draft-lm-head-quant",
