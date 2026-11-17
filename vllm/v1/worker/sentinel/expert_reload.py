@@ -13,11 +13,11 @@ def _placement_weight_loader(
     num_physical: int,
     use_global_sf: bool = False,
 ) -> Callable:
-    """Translate initial checkpoint IDs before buffering layerwise reload calls."""
+    """Translate initial checkpoint expert IDs to the recovered physical slots."""
     loader_signature = signature(loader)
 
     @wraps(loader)
-    def online_process_loader(*args, **kwargs):
+    def placement_loader(*args, **kwargs):
         bound = loader_signature.bind(*args, **kwargs)
         bound.apply_defaults()
         source = bound.arguments["expert_id"]
@@ -37,4 +37,4 @@ def _placement_weight_loader(
             success = bool(loader(*bound.args, **bound.kwargs)) or success
         return success if bound.arguments.get("return_success") else None
 
-    return online_process_loader
+    return placement_loader
