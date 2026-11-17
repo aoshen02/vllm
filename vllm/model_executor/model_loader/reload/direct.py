@@ -84,6 +84,9 @@ def _check_supported(model: torch.nn.Module) -> None:
     config = get_current_vllm_config_or_none()
     if config is not None:
         config._verify_direct_reload_compat()
+    from vllm.model_executor.kernels.linear.nvfp4.humming import (
+        HummingNvFp4LinearKernel,
+    )
     from vllm.model_executor.layers.quantization.humming import (
         HummingLinearMethod,
         HummingMoEMethod,
@@ -108,6 +111,16 @@ def _check_supported(model: torch.nn.Module) -> None:
             # its post-load processing runs once per quant method (a guard on
             # the method, not the module): a reload would keep checkpoint bytes
             raise RuntimeError(f"direct reload: humming is not supported ({name})")
+        kernel = getattr(method, "kernel", None) or getattr(
+            getattr(method, "scheme", None), "kernel", None
+        )
+        if isinstance(kernel, HummingNvFp4LinearKernel):
+            # its post-load processing renames the weight and inverts the
+            # global scale in place, so it cannot rerun on a reload
+            raise RuntimeError(
+                f"direct reload: the humming NVFP4 linear kernel is not "
+                f"supported ({name})"
+            )
         if getattr(module, "humming_configs", None) is not None:
             # experts converted to the humming kernel layout through the oracle
             # (any quant method): the conversion renames and consumes the
