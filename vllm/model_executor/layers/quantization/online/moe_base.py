@@ -17,15 +17,14 @@ from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import triton_weight
 from vllm.model_executor.layers.quantization.online.requantization import (
     OnlineRequantizationMixin,
 )
-from vllm.model_executor.model_loader.reload.layerwise import (
-    initialize_online_processing,
-)
 from vllm.model_executor.utils import set_weight_attrs
 
 
 class OnlineMoEMethodBase(OnlineRequantizationMixin, FusedMoEMethodBase):
-    """Base for MoE methods that load full-precision weights on meta device
-    and quantize them after loading via the QeRL layerwise processing system.
+    """Base for online MoE methods: loads full-precision expert weights and
+    quantizes them in `process_weights_after_loading`. The online schemes
+    quantize on load instead (`online.loading.checkpoint_method`, or their own
+    `create_weights`); this layout remains for requantization and direct use.
     """
 
     uses_meta_device: bool = True
@@ -61,13 +60,13 @@ class OnlineMoEMethodBase(OnlineRequantizationMixin, FusedMoEMethodBase):
             layer.num_experts = num_experts
             return
 
-        # Fused gate_up_proj (column parallel) — full precision on meta device
+        # Fused gate_up_proj (column parallel) — full precision; zeros: padding
+        # no checkpoint tensor fills stays zero
         w13_weight = torch.nn.Parameter(
-            torch.empty(
+            torch.zeros(
                 num_experts,
                 self.moe.w13_num_shards * intermediate_size_per_partition,
                 hidden_size,
-                device="meta",
                 dtype=params_dtype,
             ),
             requires_grad=False,
@@ -75,13 +74,12 @@ class OnlineMoEMethodBase(OnlineRequantizationMixin, FusedMoEMethodBase):
         layer.register_parameter("w13_weight", w13_weight)
         set_weight_attrs(w13_weight, extra_weight_attrs)
 
-        # down_proj (row parallel) — full precision on meta device
+        # down_proj (row parallel) — full precision
         w2_weight = torch.nn.Parameter(
-            torch.empty(
+            torch.zeros(
                 num_experts,
                 hidden_size,
                 intermediate_size_per_partition,
-                device="meta",
                 dtype=params_dtype,
             ),
             requires_grad=False,
@@ -95,7 +93,6 @@ class OnlineMoEMethodBase(OnlineRequantizationMixin, FusedMoEMethodBase):
                 torch.zeros(
                     num_experts,
                     self.moe.w13_num_shards * intermediate_size_per_partition,
-                    device="meta",
                     dtype=layer.orig_dtype,
                 ),
                 requires_grad=False,
@@ -107,7 +104,6 @@ class OnlineMoEMethodBase(OnlineRequantizationMixin, FusedMoEMethodBase):
                 torch.zeros(
                     num_experts,
                     hidden_size,
-                    device="meta",
                     dtype=layer.orig_dtype,
                 ),
                 requires_grad=False,
@@ -117,8 +113,6 @@ class OnlineMoEMethodBase(OnlineRequantizationMixin, FusedMoEMethodBase):
 
         layer.w13_input_scale = None
         layer.w2_input_scale = None
-
-        initialize_online_processing(layer)
 
     def get_weights_for_quantization(
         self, layer: torch.nn.Module

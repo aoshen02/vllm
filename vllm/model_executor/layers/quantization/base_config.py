@@ -411,13 +411,33 @@ def resolve_quant_method(
                 "(requantization) is not supported yet."
             )
 
-        online_quant_method = online_config.get_quant_method(
-            layer, prefix, requantize=True
-        )
-
         assert base_quant_method is not None and not isinstance(
             base_quant_method, (UnquantizedLinearMethod, UnquantizedFusedMoEMethod)
         )
+        # the checkpoint scheme, before an online method sets its own
+        source_scheme = getattr(layer, "scheme", None)
+        online_quant_method = online_config.get_quant_method(layer, prefix)
+        if not isinstance(
+            online_quant_method, (OnlineLinearBase, OnlineMoEMethodBase)
+        ) or getattr(online_quant_method, "supports_direct_reload", False):
+            # quantizes on load (a checkpoint method, or an online method that
+            # loads full precision tensors itself): dequantize the checkpoint
+            # tensors as they load
+            from vllm.model_executor.layers.quantization.online.loading import (
+                requantize_on_load,
+            )
+
+            requantized = requantize_on_load(
+                base_quant_method, online_quant_method, source_scheme
+            )
+            if requantized is not None:
+                return requantized
+            # dequantized after loading: cold start only, reload refuses
+            if source_scheme is not None:
+                layer.scheme = source_scheme
+            online_quant_method = online_config.get_quant_method(
+                layer, prefix, quantize_on_load=False
+            )
 
         assert isinstance(online_quant_method, (OnlineLinearBase, OnlineMoEMethodBase))
         online_quant_method.set_requantization_source(base_quant_method)

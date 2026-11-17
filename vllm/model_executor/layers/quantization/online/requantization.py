@@ -62,6 +62,10 @@ class OnlineRequantizationMixin:
 
         return activation_quant_key
 
+    # Whether a direct weight update can rerun this method: the loaded tensors
+    # stay in place and post-load processing derives the rest from them.
+    supports_direct_reload: bool = False
+
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self.requantization_source: QuantizeMethodBase | None = None
@@ -71,6 +75,8 @@ class OnlineRequantizationMixin:
         """Configure serialized-weight conversion before online quantization."""
         self.requantization_source = source_method
         self.uses_meta_device = False
+        # the checkpoint parameters are released after conversion
+        self.supports_direct_reload = False
 
     def create_requantization_source_weights(
         self, layer: torch.nn.Module, *weight_args, **extra_weight_attrs

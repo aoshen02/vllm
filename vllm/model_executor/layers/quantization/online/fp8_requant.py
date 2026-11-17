@@ -2,10 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Block-FP8 routed experts re-quantized to MXFP4 at load (ROCm).
 
-`VLLM_FP8_MOE_REQUANT=mxfp4` keeps the checkpoint's block-FP8 expert
-weights for loading and, once loaded, dequantizes each expert to bf16 and
-quantizes it to MXFP4 (e2m1 values, e8m0 block-32 scales) for the aiter MXFP4
-MoE kernels: half the expert bytes of FP8. `VLLM_FP8_MOE_REQUANT_ACT` selects
+`VLLM_FP8_MOE_REQUANT=mxfp4` loads the checkpoint's block-FP8 expert
+weights and, as each expert's weight and block scales arrive, dequantizes
+them to bf16 and quantizes them to MXFP4 (e2m1 values, e8m0 block-32 scales)
+for the aiter MXFP4 MoE kernels: half the expert bytes of FP8.
+`VLLM_FP8_MOE_REQUANT_ACT` selects
 the activation dtype: a8w4 (fp8 per-token; aiter's interleaved FlyDSL kernels,
 the `AITER_MXFP4_BF16` backend; default), a4w4 (MXFP4 activations,
 `AITER_MXFP4_MXFP4`) or a16w4 (bf16, `AITER_TRITON_MXFP4_BF16`).
@@ -21,6 +22,7 @@ from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import (
     Mxfp4MoeBackend,
     make_mxfp4_moe_quant_config,
 )
+from vllm.model_executor.layers.quantization.online.loading import _load_quantized
 from vllm.model_executor.layers.quantization.online.mxfp4 import (
     MXFP4_BLOCK_SIZE,
     Mxfp4OnlineMoEMethod,
@@ -29,10 +31,7 @@ from vllm.model_executor.layers.quantization.utils.mxfp4_utils import (
     mxfp4_quantize,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import kMxfp4Dynamic
-from vllm.model_executor.model_loader.reload.layerwise import (
-    initialize_online_processing,
-)
-from vllm.model_executor.utils import replace_parameter
+from vllm.model_executor.utils import set_weight_attrs
 
 logger = init_logger(__name__)
 
@@ -51,17 +50,15 @@ def dequant_block_fp8_to_bf16(
 class Fp8BlockExpertsAsMxfp4FusedMoE(Mxfp4OnlineMoEMethod):
     """Block-FP8 routed experts stored as MXFP4 (VLLM_FP8_MOE_REQUANT=mxfp4).
 
-    Weights are created and loaded by `Fp8MoEMethod` (fp8 values + block
-    `weight_scale_inv`), so the checkpoint loader is unchanged; the
-    re-quantization happens in `process_weights_after_loading`. Rounding the
-    values to the e2m1 grid with power-of-two block-32 scales is lossy: the
-    weight error is of the order of an MXFP4 quantization of the bf16 weights.
+    The experts are MXFP4 parameters. A checkpoint expert's fp8 weight and its
+    block `weight_scale_inv` arrive in separate loads: the first waits for the
+    other, then the pair is re-quantized and loaded (peak memory is the MXFP4
+    model plus the unpaired experts). Rounding the values to the e2m1 grid with
+    power-of-two block-32 scales is lossy: the weight error is of the order of
+    an MXFP4 quantization of the bf16 weights.
     """
 
-    # FP8 expert parameters live on the meta device and are materialized one
-    # layer at a time by the layerwise online-processing loader, so each layer
-    # is re-quantized as soon as its experts are loaded: peak memory is the
-    # MXFP4 model plus one layer of FP8 experts (TP4 would not fit otherwise).
+    # online quantization: the parameters do not map to checkpoint tensors
     uses_meta_device = True
 
     def __init__(self, quant_config, layer: RoutedExperts) -> None:
@@ -131,43 +128,80 @@ class Fp8BlockExpertsAsMxfp4FusedMoE(Mxfp4OnlineMoEMethod):
                 f"loader writes the unpadded checkpoint shapes): got "
                 f"{hidden_size}x{intermediate_size_per_partition}"
             )
-        self.fp8_method.create_weights(
-            layer,
-            num_experts,
-            hidden_size,
-            intermediate_size_per_partition,
-            params_dtype,
-            **extra_weight_attrs,
-        )
+        device = torch.get_default_device()
+        # The FP8 method names the parameters the checkpoint loads into. Built
+        # on meta, its weights then become MXFP4; its block scales stay there,
+        # never written: their loads only pair with the weights.
+        with torch.device("meta"):
+            self.fp8_method.create_weights(
+                layer,
+                num_experts,
+                hidden_size,
+                intermediate_size_per_partition,
+                params_dtype,
+                **extra_weight_attrs,
+            )
+        for name, param in list(layer.named_parameters(recurse=False)):
+            if name.endswith("weight_scale_inv"):
+                continue
+            if name in ("w13_weight", "w2_weight"):
+                e, n, k = param.shape
+                data = torch.zeros(e, n, k // 2, dtype=torch.uint8, device=device)
+                scale = torch.nn.Parameter(
+                    torch.zeros(
+                        e, n, k // MXFP4_BLOCK_SIZE, dtype=torch.uint8, device=device
+                    ),
+                    requires_grad=False,
+                )
+                layer.register_parameter(f"{name}_scale", scale)
+                set_weight_attrs(scale, extra_weight_attrs)
+            else:
+                data = torch.zeros_like(param, device=device)
+            real = torch.nn.Parameter(data, requires_grad=False)
+            real.__dict__.update(param.__dict__)
+            layer.register_parameter(name, real)
         layer.w13_input_scale = None
         layer.w2_input_scale = None
         layer.weight_block_size = [1, MXFP4_BLOCK_SIZE]
-        for name, param in list(layer.named_parameters(recurse=False)):
-            meta = torch.nn.Parameter(
-                torch.empty_like(param, device="meta"), requires_grad=False
-            )
-            meta.__dict__.update(param.__dict__)
-            layer.register_parameter(name, meta)
-        initialize_online_processing(layer)
+        self._pending: dict[tuple, dict[str, tuple]] = {}
+        for prefix in ("w13_", "w2_"):
+            self._requant_on_load(layer, prefix)
 
-    def _requant(self, weight: torch.Tensor, scale_inv: torch.Tensor):
-        num_experts, n, k = weight.shape
-        out = torch.empty(
-            (num_experts, n, k // 2), dtype=torch.uint8, device=weight.device
-        )
-        out_scale = torch.empty(
-            (num_experts, n, k // MXFP4_BLOCK_SIZE),
-            dtype=torch.uint8,
-            device=weight.device,
-        )
-        for e in range(num_experts):
-            bf16 = dequant_block_fp8_to_bf16(
-                weight[e], scale_inv[e], self.fp8_block_size
-            )
-            q, s = mxfp4_quantize(bf16)
-            out[e] = q.view(torch.uint8)
-            out_scale[e] = s.view(torch.uint8)
-        return out, out_scale
+    def _requant_on_load(self, layer: RoutedExperts, prefix: str) -> None:
+        load = _load_quantized(layer, f"{prefix}weight", f"{prefix}weight_scale")
+        pending = self._pending
+
+        def make_loader(kind: str):
+            def loader(param, loaded_weight, weight_name, shard_id, expert_id, **kw):
+                if layer._map_global_expert_id_to_local_expert_id(expert_id) == -1:
+                    return False
+                weight_param = getattr(layer, f"{prefix}weight")
+                copied = torch.Event()
+                tensor = loaded_weight.to(weight_param.device, copy=True)
+                copied.record()
+                key = (prefix, shard_id, expert_id)
+                got = pending.setdefault(key, {})
+                got[kind] = (tensor, copied, weight_name, kw)
+                if len(got) < 2:
+                    return True
+                del pending[key]
+                for _, event, _, _ in got.values():
+                    # held from another load, which may have run on another stream
+                    event.wait()
+                weight, _, name, kwargs = got["weight"]
+                bf16 = dequant_block_fp8_to_bf16(
+                    weight, got["scale"][0], self.fp8_block_size
+                )
+                q, s = mxfp4_quantize(bf16)
+                quantized = (q.view(torch.uint8), s.view(torch.uint8))
+                return load(
+                    weight_param, quantized, name, shard_id, expert_id, **kwargs
+                )
+
+            return loader
+
+        getattr(layer, f"{prefix}weight").weight_loader = make_loader("weight")
+        getattr(layer, f"{prefix}weight_scale_inv").weight_loader = make_loader("scale")
 
     def process_weights_after_loading(self, layer: RoutedExperts) -> None:
         if getattr(layer, "_already_called_process_weights_after_loading", False):
@@ -177,22 +211,24 @@ class Fp8BlockExpertsAsMxfp4FusedMoE(Mxfp4OnlineMoEMethod):
                 "VLLM_FP8_MOE_REQUANT=mxfp4 needs an MXFP4 MoE backend, and none "
                 "is available on this platform."
             )
-        w13, w13_scale = self._requant(
-            layer.w13_weight.data, layer.w13_weight_scale_inv.data
-        )
-        w2, w2_scale = self._requant(
-            layer.w2_weight.data, layer.w2_weight_scale_inv.data
-        )
-        delattr(layer, "w13_weight_scale_inv")
-        delattr(layer, "w2_weight_scale_inv")
-        # Hand the MXFP4 tensors over under the names the kernel-format
-        # conversion expects (it replaces or deletes them per backend).
-        replace_parameter(layer, "w13_weight", w13)
-        replace_parameter(layer, "w2_weight", w2)
-        replace_parameter(layer, "w13_weight_scale", w13_scale)
-        replace_parameter(layer, "w2_weight_scale", w2_scale)
-        torch.accelerator.empty_cache()
+        if self._pending:
+            unpaired = sorted(map(str, self._pending))
+            self._pending.clear()
+            raise RuntimeError(
+                f"{layer.layer_name}: FP8 experts {unpaired} got only one of their "
+                "weight and weight_scale_inv; both must be loaded in the same update"
+            )
+        # the meta block-scale parameters stay: a reload loads into them again
         layer.w13_input_scale = None
         layer.w2_input_scale = None
-        self._setup_kernel(layer, w13, w2, w13_scale, w2_scale, None, None)
+        # The kernel-format conversion replaces or deletes them per backend.
+        self._setup_kernel(
+            layer,
+            layer.w13_weight.data,
+            layer.w2_weight.data,
+            layer.w13_weight_scale.data,
+            layer.w2_weight_scale.data,
+            None,
+            None,
+        )
         layer._already_called_process_weights_after_loading = True

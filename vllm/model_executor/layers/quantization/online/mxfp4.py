@@ -79,6 +79,29 @@ def _quantize_mxfp4_moe_weight(
     return w_quant, w_scales
 
 
+def select_online_mxfp4_moe_backend(
+    moe: FusedMoEConfig, activation_key: "QuantKey | None"
+) -> tuple[Mxfp4MoeBackend, Any]:
+    """The MXFP4 MoE backend for online quantization, preferring backends that
+    compute `activation_key`."""
+    backend, experts_cls = select_mxfp4_moe_backend(
+        config=moe, activation_key=activation_key
+    )
+    # The oracle may fall back to a backend computing another activation
+    # format (EMULATION computes MXFP4): reject an override it cannot honour.
+    backend_key = (
+        kMxfp4Dynamic
+        if backend == Mxfp4MoeBackend.EMULATION
+        else _backend_activation_key(backend)
+    )
+    if activation_key != kMxfp4Dynamic and activation_key != backend_key:
+        raise NotImplementedError(
+            f"online MXFP4 MoE backend '{backend}' cannot honour "
+            f"activation={activation_key}; it computes activation={backend_key}."
+        )
+    return backend, experts_cls
+
+
 class Mxfp4OnlineLinearMethod(OnlineLinearBase, InputHadamardFusable):
     """Online MXFP4 linear method.
     Loads bf16/fp16 checkpoints and quantizes weights to MXFP4 (microscaling
@@ -176,25 +199,9 @@ class Mxfp4OnlineMoEMethod(OnlineMoEMethodBase):
         self.w13_precision_config: Any = None
         self.w2_precision_config: Any = None
 
-        self.mxfp4_backend, self.experts_cls = select_mxfp4_moe_backend(
-            config=self.moe, activation_key=self.activation_quant_key
+        self.mxfp4_backend, self.experts_cls = select_online_mxfp4_moe_backend(
+            self.moe, self.activation_quant_key
         )
-        # The oracle may fall back to a backend computing another activation
-        # format (EMULATION computes MXFP4): reject an override it cannot honour.
-        backend_key = (
-            kMxfp4Dynamic
-            if self.mxfp4_backend == Mxfp4MoeBackend.EMULATION
-            else _backend_activation_key(self.mxfp4_backend)
-        )
-        if (
-            self.activation_quant_key != kMxfp4Dynamic
-            and self.activation_quant_key != backend_key
-        ):
-            raise NotImplementedError(
-                f"online MXFP4 MoE backend '{self.mxfp4_backend}' cannot honour "
-                f"activation={self.activation_quant_key}; it computes "
-                f"activation={backend_key}."
-            )
 
     def maybe_roundup_sizes(
         self,

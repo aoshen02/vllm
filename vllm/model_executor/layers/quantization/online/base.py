@@ -503,7 +503,7 @@ class OnlineQuantizationConfig(QuantizationConfig):
         )
 
     def get_quant_method(
-        self, layer: torch.nn.Module, prefix: str, requantize: bool = False
+        self, layer: torch.nn.Module, prefix: str, quantize_on_load: bool = True
     ) -> "QuantizeMethodBase | None":
         # `targets` takes precedence over `moe` and `linear` and is exclusive.
         resolved = self.resolve_quant_method_cls(type(layer), prefix)
@@ -518,14 +518,13 @@ class OnlineQuantizationConfig(QuantizationConfig):
             )
             assert issubclass(quant_method_cls, (OnlineMoEMethodBase, OnlineLinearBase))
             default = getattr(quant_method_cls, "activation_quant_key", None)
-            # not for requantization (the checkpoint is quantized) or fused
-            # shared experts (their loader quantizes them itself)
+            # not for fused shared experts (their loader quantizes them itself)
             fused_shared = getattr(
                 getattr(layer, "expert_map_manager", None),
                 "num_fused_shared_experts",
                 0,
             )
-            if self.quantize_on_load and not requantize and not fused_shared:
+            if self.quantize_on_load and quantize_on_load and not fused_shared:
                 method = checkpoint_method(layer, quant_spec, default)
                 if method is not None:
                     return method
@@ -544,7 +543,11 @@ class OnlineQuantizationConfig(QuantizationConfig):
                     quant_spec.hadamard_size,
                     rotate_weight=True,
                 )
-            return quant_method_cls(**kwargs)
+            method = quant_method_cls(**kwargs)
+            if isinstance(layer, ParallelLMHead):
+                # a real fp16/bf16 weight, quantized after loading in place
+                method.supports_direct_reload = True
+            return method
 
         if isinstance(layer, LinearBase):
             return UnquantizedLinearMethod()
