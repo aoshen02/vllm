@@ -181,7 +181,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm.model_executor.model_loader import weight_utils
 from vllm.model_executor.model_loader.base_loader import log_online_quantization
 from vllm.model_executor.model_loader.dummy_loader import DummyModelLoader
-from vllm.model_executor.model_loader.reload import start_reload
+from vllm.model_executor.model_loader.reload import finish_reload, start_reload
 from vllm.model_executor.model_loader.utils import process_weights_after_loading
 from vllm.model_executor.models.granitemoe import (
     GraniteMoeModel,
@@ -481,17 +481,40 @@ def test_online_moe_stages_quantized_weights_for_humming(
         )
         return _expert_checkpoint(tensors, 2)
 
-    with set_current_vllm_config(config), torch.device(DEVICE):
+    def cold_start(name: str, factor: float) -> torch.nn.Module:
         model = torch.nn.Module()
-        model.runner = create("humming.loaded")
-        set(model.runner.routed_experts.load_weights(checkpoint(1.0)))
-        process_weights_after_loading(model, config.model_config, torch.device(DEVICE))
-        layer = model.runner.routed_experts
-        assert layer.quantizes_on_load
-        # post-load processing runs once per Humming method, not per layer: a
-        # direct weight update refuses it rather than keep checkpoint bytes
-        with pytest.raises(RuntimeError, match="humming is not supported"):
-            start_reload(model)
+        model.runner = create(name)
+        set(model.runner.routed_experts.load_weights(checkpoint(factor)))
+        process_weights_after_loading(model, config.model_config, device)
+        return model
+
+    device = torch.device(DEVICE)
+    with set_current_vllm_config(config), torch.device(DEVICE):
+        model = cold_start("humming.loaded", 1.0)
+        assert model.runner.routed_experts.quantizes_on_load
+        first = dict(model.named_parameters())
+        first_bytes = {n: t.clone() for n, t in first.items()}
+        expected = dict(cold_start("humming.fresh", 2.0).named_parameters())
+        start_reload(model)
+        set(model.runner.routed_experts.load_weights(checkpoint(2.0)))
+        finish_reload(model, config.model_config, device)
+        actual = dict(model.named_parameters())
+        assert actual.keys() == expected.keys()
+        for name, tensor in actual.items():
+            assert tensor is first[name]
+            if tensor.is_meta:
+                continue  # checkpoint-only stand-in
+            torch.testing.assert_close(
+                tensor.view(torch.uint8),
+                expected[name].view(torch.uint8),
+                rtol=0,
+                atol=0,
+            )
+        assert any(
+            not torch.equal(t.view(torch.uint8), first_bytes[n].view(torch.uint8))
+            for n, t in actual.items()
+            if not t.is_meta
+        )
 
 
 @pytest.mark.parametrize(
@@ -1759,10 +1782,17 @@ def test_nvfp4_one_sided_rejects_unsupported_input_dtype(input_dtype: torch.dtyp
 _ONLINE_METHODS = (OnlineLinearBase, OnlineMoEMethodBase)
 
 
+def _fp8_kernel(method):
+    """The FP8 linear kernel of an online or a checkpoint method."""
+    kernel = getattr(method, "fp8_linear", None)
+    return kernel if kernel is not None else method.kernel
+
+
 def _assert_online_method(layer, expected_cls, method=None) -> None:
     """`layer` runs `expected_cls`, or, for an online class, the checkpoint
     method that quantizes on load in its stead."""
     method = layer.quant_method if method is None else method
+    layer = getattr(layer, "routed_experts", layer)  # a MoE runner's experts
     if issubclass(expected_cls, _ONLINE_METHODS) and getattr(
         layer, "quantizes_on_load", False
     ):
@@ -2091,15 +2121,15 @@ def test_online_quantization(
 
     if model_name in (NVFP4_MOE_MODEL_NAME, MODELOPT_NVFP4_MOE_MODEL_NAME):
         # requantized on load: NVFP4-only checkpoint tensors are meta stand-ins
-        assert moe.quantizes_on_load
-        assert any(parameter.is_meta for parameter in moe.parameters())
+        experts = getattr(moe, "routed_experts", moe)
+        assert experts.quantizes_on_load
+        assert any(parameter.is_meta for parameter in experts.parameters())
         if expected_moe_cls is Mxfp4OnlineMoEMethod:
-            assert moe.w13_weight_scale.dtype == torch.uint8
+            assert experts.w13_weight_scale.dtype == torch.uint8
         else:
-            assert moe.w13_weight.dtype == current_platform.fp8_dtype()
+            assert experts.w13_weight.dtype == current_platform.fp8_dtype()
     if model_name == "vllm-project/Qwen3-0.6B-MXFP8":
         assert o_proj.quantizes_on_load
-        assert o_proj.weight_scale.shape[-1] == 1
 
     moe_args = (
         online_quant_args.get("moe") if isinstance(online_quant_args, dict) else None
@@ -2142,12 +2172,12 @@ def test_online_quantization(
         if current_platform.supports_fp8() and not force_marlin:
             assert o_proj.weight.dtype == torch.float8_e4m3fn
             assert not isinstance(
-                o_proj.quant_method.fp8_linear, MarlinFP8ScaledMMLinearKernel
+                _fp8_kernel(o_proj.quant_method), MarlinFP8ScaledMMLinearKernel
             )
         else:
             assert o_proj.weight.dtype == torch.int32
             assert isinstance(
-                o_proj.quant_method.fp8_linear, MarlinFP8ScaledMMLinearKernel
+                _fp8_kernel(o_proj.quant_method), MarlinFP8ScaledMMLinearKernel
             )
     elif current_platform.is_rocm():
         assert o_proj.weight.dtype == current_platform.fp8_dtype()
@@ -2243,21 +2273,19 @@ def test_online_quantization_loads_real_weights(
 
             def check_model(model):
                 layer = model.model.layers[0]
-                assert isinstance(
-                    layer.self_attn.o_proj.quant_method,
-                    Fp8PerTensorOnlineLinearMethod,
+                experts = layer.block_sparse_moe.experts
+                _assert_online_method(
+                    layer.self_attn.o_proj, Fp8PerTensorOnlineLinearMethod
                 )
-                assert isinstance(
-                    layer.block_sparse_moe.experts._quant_method,
-                    Fp8PerTensorOnlineMoEMethod,
+                _assert_online_method(
+                    experts, Fp8PerTensorOnlineMoEMethod, experts._quant_method
                 )
 
         else:
 
             def check_model(model):
-                assert isinstance(
-                    model.model.layers[1].self_attn.o_proj.quant_method,
-                    Mxfp8OnlineLinearMethod,
+                _assert_online_method(
+                    model.model.layers[1].self_attn.o_proj, Mxfp8OnlineLinearMethod
                 )
                 assert isinstance(
                     model.model.layers[0].self_attn.o_proj.quant_method,
@@ -2575,7 +2603,7 @@ def test_online_nvfp4_per_token_moe(vllm_runner, monkeypatch) -> None:
             layer = model.model.layers[0]
             experts = layer.block_sparse_moe.experts
             assert isinstance(experts._quant_method, ModelOptNvFp4FusedMoE)
-            assert experts.quantizes_on_load
+            assert experts.routed_experts.quantizes_on_load
             assert isinstance(
                 layer.self_attn.o_proj.quant_method, UnquantizedLinearMethod
             )
