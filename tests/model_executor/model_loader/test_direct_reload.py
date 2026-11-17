@@ -577,7 +577,7 @@ def _config(**overrides) -> SimpleNamespace:
             {"model_config": SimpleNamespace(quantization="torchao")},
             "torchao",
         ),
-        ({"lora_config": object()}, "LoRA"),
+        ({"lora_config": object()}, None),
         (
             {"speculative_config": SimpleNamespace(draft_lm_head_quantization="fp8")},
             "draft_lm_head_quantization",
@@ -589,7 +589,7 @@ def _config(**overrides) -> SimpleNamespace:
         "offload-prefetch",
         "uva-offload-allowed",
         "torchao",
-        "lora",
+        "lora-allowed",
         "draft-lm-head-quant",
     ],
 )
