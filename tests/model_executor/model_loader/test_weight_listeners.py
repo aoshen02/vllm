@@ -62,7 +62,7 @@ class TestWeightUpdates:
         assert recorder.events == ["invalidated", "ready"]
 
     def test_kernel_format_update(self, recorder):
-        model = nn.Linear(2, 2, bias=False)
+        model = nn.Linear(2, 2, bias=False).requires_grad_(False)
         new_weight = torch.ones(2, 2)
 
         inplace.reload_weights(

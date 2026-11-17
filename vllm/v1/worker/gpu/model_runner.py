@@ -641,13 +641,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         """Reload weights in place."""
         vllm_config = self.vllm_config
         model = self.get_model()
+        # Reuse the loader that loaded the model unless the load config was
+        # overridden since, e.g. dummy weights reloaded from the checkpoint.
+        model_loader = self.model_loader
+        if model_loader and model_loader.load_config is not vllm_config.load_config:
+            model_loader = None
         reload_weights(
             vllm_config,
             model,
             weights_iterator,
             weights_path,
             is_checkpoint_format,
-            model_loader=self.model_loader,
+            model_loader=model_loader,
         )
         self.on_target_weights_replaced()
         self.reset_encoder_cache()
