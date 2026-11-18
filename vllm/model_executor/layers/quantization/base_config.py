@@ -29,6 +29,9 @@ class QuantizeMethodBase(ABC):
     requires_device_loading: bool = True
     """Whether post-load processing requires parameters on the target device."""
 
+    supports_direct_reload: bool = True  # False: a direct reload of its layers is wrong
+    direct_reload_unsupported_reason: str | None = None
+
     uses_meta_device: bool = False
     """
     Whether this method creates weights on meta device for online quantization.

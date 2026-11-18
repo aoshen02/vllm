@@ -186,31 +186,20 @@ def _config_refusals(vllm_config: VllmConfig) -> list[str]:
     return reasons
 
 
-def _module_refusal(model: torch.nn.Module) -> str | None:
-    """Why the model's modules cannot reload directly, if they cannot."""
-    from vllm.model_executor.layers.quantization.humming import (
-        HummingLinearMethod,
-        HummingMoEMethod,
-    )
-    from vllm.model_executor.layers.quantization.online.fp8 import OnlineLinearBase
-    from vllm.model_executor.layers.quantization.online.moe_base import (
-        OnlineMoEMethodBase,
+def _declared_refusal(model: torch.nn.Module) -> str | None:
+    """Why a module or quant method declares that it cannot reload directly."""
+    from vllm.model_executor.layers.fused_moe.fused_moe_modular_method import (
+        FusedMoEModularMethod,
     )
 
     for name, module in model.named_modules():
         method = getattr(module, "quant_method", None)
-        # online methods without a checkpoint counterpart; fused shared experts
-        # quantize staging parameters that post-load processing deletes
-        if (
-            isinstance(method, (OnlineLinearBase, OnlineMoEMethodBase))
-            or getattr(method, "uses_meta_device", False)
-            or getattr(module, "shared_expert_online_loader", None) is not None
-        ):
-            return f"online quantization ({name}: {type(method).__name__})"
-        if isinstance(method, (HummingLinearMethod, HummingMoEMethod)):
-            # its post-load processing runs once per quant method (a guard on
-            # the method, not the module): a reload would keep checkpoint bytes
-            return f"humming ({name})"
+        if isinstance(method, FusedMoEModularMethod):  # elastic EP wraps it
+            method = method.old_quant_method
+        for obj in (module, method):
+            if getattr(obj, "supports_direct_reload", True) is False:
+                reason = getattr(obj, "direct_reload_unsupported_reason", None)
+                return f"{type(obj).__name__} ({name or 'model'}): {reason}"
     return None
 
 
@@ -218,8 +207,6 @@ def _refusals(model: torch.nn.Module) -> list[str]:
     """Reasons direct reload cannot update `model` under the current config."""
     config = get_current_vllm_config_or_none()
     reasons = _config_refusals(config) if config is not None else []
-    if (module_reason := _module_refusal(model)) is not None:
-        reasons.append(module_reason)
     if is_weights_pre_processed():
         # the weight cache's runtime-layout weights have no checkpoint layout
         reasons.append("pre-processed weights")
@@ -231,9 +218,16 @@ def _refusals(model: torch.nn.Module) -> list[str]:
 
 def reloads_directly(model: torch.nn.Module) -> bool:
     """Whether `model` reloads directly; refused models reload layerwise."""
-    return direct_reload_enabled() and not getattr(
-        model, "_direct_reload_refusals", None
-    )
+    if not direct_reload_enabled() or getattr(model, "_direct_reload_refusals", None):
+        return False
+    if "_direct_reload_declared" not in model.__dict__:
+        # at the first update: post-load processing may declare a refusal
+        reason = model._direct_reload_declared = _declared_refusal(model)
+        if reason:
+            logger.info(
+                "Direct reload does not support %s: reloading layerwise.", reason
+            )
+    return not model._direct_reload_declared
 
 
 def record_checkpoint_layout(model: torch.nn.Module) -> None:
@@ -244,7 +238,6 @@ def record_checkpoint_layout(model: torch.nn.Module) -> None:
     Runs once; reloads reuse the cold-start record."""
     if hasattr(model, "_direct_reload_refusals"):
         return
-    # neither the configuration nor the modules change after cold start
     reasons = model._direct_reload_refusals = _refusals(model)
     if reasons:
         logger.info(

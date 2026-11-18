@@ -378,12 +378,12 @@ class TestUnsent:
 
 
 def _assert_reloads_layerwise(model: _ToyModel, match: str, monkeypatch) -> None:
-    """Cold start succeeded and recorded no layout; updates reload layerwise."""
+    """Cold start succeeded; updates reload layerwise."""
     from vllm.model_executor.model_loader.reload import lifecycle
 
     assert not reloads_directly(model)
-    assert match in "; ".join(model._direct_reload_refusals)
-    assert not hasattr(model, "_ckpt_param_names")
+    reasons = model.__dict__.get("_direct_reload_refusals")
+    assert match in "; ".join(reasons or [model._direct_reload_declared])
     calls = []
     monkeypatch.setattr(
         lifecycle, "initialize_layerwise_reload", lambda m: calls.append("init")
@@ -434,19 +434,26 @@ class TestRefusals:
             _cold_start(_checkpoint()), "online quantization", monkeypatch
         )
 
-    def test_online_shared_experts_refused(self, monkeypatch):
-        # post-load processing deletes the staging parameters a reload loads
+    def test_declared_module_refused(self, monkeypatch):
         init = _ToyModel.__init__
 
-        def with_online_shared_experts(self):
+        def with_declaration(self):
             init(self)
-            self.proj.shared_expert_online_loader = SimpleNamespace(
-                finalize=lambda module: None
-            )
+            self.proj.supports_direct_reload = False
+            self.proj.direct_reload_unsupported_reason = "declared"
 
-        monkeypatch.setattr(_ToyModel, "__init__", with_online_shared_experts)
+        monkeypatch.setattr(_ToyModel, "__init__", with_declaration)
+        _assert_reloads_layerwise(_cold_start(_checkpoint()), "declared", monkeypatch)
+
+    def test_refusal_declared_during_post_load_processing(self, monkeypatch):
+        # e.g. a kernel conversion that runs once; after cold start's record
+        def declare(layer):
+            layer.supports_direct_reload = False
+            layer.direct_reload_unsupported_reason = "converted once"
+
+        monkeypatch.setitem(_PWAL, "pad", declare)
         _assert_reloads_layerwise(
-            _cold_start(_checkpoint()), "online quantization", monkeypatch
+            _cold_start(_checkpoint()), "converted once", monkeypatch
         )
 
     @pytest.mark.parametrize("method_cls", ["HummingLinearMethod", "HummingMoEMethod"])

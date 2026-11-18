@@ -72,6 +72,10 @@ class InputHadamardLinearMethod(LinearMethodBase):
     over through `InputHadamardFusable`.
     """
 
+    # post-load processing deletes `input_rotation`, which a reload loads into
+    supports_direct_reload = False
+    direct_reload_unsupported_reason = "online input rotation"
+
     def __init__(
         self, quant_method: LinearMethodBase, size: int, rotate_weight: bool
     ) -> None:

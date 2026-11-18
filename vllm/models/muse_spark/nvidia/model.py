@@ -2052,6 +2052,11 @@ class MuseSparkForCausalLM(LlamaForCausalLM, SupportsLoRA, MixtureOfExperts):
         self.specialized_decode = SpecializedDecode(
             self.model, self.specialized_decode_config
         )
+        # its post-load processing raises on a reload
+        self.supports_direct_reload = False
+        self.direct_reload_unsupported_reason = (
+            "the specialized decode does not support reloading weights"
+        )
 
     def get_model_state_cls(self) -> "type[ModelState]":
         if self.specialized_decode_config is None:
