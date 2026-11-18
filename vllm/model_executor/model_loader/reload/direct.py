@@ -41,13 +41,13 @@ logger = init_logger(__name__)
 
 __all__ = [
     "begin_direct_reload",
-    "check_direct_reload",
     "direct_reload_active",
     "direct_reload_enabled",
     "finish_direct_reload",
     "loadable_tensors",
     "mark_loaded",
     "record_checkpoint_layout",
+    "reloads_directly",
     "track_loaded_params",
 ]
 
@@ -231,17 +231,12 @@ def _refusals(model: torch.nn.Module) -> list[str]:
     return reasons
 
 
-def _refusal_message(reasons: list[str]) -> str:
-    return (
-        f"direct reload does not support {'; '.join(reasons)}. Set "
-        "VLLM_RELOAD_MODE=layerwise to update this model's weights."
+def reloads_directly(model: torch.nn.Module) -> bool:
+    """Whether `model`'s weight updates reload directly: in direct mode, unless
+    cold start found a setup direct reload cannot update (layerwise then)."""
+    return direct_reload_enabled() and not getattr(
+        model, "_direct_reload_refusals", None
     )
-
-
-def check_direct_reload(model: torch.nn.Module) -> None:
-    """Raise if cold start found that `model` cannot reload directly."""
-    if reasons := getattr(model, "_direct_reload_refusals", None):
-        raise RuntimeError(_refusal_message(reasons))
 
 
 def record_checkpoint_layout(model: torch.nn.Module) -> None:
@@ -255,7 +250,11 @@ def record_checkpoint_layout(model: torch.nn.Module) -> None:
     # neither the configuration nor the modules change after cold start
     reasons = model._direct_reload_refusals = _refusals(model)
     if reasons:
-        logger.info("%s", _refusal_message(reasons))
+        logger.info(
+            "Direct reload does not support %s: weight updates of this model "
+            "reload layerwise.",
+            "; ".join(reasons),
+        )
         for _, t in loadable_tensors(model):
             t._ckpt_refused = True  # a model sharing it refuses too
         return
@@ -344,7 +343,6 @@ def begin_direct_reload(model: torch.nn.Module) -> None:
     Everything that can refuse the reload is checked first and raises with
     the model untouched. Once this returns, the model holds checkpoint-layout
     bytes until a finish succeeds."""
-    check_direct_reload(model)
     if not hasattr(model, "_ckpt_param_names"):
         raise RuntimeError("direct reload: no checkpoint layout was recorded")
     _check_params_kept(model)

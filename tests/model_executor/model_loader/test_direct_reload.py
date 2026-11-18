@@ -34,10 +34,10 @@ from vllm.model_executor.layers.quantization.online.loading import quantize_on_l
 from vllm.model_executor.model_loader.reload import direct, finish_reload, start_reload
 from vllm.model_executor.model_loader.reload.direct import (
     begin_direct_reload,
-    check_direct_reload,
     direct_reload_enabled,
     finish_direct_reload,
     record_checkpoint_layout,
+    reloads_directly,
     track_loaded_params,
 )
 from vllm.model_executor.model_loader.utils import process_weights_after_loading
@@ -379,13 +379,23 @@ class TestUnsent:
         _assert_same(after, _state(_cold_start(expected)))
 
 
-def _assert_refused_at_update(model: _ToyModel, match: str) -> None:
-    """Cold start succeeded; the update is refused before it changes the model."""
-    before = _state(model)
-    with pytest.raises(RuntimeError, match=match):
-        start_reload(model)
-    _assert_same(_state(model), before, addresses=True)
-    assert "_direct_reload_begun" not in model.__dict__
+def _assert_reloads_layerwise(model: _ToyModel, match: str, monkeypatch) -> None:
+    """Cold start succeeded and recorded no layout; updates reload layerwise."""
+    from vllm.model_executor.model_loader.reload import lifecycle
+
+    assert not reloads_directly(model)
+    assert match in "; ".join(model._direct_reload_refusals)
+    assert not hasattr(model, "_ckpt_param_names")
+    calls = []
+    monkeypatch.setattr(
+        lifecycle, "initialize_layerwise_reload", lambda m: calls.append("init")
+    )
+    monkeypatch.setattr(
+        lifecycle, "finalize_layerwise_reload", lambda m, c: calls.append("finalize")
+    )
+    start_reload(model)
+    finish_reload(model, _MODEL_CONFIG, _DEVICE)
+    assert calls == ["init", "finalize"]
 
 
 class TestRefusals:
@@ -422,7 +432,9 @@ class TestRefusals:
             self.proj.quant_method = online
 
         monkeypatch.setattr(_ToyModel, "__init__", with_online_layer)
-        _assert_refused_at_update(_cold_start(_checkpoint()), "online quantization")
+        _assert_reloads_layerwise(
+            _cold_start(_checkpoint()), "online quantization", monkeypatch
+        )
 
     def test_online_shared_experts_refused(self, monkeypatch):
         # post-load processing deletes the staging parameters a reload loads
@@ -435,7 +447,9 @@ class TestRefusals:
             )
 
         monkeypatch.setattr(_ToyModel, "__init__", with_online_shared_experts)
-        _assert_refused_at_update(_cold_start(_checkpoint()), "online quantization")
+        _assert_reloads_layerwise(
+            _cold_start(_checkpoint()), "online quantization", monkeypatch
+        )
 
     @pytest.mark.parametrize("method_cls", ["HummingLinearMethod", "HummingMoEMethod"])
     def test_humming_refused(self, monkeypatch, method_cls):
@@ -453,7 +467,7 @@ class TestRefusals:
             self.proj.quant_method = humming
 
         monkeypatch.setattr(_ToyModel, "__init__", with_humming_layer)
-        _assert_refused_at_update(_cold_start(_checkpoint()), "humming")
+        _assert_reloads_layerwise(_cold_start(_checkpoint()), "humming", monkeypatch)
 
     def test_replaced_param_refused(self):
         # a new Parameter under a checkpoint name has no checkpoint layout:
@@ -759,11 +773,7 @@ def test_config_refusals(monkeypatch, mode, overrides, match):
         model.load_weights(_checkpoint().items())
         finish_reload(model, _MODEL_CONFIG, _DEVICE)
     else:
-        # a refused model records no layout
-        assert not hasattr(model, "_ckpt_param_names")
-        with pytest.raises(RuntimeError, match=match) as err:
-            start_reload(model)
-        assert "VLLM_RELOAD_MODE=layerwise" in str(err.value)
+        _assert_reloads_layerwise(model, match, monkeypatch)
 
 
 def test_refused_target_refuses_a_draft_sharing_its_tensors(monkeypatch):
@@ -775,8 +785,8 @@ def test_refused_target_refuses_a_draft_sharing_its_tensors(monkeypatch):
         draft = _ToyModel()
     draft.proj = target.proj  # e.g. a shared lm_head
     record_checkpoint_layout(draft)
-    with pytest.raises(RuntimeError, match="shared with a model"):
-        begin_direct_reload(draft)
+    assert not reloads_directly(draft)
+    assert "shared with a model" in "; ".join(draft._direct_reload_refusals)
 
 
 def test_refusals_recorded_for_pre_processed_weights(monkeypatch):
@@ -787,5 +797,5 @@ def test_refusals_recorded_for_pre_processed_weights(monkeypatch):
     with _DEVICE:
         model = _ToyModel()
     record_checkpoint_layout(model)
-    with pytest.raises(RuntimeError, match="LoRA"):
-        check_direct_reload(model)
+    assert not reloads_directly(model)
+    assert "LoRA" in model._direct_reload_refusals
