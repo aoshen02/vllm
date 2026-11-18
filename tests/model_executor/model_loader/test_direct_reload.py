@@ -706,16 +706,16 @@ def _config(**overrides) -> SimpleNamespace:
     return SimpleNamespace(**(fields | overrides))
 
 
-_LORA = {"lora_config": object()}
+_TORCHAO = {"model_config": SimpleNamespace(quantization="torchao")}
 
 
 @pytest.mark.parametrize(
     "mode,overrides,match",
     [
-        ("direct", _LORA, "LoRA"),
-        ("layerwise", _LORA, "layerwise"),
+        ("direct", _TORCHAO, "torchao"),
+        ("layerwise", _TORCHAO, "layerwise"),
         # without weight updates, reloads are layerwise
-        ("direct", _LORA | {"weight_transfer_config": None}, "layerwise"),
+        ("direct", _TORCHAO | {"weight_transfer_config": None}, "layerwise"),
         (
             "direct",
             {
@@ -729,22 +729,16 @@ _LORA = {"lora_config": object()}
         ),
         (
             "direct",
-            {"model_config": SimpleNamespace(quantization="torchao")},
-            "torchao",
-        ),
-        (
-            "direct",
             {"speculative_config": SimpleNamespace(draft_lm_head_quantization="fp8")},
             "draft_lm_head_quantization",
         ),
         ("direct", {}, "pre-processed"),
     ],
     ids=[
-        "lora",
+        "torchao",
         "layerwise",
         "no-updates",
         "offload",
-        "torchao",
         "draft-lm-head",
         "pre-processed",
     ],
