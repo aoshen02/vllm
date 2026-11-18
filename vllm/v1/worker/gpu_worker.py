@@ -1702,7 +1702,9 @@ class Worker(WorkerBase):
         assert self.weight_transfer_engine is not None
         # Parse dict into backend-specific typed dataclass
         typed_init_info = self.weight_transfer_engine.parse_init_info(init_info)
-        self.weight_transfer_engine.init_transfer_engine(typed_init_info)
+        # init checks the reload mode (e.g. for a load plan)
+        with set_current_vllm_config(self.vllm_config):
+            self.weight_transfer_engine.init_transfer_engine(typed_init_info)
 
     def shutdown_weight_transfer_engine(self) -> None:
         """Release a trainer connection without shutting down inference."""

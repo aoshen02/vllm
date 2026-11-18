@@ -16,6 +16,7 @@ import torch.nn as nn
 from vllm.config import (
     ParallelConfig,
     VllmConfig,
+    WeightTransferConfig,
     get_current_vllm_config,
 )
 from vllm.lora.layers import BaseLayerWithLoRA
@@ -84,7 +85,8 @@ class _RecordingModelRunner:
 
 def _make_worker(engine: _RecordingEngine | None) -> Worker:
     worker = object.__new__(Worker)
-    worker.vllm_config = VllmConfig()
+    transfer = WeightTransferConfig() if engine is not None else None
+    worker.vllm_config = VllmConfig(weight_transfer_config=transfer)
     worker.weight_transfer_engine = engine
     worker._weight_update_active = False
     worker._incomplete_weight_updates = set()
@@ -329,3 +331,19 @@ def test_missing_engine_raises():
     worker = _make_worker(None)
     with pytest.raises(RuntimeError, match="Weight transfer not configured"):
         Worker.start_weight_update(worker)
+
+
+def test_init_engine_runs_under_the_worker_config(monkeypatch):
+    # init checks the reload mode (e.g. for a load plan)
+    engine = _RecordingEngine()
+    seen: list[VllmConfig] = []
+    monkeypatch.setattr(engine, "parse_init_info", lambda info: info, raising=False)
+    monkeypatch.setattr(
+        engine,
+        "init_transfer_engine",
+        lambda info: seen.append(get_current_vllm_config()),
+        raising=False,
+    )
+    worker = _make_worker(engine)
+    Worker.init_weight_transfer_engine(worker, {})
+    assert len(seen) == 1 and seen[0] is worker.vllm_config

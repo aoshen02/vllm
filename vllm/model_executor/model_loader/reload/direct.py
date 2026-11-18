@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Direct weight reload: `VLLM_RELOAD_MODE=direct`, or the default `auto` with
-runtime weight updates enabled.
+"""Direct weight reload, the default with runtime weight updates enabled.
 
 Cold start records each tensor's checkpoint layout before post-load processing
 (PWAL). `begin` views re-laid-out tensors back to that layout on their
@@ -225,6 +224,9 @@ def _refusals(model: torch.nn.Module) -> list[str]:
     reasons = _config_refusals(config) if config is not None else []
     if (module_reason := _module_refusal(model)) is not None:
         reasons.append(module_reason)
+    if is_weights_pre_processed():
+        # the weight cache's runtime-layout weights have no checkpoint layout
+        reasons.append("pre-processed weights")
     if any(hasattr(t, "_ckpt_refused") for _, t in loadable_tensors(model)):
         # e.g. a draft sharing a refused target's lm_head: it would write there
         reasons.append("tensors shared with a model direct reload refuses")
@@ -257,8 +259,6 @@ def record_checkpoint_layout(model: torch.nn.Module) -> None:
         for _, t in loadable_tensors(model):
             t._ckpt_refused = True  # a model sharing it refuses too
         return
-    if is_weights_pre_processed():
-        return  # already in runtime layout
     # what cold start loaded, every update must load again; after a dummy
     # start (nothing loaded) the first update sets it
     model._required_params = model.__dict__.pop("_loaded_params", None)

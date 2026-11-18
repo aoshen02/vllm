@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Direct weight reload (`VLLM_RELOAD_MODE=direct`) on a toy model whose
+"""Direct weight reload on a toy model whose
 post-load processing has the hazards found on real models:
 
 (a) a parent derives a separate tensor from a child's weight (MLA W_UK/W_UV
@@ -279,9 +279,7 @@ def _runs(model: _ToyModel) -> dict[str, int]:
     }
 
 
-@pytest.fixture(autouse=True)
-def _direct_mode(monkeypatch):
-    monkeypatch.setenv("VLLM_RELOAD_MODE", "direct")
+pytestmark = pytest.mark.usefixtures("weight_updates")
 
 
 class TestReloadEqualsColdStart:
@@ -703,29 +701,21 @@ def _config(**overrides) -> SimpleNamespace:
         quant_config=None,
         lora_config=None,
         speculative_config=None,
-        weight_transfer_config=None,
+        weight_transfer_config=SimpleNamespace(backend="nccl"),
     )
     return SimpleNamespace(**(fields | overrides))
 
 
-_UPDATES = {"weight_transfer_config": SimpleNamespace(backend="nccl")}
 _LORA = {"lora_config": object()}
 
 
 @pytest.mark.parametrize(
     "mode,overrides,match",
     [
-        ("direct", {}, None),
-        # without weight updates the default loads and reloads layerwise
-        ("auto", _LORA, "layerwise"),
-        ("auto", _LORA | _UPDATES, "LoRA"),
-        ("layerwise", _LORA | _UPDATES, "layerwise"),
-        # it always reloads layerwise
-        (
-            "auto",
-            _LORA | {"weight_transfer_config": SimpleNamespace(backend="sharded_rdt")},
-            "layerwise",
-        ),
+        ("direct", _LORA, "LoRA"),
+        ("layerwise", _LORA, "layerwise"),
+        # without weight updates, reloads are layerwise
+        ("direct", _LORA | {"weight_transfer_config": None}, "layerwise"),
         (
             "direct",
             {
@@ -747,55 +737,36 @@ _LORA = {"lora_config": object()}
             {"speculative_config": SimpleNamespace(draft_lm_head_quantization="fp8")},
             "draft_lm_head_quantization",
         ),
+        ("direct", {}, "pre-processed"),
     ],
     ids=[
-        "defaults",
-        "auto-lora",
-        "auto-updates-lora",
-        "layerwise-updates-lora",
-        "auto-sharded-rdt-lora",
+        "lora",
+        "layerwise",
+        "no-updates",
         "offload",
         "torchao",
-        "draft-lm-head-quant",
+        "draft-lm-head",
+        "pre-processed",
     ],
 )
 def test_config_refusals(monkeypatch, mode, overrides, match):
-    # checked when an update starts or an engine is set up, never at cold start
+    # recorded at cold start; such a model reloads layerwise
     monkeypatch.setenv("VLLM_RELOAD_MODE", mode)
     config = _config(**overrides)
     monkeypatch.setattr(direct, "get_current_vllm_config_or_none", lambda: config)
-    model = _cold_start(_checkpoint())  # records the reasons, never raises
+    pre_processed = match == "pre-processed"
+    monkeypatch.setattr(direct, "is_weights_pre_processed", lambda: pre_processed)
+    model = _cold_start(_checkpoint())
     if match == "layerwise":
         assert not direct_reload_enabled()
         assert not hasattr(model, "_direct_reload_refusals")
-    elif match is None:
-        start_reload(model)
-        model.load_weights(_checkpoint().items())
-        finish_reload(model, _MODEL_CONFIG, _DEVICE)
-    else:
-        _assert_reloads_layerwise(model, match, monkeypatch)
-
-
-def test_refused_target_refuses_a_draft_sharing_its_tensors(monkeypatch):
-    lora = _config(**_LORA)
-    monkeypatch.setattr(direct, "get_current_vllm_config_or_none", lambda: lora)
-    target = _cold_start(_checkpoint())
+        return
+    _assert_reloads_layerwise(model, match, monkeypatch)
+    # a draft sharing its tensors (e.g. the lm_head) reloads layerwise too
     monkeypatch.setattr(direct, "get_current_vllm_config_or_none", _config)
     with _DEVICE:
         draft = _ToyModel()
-    draft.proj = target.proj  # e.g. a shared lm_head
+    draft.proj = model.proj
     record_checkpoint_layout(draft)
     assert not reloads_directly(draft)
     assert "shared with a model" in "; ".join(draft._direct_reload_refusals)
-
-
-def test_refusals_recorded_for_pre_processed_weights(monkeypatch):
-    # the weight cache's pre-processed weights record no layout
-    lora = _config(**_LORA)
-    monkeypatch.setattr(direct, "get_current_vllm_config_or_none", lambda: lora)
-    monkeypatch.setattr(direct, "is_weights_pre_processed", lambda: True)
-    with _DEVICE:
-        model = _ToyModel()
-    record_checkpoint_layout(model)
-    assert not reloads_directly(model)
-    assert "LoRA" in model._direct_reload_refusals
