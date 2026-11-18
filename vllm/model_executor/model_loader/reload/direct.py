@@ -232,8 +232,7 @@ def _refusals(model: torch.nn.Module) -> list[str]:
 
 
 def reloads_directly(model: torch.nn.Module) -> bool:
-    """Whether `model`'s weight updates reload directly: in direct mode, unless
-    cold start found a setup direct reload cannot update (layerwise then)."""
+    """Whether `model` reloads directly; refused models reload layerwise."""
     return direct_reload_enabled() and not getattr(
         model, "_direct_reload_refusals", None
     )
