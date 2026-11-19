@@ -320,6 +320,7 @@ class TestNCCLEngineParsing:
 
         monkeypatch.setattr(reload_mod, "plan_loads", logged_plan_loads)
         engine = self._make_engine()
+        engine.model._ckpt_param_names = frozenset()  # as a direct cold start records
         engine.init_transfer_engine(
             NCCLWeightTransferInitInfo(
                 master_address="127.0.0.1",
