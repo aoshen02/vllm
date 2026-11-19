@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Direct weight reload (`VLLM_RELOAD_MODE=direct`).
+"""Direct weight reload (`VLLM_RELOAD_MODE=direct`, or `auto` where it applies).
 
 Cold start records each tensor's checkpoint layout before post-load processing
 (PWAL). `begin` views re-laid-out tensors back to that layout on their
@@ -28,7 +28,8 @@ from fnmatch import fnmatchcase
 import torch
 
 import vllm.envs as envs
-from vllm.config import ModelConfig
+from vllm.config import ModelConfig, get_current_vllm_config_or_none
+from vllm.config.vllm import direct_reload_refusal
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
 from vllm.model_executor.utils import (
@@ -46,6 +47,7 @@ __all__ = [
     "loadable_tensors",
     "mark_loaded",
     "record_checkpoint_layout",
+    "reloads_directly",
     "track_loaded_params",
 ]
 
@@ -67,8 +69,22 @@ _LOADER_ATTRS = (
 
 
 def direct_reload_enabled() -> bool:
-    """Whether weight updates reload in place (`VLLM_RELOAD_MODE=direct`)."""
-    return envs.VLLM_RELOAD_MODE == "direct"
+    """Whether a model loaded now records its checkpoint layout to reload directly."""
+    if envs.VLLM_RELOAD_MODE != "auto":
+        return envs.VLLM_RELOAD_MODE == "direct"
+    config = get_current_vllm_config_or_none()
+    # auto leaves online quantization layerwise: its methods stay online
+    return (
+        config is not None
+        and config.weight_transfer_config is not None
+        and direct_reload_refusal(config) is None
+        and getattr(config.model_config, "quantization_config", None) is None
+    )
+
+
+def reloads_directly(model: torch.nn.Module) -> bool:
+    """Whether `model`'s updates reload directly: its cold start recorded a layout."""
+    return envs.VLLM_RELOAD_MODE != "layerwise" and hasattr(model, "_ckpt_param_names")
 
 
 def direct_reload_active(model: torch.nn.Module) -> bool:
@@ -157,8 +173,8 @@ def _check_update_complete(model: torch.nn.Module, model_config: ModelConfig) ->
         )
 
 
-def _check_supported_modules(model: torch.nn.Module) -> None:
-    # config-level refusals: VllmConfig._verify_direct_reload_compat
+def _module_refusal(model: torch.nn.Module) -> str | None:
+    """Why the model's modules cannot reload directly, if they cannot."""
     from vllm.model_executor.layers.quantization.humming import (
         HummingLinearMethod,
         HummingMoEMethod,
@@ -175,14 +191,12 @@ def _check_supported_modules(model: torch.nn.Module) -> None:
         if isinstance(method, (OnlineLinearBase, OnlineMoEMethodBase)) or (
             getattr(module, "shared_expert_online_loader", None) is not None
         ):
-            raise RuntimeError(
-                f"direct reload: online quantization is not supported "
-                f"({name}: {type(method).__name__})"
-            )
+            return f"online quantization ({name}: {type(method).__name__})"
         if isinstance(method, (HummingLinearMethod, HummingMoEMethod)):
             # its post-load processing runs once per quant method (a guard on
             # the method, not the module): a reload would keep checkpoint bytes
-            raise RuntimeError(f"direct reload: humming is not supported ({name})")
+            return f"humming ({name})"
+    return None
 
 
 def record_checkpoint_layout(model: torch.nn.Module) -> None:
@@ -193,7 +207,11 @@ def record_checkpoint_layout(model: torch.nn.Module) -> None:
     Runs once; reloads reuse the cold-start record."""
     if hasattr(model, "_ckpt_param_names") or is_weights_pre_processed():
         return  # pre-processed weights are already in runtime layout
-    _check_supported_modules(model)
+    if reason := _module_refusal(model):
+        logger.info_once(
+            "Direct reload does not support %s: reloading layerwise.", reason
+        )
+        return
     # what cold start loaded, every update must load again; after a dummy
     # start (nothing loaded) the first update sets it
     model._required_params = model.__dict__.pop("_loaded_params", None)
