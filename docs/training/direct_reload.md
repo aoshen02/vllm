@@ -1,8 +1,11 @@
 # Direct Weight Reload
 
-Direct reload updates a running model's weights in place. Set the
-`VLLM_RELOAD_MODE` environment variable to `direct`; the default is
-`layerwise` (see [Layerwise (Re)loading](layerwise.md)).
+Direct reload updates a running model's weights in place. It is the default
+(`VLLM_RELOAD_MODE=auto`) for engines with runtime weight updates
+(`--weight-transfer-config`), except for the configurations below and online
+quantization, which reload layerwise (see [Layerwise (Re)loading](layerwise.md)).
+`VLLM_RELOAD_MODE=direct` also enables it for online quantization and disk
+`reload_weights`; `layerwise` disables it.
 
 !!! tip
     Prefer direct reload for RL weight updates. Use layerwise reload only for
@@ -50,8 +53,8 @@ arrives, and an update that delivers only one of them fails at finish.
 
 ## Refused Configurations
 
-Direct reload raises an error for the following; use
-`VLLM_RELOAD_MODE=layerwise` for them instead:
+In `auto` mode the following reload layerwise. With `VLLM_RELOAD_MODE=direct`,
+the configurations raise an error at startup and the modules reload layerwise:
 
 - Online quantization not in the table above: `mxfp4` and `mxfp4_hadamard32`
   linear layers, `int8_per_channel_weight_only`, `lut_b_moe`, a quantized
@@ -62,5 +65,5 @@ Direct reload raises an error for the following; use
   multiples of 128.
 - The NCCL weight transfer load plan (`use_load_plan`) with online
   quantization.
-- `torchao` quantization, Humming kernels, LoRA, weight offloading,
+- `torchao` quantization, Humming kernels, weight offloading,
   `draft_lm_head_quantization`, and the `sharded_rdt` weight transfer backend.

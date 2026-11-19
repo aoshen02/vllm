@@ -31,11 +31,13 @@ from vllm.model_executor.layers.quantization.online.fp8 import (
     Fp8PerTensorOnlineLinearMethod,
 )
 from vllm.model_executor.layers.quantization.online.loading import quantize_on_load
-from vllm.model_executor.model_loader.reload import finish_reload, start_reload
+from vllm.model_executor.model_loader.reload import direct, finish_reload, start_reload
 from vllm.model_executor.model_loader.reload.direct import (
     begin_direct_reload,
+    direct_reload_enabled,
     finish_direct_reload,
     record_checkpoint_layout,
+    reloads_directly,
     track_loaded_params,
 )
 from vllm.model_executor.model_loader.utils import process_weights_after_loading
@@ -400,8 +402,9 @@ class TestRefusals:
             self.proj.quant_method = online
 
         monkeypatch.setattr(_ToyModel, "__init__", with_online_layer)
-        with pytest.raises(RuntimeError, match="online quantization"):
-            _cold_start(_checkpoint())
+        model = _ToyModel()
+        record_checkpoint_layout(model)
+        assert not reloads_directly(model)  # reloads layerwise
 
     def test_online_shared_experts_refused(self, monkeypatch):
         # post-load processing deletes the staging parameters a reload loads
@@ -412,8 +415,9 @@ class TestRefusals:
             self.proj.shared_expert_online_loader = object()
 
         monkeypatch.setattr(_ToyModel, "__init__", with_online_shared_experts)
-        with pytest.raises(RuntimeError, match="online quantization"):
-            _cold_start(_checkpoint())
+        model = _ToyModel()
+        record_checkpoint_layout(model)
+        assert not reloads_directly(model)  # reloads layerwise
 
     @pytest.mark.parametrize("method_cls", ["HummingLinearMethod", "HummingMoEMethod"])
     def test_humming_refused(self, monkeypatch, method_cls):
@@ -428,8 +432,9 @@ class TestRefusals:
             self.proj.quant_method = humming
 
         monkeypatch.setattr(_ToyModel, "__init__", with_humming_layer)
-        with pytest.raises(RuntimeError, match="humming"):
-            _cold_start(_checkpoint())
+        model = _ToyModel()
+        record_checkpoint_layout(model)
+        assert not reloads_directly(model)  # reloads layerwise
 
     def test_replaced_param_refused(self):
         # a new Parameter under a checkpoint name has no checkpoint layout:
@@ -743,3 +748,61 @@ def test_verify_direct_reload_compat(monkeypatch, mode, overrides, match):
     else:
         with pytest.raises(ValueError, match=match):
             VllmConfig._verify_direct_reload_compat(config)
+
+
+_IPC = SimpleNamespace(backend="ipc")
+_TORCHAO = SimpleNamespace(quantization="torchao")
+_ONLINE = SimpleNamespace(quantization="fp8_per_tensor", quantization_config={})
+
+
+@pytest.mark.parametrize(
+    "mode,overrides,expected",
+    [
+        ("auto", {"weight_transfer_config": _IPC}, True),
+        ("auto", {}, False),
+        (
+            "auto",
+            {"weight_transfer_config": SimpleNamespace(backend="sharded_rdt")},
+            False,
+        ),
+        ("auto", {"weight_transfer_config": _IPC, "model_config": _TORCHAO}, False),
+        ("auto", {"weight_transfer_config": _IPC, "model_config": _ONLINE}, False),
+        ("direct", {}, True),
+        ("layerwise", {"weight_transfer_config": _IPC}, False),
+    ],
+    ids=[
+        "updates",
+        "no-updates",
+        "sharded-rdt",
+        "torchao",
+        "online",
+        "direct",
+        "layerwise",
+    ],
+)
+def test_direct_reload_enabled(monkeypatch, mode, overrides, expected):
+    monkeypatch.setenv("VLLM_RELOAD_MODE", mode)
+    config = _config(**overrides)
+    monkeypatch.setattr(direct, "get_current_vllm_config_or_none", lambda: config)
+    assert direct_reload_enabled() is expected
+
+
+def test_refused_module_reloads_layerwise(monkeypatch):
+    """A refused module leaves no layout, so updates reload layerwise."""
+    from vllm.model_executor.model_loader.reload import lifecycle
+
+    model = _cold_start(_checkpoint())
+    del model._ckpt_param_names
+    model.shared_expert_online_loader = object()  # fused shared experts refuse
+    record_checkpoint_layout(model)
+    assert not reloads_directly(model)
+    calls = []
+    monkeypatch.setattr(
+        lifecycle, "initialize_layerwise_reload", lambda m: calls.append("init")
+    )
+    monkeypatch.setattr(
+        lifecycle, "finalize_layerwise_reload", lambda m, c: calls.append("finalize")
+    )
+    start_reload(model)
+    finish_reload(model, _MODEL_CONFIG, _DEVICE)
+    assert calls == ["init", "finalize"]
