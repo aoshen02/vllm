@@ -402,7 +402,9 @@ class TestRefusals:
             self.proj.quant_method = online
 
         monkeypatch.setattr(_ToyModel, "__init__", with_online_layer)
-        assert not reloads_directly(_cold_start(_checkpoint()))  # layerwise
+        model = _ToyModel()
+        record_checkpoint_layout(model)
+        assert not reloads_directly(model)  # reloads layerwise
 
     def test_online_shared_experts_refused(self, monkeypatch):
         # post-load processing deletes the staging parameters a reload loads
@@ -413,7 +415,9 @@ class TestRefusals:
             self.proj.shared_expert_online_loader = object()
 
         monkeypatch.setattr(_ToyModel, "__init__", with_online_shared_experts)
-        assert not reloads_directly(_cold_start(_checkpoint()))  # layerwise
+        model = _ToyModel()
+        record_checkpoint_layout(model)
+        assert not reloads_directly(model)  # reloads layerwise
 
     @pytest.mark.parametrize("method_cls", ["HummingLinearMethod", "HummingMoEMethod"])
     def test_humming_refused(self, monkeypatch, method_cls):
@@ -428,7 +432,9 @@ class TestRefusals:
             self.proj.quant_method = humming
 
         monkeypatch.setattr(_ToyModel, "__init__", with_humming_layer)
-        assert not reloads_directly(_cold_start(_checkpoint()))  # layerwise
+        model = _ToyModel()
+        record_checkpoint_layout(model)
+        assert not reloads_directly(model)  # reloads layerwise
 
     def test_replaced_param_refused(self):
         # a new Parameter under a checkpoint name has no checkpoint layout:
