@@ -28,8 +28,7 @@ from fnmatch import fnmatchcase
 import torch
 
 import vllm.envs as envs
-from vllm.config import ModelConfig, get_current_vllm_config_or_none
-from vllm.config.vllm import direct_reload_refusal
+from vllm.config import ModelConfig, VllmConfig, get_current_vllm_config_or_none
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
 from vllm.model_executor.utils import (
@@ -41,6 +40,7 @@ logger = init_logger(__name__)
 
 __all__ = [
     "begin_direct_reload",
+    "direct_reload_refusal",
     "direct_reload_active",
     "direct_reload_enabled",
     "finish_direct_reload",
@@ -66,6 +66,34 @@ _LOADER_ATTRS = (
     "packed_factor",
     "pack_factor",
 )
+
+
+def direct_reload_refusal(config: VllmConfig) -> str | None:
+    """Why direct weight reload cannot update `config`'s model, if it cannot."""
+    offload = config.offload_config
+    if (
+        offload.offload_backend != "auto"
+        or offload.prefetch.offload_group_size > 0
+        or offload.uva.cpu_offload_gb > 0
+    ):
+        # CPU/UVA offload gives parameters new storage on every post-load
+        # processing; prefetch offload shares one buffer between layers
+        return "weight offloading"
+    model_config = config.model_config
+    if model_config is not None and model_config.quantization == "torchao":
+        # its load_weights runs a layerwise reload, and its post-load
+        # processing replaces the weight parameter
+        return "torchao quantization"
+    spec = config.speculative_config
+    if spec is not None and spec.draft_lm_head_quantization is not None:
+        # after `begin` the draft's quantized lm_head is a view of the target
+        # lm_head's storage: post-load processing would write it there
+        return "draft_lm_head_quantization"
+    transfer = config.weight_transfer_config
+    if transfer is not None and transfer.backend == "sharded_rdt":
+        # its replay plan is baked by a layerwise (meta) dry run
+        return "the sharded_rdt weight-transfer backend"
+    return None
 
 
 def direct_reload_enabled() -> bool:
