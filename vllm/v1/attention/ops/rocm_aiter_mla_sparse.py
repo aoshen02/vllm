@@ -2066,6 +2066,20 @@ def _get_cached_wo_a_bf16(
     return cached
 
 
+def refresh_cached_wo_a_bf16(model: torch.nn.Module) -> None:
+    """Rebuild the cached bf16 wo_a after a weight update, in place since
+    captured CUDA graphs read its address."""
+    # built in the forward pass, so an inference tensor
+    with torch.inference_mode():
+        for module in model.modules():
+            cached = getattr(module, "_dsv4_wo_a_bf16", None)
+            if cached is None:
+                continue
+            del module._dsv4_wo_a_bf16
+            cached.copy_(_get_cached_wo_a_bf16(module, *cached.shape))
+            module._dsv4_wo_a_bf16 = cached
+
+
 def rocm_inv_rope_einsum(
     rotary_emb: torch.nn.Module,
     o: torch.Tensor,

@@ -43,3 +43,9 @@ def finish_reload(
         finish_direct_reload(model, model_config, device)
     else:
         finalize_layerwise_reload(model, model_config)
+    if any(hasattr(module, "_dsv4_wo_a_bf16") for module in model.modules()):
+        from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
+            refresh_cached_wo_a_bf16,
+        )
+
+        refresh_cached_wo_a_bf16(model)
