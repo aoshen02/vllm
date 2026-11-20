@@ -167,13 +167,20 @@ class Fp8Config(QuantizationConfig):
             ignored_layers = cls.get_from_keys_or(
                 config, ["modules_to_not_convert"], None
             )
-        return cls(
+        match_mode = cls.get_from_keys_or(
+            config, ["ignored_layers_match_mode"], "exact"
+        )
+        if match_mode not in ("exact", "substring", "suffix"):
+            raise ValueError(f"Unsupported ignored_layers_match_mode={match_mode!r}")
+        quant_config = cls(
             is_checkpoint_fp8_serialized=is_checkpoint_fp8_serialized,
             activation_scheme=activation_scheme,
             ignored_layers=ignored_layers,
             weight_block_size=weight_block_size,
             store_dtype=store_dtype,
         )
+        quant_config.ignored_layers_match_mode = match_mode
+        return quant_config
 
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
