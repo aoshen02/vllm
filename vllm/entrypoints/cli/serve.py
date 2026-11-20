@@ -147,7 +147,7 @@ class ServeSubcommand(CLISubcommand):
         if is_multi_port:
             run_dp_supervisor(args)
         elif args.api_server_count < 1:
-            run_headless(args)
+            run_headless(args, install_shutdown_handlers())
         elif args.api_server_count > 1 or rust_frontend_path:
             run_multi_api_server(args)
         else:
@@ -178,7 +178,32 @@ def cmd_init() -> list[CLISubcommand]:
     return [ServeSubcommand()]
 
 
-def run_headless(args: argparse.Namespace):
+class ShutdownRequest:
+    """Whether SIGTERM / SIGINT asked the process to shut down."""
+
+    requested = False
+
+
+def install_shutdown_handlers() -> ShutdownRequest:
+    """Turn the first SIGTERM / SIGINT into a graceful SystemExit. Only a
+    process entrypoint calls this, since signal handlers are process-global."""
+    shutdown = ShutdownRequest()
+
+    def signal_handler(signum, frame):
+        logger.debug("Received %d signal.", signum)
+        if not shutdown.requested:
+            shutdown.requested = True
+            raise SystemExit
+
+    signal.signal(signal.SIGTERM, signal_handler)
+    signal.signal(signal.SIGINT, signal_handler)
+    return shutdown
+
+
+def run_headless(args: argparse.Namespace, shutdown: ShutdownRequest | None = None):
+    """Run headless engines or workers. Signal handling belongs to the caller:
+    the CLI passes `install_shutdown_handlers()`; an embedding host (e.g. an RL
+    framework running this in a worker thread) installs none."""
     if args.api_server_count > 1:
         raise ValueError("api_server_count can't be set in headless mode")
 
@@ -201,19 +226,6 @@ def run_headless(args: argparse.Namespace):
 
     if local_engine_count <= 0:
         raise ValueError("data_parallel_size_local must be > 0 in headless mode")
-
-    shutdown_requested = False
-
-    # Catch SIGTERM and SIGINT to allow graceful shutdown.
-    def signal_handler(signum, frame):
-        nonlocal shutdown_requested
-        logger.debug("Received %d signal.", signum)
-        if not shutdown_requested:
-            shutdown_requested = True
-            raise SystemExit
-
-    signal.signal(signal.SIGTERM, signal_handler)
-    signal.signal(signal.SIGINT, signal_handler)
 
     if parallel_config.node_rank_within_dp > 0:
         from vllm.version import __version__ as VLLM_VERSION
@@ -264,7 +276,7 @@ def run_headless(args: argparse.Namespace):
         engine_manager.monitor_engine_liveness()
     finally:
         timeout = None
-        if shutdown_requested:
+        if shutdown is not None and shutdown.requested:
             timeout = vllm_config.shutdown_timeout
             logger.info("Waiting up to %d seconds for processes to exit", timeout)
         engine_manager.shutdown(timeout=timeout)
