@@ -2033,8 +2033,31 @@ def _get_cached_wo_a_bf16(
     bf16 and feed a plain bf16 GEMM; this mirrors that.
     """
     cached = getattr(wo_a, "_dsv4_wo_a_bf16", None)
-    if cached is not None:
-        return cached
+    if cached is None:
+        cached = _dequant_wo_a_bf16(wo_a, n_local_groups, o_lora_rank, hidden_dim)
+        wo_a._dsv4_wo_a_bf16 = cached
+    return cached
+
+
+def refresh_cached_wo_a_bf16(wo_a: torch.nn.Module) -> None:
+    """Refill a built bf16 wo_a copy in place from the current weights; for
+    process_weights_after_loading, so reloads update it under captured graphs."""
+    cached = getattr(wo_a, "_dsv4_wo_a_bf16", None)
+    if cached is None:
+        return
+    from vllm.model_executor.utils import refill_derived
+
+    # the copy was built in the forward pass, so it is an inference tensor
+    with torch.inference_mode():
+        refill_derived(wo_a, "_dsv4_wo_a_bf16", _dequant_wo_a_bf16(wo_a, *cached.shape))
+
+
+def _dequant_wo_a_bf16(
+    wo_a: torch.nn.Module,
+    n_local_groups: int,
+    o_lora_rank: int,
+    hidden_dim: int,
+) -> torch.Tensor:
     from vllm.model_executor.layers.quantization.utils.fp8_utils import (
         get_fp8_block_weight_scale,
     )
@@ -2057,13 +2080,8 @@ def _get_cached_wo_a_bf16(
             o_lora_rank,
             hidden_dim,
         )
-        cached = (wo_a_weight * wo_a_scale).to(torch.bfloat16)
-    else:
-        cached = wo_a.weight.view(n_local_groups, o_lora_rank, hidden_dim).to(
-            torch.bfloat16
-        )
-    wo_a._dsv4_wo_a_bf16 = cached
-    return cached
+        return (wo_a_weight * wo_a_scale).to(torch.bfloat16)
+    return wo_a.weight.view(n_local_groups, o_lora_rank, hidden_dim).to(torch.bfloat16)
 
 
 def rocm_inv_rope_einsum(
