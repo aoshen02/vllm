@@ -3,6 +3,7 @@
 
 import argparse
 import signal
+import threading
 import time
 
 import uvloop
@@ -212,8 +213,10 @@ def run_headless(args: argparse.Namespace):
             shutdown_requested = True
             raise SystemExit
 
-    signal.signal(signal.SIGTERM, signal_handler)
-    signal.signal(signal.SIGINT, signal_handler)
+    # only the main thread may install handlers; an embedding host owns them
+    if threading.current_thread() is threading.main_thread():
+        signal.signal(signal.SIGTERM, signal_handler)
+        signal.signal(signal.SIGINT, signal_handler)
 
     if parallel_config.node_rank_within_dp > 0:
         from vllm.version import __version__ as VLLM_VERSION
