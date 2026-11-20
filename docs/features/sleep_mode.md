@@ -39,6 +39,34 @@ This is the same on CUDA, ROCm and XPU.
 
 **Host memory** is what non-parameter state takes, plus any preserved parameters. For example, DeepSeek-V4.1-Flash at TP 4 frees 80 GiB per GPU and backs up 2.35 GiB per rank. An allocation that mixes parameters with other tensors is backed up whole.
 
+`sleep(level=0|1|2, mode=...)` (HTTP: `POST /sleep?level=0|1|2&mode=abort|wait|keep`) defaults to `level=1` and `mode="abort"`. Every level first pauses the scheduler, and `mode` decides what happens to in-flight requests (same semantics as `pause_generation`):
+
+- `abort` (default): abort all running and waiting requests.
+- `wait`: stop admitting requests and let in-flight ones finish first. Raises `ValueError` with the in-process engine (`VLLM_ENABLE_V1_MULTIPROCESSING=0`).
+- `keep`: freeze in-flight requests; they continue after wake-up.
+
+Requests submitted while asleep are queued, not rejected, and run after wake-up.
+
+### Level 0: pause scheduling only (no memory freed)
+
+Level 0 stops scheduling and changes no GPU memory: weights, KV cache, and prefix cache stay resident (levels 1 and 2 clear the prefix cache). Use it to quiesce the engine with the same sleep/wake calls, e.g. for a short phase of an RL loop.
+
+```python
+llm.sleep(level=0, mode="keep")   # mode: "abort" (default) | "wait" | "keep"
+# ... engine is paused, GPU memory untouched ...
+llm.wake_up(tags=["scheduling"])  # or llm.wake_up()
+```
+
+```bash
+curl -X POST 'http://localhost:8000/sleep?level=0&mode=keep'
+curl -X POST 'http://localhost:8000/wake_up?tags=scheduling'
+```
+
+- Wake with `tags=["scheduling"]` (HTTP: `?tags=scheduling`) or a plain `wake_up()`. The `scheduling` tag restores no memory: after level 1 or 2, scheduling resumes only once `weights` and `kv_cache` are awake too, and until then `wake_up` returns `False` (HTTP: `"status": "sleeping"`).
+- `is_sleeping` reports `true` while paused at level 0.
+- Level 0 does not require `--enable-sleep-mode` (`enable_sleep_mode=True`): it never reaches the executor or the sleep-mode allocator. The HTTP endpoints still require `VLLM_SERVER_DEV_MODE=1`.
+- To free only the KV cache after a level-0 pause, see [Release only KV cache memory](#release-only-kv-cache-memory).
+
 ## Usage
 
 ### Offline inference
