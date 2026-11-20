@@ -40,6 +40,9 @@ trainer engine.
 
 ## Trainer Side
 
+!!! tip
+    With `VLLM_BATCH_INVARIANT=1` (bitwise-reproducible rollouts), call `vllm.model_executor.determinism.batch_invariant.init_batch_invariance()` in the trainer before `trainer_init`, so the trainer's NCCL settings match the vLLM workers. See [Batch Invariance for RL](../../features/batch_invariance.md#rl-bitwise-train-inference-consistency-trainer-side).
+
 ```python
 from vllm.distributed.weight_transfer import (
     ModuleSource,

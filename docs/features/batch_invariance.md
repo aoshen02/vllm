@@ -12,20 +12,20 @@ Batch invariance is crucial for several use cases:
 
 - **Framework debugging**: Deterministic outputs make it easier to debug issues in the inference framework, as the same input will always produce the same output regardless of batching.
 - **Model debugging**: Helps identify issues in model implementations by ensuring consistent behavior across different batch configurations.
-- **Reinforcement Learning (RL)**: RL training often requires deterministic rollouts for reproducibility and stable training.
+- **Reinforcement Learning (RL)**: RL training often requires deterministic rollouts for reproducibility and stable training. For bitwise train-inference consistency with an NCCL weight-sync group, also set up the trainer; see [RL: Bitwise Train-Inference Consistency](#rl-bitwise-train-inference-consistency-trainer-side).
 - **Large-scale inference systems**: Systems that use vLLM as a component benefit from deterministic behavior for testing, validation, and consistency guarantees.
 
 ## Hardware Requirements
 
 Batch invariance is supported on the following platforms:
 
-- NVIDIA GPUs with compute capability 8.0 or higher.
-- AMD Instinct GPUs (gfx90a, gfx942, gfx950).
+- NVIDIA GPUs with compute capability 8.0 or higher. On SM8x (Ampere, Ada), vLLM replaces `mm`/`addmm`/`matmul`/`linear` with Triton persistent kernels because cuBLASLt is not batch invariant there. On SM90 and newer (Hopper, Blackwell), it keeps cuBLASLt and disables split-K through `CUBLAS_WORKSPACE_CONFIG`.
+- AMD Instinct GPUs (gfx90a, gfx942, gfx950). These use the same Triton matmul overrides as SM8x.
 - Intel XPUs with Triton support.
 
 ### Attention Backend Selection for XPU
 
-On XPU, Triton Attention backend is required for batch invariance.
+On XPU, Triton Attention backend is required for batch invariance. If no backend is set, vLLM selects `TRITON_ATTN` automatically. An explicit `FLASH_ATTN` is honored with a warning, but it is not validated for batch invariance.
 Select this backend using Qwen/Qwen3-1.7B model as an example:
 
 ```python
@@ -118,6 +118,40 @@ for output in outputs:
     print(f"Prompt: {prompt!r}")
     print(f"Generated: {generated_text!r}\n")
 ```
+
+## RL: Bitwise Train-Inference Consistency (Trainer Side)
+
+For RL rollouts that must be bitwise reproducible (train-inference consistency, on-policy RL), set `VLLM_BATCH_INVARIANT=1` for vLLM **and** for every trainer process that joins an NCCL weight-sync group, and call `init_batch_invariance()` in the trainer before its first NCCL call:
+
+```python
+# Trainer process. VLLM_BATCH_INVARIANT=1 must be in this process's environment;
+# without it, init_batch_invariance() does nothing.
+from vllm.model_executor.determinism.batch_invariant import init_batch_invariance
+
+init_batch_invariance()  # before creating any NCCL communicator / weight-transfer engine
+
+model = AutoModelForCausalLM.from_pretrained(model_name, dtype=torch.bfloat16).to("cuda")
+# ... then WeightTransferTrainerFactory.trainer_init(...) as usual
+```
+
+vLLM workers call `init_batch_invariance()` themselves at startup (`init_worker_distributed_environment` in `vllm/v1/worker/gpu_worker.py`). With Ray, put the variable in `runtime_env={"env_vars": {"VLLM_BATCH_INVARIANT": "1"}}` so trainer actors and vLLM workers both see it. See [`rlhf_async_new_apis.py`](../../examples/rl/rlhf_async_new_apis.py) for a complete trainer + `AsyncLLMEngine` example.
+
+`init_batch_invariance()` sets these environment variables in the calling process (`override_envs_for_invariance()` in `vllm/model_executor/determinism/batch_invariant.py`):
+
+| Variables | Value | Applies to |
+| --- | --- | --- |
+| `NCCL_LAUNCH_MODE` | `GROUP` | Every communicator in the process, including the weight-sync communicator shared with the trainer. |
+| `NCCL_ALGO`, `NCCL_PROTO`, `NCCL_MIN_NCHANNELS`, `NCCL_MAX_NCHANNELS`, `NCCL_NTHREADS`, `NCCL_SOCKET_NTHREADS`, `NCCL_COLLNET_ENABLE`, `NCCL_NVLS_ENABLE`, `NCCL_P2P_NET_DISABLE` | `ring,tree;allreduce:tree`, `Simple`, `1`, `1`, `1`, `1`, `0`, `0`, `1` | The process's own communicators only, if NCCL >= 2.29.7 (vLLM lists them in `NCCL_NO_CACHE` and creates weight-sync communicators without them). With older NCCL they also apply to the weight-sync communicator. |
+| `VLLM_CUSTOM_ALLREDUCE_ALGO`, `VLLM_ALLREDUCE_USE_SYMM_MEM` | `1stage`, `0` | vLLM tensor-parallel all-reduce. |
+| `CUBLAS_WORKSPACE_CONFIG` (+ `CUBLASLT_WORKSPACE_SIZE` on SM90+) | `:4096:8`, then `:16:8` and `1` on SM90+ | cuBLAS / cuBLASLt (disables split-K). |
+| `VLLM_USE_AOT_COMPILE` | `0` | vLLM `torch.compile`. |
+| `VLLM_ROCM_USE_SKINNY_GEMM` (ROCm only, instead of the `NCCL_*` variables) | `0` | ROCm skinny GEMMs. |
+
+It also changes the trainer's own math: it installs batch-invariant `aten` overrides (`softmax`, `_log_softmax`, `bmm`, `mean.dim`; plus `mm`, `addmm`, `matmul` and `linear` on SM8x, ROCm and XPU), disables TF32 and reduced-precision fp16/bf16 reductions, and sets `torch._inductor.config.batch_invariant = True`. Expect the trainer to run slower.
+
+Failure behavior: on NCCL < 2.29.7, vLLM logs `NCCL_NO_CACHE needs CUDA NCCL >= 2.29.7, ...` when it creates the weight-sync communicator. A trainer that has not set the same `NCCL_*` variables (for example, because it skipped `init_batch_invariance()`) hangs on that communicator.
+
+Scope: batch invariance makes vLLM's outputs independent of batching. It does not make vLLM logprobs equal to logprobs from a different model implementation (for example, Hugging Face Transformers). A bitwise match with the trainer also needs the trainer's forward pass to use the same kernels, dtype and reduction order as vLLM. The `rlhf_async_new_apis.py` example only checks the weight-synced engine against a fresh vLLM instance loaded with the trained weights. To check against your trainer, recompute logprobs of the sampled token ids in the trainer and compare them to vLLM's returned `logprobs` with `torch.equal`. These are `raw_logprobs` by default (before temperature and top-k/top-p); set `logprobs_mode="processed_logprobs"` if the trainer applies temperature.
 
 ## Tested Models
 

@@ -20,6 +20,8 @@ For weight synchronization between training and inference, see the [Weight Trans
 
 For MoE policies, see [Routed Experts Return](routed_experts.md) (`--enable-return-routed-experts`) to get the per-token expert routing of each rollout for routing replay (R3) in the trainer.
 
+For bitwise-reproducible rollouts (train-inference consistency), see [Batch Invariance](../features/batch_invariance.md#rl-bitwise-train-inference-consistency-trainer-side). Set `VLLM_BATCH_INVARIANT=1` for vLLM and the trainer, and call `init_batch_invariance()` in the trainer process before it joins the NCCL weight-sync group.
+
 For pipelining generation and training to improve GPU utilization and throughput, see the [Async Reinforcement Learning](async_rl.md) guide, which covers the pause/resume API for safely updating weights mid-flight.
 
 See the following notebooks showing how to use vLLM for GRPO:
