@@ -18,6 +18,10 @@ from vllm.model_executor.layers.fused_moe import (
 from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compressed_tensors_wNa16 import (  # noqa
     WNA16_SUPPORTED_BITS,
 )
+from vllm.model_executor.layers.quantization.utils.quant_utils import (
+    kNvfp4Dynamic,
+    kNvfp4DynamicToken,
+)
 from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
@@ -155,8 +159,13 @@ class CompressedTensorsMoEMethod(FusedMoEMethodBase):
                     "For NVFP4 weights, input quantization must also be NVFP4 "
                     f"format or None for NVFP4A16, found {input_quant}"
                 )
+            # fully dynamic inputs (no global scale) are quantized per token
+            per_token = input_quant is not None and input_quant.dynamic is True
             return CompressedTensorsW4A4Nvfp4MoEMethod(
-                layer.moe_config, layer_name, use_a16=(input_quant is None)
+                layer.moe_config,
+                layer_name,
+                use_a16=(input_quant is None),
+                activation_key=kNvfp4DynamicToken if per_token else kNvfp4Dynamic,
             )
         elif (
             quant_config._is_fp8_w8a8_sm90(weight_quant, input_quant)
