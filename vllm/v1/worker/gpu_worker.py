@@ -77,7 +77,11 @@ from vllm.model_executor.layers.quantization.online.lm_head import (
     restore_quantized_lm_heads,
     share_source_lm_heads,
 )
-from vllm.model_executor.model_loader import get_model_loader
+from vllm.model_executor.model_loader import (
+    get_model_loader,
+    get_model_loader_for_model,
+    release_model_loader,
+)
 from vllm.model_executor.model_loader.weight_cache.utils import ExternalWeightCharges
 from vllm.model_executor.model_loader.weight_checksum import (
     compute_tensor_digests,
@@ -348,7 +352,23 @@ class Worker(WorkerBase):
             )
         return set(storage.values()) - preserved
 
+    def _iter_loaded_models(self) -> Iterable[nn.Module]:
+        runner = getattr(self, "model_runner", None)
+        if runner is None:
+            return
+        model = getattr(runner, "model", None)
+        if model is not None:
+            yield model
+        if getattr(runner, "speculator", None) is not None:
+            draft = self.get_draft_model()
+            if draft is not None:
+                yield draft
+
     def sleep(self, level: int = 1) -> None:
+        for model in self._iter_loaded_models():
+            if (loader := get_model_loader_for_model(model)) is not None:
+                loader.on_sleep(level)
+
         torch.accelerator.synchronize()
         free_bytes_before_sleep = torch.accelerator.get_memory_info()[0]
         # Level 2 keeps everything the weight update doesn't rewrite.
@@ -400,7 +420,15 @@ class Worker(WorkerBase):
 
         self.synchronize_device()
 
+        for model in self._iter_loaded_models():
+            if (loader := get_model_loader_for_model(model)) is not None:
+                loader.on_wake_up(tags)
+
     def discard(self, tags: tuple[str, ...]) -> None:
+        if "weights" in tags:
+            for model in self._iter_loaded_models():
+                if (loader := get_model_loader_for_model(model)) is not None:
+                    loader.on_sleep(level=2)
         if has_kv_transfer_group() and "kv_cache" in tags:
             get_kv_transfer_group().unregister_kv_caches()
         # Outside the allocator pool, like in sleep.
@@ -1888,6 +1916,9 @@ class Worker(WorkerBase):
             weight_transfer_engine.shutdown()
 
         self.elastic_ep_executor.shutdown()
+
+        for model in self._iter_loaded_models():
+            release_model_loader(model)
 
         # Release GPU resources held by the model runner so that memory
         # can be reclaimed when running in-process

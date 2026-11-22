@@ -60,7 +60,7 @@ from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
 from vllm.model_executor.layers.quantization.online.lm_head import (
     refresh_quantized_lm_heads,
 )
-from vllm.model_executor.model_loader import get_model_loader
+from vllm.model_executor.model_loader import get_model
 from vllm.model_executor.model_loader.reload.inplace import reload_weights
 from vllm.model_executor.model_loader.utils import log_layer_backends
 from vllm.model_executor.models.interfaces import requires_raw_input_tokens
@@ -411,15 +411,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.eplb.prepare_load()
         eplb_models_added = False
         with DeviceMemoryProfiler() as m:
-            model_loader = get_model_loader(self.vllm_config.load_config)
             logger.info_once("Loading model from scratch...")
 
             # Capture warmup providers selected while constructing the model.
             with self.jit_warmup_registry.activate():
-                self.model = model or model_loader.load_model(
-                    vllm_config=self.vllm_config,
-                    model_config=self.vllm_config.model_config,
-                )
+                self.model = model or get_model(vllm_config=self.vllm_config)
             log_layer_backends(self.model, self.vllm_config.model_config)
             if self.lora_config:
                 self.model = self.load_lora_model(

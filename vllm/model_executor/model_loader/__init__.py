@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from typing import Literal
+from weakref import WeakKeyDictionary
 
 from torch import nn
 
@@ -125,12 +126,43 @@ def register_model_loader(load_format: str):
     return _wrapper
 
 
+_MODEL_LOADERS: WeakKeyDictionary[nn.Module, BaseModelLoader] = WeakKeyDictionary()
+
+
 def get_model_loader(load_config: LoadConfig) -> BaseModelLoader:
     """Get a model loader based on the load format."""
     load_format = load_config.load_format
     if load_format not in _LOAD_FORMAT_TO_MODEL_LOADER:
         raise ValueError(f"Load format `{load_format}` is not supported")
     return _LOAD_FORMAT_TO_MODEL_LOADER[load_format](load_config)
+
+
+def get_model_loader_for_model(model: nn.Module) -> BaseModelLoader | None:
+    """Return the loader instance currently bound to `model`, if any."""
+    return _MODEL_LOADERS.get(model)
+
+
+def get_or_create_model_loader(
+    model: nn.Module, load_config: LoadConfig
+) -> BaseModelLoader:
+    """Reuse `model`'s loader if `load_config` still matches; otherwise replace it."""
+    loader = _MODEL_LOADERS.get(model)
+    expected_cls = _LOAD_FORMAT_TO_MODEL_LOADER.get(load_config.load_format)
+    if (
+        loader is not None
+        and expected_cls is not None
+        and type(loader) is expected_cls
+        and loader.load_config == load_config
+    ):
+        return loader
+    loader = get_model_loader(load_config)
+    _MODEL_LOADERS[model] = loader
+    return loader
+
+
+def release_model_loader(model: nn.Module) -> None:
+    """Detach any model loader bound to `model`."""
+    _MODEL_LOADERS.pop(model, None)
 
 
 def get_model(
@@ -143,14 +175,19 @@ def get_model(
     loader = get_model_loader(load_config or vllm_config.load_config)
     if model_config is None:
         model_config = vllm_config.model_config
-    return loader.load_model(
+    model = loader.load_model(
         vllm_config=vllm_config, model_config=model_config, prefix=prefix
     )
+    _MODEL_LOADERS[model] = loader
+    return model
 
 
 __all__ = [
     "get_model",
     "get_model_loader",
+    "get_model_loader_for_model",
+    "get_or_create_model_loader",
+    "release_model_loader",
     "get_architecture_class_name",
     "get_model_architecture",
     "get_model_cls",

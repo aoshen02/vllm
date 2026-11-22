@@ -52,6 +52,38 @@ class BaseModelLoader(ABC):
         inplace weights loading for an already-initialized model"""
         raise NotImplementedError
 
+    def on_sleep(self, level: int) -> None:  # noqa: B027
+        """Called before GPU weight memory is freed/unmapped by sleep or discard."""
+
+    def on_wake_up(self, tags: list[str] | None) -> None:  # noqa: B027
+        """Called after `Worker.wake_up(tags)` restores GPU memory and syncs.
+
+        After level-1 sleep, weights are valid here. After level-2 sleep,
+        weights are only valid once `reload_model` completes.
+        """
+
+    def reload_model(
+        self,
+        vllm_config: VllmConfig,
+        model_config: ModelConfig,
+        model: nn.Module,
+        is_checkpoint_format: bool = True,
+    ) -> None:
+        """Reload `model`'s weights in place from this loader's source.
+
+        Default implementation streams weights via `get_all_weights()` through
+        vLLM's generic inplace reload path. Override for loaders that write
+        final weights directly into `model` (e.g., over P2P/RDMA).
+        """
+        from vllm.model_executor.model_loader.reload.inplace import (
+            reload_weights_from_iterator,
+        )
+
+        weights_iterator = self.get_all_weights(model_config, model)
+        reload_weights_from_iterator(
+            vllm_config, model, weights_iterator, is_checkpoint_format
+        )
+
     def create_model(
         self, vllm_config: VllmConfig, model_config: ModelConfig, prefix: str = ""
     ) -> nn.Module:

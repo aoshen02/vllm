@@ -2,14 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import time
 from collections.abc import Iterable
-from typing import cast
 
 import torch
 import torch.nn as nn
 
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
-from vllm.model_executor.model_loader import get_model_loader
+from vllm.model_executor.model_loader import get_or_create_model_loader
 from vllm.model_executor.model_loader.weight_utils import finalize_model_weights
 from vllm.model_executor.utils import weights_already_processed
 
@@ -17,7 +16,11 @@ from .lifecycle import finish_reload, start_reload
 
 logger = init_logger(__name__)
 
-__all__ = ["get_parameter_for_reload", "reload_weights"]
+__all__ = [
+    "get_parameter_for_reload",
+    "reload_weights",
+    "reload_weights_from_iterator",
+]
 
 
 def get_parameter_for_reload(model: nn.Module, name: str) -> nn.Parameter:
@@ -31,38 +34,13 @@ def get_parameter_for_reload(model: nn.Module, name: str) -> nn.Parameter:
     return module.get_parameter(parameter_name)
 
 
-def reload_weights(
+def reload_weights_from_iterator(
     vllm_config: VllmConfig,
     model: nn.Module,
-    weights_iterator: Iterable[tuple[str, torch.Tensor]] | None,
-    weights_path: str | None,
+    weights_iterator: Iterable[tuple[str, torch.Tensor]],
     is_checkpoint_format: bool,
 ) -> None:
-    """Reload a model's weights in place from a weights iterator or from disk.
-
-    Callers are responsible for invalidating any state derived from the old
-    weights (e.g. LoRA, encoder and multimodal caches).
-
-    Args:
-        vllm_config: config of the model being reloaded. If `weights_path` is
-            given, `vllm_config.model_config` is updated to point at it.
-        model: model to load weights into
-        weights_iterator: weights to load into model
-        weights_path: path to load weights from if weights_iterator is not
-            provided. Use path of original model if neither is provided.
-        is_checkpoint_format: set to False if weights have already been
-            processed into kernel format (repacking, renaming, etc.)
-
-    """
-    # TODO(@kylesayrs): generalize to all runners and loaders
-    # argument validation
-    if weights_iterator is None and not is_checkpoint_format:
-        logger.warning(
-            "Reloading from disk means that weights will be in checkpoint format. "
-            "Please use `is_checkpoint_format=True` "
-            "to avoid weight reloading errors"
-        )
-
+    """Reload a model's weights in place from an explicit `(name, tensor)` iterator."""
     model_config = vllm_config.model_config
     load_config = vllm_config.load_config
     weights_to_load = {
@@ -70,24 +48,6 @@ def reload_weights(
         for name, _ in model.named_parameters()
     }
     counter_before_reloading = time.perf_counter()
-
-    # load weights from disk if none are provided
-    if weights_iterator is None:
-        model_loader = get_model_loader(load_config)
-        if not hasattr(model_loader, "get_all_weights"):
-            raise NotImplementedError(
-                f"Model reloading with `{load_config.load_format}` format"
-            )
-
-        if weights_path is not None:
-            # The revision and any object-storage `model_weights` source
-            # belong to the model we are reloading away from, so they must
-            # not be carried over to the new path.
-            model_config.model = weights_path
-            model_config.model_weights = ""
-            model_config.revision = None
-        weights_iterator = model_loader.get_all_weights(model_config, model)
-        weights_iterator = cast(Iterable[tuple[str, torch.Tensor]], weights_iterator)
 
     # begin loading weights
     logger.info_once("Reloading weights inplace...")
@@ -127,3 +87,53 @@ def reload_weights(
                 "Following weights were not loaded from checkpoint: %s",
                 weights_not_loaded,
             )
+
+
+def reload_weights(
+    vllm_config: VllmConfig,
+    model: nn.Module,
+    weights_iterator: Iterable[tuple[str, torch.Tensor]] | None,
+    weights_path: str | None,
+    is_checkpoint_format: bool,
+) -> None:
+    """Reload a model's weights in place from a weights iterator or the model's loader.
+
+    Callers are responsible for invalidating any state derived from the old
+    weights (e.g. LoRA, encoder and multimodal caches).
+
+    Args:
+        vllm_config: config of the model being reloaded. If `weights_path` is
+            given, `vllm_config.model_config` is updated to point at it.
+        model: model to load weights into
+        weights_iterator: weights to load into model
+        weights_path: path to load weights from if weights_iterator is not
+            provided. Use path of original model if neither is provided.
+        is_checkpoint_format: set to False if weights have already been
+            processed into kernel format (repacking, renaming, etc.)
+
+    """
+    # TODO(@kylesayrs): generalize to all runners and loaders
+    if weights_iterator is None:
+        if not is_checkpoint_format:
+            logger.warning(
+                "Reloading from disk means that weights will be in checkpoint format. "
+                "Please use `is_checkpoint_format=True` "
+                "to avoid weight reloading errors"
+            )
+        model_config = vllm_config.model_config
+        if weights_path is not None:
+            # The revision and any object-storage `model_weights` source
+            # belong to the model we are reloading away from, so they must
+            # not be carried over to the new path.
+            model_config.model = weights_path
+            model_config.model_weights = ""
+            model_config.revision = None
+        model_loader = get_or_create_model_loader(model, vllm_config.load_config)
+        model_loader.reload_model(
+            vllm_config, model_config, model, is_checkpoint_format
+        )
+        return
+
+    reload_weights_from_iterator(
+        vllm_config, model, weights_iterator, is_checkpoint_format
+    )

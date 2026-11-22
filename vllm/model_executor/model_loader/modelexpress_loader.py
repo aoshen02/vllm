@@ -55,6 +55,32 @@ class ModelExpressModelLoader(BaseModelLoader):
     def load_weights(self, model: nn.Module, model_config: ModelConfig) -> None:
         self._loader.load_weights(model, model_config)
 
+    def on_sleep(self, level: int) -> None:
+        if hasattr(self._loader, "on_sleep"):
+            self._loader.on_sleep(level)
+
+    def on_wake_up(self, tags: list[str] | None) -> None:
+        if hasattr(self._loader, "on_wake_up"):
+            self._loader.on_wake_up(tags)
+
+    def reload_model(
+        self,
+        vllm_config: VllmConfig,
+        model_config: ModelConfig,
+        model: nn.Module,
+        is_checkpoint_format: bool = True,
+    ) -> None:
+        if hasattr(self._loader, "reload_model"):
+            self._loader.reload_model(
+                vllm_config=vllm_config,
+                model_config=model_config,
+                model=model,
+            )
+            return
+        super().reload_model(
+            vllm_config, model_config, model, is_checkpoint_format
+        )
+
     @instrument(span_name="Load model")
     def load_model(
         self,
