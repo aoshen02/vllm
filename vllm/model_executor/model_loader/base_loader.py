@@ -1,11 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import functools
 import gc
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Generator
-from typing import Any
 from weakref import WeakKeyDictionary
 
 import torch
@@ -36,23 +34,6 @@ logger = init_logger(__name__)
 class BaseModelLoader(ABC):
     """Base class for model loaders."""
 
-    def __init_subclass__(cls, **kwargs: Any) -> None:
-        super().__init_subclass__(**kwargs)
-        if "load_model" not in cls.__dict__:
-            return
-        orig_load_model = cls.__dict__["load_model"]
-
-        @functools.wraps(orig_load_model)
-        def _bound_load_model(
-            self: "BaseModelLoader", *args: Any, **kw: Any
-        ) -> nn.Module:
-            model = orig_load_model(self, *args, **kw)
-            if model is not None:
-                _MODEL_LOADERS[model] = self
-            return model
-
-        cls.load_model = _bound_load_model  # type: ignore[method-assign]
-
     def __init__(self, load_config: LoadConfig):
         self.load_config = load_config
 
@@ -73,14 +54,11 @@ class BaseModelLoader(ABC):
         raise NotImplementedError
 
     def on_sleep(self, level: int) -> None:  # noqa: B027
-        """Called before GPU weight memory is freed/unmapped by sleep or discard."""
+        """Called before GPU weight memory is freed by sleep or discard."""
 
     def on_wake_up(self, tags: list[str] | None) -> None:  # noqa: B027
-        """Called after `Worker.wake_up(tags)` restores GPU memory and syncs.
-
-        After level-1 sleep, weights are valid here. After level-2 sleep,
-        weights are only valid once `reload_model` completes.
-        """
+        """Called after `Worker.wake_up(tags)` restores GPU memory and syncs
+        (weights are valid at level 1, or after `reload_model` at level 2)."""
 
     def reload_model(
         self,
@@ -89,12 +67,8 @@ class BaseModelLoader(ABC):
         model: nn.Module,
         is_checkpoint_format: bool = True,
     ) -> None:
-        """Reload `model`'s weights in place from this loader's source.
-
-        Default implementation streams weights via `get_all_weights()` through
-        vLLM's generic inplace reload path. Override for loaders that write
-        final weights directly into `model` (e.g., over P2P/RDMA).
-        """
+        """Reload weights into `model` in place; override to bypass
+        `get_all_weights()` + generic inplace reload."""
         from vllm.model_executor.model_loader.reload.inplace import (
             reload_weights_from_iterator,
         )
@@ -191,21 +165,26 @@ class BaseModelLoader(ABC):
             torch.accelerator.empty_cache()
 
         model = model.eval()
-        _MODEL_LOADERS[model] = self
+        bind_model_loader(model, self)
         return model
 
 
 _MODEL_LOADERS: WeakKeyDictionary[nn.Module, BaseModelLoader] = WeakKeyDictionary()
 
 
+def bind_model_loader(model: nn.Module, loader: BaseModelLoader) -> None:
+    """Associate `model` with the loader managing its weights."""
+    _MODEL_LOADERS[model] = loader
+
+
 def sleep_model_loaders(level: int) -> None:
-    """Notify all active model loaders before GPU weight memory is released."""
+    """Notify active model loaders before GPU weight memory is released."""
     for loader in list(_MODEL_LOADERS.values()):
         loader.on_sleep(level)
 
 
 def wake_up_model_loaders(tags: list[str] | None = None) -> None:
-    """Notify all active model loaders after GPU memory is restored."""
+    """Notify active model loaders after GPU memory is restored."""
     for loader in list(_MODEL_LOADERS.values()):
         loader.on_wake_up(tags)
 

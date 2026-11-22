@@ -9,7 +9,10 @@ from torch import nn
 
 from vllm.config import ModelConfig, VllmConfig
 from vllm.config.load import LoadConfig
-from vllm.model_executor.model_loader.base_loader import BaseModelLoader
+from vllm.model_executor.model_loader.base_loader import (
+    BaseModelLoader,
+    bind_model_loader,
+)
 from vllm.tracing import instrument
 
 _MODELEXPRESS_LOADER_MODULE = "modelexpress.engines.vllm.loader"
@@ -93,4 +96,6 @@ class ModelExpressModelLoader(BaseModelLoader):
             model_config=model_config,
             prefix=prefix,
         )
-        return model.eval()
+        model = model.eval()
+        bind_model_loader(model, self)
+        return model

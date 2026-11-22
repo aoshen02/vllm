@@ -11,6 +11,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.model_loader.base_loader import (
     _MODEL_LOADERS,
     BaseModelLoader,
+    bind_model_loader,
     release_model_loaders,
     sleep_model_loaders,
     wake_up_model_loaders,
@@ -167,12 +168,15 @@ def get_model(
     loader = get_model_loader(load_config or vllm_config.load_config)
     if model_config is None:
         model_config = vllm_config.model_config
-    return loader.load_model(
+    model = loader.load_model(
         vllm_config=vllm_config, model_config=model_config, prefix=prefix
     )
+    bind_model_loader(model, loader)
+    return model
 
 
 __all__ = [
+    "bind_model_loader",
     "get_model",
     "get_model_loader",
     "get_or_create_model_loader",
