@@ -137,11 +137,6 @@ def get_model_loader(load_config: LoadConfig) -> BaseModelLoader:
     return _LOAD_FORMAT_TO_MODEL_LOADER[load_format](load_config)
 
 
-def get_model_loader_for_model(model: nn.Module) -> BaseModelLoader | None:
-    """Return the loader instance currently bound to `model`, if any."""
-    return _MODEL_LOADERS.get(model)
-
-
 def get_or_create_model_loader(
     model: nn.Module, load_config: LoadConfig
 ) -> BaseModelLoader:
@@ -160,9 +155,21 @@ def get_or_create_model_loader(
     return loader
 
 
-def release_model_loader(model: nn.Module) -> None:
-    """Detach any model loader bound to `model`."""
-    _MODEL_LOADERS.pop(model, None)
+def sleep_model_loaders(level: int) -> None:
+    """Notify all active model loaders before GPU weight memory is released."""
+    for loader in list(_MODEL_LOADERS.values()):
+        loader.on_sleep(level)
+
+
+def wake_up_model_loaders(tags: list[str] | None = None) -> None:
+    """Notify all active model loaders after GPU memory is restored."""
+    for loader in list(_MODEL_LOADERS.values()):
+        loader.on_wake_up(tags)
+
+
+def release_model_loaders() -> None:
+    """Detach all model loaders tracked in this process."""
+    _MODEL_LOADERS.clear()
 
 
 def get_model(
@@ -185,9 +192,10 @@ def get_model(
 __all__ = [
     "get_model",
     "get_model_loader",
-    "get_model_loader_for_model",
     "get_or_create_model_loader",
-    "release_model_loader",
+    "release_model_loaders",
+    "sleep_model_loaders",
+    "wake_up_model_loaders",
     "get_architecture_class_name",
     "get_model_architecture",
     "get_model_cls",
