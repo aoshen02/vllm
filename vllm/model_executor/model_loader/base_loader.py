@@ -1,9 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import functools
 import gc
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Generator
+from typing import Any
+from weakref import WeakKeyDictionary
 
 import torch
 import torch.nn as nn
@@ -32,6 +35,23 @@ logger = init_logger(__name__)
 
 class BaseModelLoader(ABC):
     """Base class for model loaders."""
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        super().__init_subclass__(**kwargs)
+        if "load_model" not in cls.__dict__:
+            return
+        orig_load_model = cls.__dict__["load_model"]
+
+        @functools.wraps(orig_load_model)
+        def _bound_load_model(
+            self: "BaseModelLoader", *args: Any, **kw: Any
+        ) -> nn.Module:
+            model = orig_load_model(self, *args, **kw)
+            if model is not None:
+                _MODEL_LOADERS[model] = self
+            return model
+
+        cls.load_model = _bound_load_model  # type: ignore[method-assign]
 
     def __init__(self, load_config: LoadConfig):
         self.load_config = load_config
@@ -170,7 +190,29 @@ class BaseModelLoader(ABC):
             gc.collect()
             torch.accelerator.empty_cache()
 
-        return model.eval()
+        model = model.eval()
+        _MODEL_LOADERS[model] = self
+        return model
+
+
+_MODEL_LOADERS: WeakKeyDictionary[nn.Module, BaseModelLoader] = WeakKeyDictionary()
+
+
+def sleep_model_loaders(level: int) -> None:
+    """Notify all active model loaders before GPU weight memory is released."""
+    for loader in list(_MODEL_LOADERS.values()):
+        loader.on_sleep(level)
+
+
+def wake_up_model_loaders(tags: list[str] | None = None) -> None:
+    """Notify all active model loaders after GPU memory is restored."""
+    for loader in list(_MODEL_LOADERS.values()):
+        loader.on_wake_up(tags)
+
+
+def release_model_loaders() -> None:
+    """Detach all model loaders tracked in this process."""
+    _MODEL_LOADERS.clear()
 
 
 def log_model_inspection(model: nn.Module) -> None:

@@ -2,14 +2,19 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from typing import Literal
-from weakref import WeakKeyDictionary
 
 from torch import nn
 
 from vllm.config import ModelConfig, VllmConfig
 from vllm.config.load import LoadConfig
 from vllm.logger import init_logger
-from vllm.model_executor.model_loader.base_loader import BaseModelLoader
+from vllm.model_executor.model_loader.base_loader import (
+    _MODEL_LOADERS,
+    BaseModelLoader,
+    release_model_loaders,
+    sleep_model_loaders,
+    wake_up_model_loaders,
+)
 from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
 from vllm.model_executor.model_loader.dummy_loader import DummyModelLoader
 from vllm.model_executor.model_loader.modelexpress_loader import (
@@ -126,9 +131,6 @@ def register_model_loader(load_format: str):
     return _wrapper
 
 
-_MODEL_LOADERS: WeakKeyDictionary[nn.Module, BaseModelLoader] = WeakKeyDictionary()
-
-
 def get_model_loader(load_config: LoadConfig) -> BaseModelLoader:
     """Get a model loader based on the load format."""
     load_format = load_config.load_format
@@ -155,23 +157,6 @@ def get_or_create_model_loader(
     return loader
 
 
-def sleep_model_loaders(level: int) -> None:
-    """Notify all active model loaders before GPU weight memory is released."""
-    for loader in list(_MODEL_LOADERS.values()):
-        loader.on_sleep(level)
-
-
-def wake_up_model_loaders(tags: list[str] | None = None) -> None:
-    """Notify all active model loaders after GPU memory is restored."""
-    for loader in list(_MODEL_LOADERS.values()):
-        loader.on_wake_up(tags)
-
-
-def release_model_loaders() -> None:
-    """Detach all model loaders tracked in this process."""
-    _MODEL_LOADERS.clear()
-
-
 def get_model(
     *,
     vllm_config: VllmConfig,
@@ -182,11 +167,9 @@ def get_model(
     loader = get_model_loader(load_config or vllm_config.load_config)
     if model_config is None:
         model_config = vllm_config.model_config
-    model = loader.load_model(
+    return loader.load_model(
         vllm_config=vllm_config, model_config=model_config, prefix=prefix
     )
-    _MODEL_LOADERS[model] = loader
-    return model
 
 
 __all__ = [
