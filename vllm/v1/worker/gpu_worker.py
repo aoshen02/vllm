@@ -77,7 +77,12 @@ from vllm.model_executor.layers.quantization.online.lm_head import (
     restore_quantized_lm_heads,
     share_source_lm_heads,
 )
-from vllm.model_executor.model_loader import get_model_loader
+from vllm.model_executor.model_loader import (
+    get_model_loader,
+    release_model_loaders,
+    sleep_model_loaders,
+    wake_up_model_loaders,
+)
 from vllm.model_executor.model_loader.weight_cache.utils import ExternalWeightCharges
 from vllm.model_executor.model_loader.weight_checksum import (
     compute_tensor_digests,
@@ -349,6 +354,8 @@ class Worker(WorkerBase):
         return set(storage.values()) - preserved
 
     def sleep(self, level: int = 1) -> None:
+        sleep_model_loaders(level)
+
         torch.accelerator.synchronize()
         free_bytes_before_sleep = torch.accelerator.get_memory_info()[0]
         # Level 2 keeps everything the weight update doesn't rewrite.
@@ -399,8 +406,11 @@ class Worker(WorkerBase):
             resume_device_comms()
 
         self.synchronize_device()
+        wake_up_model_loaders(tags)
 
     def discard(self, tags: tuple[str, ...]) -> None:
+        if "weights" in tags:
+            sleep_model_loaders(level=2)
         if has_kv_transfer_group() and "kv_cache" in tags:
             get_kv_transfer_group().unregister_kv_caches()
         # Outside the allocator pool, like in sleep.
@@ -1888,6 +1898,8 @@ class Worker(WorkerBase):
             weight_transfer_engine.shutdown()
 
         self.elastic_ep_executor.shutdown()
+
+        release_model_loaders()
 
         # Release GPU resources held by the model runner so that memory
         # can be reclaimed when running in-process

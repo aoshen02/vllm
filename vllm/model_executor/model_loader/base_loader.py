@@ -4,6 +4,7 @@ import gc
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Generator
+from weakref import WeakKeyDictionary
 
 import torch
 import torch.nn as nn
@@ -51,6 +52,31 @@ class BaseModelLoader(ABC):
         """Load weights into a model. This standalone API allows
         inplace weights loading for an already-initialized model"""
         raise NotImplementedError
+
+    def on_sleep(self, level: int) -> None:  # noqa: B027
+        """Called before GPU weight memory is freed by sleep or discard."""
+
+    def on_wake_up(self, tags: list[str] | None) -> None:  # noqa: B027
+        """Called after `Worker.wake_up(tags)` restores GPU memory and syncs
+        (weights are valid at level 1, or after `reload_model` at level 2)."""
+
+    def reload_model(
+        self,
+        vllm_config: VllmConfig,
+        model_config: ModelConfig,
+        model: nn.Module,
+        is_checkpoint_format: bool = True,
+    ) -> None:
+        """Reload weights into `model` in place; override to bypass
+        `get_all_weights()` + generic inplace reload."""
+        from vllm.model_executor.model_loader.reload.inplace import (
+            reload_weights_from_iterator,
+        )
+
+        weights_iterator = self.get_all_weights(model_config, model)
+        reload_weights_from_iterator(
+            vllm_config, model, weights_iterator, is_checkpoint_format
+        )
 
     def create_model(
         self, vllm_config: VllmConfig, model_config: ModelConfig, prefix: str = ""
@@ -138,7 +164,34 @@ class BaseModelLoader(ABC):
             gc.collect()
             torch.accelerator.empty_cache()
 
-        return model.eval()
+        model = model.eval()
+        bind_model_loader(model, self)
+        return model
+
+
+_MODEL_LOADERS: WeakKeyDictionary[nn.Module, BaseModelLoader] = WeakKeyDictionary()
+
+
+def bind_model_loader(model: nn.Module, loader: BaseModelLoader) -> None:
+    """Associate `model` with the loader managing its weights."""
+    _MODEL_LOADERS[model] = loader
+
+
+def sleep_model_loaders(level: int) -> None:
+    """Notify active model loaders before GPU weight memory is released."""
+    for loader in list(_MODEL_LOADERS.values()):
+        loader.on_sleep(level)
+
+
+def wake_up_model_loaders(tags: list[str] | None = None) -> None:
+    """Notify active model loaders after GPU memory is restored."""
+    for loader in list(_MODEL_LOADERS.values()):
+        loader.on_wake_up(tags)
+
+
+def release_model_loaders() -> None:
+    """Detach all model loaders tracked in this process."""
+    _MODEL_LOADERS.clear()
 
 
 def log_model_inspection(model: nn.Module) -> None:

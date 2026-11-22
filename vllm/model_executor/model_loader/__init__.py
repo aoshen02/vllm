@@ -8,7 +8,14 @@ from torch import nn
 from vllm.config import ModelConfig, VllmConfig
 from vllm.config.load import LoadConfig
 from vllm.logger import init_logger
-from vllm.model_executor.model_loader.base_loader import BaseModelLoader
+from vllm.model_executor.model_loader.base_loader import (
+    _MODEL_LOADERS,
+    BaseModelLoader,
+    bind_model_loader,
+    release_model_loaders,
+    sleep_model_loaders,
+    wake_up_model_loaders,
+)
 from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
 from vllm.model_executor.model_loader.dummy_loader import DummyModelLoader
 from vllm.model_executor.model_loader.modelexpress_loader import (
@@ -133,6 +140,24 @@ def get_model_loader(load_config: LoadConfig) -> BaseModelLoader:
     return _LOAD_FORMAT_TO_MODEL_LOADER[load_format](load_config)
 
 
+def get_or_create_model_loader(
+    model: nn.Module, load_config: LoadConfig
+) -> BaseModelLoader:
+    """Reuse `model`'s loader if `load_config` still matches; otherwise replace it."""
+    loader = _MODEL_LOADERS.get(model)
+    expected_cls = _LOAD_FORMAT_TO_MODEL_LOADER.get(load_config.load_format)
+    if (
+        loader is not None
+        and expected_cls is not None
+        and type(loader) is expected_cls
+        and loader.load_config == load_config
+    ):
+        return loader
+    loader = get_model_loader(load_config)
+    _MODEL_LOADERS[model] = loader
+    return loader
+
+
 def get_model(
     *,
     vllm_config: VllmConfig,
@@ -143,14 +168,21 @@ def get_model(
     loader = get_model_loader(load_config or vllm_config.load_config)
     if model_config is None:
         model_config = vllm_config.model_config
-    return loader.load_model(
+    model = loader.load_model(
         vllm_config=vllm_config, model_config=model_config, prefix=prefix
     )
+    bind_model_loader(model, loader)
+    return model
 
 
 __all__ = [
+    "bind_model_loader",
     "get_model",
     "get_model_loader",
+    "get_or_create_model_loader",
+    "release_model_loaders",
+    "sleep_model_loaders",
+    "wake_up_model_loaders",
     "get_architecture_class_name",
     "get_model_architecture",
     "get_model_cls",
