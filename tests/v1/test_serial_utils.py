@@ -585,50 +585,88 @@ def test_zero_copy_frames_survive_without_caller_side_references():
         pull.close(linger=0)
 
 
-@pytest.mark.parametrize(
-    ("rows_per_output", "widths", "packed"),
-    [
-        # Mixed: outputs without logprobs, and multi-token (spec decode) outputs.
-        ([1, None, 3, 1, None, 2], [1] * 6, True),
-        ([1, 1, 1], [6, 6, 6], True),
-        # Nothing to batch.
-        ([1], [1], False),
-        ([None, None], [1, 1], False),
-        # Trailing shapes differ within the message: sent per output.
-        ([1, 1], [1, 4], False),
-    ],
-)
-def test_packed_logprobs_roundtrip(rows_per_output, widths, packed):
-    from vllm.v1.engine import EngineCoreOutput, EngineCoreOutputs
+def _logprobs(rng, rows, width=4, dtype=np.float32):
     from vllm.v1.outputs import LogprobsLists
 
+    return LogprobsLists(
+        rng.integers(0, 1000, (rows, width), dtype=np.int32),
+        rng.standard_normal((rows, width)).astype(dtype),
+        rng.integers(0, 10, rows, dtype=np.int32),
+    )
+
+
+def _routed_experts(rng, rows, dtype=np.uint8):
+    return rng.integers(0, 64, (rows, 3, 2)).astype(dtype)
+
+
+def _sampling_mask(rng, positions):
+    from vllm.v1.outputs import SamplingMaskLists
+
+    sizes = rng.integers(1, 5, positions)
+    token_ids = rng.integers(0, 1000, sizes.sum(), dtype=np.int64)
+    if positions == 1:
+        return SamplingMaskLists(token_ids)
+    return SamplingMaskLists(token_ids, np.concatenate([[0], np.cumsum(sizes)]))
+
+
+@pytest.mark.parametrize(
+    ("field", "values", "packed"),
+    [
+        # Outputs without the field and multi-token (spec decode) outputs.
+        ("new_logprobs", [(_logprobs, 1), None, (_logprobs, 3), (_logprobs, 1)], True),
+        ("routed_experts", [(_routed_experts, 5), None, (_routed_experts, 1)], True),
+        # Single-position masks have no offsets; multi-position masks do.
+        ("new_sampling_mask", [(_sampling_mask, 1), None, (_sampling_mask, 3)], True),
+        ("new_sampling_mask", [(_sampling_mask, 1), (_sampling_mask, 1)], True),
+        # Nothing to batch.
+        ("new_logprobs", [(_logprobs, 1), None], False),
+        # Trailing shape or dtype differs within the message: sent per output.
+        ("new_logprobs", [(_logprobs, 1, 4), (_logprobs, 1, 6)], False),
+        (
+            "routed_experts",
+            [(_routed_experts, 1, np.uint8), (_routed_experts, 1, np.int16)],
+            False,
+        ),
+    ],
+    ids=[
+        "logprobs-mixed",
+        "routed-experts",
+        "mask-offsets-mixed",
+        "mask-no-offsets",
+        "single-output",
+        "shape-differs",
+        "dtype-differs",
+    ],
+)
+def test_packed_output_field_roundtrip(field, values, packed):
+    from vllm.v1.engine import EngineCoreOutput, EngineCoreOutputs
+
     rng = np.random.default_rng(0)
-    expected = []
-    outputs = []
-    for i, (rows, width) in enumerate(zip(rows_per_output, widths)):
-        lp = None
-        if rows is not None:
-            lp = LogprobsLists(
-                rng.integers(0, 1000, (rows, width), dtype=np.int32),
-                rng.standard_normal((rows, width)).astype(np.float32),
-                rng.integers(0, 10, rows, dtype=np.int32),
-            )
-        expected.append(lp)
-        outputs.append(
-            EngineCoreOutput(request_id=f"r{i}", new_token_ids=[i], new_logprobs=lp)
-        )
-    sent = EngineCoreOutputs(outputs=outputs)
+    expected = [None if v is None else v[0](rng, *v[1:]) for v in values]
+    sent = EngineCoreOutputs(
+        outputs=[
+            EngineCoreOutput(request_id=f"r{i}", new_token_ids=[i], **{field: v})
+            for i, v in enumerate(expected)
+        ]
+    )
     sent.pack_for_transport()
-    assert (sent.packed_logprobs is not None) == packed
+    assert (sent.packed_fields is not None) == packed
 
     received = MsgpackDecoder(EngineCoreOutputs).decode(MsgpackEncoder().encode(sent))
     received.unpack_after_transport()
 
-    assert received.packed_logprobs is None
-    for want_lp, output in zip(expected, received.outputs):
-        if want_lp is None:
-            assert output.new_logprobs is None
+    assert received.packed_fields is None
+    for want, output in zip(expected, received.outputs):
+        got = getattr(output, field)
+        if want is None:
+            assert got is None
             continue
-        for want_arr, got_arr in zip(want_lp[:3], output.new_logprobs[:3]):
+        want_arrays = (want,) if isinstance(want, np.ndarray) else tuple(want)
+        got_arrays = (got,) if isinstance(got, np.ndarray) else tuple(got)
+        assert type(got) is type(want)
+        for want_arr, got_arr in zip(want_arrays, got_arrays, strict=True):
+            if want_arr is None:
+                assert got_arr is None
+                continue
             assert got_arr.dtype == want_arr.dtype
             np.testing.assert_array_equal(got_arr, want_arr)

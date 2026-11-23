@@ -163,8 +163,7 @@ class EngineCoreOutputs(
     wave_complete: int | None = None
     start_wave: int | None = None
     weight_version: str | None = None
-    packed_logprobs: object | None = None
-    packed_logprobs_rows: list[int] | None = None
+    packed_fields: list | None = None
 
 
 def token_ids(ids: list[int]) -> list:
@@ -454,9 +453,9 @@ multipart_logprobs = engine_outputs_wire(
 )
 
 
-def packed_logprobs_outputs_wire():
-    # EngineCoreOutputs.pack_for_transport: the outputs' sample logprobs rows
-    # concatenated, and the row count per output (-1 for none).
+def packed_fields_outputs_wire():
+    # EngineCoreOutputs.pack_for_transport: per field, each component's arrays
+    # concatenated in output order, and the row counts per output (-1 for none).
     return [
         0,
         [engine_output_wire(f"req-{i}") for i in range(1, 4)],
@@ -467,13 +466,30 @@ def packed_logprobs_outputs_wire():
         None,
         None,
         None,
-        (
-            np.array([[1, 2, 3], [4, 5, 6], [7, 8, 9]], dtype=np.int32),
-            np.array([[1, 2, 3], [4, 5, 6], [7, 8, 9]], dtype=np.float32),
-            np.array([1, 2, 3], dtype=np.int32),
-            None,
-        ),
-        [2, -1, 1],
+        [
+            [
+                "new_logprobs",
+                [
+                    np.array([[1, 2, 3], [4, 5, 6], [7, 8, 9]], dtype=np.int32),
+                    np.array([[1, 2, 3], [4, 5, 6], [7, 8, 9]], dtype=np.float32),
+                    np.array([1, 2, 3], dtype=np.int32),
+                ],
+                [[2, -1, 1]] * 3,
+            ],
+            [
+                "routed_experts",
+                [np.arange(8, dtype=np.uint8).reshape(4, 2)],
+                [[-1, 3, 1]],
+            ],
+            [
+                "new_sampling_mask",
+                [
+                    np.array([7, 8, 1, 2, 3], dtype=np.int64),
+                    np.array([0, 2, 3], dtype=np.int64),
+                ],
+                [[2, 3, -1], [-1, 3, -1]],
+            ],
+        ],
     ]
 
 
@@ -746,10 +762,16 @@ print(msgspec.msgpack.encode(lora_request).hex())
 print(msgspec.msgpack.encode(inplace_lora_request).hex())
 print(msgspec.msgpack.encode(simple_cpu_offload_stats).hex())
 print(msgspec.msgpack.encode(kv_offload_stats).hex())
-print(" ".join(frame.hex() for frame in encode_output_frames(packed_logprobs_outputs_wire())))
+print(
+    " ".join(
+        frame.hex() for frame in encode_output_frames(packed_fields_outputs_wire())
+    )
+)
 print(
     " ".join(
         frame.hex()
-        for frame in encode_output_frames(packed_logprobs_outputs_wire(), size_threshold=1)
+        for frame in encode_output_frames(
+            packed_fields_outputs_wire(), size_threshold=1
+        )
     )
 )
