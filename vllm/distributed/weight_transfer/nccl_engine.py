@@ -3,6 +3,7 @@
 """NCCL-based (dense) weight transfer engine."""
 
 from collections.abc import Iterable, Iterator, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from functools import partial
 from typing import TYPE_CHECKING, ClassVar, Self
@@ -252,9 +253,9 @@ class NCCLWeightTransferEngine(
         """Begin reloading the incoming checkpoint weights; with
         `use_load_plan`, the first target update also builds the load plan,
         reused by every later one."""
-        from vllm.model_executor.model_loader.reload import plan_loads
+        from vllm.model_executor.model_loader.reload import plan_loads, start_reload
 
-        super().start_weight_update()
+        start_reload(self.model)
         if (
             self._plan_metadata is not None
             and self._plan is None
@@ -274,6 +275,15 @@ class NCCLWeightTransferEngine(
                     "to retry planning"
                 )
                 raise
+
+    def finish_weight_update(self) -> None:
+        """Finish reloading after all weights have been received."""
+        from vllm.model_executor.model_loader.reload import finish_reload
+
+        finish_reload(self.model, self.model_config, self.device)
+        # Release the cached receive buffers and post-load temporaries so memory
+        # allocated outside torch (NCCL, other processes on the GPU) can use it.
+        torch.accelerator.empty_cache()
 
     def receive_weights(self, update_info: NCCLWeightTransferUpdateInfo) -> None:
         """Receive weights from trainer via NCCL broadcast.
@@ -582,8 +592,25 @@ class NCCLTrainerWeightTransferEngine(TrainerWeightTransferEngine[NCCLTrainerIni
             del payload["src"]
         # update_weights (workers receive) must run concurrently with the
         # trainer-side broadcast — both rendezvous inside the same NCCL calls.
-        with self._concurrent_update_rpc(payload):
+        exe = ThreadPoolExecutor(max_workers=1)
+        try:
+            future = exe.submit(self.client.update_weights, payload)
+            # Cheap best-effort: if update_weights already failed (e.g. a bad
+            # request rejected before any NCCL call), surface it now instead of
+            # hanging in broadcast waiting for a peer that will never arrive.
+            if future.done():
+                future.result()
             self._broadcast(meta, src)
+            future.result()  # surface inference-side errors
+        finally:
+            # Never wait for the RPC thread here. If the broadcast raised, the
+            # worker is still blocked in the matching NCCL call and will never
+            # return, so joining would turn the error into a permanent hang.
+            # Let the exception out instead; the transfer group is unusable
+            # either way and the caller has to tear it down. (The orphaned
+            # thread is still joined at interpreter exit, so a caller that wants
+            # to exit cleanly after such a failure must not wait on it.)
+            exe.shutdown(wait=False)
 
     def _broadcast(self, meta: list[ParamMeta], src: int) -> None:
         """Broadcast `meta` from group rank `src`: that rank sends from

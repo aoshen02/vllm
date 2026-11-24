@@ -25,10 +25,7 @@ if TYPE_CHECKING:
 from vllm.distributed.device_communicators.pynccl_wrapper import (
     NCCL_UNIQUE_ID_BYTES,
 )
-from vllm.distributed.weight_transfer.base import (
-    WeightTransferInitInfo,
-    global_worker_rank,
-)
+from vllm.distributed.weight_transfer.base import WeightTransferInitInfo
 from vllm.distributed.weight_transfer.packed_tensor import (
     DEFAULT_PACKED_BUFFER_SIZE_BYTES,
     DEFAULT_PACKED_NUM_BUFFERS,
@@ -266,7 +263,10 @@ def uid_init_process_group(
 
 def _worker_group_rank(rank_offset: int, parallel_config: "ParallelConfig") -> int:
     """Return this worker's rank in a trainer-to-worker process group."""
-    return rank_offset + global_worker_rank(parallel_config)
+    dp_rank = parallel_config.data_parallel_index
+    world_size_per_dp = parallel_config.world_size  # TP * PP
+    rank_within_dp = parallel_config.rank
+    return rank_offset + dp_rank * world_size_per_dp + rank_within_dp
 
 
 def worker_init_metadata_group(

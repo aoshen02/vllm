@@ -155,17 +155,21 @@ class IPCWeightTransferEngine(
 
     def start_weight_update(self) -> None:
         """Begin reloading the incoming checkpoint weights."""
-        super().start_weight_update()
+        from vllm.model_executor.model_loader.reload import start_reload
+
+        start_reload(self.model)
         if self.packed:
             gpu_uuid, device_index = self._local_gpu()
             self._packed_consumer = PackedIpcConsumer(device_index, gpu_uuid)
 
     def finish_weight_update(self) -> None:
         """Finish reloading after all weights have been received."""
+        from vllm.model_executor.model_loader.reload import finish_reload
+
         consumer, self._packed_consumer = self._packed_consumer, None
         if consumer is not None:
             consumer.close()  # raises if the transfer was cut short
-        super().finish_weight_update()
+        finish_reload(self.model, self.model_config, self.device)
 
     def receive_weights(self, update_info: IPCWeightTransferUpdateInfo) -> None:
         """Receive weights from the trainer via CUDA IPC handles and load them.

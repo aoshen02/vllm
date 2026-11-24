@@ -449,13 +449,17 @@ class M2NWeightTransferEngine(
         """
         if not self._uses_load_weights:
             return
-        super().start_weight_update()
+        from vllm.model_executor.model_loader.reload import start_reload
+
+        start_reload(self.model)
 
     def finish_weight_update(self) -> None:
         """Finish reloading when the plan uses fallback entries."""
         if not self._uses_load_weights:
             return
-        super().finish_weight_update()
+        from vllm.model_executor.model_loader.reload import finish_reload
+
+        finish_reload(self.model, self.model_config, self.device)
 
     def receive_weights(self, update_info: M2NWeightTransferUpdateInfo) -> None:
         """Receive each requested parameter using its initialization-time plan."""

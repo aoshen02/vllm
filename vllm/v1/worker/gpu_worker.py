@@ -71,7 +71,6 @@ from vllm.distributed.weight_transfer import (
     WeightTransferEngine,
     WeightTransferEngineFactory,
 )
-from vllm.distributed.weight_transfer.base import global_worker_rank
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.model_executor.layers.quantization.online.lm_head import (
@@ -1826,8 +1825,10 @@ class Worker(WorkerBase):
         with set_current_vllm_config(self.vllm_config):
             try:
                 if isinstance(update_info, list):
+                    parallel_config = self.vllm_config.parallel_config
                     local_update_info = update_info[
-                        global_worker_rank(self.vllm_config.parallel_config, self.rank)
+                        parallel_config.data_parallel_index * parallel_config.world_size
+                        + self.rank
                     ]
                 else:
                     local_update_info = update_info
