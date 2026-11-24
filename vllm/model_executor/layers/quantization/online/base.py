@@ -8,7 +8,8 @@ from typing import Any
 
 import torch
 
-import vllm.envs as envs
+from vllm.config import get_current_vllm_config_or_none
+from vllm.config.load import resolve_reload_mode
 from vllm.config.quantization import (
     _ONLINE_SHORTHANDS,
     QuantizationConfigArgs,
@@ -517,7 +518,12 @@ class OnlineQuantizationConfig(QuantizationConfig):
             )
             assert issubclass(quant_method_cls, (OnlineMoEMethodBase, OnlineLinearBase))
             default = getattr(quant_method_cls, "activation_quant_key", None)
-            if envs.VLLM_RELOAD_MODE == "direct":
+            if (
+                resolve_reload_mode(
+                    getattr(get_current_vllm_config_or_none(), "load_config", None)
+                )
+                == "direct"
+            ):
                 method = checkpoint_method(layer, quant_spec, default)
                 if method is None:
                     raise NotImplementedError(

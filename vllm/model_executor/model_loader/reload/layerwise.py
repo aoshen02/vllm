@@ -36,6 +36,7 @@ from .utils import (
 logger = init_logger(__name__)
 
 __all__ = [
+    "abort_layerwise_reload",
     "get_layerwise_info",
     "record_metadata_for_reloading",
     "initialize_layerwise_reload",
@@ -134,6 +135,23 @@ def initialize_layerwise_reload(
         # Wrap weight loaders to buffer loading
         initialize_online_processing(layer)
         info.defer_processing = defer_processing
+
+
+@torch.no_grad()
+def abort_layerwise_reload(model: torch.nn.Module) -> None:
+    """Restore any layers left in layerwise reload state after an aborted update."""
+    for layer in model.modules():
+        info = LAYERWISE_INFO.get(layer)
+        if info is None:
+            continue
+        if info.kernel_tensors is not None:
+            _place_kernel_tensors(layer, info)
+            info.reset()
+        elif info.can_load():
+            for param in get_layer_tensors(layer).values():
+                param.weight_loader = _get_original_loader(param)
+            info.reset()
+        LOADING_LAYERS.discard(layer)
 
 
 def initialize_online_processing(layer: torch.nn.Module):

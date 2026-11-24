@@ -4,12 +4,14 @@
 a weight update, where one call may hold only part of the checkpoint, or in a
 cold start, where completeness checks must run."""
 
+import gc
 from types import SimpleNamespace
 
 import pytest
 import torch
 
 from vllm.model_executor.model_loader.reload import (
+    abort_reload,
     finish_reload,
     record_metadata_for_reloading,
     start_reload,
@@ -183,3 +185,158 @@ def test_cpu_offloaded_table_keeps_storage_and_loader_across_updates(monkeypatch
             assert torch.equal(table.finalized[-1][name], expected[name])
         assert linear.weight is linear_weight
         assert torch.equal(linear.weight, new_linear_weight)
+
+
+@pytest.mark.parametrize("mode", ["direct", "layerwise"], ids=["direct", "layerwise"])
+def test_abort_reload_clears_active_state_and_allows_retry(monkeypatch, mode):
+    monkeypatch.setenv("VLLM_RELOAD_MODE", mode)
+    model = _TinyModel()
+    record_metadata_for_reloading(model)
+    model.load_weights(_checkpoint().items())
+    process_weights_after_loading(model, _MODEL_CONFIG, _DEVICE)
+
+    start_reload(model)
+    assert weight_update_active()
+    abort_reload(model)
+    assert not weight_update_active()
+
+    if mode == "direct":
+        with pytest.raises(RuntimeError, match="finish without a begin"):
+            finish_reload(model, _MODEL_CONFIG, _DEVICE)
+
+    # A fresh update can start and complete cleanly after abort.
+    start_reload(model)
+    assert weight_update_active()
+    model.load_weights(_checkpoint(1.02).items())
+    finish_reload(model, _MODEL_CONFIG, _DEVICE)
+    assert not weight_update_active()
+    torch.testing.assert_close(model.proj.weight, _checkpoint(1.02)["proj.weight"])
+
+
+@pytest.mark.parametrize("mode", ["direct", "layerwise"], ids=["direct", "layerwise"])
+def test_inplace_reload_clears_active_on_load_error(monkeypatch, mode):
+    from vllm.model_executor.model_loader.reload.inplace import (
+        reload_weights_from_iterator,
+    )
+
+    monkeypatch.setenv("VLLM_RELOAD_MODE", mode)
+    model = _TinyModel()
+    record_metadata_for_reloading(model)
+    model.load_weights(_checkpoint().items())
+    process_weights_after_loading(model, _MODEL_CONFIG, _DEVICE)
+
+    def failing_weights():
+        yield "embed.weight", torch.ones(8, 4)
+        raise RuntimeError("simulated mid-transfer failure")
+
+    vllm_config = SimpleNamespace(
+        model_config=_MODEL_CONFIG,
+        load_config=SimpleNamespace(device="cpu"),
+        device_config=SimpleNamespace(device="cpu"),
+        lora_config=None,
+    )
+    with pytest.raises(RuntimeError, match="simulated mid-transfer failure"):
+        reload_weights_from_iterator(
+            vllm_config, model, failing_weights(), is_checkpoint_format=True
+        )
+    assert not weight_update_active()
+
+
+def test_unfinished_model_gc_clears_active_state(monkeypatch):
+    monkeypatch.setenv("VLLM_RELOAD_MODE", "direct")
+    model = _TinyModel()
+    record_metadata_for_reloading(model)
+    model.load_weights(_checkpoint().items())
+    process_weights_after_loading(model, _MODEL_CONFIG, _DEVICE)
+
+    start_reload(model)
+    assert weight_update_active()
+    del model
+    gc.collect()
+    assert not weight_update_active()
+
+
+def test_multiple_models_track_active_independently(monkeypatch):
+    monkeypatch.setenv("VLLM_RELOAD_MODE", "direct")
+    m1 = _TinyModel()
+    m2 = _TinyModel()
+    for m in (m1, m2):
+        record_metadata_for_reloading(m)
+        m.load_weights(_checkpoint().items())
+        process_weights_after_loading(m, _MODEL_CONFIG, _DEVICE)
+
+    start_reload(m1)
+    start_reload(m2)
+    assert weight_update_active()
+
+    m1.load_weights(_checkpoint(1.01).items())
+    finish_reload(m1, _MODEL_CONFIG, _DEVICE)
+    # m2 is still mid-update.
+    assert weight_update_active()
+
+    abort_reload(m2)
+    assert not weight_update_active()
+
+
+def test_layerwise_abort_restores_params_and_retry_does_not_corrupt(monkeypatch):
+    """Aborting a layerwise reload mid-layer must restore live tensors off meta,
+    clear buffered state, and allow a subsequent retry to load every parameter."""
+    from vllm.model_executor.model_loader.reload.layerwise import (
+        LAYERWISE_INFO,
+        LOADING_LAYERS,
+    )
+
+    class _TwoParamLayer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.w1 = torch.nn.Parameter(torch.full((4, 4), 1.0), requires_grad=False)
+            self.w2 = torch.nn.Parameter(torch.full((4, 4), 2.0), requires_grad=False)
+
+    class _TwoParamModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layer = _TwoParamLayer()
+
+        def load_weights(self, weights):
+            params = dict(self.named_parameters())
+            for name, weight in weights:
+                param = params[name]
+                getattr(param, "weight_loader", default_weight_loader)(param, weight)
+            return set(params)
+
+    monkeypatch.setenv("VLLM_RELOAD_MODE", "layerwise")
+    model = _TwoParamModel()
+    record_metadata_for_reloading(model)
+    process_weights_after_loading(model, _MODEL_CONFIG, _DEVICE)
+
+    # Start a layerwise update, partially load w1, then abort before w2 arrives.
+    start_reload(model)
+    assert model.layer.w1.is_meta and model.layer.w2.is_meta
+    model.load_weights([("layer.w1", torch.full((4, 4), 9.0))])
+    info = LAYERWISE_INFO[model.layer]
+    assert info.can_load()
+    assert len(info.loaded_weights) == 1
+
+    abort_reload(model)
+    assert not weight_update_active()
+    assert not model.layer.w1.is_meta and not model.layer.w2.is_meta
+    assert not info.can_load()
+    assert info.kernel_tensors is None
+    assert info.loaded_weights == []
+    assert model.layer not in LOADING_LAYERS
+    # Original live weights are intact after abort.
+    assert torch.equal(model.layer.w1, torch.full((4, 4), 1.0))
+    assert torch.equal(model.layer.w2, torch.full((4, 4), 2.0))
+
+    # Retrying the full update must load both w1 and w2 cleanly (no double-count).
+    start_reload(model)
+    model.load_weights(
+        [
+            ("layer.w1", torch.full((4, 4), 5.0)),
+            ("layer.w2", torch.full((4, 4), 6.0)),
+        ]
+    )
+    finish_reload(model, _MODEL_CONFIG, _DEVICE)
+    assert not weight_update_active()
+    assert torch.equal(model.layer.w1, torch.full((4, 4), 5.0))
+    assert torch.equal(model.layer.w2, torch.full((4, 4), 6.0))

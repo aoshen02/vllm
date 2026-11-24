@@ -17,6 +17,7 @@ Limitations:
 """
 
 __all__ = [
+    "abort_reload",
     "record_metadata_for_reloading",
     "initialize_layerwise_reload",
     "finalize_layerwise_processing",
@@ -36,5 +37,5 @@ from .layerwise import (
     initialize_layerwise_reload,
     record_metadata_for_reloading,
 )
-from .lifecycle import finish_reload, start_reload, weight_update_active
+from .lifecycle import abort_reload, finish_reload, start_reload, weight_update_active
 from .plan import LoadPlan, check_plannable, load_planned, plan_loads

@@ -27,8 +27,8 @@ from fnmatch import fnmatchcase
 
 import torch
 
-import vllm.envs as envs
 from vllm.config import ModelConfig, VllmConfig, get_current_vllm_config_or_none
+from vllm.config.load import ReloadMode, resolve_reload_mode
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
 from vllm.model_executor.utils import (
@@ -44,6 +44,7 @@ __all__ = [
     "direct_reload_enabled",
     "direct_reload_refusal",
     "finish_direct_reload",
+    "get_reload_mode",
     "loadable_tensors",
     "mark_loaded",
     "record_checkpoint_layout",
@@ -95,12 +96,20 @@ def direct_reload_refusal(config: VllmConfig) -> str | None:
     return None
 
 
+def get_reload_mode(config: VllmConfig | None = None) -> ReloadMode:
+    """Return the reload mode for `config` (or the current `VllmConfig`)."""
+    if config is None:
+        config = get_current_vllm_config_or_none()
+    return resolve_reload_mode(getattr(config, "load_config", None))
+
+
 def direct_reload_enabled() -> bool:
     """Whether a model loaded now records its checkpoint layout to reload directly."""
-    if envs.VLLM_RELOAD_MODE == "layerwise":
+    config = get_current_vllm_config_or_none()
+    mode = get_reload_mode(config)
+    if mode == "layerwise":
         return False
-    if envs.VLLM_RELOAD_MODE == "auto":
-        config = get_current_vllm_config_or_none()
+    if mode == "auto":
         if config is None or config.weight_transfer_config is None:
             return False
         reason: str | None
@@ -256,7 +265,7 @@ def record_checkpoint_layout(model: torch.nn.Module) -> None:
     reason: str | None
     if is_weights_pre_processed():
         reason = "pre-processed weights"  # already in runtime layout
-    elif (reason := _module_refusal(model)) and envs.VLLM_RELOAD_MODE == "direct":
+    elif (reason := _module_refusal(model)) and get_reload_mode() == "direct":
         raise RuntimeError(f"direct reload: {reason} is not supported")
     if reason:
         _log_layerwise(reason)

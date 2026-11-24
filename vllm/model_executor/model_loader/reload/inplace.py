@@ -17,7 +17,7 @@ from vllm.model_executor.model_loader.base_loader import (
 from vllm.model_executor.model_loader.weight_utils import finalize_model_weights
 from vllm.model_executor.utils import weights_already_processed
 
-from .lifecycle import finish_reload, start_reload
+from .lifecycle import abort_reload, finish_reload, start_reload
 from .types import WeightReloadValidator
 
 logger = init_logger(__name__)
@@ -133,7 +133,11 @@ def reload_weights_from_iterator(
         # load weights from checkpoint/ original model format
         device = torch.device(load_config.device or vllm_config.device_config.device)
         start_reload(model)
-        loaded_weights = model.load_weights(weights_iterator)
+        try:
+            loaded_weights = model.load_weights(weights_iterator)
+        except BaseException:
+            abort_reload(model)
+            raise
         finish_reload(model, model_config, device)
 
     else:

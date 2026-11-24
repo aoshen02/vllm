@@ -5,12 +5,14 @@ from typing import TYPE_CHECKING, Any, Literal, TypeAlias
 
 from pydantic import Field, field_validator
 
+import vllm.envs as envs
 from vllm.config.utils import CompileFactors, config
 from vllm.logger import init_logger
 
 DEFAULT_SAFETENSORS_PREFETCH_NUM_THREADS = 8
 DEFAULT_SAFETENSORS_PREFETCH_BLOCK_SIZE = 16 * 1024 * 1024
 SafetensorsLoadStrategy: TypeAlias = Literal["lazy", "eager", "prefetch", "torchao"]
+ReloadMode: TypeAlias = Literal["auto", "layerwise", "direct"]
 
 if TYPE_CHECKING:
     from vllm.model_executor.model_loader import LoadFormats
@@ -126,6 +128,17 @@ class LoadConfig:
     load different files in a randomized order.
     Set to True to enable shuffling. Default is False.
     """
+    reload_mode: ReloadMode | None = None
+    """
+    How weight updates reload the model:
+
+    - None (default): Fall back to the `VLLM_RELOAD_MODE` environment variable.
+    - "auto": Reload directly with runtime weight updates where supported,
+      else layerwise.
+    - "direct": Write incoming checkpoint weights into the live tensors and
+      rerun post-load processing in place.
+    - "layerwise": Rebuild each layer from the checkpoint tensors.
+    """
 
     def compile_factors(self) -> CompileFactors:
         """This config does not affect the compiled graph.
@@ -151,3 +164,19 @@ class LoadConfig:
             )
 
         return ignore_patterns
+
+
+def resolve_reload_mode(load_config: LoadConfig | None = None) -> ReloadMode:
+    """Resolve the weight reload mode for `load_config`.
+
+    Uses `load_config.reload_mode` when explicitly set; otherwise reads
+    `VLLM_RELOAD_MODE` live rather than through `envs.__getattr__` so an
+    earlier in-process engine's `enable_envs_cache()` cannot freeze the reload
+    mode of a later engine.
+    """
+    mode = getattr(load_config, "reload_mode", None)
+    if mode is not None:
+        return mode
+    if "VLLM_RELOAD_MODE" in envs.__dict__:
+        return envs.__dict__["VLLM_RELOAD_MODE"]
+    return envs.environment_variables["VLLM_RELOAD_MODE"]()

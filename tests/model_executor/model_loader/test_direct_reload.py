@@ -795,3 +795,74 @@ def test_auto_refused_model_reloads_layerwise(monkeypatch):
     finish_reload(target, _MODEL_CONFIG, _DEVICE)
     assert calls == ["init", "finalize"]
     assert reloads_directly(_cold_start(_checkpoint()))
+
+
+def test_reload_mode_not_frozen_by_enable_envs_cache(monkeypatch):
+    """Changing VLLM_RELOAD_MODE between in-process engines must take effect
+    even after a prior engine called `envs.enable_envs_cache()`."""
+    import vllm.envs as envs
+
+    monkeypatch.setenv("VLLM_RELOAD_MODE", "auto")
+    config_no_transfer = _config()
+    monkeypatch.setattr(
+        direct, "get_current_vllm_config_or_none", lambda: config_no_transfer
+    )
+
+    envs.enable_envs_cache()
+    try:
+        assert envs.VLLM_RELOAD_MODE == "auto"
+        assert direct_reload_enabled() is False
+
+        monkeypatch.setenv("VLLM_RELOAD_MODE", "direct")
+        # envs.__getattr__ is still cached, but reload mode resolution reads live.
+        assert envs.VLLM_RELOAD_MODE == "auto"
+        assert direct_reload_enabled() is True
+
+        refused = _config(weight_transfer_config=SimpleNamespace(backend="sharded_rdt"))
+        with pytest.raises(ValueError, match="sharded_rdt"):
+            VllmConfig._verify_direct_reload_compat(refused)
+
+        monkeypatch.setenv("VLLM_RELOAD_MODE", "layerwise")
+        assert direct_reload_enabled() is False
+        VllmConfig._verify_direct_reload_compat(refused)
+    finally:
+        envs.disable_envs_cache()
+
+
+def test_load_config_reload_mode_overrides_env(monkeypatch):
+    """Per-engine `LoadConfig.reload_mode` overrides `VLLM_RELOAD_MODE`."""
+    from vllm.config.load import LoadConfig
+
+    monkeypatch.setenv("VLLM_RELOAD_MODE", "layerwise")
+    cfg_direct = _config(load_config=LoadConfig(reload_mode="direct"))
+    monkeypatch.setattr(direct, "get_current_vllm_config_or_none", lambda: cfg_direct)
+    assert direct_reload_enabled() is True
+
+    refused_direct = _config(
+        load_config=LoadConfig(reload_mode="direct"),
+        weight_transfer_config=SimpleNamespace(backend="sharded_rdt"),
+    )
+    with pytest.raises(ValueError, match="sharded_rdt"):
+        VllmConfig._verify_direct_reload_compat(refused_direct)
+
+    monkeypatch.setenv("VLLM_RELOAD_MODE", "direct")
+    cfg_layerwise = _config(
+        load_config=LoadConfig(reload_mode="layerwise"),
+        weight_transfer_config=SimpleNamespace(backend="sharded_rdt"),
+    )
+    monkeypatch.setattr(
+        direct, "get_current_vllm_config_or_none", lambda: cfg_layerwise
+    )
+    assert direct_reload_enabled() is False
+    VllmConfig._verify_direct_reload_compat(cfg_layerwise)
+
+    cfg_auto = _config(
+        load_config=LoadConfig(reload_mode="auto"),
+        weight_transfer_config=_IPC,
+    )
+    monkeypatch.setattr(direct, "get_current_vllm_config_or_none", lambda: cfg_auto)
+    assert direct_reload_enabled() is True
+    target = _ToyModel()
+    target.proj.shared_expert_online_loader = object()
+    record_checkpoint_layout(target)
+    assert not reloads_directly(target)
