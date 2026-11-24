@@ -1925,8 +1925,12 @@ class TestTrainerClients:
         assert update_req.update_info == {"names": ["w"]}
 
         client.finish_weight_update("step-42")
+        handle.finish_weight_update.remote.assert_called_once_with("step-42")
+        handle.update_weight_version.remote.assert_not_called()
+
+        handle.finish_weight_update.remote.reset_mock()
+        client.finish_weight_update()
         handle.finish_weight_update.remote.assert_called_once_with()
-        handle.update_weight_version.remote.assert_called_once_with("step-42")
 
         client.shutdown_weight_transfer_engine()
         handle.shutdown_weight_transfer_engine.remote.assert_called_once_with()

@@ -131,8 +131,8 @@ class RayVLLMWeightSyncClient:
     def finish_weight_update(self, weight_version: str | None = None) -> None:
         import ray
 
-        ray.get([h.finish_weight_update.remote() for h in self.handles])
-        if weight_version is not None:
-            ray.get(
-                [h.update_weight_version.remote(weight_version) for h in self.handles]
-            )
+        if weight_version is None:
+            refs = [h.finish_weight_update.remote() for h in self.handles]
+        else:
+            refs = [h.finish_weight_update.remote(weight_version) for h in self.handles]
+        ray.get(refs)

@@ -1358,7 +1358,7 @@ class Worker(WorkerBase):
         )
 
     def _set_draft_weight_update_target(self) -> None:
-        assert self.weight_transfer_engine is not None
+        engine = self._require_weight_transfer_engine()
 
         draft_model = self.get_draft_model()
         if draft_model is None:
@@ -1373,7 +1373,7 @@ class Worker(WorkerBase):
                 "config is configured."
             )
 
-        self.weight_transfer_engine.set_weight_update_target(
+        engine.set_weight_update_target(
             draft_model, speculative_config.draft_model_config
         )
 
@@ -1698,12 +1698,13 @@ class Worker(WorkerBase):
             model_config=self.model_config,
         )
 
-    def _check_weight_transfer_engine(self) -> None:
+    def _require_weight_transfer_engine(self) -> WeightTransferEngine:
         if self.weight_transfer_engine is None:
             raise RuntimeError(
                 "Weight transfer not configured. "
                 "Please set weight_transfer_config to enable weight transfer."
             )
+        return self.weight_transfer_engine
 
     def init_weight_transfer_engine(self, init_info: dict) -> None:
         """Initialize weight transfer mechanism.
@@ -1713,11 +1714,10 @@ class Worker(WorkerBase):
             init_info: Dictionary containing backend-specific initialization info
 
         """
-        self._check_weight_transfer_engine()
-        assert self.weight_transfer_engine is not None
+        engine = self._require_weight_transfer_engine()
         # Parse dict into backend-specific typed dataclass
-        typed_init_info = self.weight_transfer_engine.parse_init_info(init_info)
-        self.weight_transfer_engine.init_transfer_engine(typed_init_info)
+        typed_init_info = engine.parse_init_info(init_info)
+        engine.init_transfer_engine(typed_init_info)
 
     def shutdown_weight_transfer_engine(self) -> None:
         """Release a trainer connection without shutting down inference."""
@@ -1749,24 +1749,23 @@ class Worker(WorkerBase):
             self._start_weight_update(is_draft=True)
 
     def _start_weight_update(self, is_draft: bool = False) -> None:
-        self._check_weight_transfer_engine()
-        assert self.weight_transfer_engine is not None
+        engine = self._require_weight_transfer_engine()
 
-        if is_draft and not self.weight_transfer_engine.supports_draft_weight_update:
-            raise RuntimeError(
-                f"{type(self.weight_transfer_engine).__name__} does not support "
-                "draft model weight updates."
-            )
-        speculative_config = self.vllm_config.speculative_config
-        if (
-            is_draft
-            and speculative_config is not None
-            and speculative_config.prefill_context_kv_only
-        ):
-            raise RuntimeError(
-                "Draft model weight updates are not supported with "
-                "prefill_context_kv_only, which frees draft weights."
-            )
+        if is_draft:
+            if not engine.supports_draft_weight_update:
+                raise RuntimeError(
+                    f"{type(engine).__name__} does not support "
+                    "draft model weight updates."
+                )
+            speculative_config = self.vllm_config.speculative_config
+            if (
+                speculative_config is not None
+                and speculative_config.prefill_context_kv_only
+            ):
+                raise RuntimeError(
+                    "Draft model weight updates are not supported with "
+                    "prefill_context_kv_only, which frees draft weights."
+                )
 
         if self._weight_update_active:
             raise RuntimeError(
@@ -1775,6 +1774,7 @@ class Worker(WorkerBase):
             )
 
         draft_model = self.get_draft_model() if is_draft else None
+        self._weight_update_is_draft = is_draft
         try:
             if is_draft:
                 self._set_draft_weight_update_target()
@@ -1782,27 +1782,25 @@ class Worker(WorkerBase):
                 # Load through the unquantized target head, as without
                 # draft_lm_head_quantization; finish re-derives the copies.
                 share_source_lm_heads(draft_model)
+            # Engines may receive kernel-format weights, needing no room; so warn
+            # rather than fail when short. Enter before engine.start_weight_update
+            # so start-phase allocations (e.g. load planning) can use the room.
+            self._weight_update_kv_cache_loan.enter_context(
+                kv_cache_lent_for_weight_update(
+                    getattr(self.model_runner, "extensible_kv_cache", None),
+                    draft_model or self.model_runner.get_model(),
+                    reclaimable=self._kv_cache_reclaimable,
+                    fail_if_short=False,
+                )
+            )
             # Starting may already move weights; only a successful finish
             # restores them.
             self._incomplete_weight_updates.add(is_draft)
-            self.weight_transfer_engine.start_weight_update()
+            engine.start_weight_update()
         except BaseException:
-            self.weight_transfer_engine.reset_weight_update_target()
-            if draft_model is not None:
-                restore_quantized_lm_heads(draft_model, refresh=False)
+            self._end_weight_update(refresh=False)
             raise
-        # Engines may receive kernel-format weights, needing no room; so warn
-        # rather than fail when short.
-        self._weight_update_kv_cache_loan.enter_context(
-            kv_cache_lent_for_weight_update(
-                getattr(self.model_runner, "extensible_kv_cache", None),
-                draft_model or self.model_runner.get_model(),
-                reclaimable=self._kv_cache_reclaimable,
-                fail_if_short=False,
-            )
-        )
         self._weight_update_active = True
-        self._weight_update_is_draft = is_draft
 
     def update_weights(self, update_info: dict | list[dict]) -> None:
         """Receive one weight update chunk from the trainer.
@@ -1817,8 +1815,7 @@ class Worker(WorkerBase):
                 global worker rank across data parallel replicas.
 
         """
-        self._check_weight_transfer_engine()
-        assert self.weight_transfer_engine is not None
+        engine = self._require_weight_transfer_engine()
 
         if not self._weight_update_active:
             raise RuntimeError(
@@ -1835,16 +1832,16 @@ class Worker(WorkerBase):
                     ]
                 else:
                     local_update_info = update_info
-                self.weight_transfer_engine.update_weights(local_update_info)
+                engine.update_weights(local_update_info)
             except BaseException:
                 self._end_weight_update(refresh=False)
                 raise
 
     def _end_weight_update(self, refresh: bool) -> None:
-        assert self.weight_transfer_engine is not None
+        engine = self._require_weight_transfer_engine()
         self._weight_update_active = False
         self._weight_update_kv_cache_loan.close()
-        self.weight_transfer_engine.reset_weight_update_target()
+        engine.reset_weight_update_target()
         if self._weight_update_is_draft and (
             (draft_model := self.get_draft_model()) is not None
         ):
@@ -1852,8 +1849,7 @@ class Worker(WorkerBase):
 
     def finish_weight_update(self) -> None:
         """Finish the current weight update session."""
-        self._check_weight_transfer_engine()
-        assert self.weight_transfer_engine is not None
+        engine = self._require_weight_transfer_engine()
 
         if not self._weight_update_active:
             raise RuntimeError(
@@ -1861,16 +1857,14 @@ class Worker(WorkerBase):
             )
 
         with set_current_vllm_config(self.vllm_config):
+            refresh = False
             try:
-                self.weight_transfer_engine.finish_weight_update()
-            except BaseException:
-                # a failed finish cannot be retried: end the session so that
-                # a new full update can start
-                self._end_weight_update(refresh=False)
-                raise
+                engine.finish_weight_update()
+                refresh = True
             finally:
-                self._weight_update_kv_cache_loan.close()
-            self._end_weight_update(refresh=True)
+                # A failed finish cannot be retried: always end the session
+                # so that a new full update can start.
+                self._end_weight_update(refresh=refresh)
             self._incomplete_weight_updates.discard(self._weight_update_is_draft)
 
         # Weight transfer bypasses GPUModelRunner.reload_weights().
