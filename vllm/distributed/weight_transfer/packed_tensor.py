@@ -402,19 +402,101 @@ def packed_nccl_broadcast_consumer(
 
 # ── IPC packed transfer ────────────────────────────────────────────────
 
+_IPC_REBUILD_ARGC = 15
+_IPC_TENSOR_CLASSES: dict[str, type] = {
+    "tensor": torch.Tensor,
+    "parameter": torch.nn.Parameter,
+}
+_IPC_STORAGE_CLASSES: dict[str, type] = {
+    "TypedStorage": torch.storage.TypedStorage,
+    "UntypedStorage": torch.UntypedStorage,
+}
+
+
+def encode_ipc_args(ipc_args: Sequence[Any]) -> tuple[Any, ...]:
+    """Convert `reduce_tensor` CUDA IPC args to msgpack-native primitives.
+
+    Replaces the non-primitive objects (`torch.Tensor`/`Parameter`,
+    `torch.Size`, `TypedStorage`/`UntypedStorage`, `torch.dtype`) with
+    primitive tags/tuples so `ipc_handles` can cross ZMQ msgpack without
+    `VLLM_ALLOW_INSECURE_SERIALIZATION=1`.
+    """
+    if len(ipc_args) != _IPC_REBUILD_ARGC:
+        raise ValueError(
+            f"Expected {_IPC_REBUILD_ARGC}-element rebuild_cuda_tensor args, "
+            f"got {len(ipc_args)}"
+        )
+    tensor_cls = ipc_args[0]
+    if tensor_cls is torch.Tensor:
+        tensor_cls_tag = "tensor"
+    elif tensor_cls is torch.nn.Parameter:
+        tensor_cls_tag = "parameter"
+    else:
+        raise TypeError(f"Unsupported IPC tensor class: {tensor_cls!r}")
+
+    storage_cls = ipc_args[4]
+    if storage_cls is torch.storage.TypedStorage:
+        storage_cls_tag = "TypedStorage"
+    elif storage_cls is torch.UntypedStorage:
+        storage_cls_tag = "UntypedStorage"
+    else:
+        raise TypeError(f"Unsupported IPC storage class: {storage_cls!r}")
+
+    dtype = ipc_args[5]
+    if not isinstance(dtype, torch.dtype):
+        raise TypeError(f"Expected torch.dtype in IPC args, got {dtype!r}")
+
+    return (
+        tensor_cls_tag,
+        tuple(int(dim) for dim in ipc_args[1]),
+        tuple(int(stride) for stride in ipc_args[2]),
+        ipc_args[3],
+        storage_cls_tag,
+        dtype_name(dtype),
+        *ipc_args[6:],
+    )
+
+
+def decode_ipc_args(ipc_args: Sequence[Any], device_index: int) -> list[Any]:
+    """Decode encoded (or legacy raw `reduce_tensor`) CUDA IPC args and
+    retarget them to `device_index`."""
+    args = list(ipc_args)
+    if args and isinstance(args[0], str):
+        if len(args) != _IPC_REBUILD_ARGC:
+            raise ValueError(
+                f"Expected {_IPC_REBUILD_ARGC}-element encoded IPC args, "
+                f"got {len(args)}"
+            )
+        tensor_cls = _IPC_TENSOR_CLASSES.get(args[0])
+        if tensor_cls is None:
+            raise ValueError(f"Unknown IPC tensor class tag: {args[0]!r}")
+        args[0] = tensor_cls
+        args[1] = tuple(args[1])
+        args[2] = tuple(args[2])
+        storage_cls = (
+            _IPC_STORAGE_CLASSES.get(args[4]) if isinstance(args[4], str) else None
+        )
+        if storage_cls is None:
+            raise ValueError(f"Unknown IPC storage class tag: {args[4]!r}")
+        args[4] = storage_cls
+        dtype = getattr(torch, args[5], None) if isinstance(args[5], str) else None
+        if not isinstance(dtype, torch.dtype):
+            raise ValueError(f"Unknown IPC dtype name: {args[5]!r}")
+        args[5] = dtype
+    args[6] = device_index  # the exporter's device index
+    return args
+
 
 def local_rebuild_args(
-    ipc_handle: dict[str, tuple], gpu_uuid: str, device_index: int
-) -> list:
+    ipc_handle: dict[str, Sequence[Any]], gpu_uuid: str, device_index: int
+) -> list[Any]:
     """`rebuild_cuda_tensor` args of this GPU's entry, on `device_index`."""
     if gpu_uuid not in ipc_handle:
         raise ValueError(
             f"IPC handle not found for GPU UUID {gpu_uuid}. "
             f"Available UUIDs: {list(ipc_handle.keys())}"
         )
-    args = list(ipc_handle[gpu_uuid])
-    args[6] = device_index  # the exporter's device index
-    return args
+    return decode_ipc_args(ipc_handle[gpu_uuid], device_index)
 
 
 @dataclass(slots=True)
@@ -497,7 +579,7 @@ def packed_ipc_producer(
             last = ahead[0] is None
         handle = None
         if k == 0 and buf is not None:  # only the first chunk grows `buf`
-            handle = {gpu_uuid: reduce_tensor(buf)[1]}
+            handle = {gpu_uuid: encode_ipc_args(reduce_tensor(buf)[1])}
         yield PackedIpcChunk(
             names=[name for name, _, _ in started],
             shapes=[shape for _, shape, _ in started],
@@ -525,7 +607,7 @@ class PackedIpcConsumer:
 
     def receive(
         self,
-        ipc_handle: dict[str, tuple] | None,
+        ipc_handle: dict[str, Sequence[Any]] | None,
         names: list[str],
         shapes: list[list[int]],
         dtype_names: list[str],

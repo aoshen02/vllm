@@ -3,8 +3,9 @@
 """IPC-based weight transfer engine using CUDA IPC for communication."""
 
 import pickle
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass
-from typing import TYPE_CHECKING, ClassVar, Self
+from typing import TYPE_CHECKING, Any, ClassVar, Self
 
 import pybase64 as base64
 import torch
@@ -27,6 +28,8 @@ if TYPE_CHECKING:
 from vllm.distributed.weight_transfer.packed_tensor import (
     DEFAULT_PACKED_BUFFER_SIZE_BYTES,
     PackedIpcConsumer,
+    encode_ipc_args,
+    local_rebuild_args,
     packed_ipc_producer,
 )
 
@@ -57,8 +60,9 @@ class IPCWeightTransferUpdateInfo(WeightTransferUpdateInfo):
     """Packed mode: the tensors that start in this chunk (`PackedIpcChunk`)."""
     dtype_names: list[str]
     shapes: list[list[int]]
-    ipc_handles: list[dict[str, tuple]] | dict[str, tuple] | None = None
-    """IPC handles mapping physical GPU UUID to rebuild_cuda_tensor args.
+    ipc_handles: list[dict[str, Sequence[Any]]] | dict[str, Sequence[Any]] | None = None
+    """IPC handles mapping physical GPU UUID to encoded (or legacy raw)
+    rebuild_cuda_tensor args.
     For non-packed mode: list of per-parameter handle dicts.
     For packed mode: the packed buffer's handle dict in the first chunk of a
     transfer with bytes, else empty."""
@@ -189,8 +193,6 @@ class IPCWeightTransferEngine(
         # `with torch.device(self.device)` by the caller, so the current device
         # is not guaranteed to match self.device. The IPC tensors must be
         # rebuilt on the device the model lives on.
-        device_index = self.device.index
-
         if self.packed:
             assert self._packed_consumer is not None, (
                 "packed IPC receive_weights called outside "
@@ -210,27 +212,23 @@ class IPCWeightTransferEngine(
         else:
             assert isinstance(update_info.ipc_handles, list)
             weights = []
-            for name, ipc_handle in zip(
-                update_info.names,
-                update_info.ipc_handles,
-            ):
-                props = torch.cuda.get_device_properties(device_index)
-                physical_gpu_id = str(props.uuid)
-
-                if physical_gpu_id not in ipc_handle:
-                    raise ValueError(
-                        f"IPC handle not found for GPU UUID "
-                        f"{physical_gpu_id}. "
-                        f"Available UUIDs: {list(ipc_handle.keys())}"
+            if update_info.names:
+                physical_gpu_id, device_index = self._local_gpu()
+                weights = [
+                    (
+                        name,
+                        rebuild_cuda_tensor(
+                            *local_rebuild_args(
+                                ipc_handle, physical_gpu_id, device_index
+                            )
+                        ),
                     )
-
-                args = ipc_handle[physical_gpu_id]
-                list_args = list(args)
-                # Index 6 of the args from reduce_tensor is the device_index.
-                # We need to overwrite it with the receiver's device index.
-                list_args[6] = device_index
-                weight = rebuild_cuda_tensor(*list_args)
-                weights.append((name, weight))
+                    for name, ipc_handle in zip(
+                        update_info.names,
+                        update_info.ipc_handles,
+                        strict=True,
+                    )
+                ]
 
         self.model.load_weights(weights)
 
@@ -394,7 +392,7 @@ class IPCTrainerWeightTransferEngine(TrainerWeightTransferEngine[IPCTrainerInitI
             weight = tensor.detach().contiguous()
             weight_refs.append(weight)
             _, ipc_args = reduce_tensor(weight)
-            ipc_handles.append({self.gpu_uuid: ipc_args})
+            ipc_handles.append({self.gpu_uuid: encode_ipc_args(ipc_args)})
 
         ipc_handles = self._all_gather_and_merge_handles(ipc_handles)
         self._do_send(
@@ -442,8 +440,9 @@ class IPCTrainerWeightTransferEngine(TrainerWeightTransferEngine[IPCTrainerInitI
         """Build one update payload and ship it via the client. Only the sender
         ships (non-sender ranks already contributed to the handle all-gather).
 
-        Emits raw `ipc_handles`; transports that cannot carry them natively
-        (HTTP/JSON) pickle them in their client (see `HTTPVLLMWeightSyncClient`).
+        Emits msgpack-native encoded `ipc_handles`; transports that cannot
+        carry binary fields natively (HTTP/JSON) pickle them in their client
+        (see `HTTPVLLMWeightSyncClient`).
         """
         if not self.is_sender:
             return
