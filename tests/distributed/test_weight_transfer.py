@@ -3336,3 +3336,269 @@ def test_plugin_does_not_replace_native_backend(mx_client):
     register_plugin_weight_transfer_engine()
     assert WeightTransferEngineFactory._registry["modelexpress"] is native_loader
     assert type(_make_modelexpress_engine()) is ModelExpressWeightTransferEngine
+
+
+# --- Unit Tests: IPC Handle Serialization & Local GPU Lookup ---
+
+
+def _sample_raw_ipc_args(
+    *,
+    tensor_cls: type = torch.Tensor,
+    storage_cls: type = torch.storage.TypedStorage,
+    dtype: torch.dtype = torch.bfloat16,
+    shape: tuple[int, ...] = (4, 8),
+    stride: tuple[int, ...] = (8, 1),
+    src_device: int = 3,
+    storage_handle: bytes | None = b"\x01\x02\x03\x04",
+    event_handle: bytes | None = b"\x05\x06",
+) -> tuple:
+    return (
+        tensor_cls,
+        torch.Size(shape),
+        stride,
+        0,
+        storage_cls,
+        dtype,
+        src_device,
+        storage_handle,
+        64,
+        16,
+        False,
+        b"ref-counter-handle",
+        0,
+        event_handle,
+        event_handle is not None,
+    )
+
+
+@pytest.mark.parametrize(
+    "tensor_cls,storage_cls,dtype,storage_handle,event_handle",
+    [
+        (
+            torch.Tensor,
+            torch.storage.TypedStorage,
+            torch.bfloat16,
+            b"\x01\x02\x03\x04",
+            b"\x05\x06",
+        ),
+        (
+            torch.nn.Parameter,
+            torch.UntypedStorage,
+            torch.float8_e4m3fn,
+            b"\xaa\xbb",
+            None,
+        ),
+        (
+            torch.Tensor,
+            torch.storage.TypedStorage,
+            torch.uint8,
+            None,
+            None,
+        ),
+    ],
+)
+def test_ipc_args_msgpack_roundtrip_without_insecure_serialization(
+    monkeypatch,
+    tensor_cls,
+    storage_cls,
+    dtype,
+    storage_handle,
+    event_handle,
+):
+    """Encoded IPC args must cross vLLM's MsgpackEncoder/Decoder with
+    VLLM_ALLOW_INSECURE_SERIALIZATION=0 and decode back to rebuild_cuda_tensor args."""
+    from vllm.distributed.weight_transfer.packed_tensor import (
+        decode_ipc_args,
+        encode_ipc_args,
+    )
+    from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
+
+    monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "0")
+    raw = _sample_raw_ipc_args(
+        tensor_cls=tensor_cls,
+        storage_cls=storage_cls,
+        dtype=dtype,
+        storage_handle=storage_handle,
+        event_handle=event_handle,
+    )
+
+    encoder = MsgpackEncoder()
+    decoder = MsgpackDecoder()
+
+    # Raw reduce_tensor args contain torch.Tensor / TypedStorage / torch.dtype
+    # and fail strict msgpack serialization.
+    with pytest.raises(TypeError, match="not serializable"):
+        encoder.encode({"ipc_handles": [{"gpu-0": raw}]})
+
+    encoded = encode_ipc_args(raw)
+    payload = {
+        "names": ["layer.weight"],
+        "dtype_names": [str(dtype).removeprefix("torch.")],
+        "shapes": [[4, 8]],
+        "ipc_handles": [{"gpu-0": encoded}],
+    }
+    wire = encoder.encode(payload)
+    decoded_payload = decoder.decode(wire)
+    decoded_args = decode_ipc_args(
+        decoded_payload["ipc_handles"][0]["gpu-0"], device_index=1
+    )
+
+    expected = list(raw)
+    expected[1] = tuple(raw[1])
+    expected[6] = 1
+    assert decoded_args == expected
+    assert decoded_args[0] is tensor_cls
+    assert decoded_args[4] is storage_cls
+    assert decoded_args[5] is dtype
+    assert type(decoded_args[1]) is tuple
+    assert type(decoded_args[2]) is tuple
+
+
+def test_ipc_decode_args_accepts_legacy_raw_tuples_and_rejects_invalid_tags():
+    """Receiver stays backwards-compatible with raw reduce_tensor tuples while
+    strictly validating encoded tags against an allowlist."""
+    from vllm.distributed.weight_transfer.packed_tensor import (
+        decode_ipc_args,
+        encode_ipc_args,
+        local_rebuild_args,
+    )
+
+    raw = _sample_raw_ipc_args(src_device=2)
+    decoded = local_rebuild_args({"gpu-0": raw}, "gpu-0", device_index=0)
+    expected = list(raw)
+    expected[6] = 0
+    assert decoded == expected
+
+    encoded = list(encode_ipc_args(raw))
+    bad_tensor = encoded.copy()
+    bad_tensor[0] = "os.system"
+    with pytest.raises(ValueError, match="Unknown IPC tensor class tag"):
+        decode_ipc_args(bad_tensor, device_index=0)
+
+    bad_storage = encoded.copy()
+    bad_storage[4] = "BadStorage"
+    with pytest.raises(ValueError, match="Unknown IPC storage class tag"):
+        decode_ipc_args(bad_storage, device_index=0)
+
+    bad_dtype = encoded.copy()
+    bad_dtype[5] = "nn"
+    with pytest.raises(ValueError, match="Unknown IPC dtype name"):
+        decode_ipc_args(bad_dtype, device_index=0)
+
+    with pytest.raises(ValueError, match="Expected 15-element encoded IPC args"):
+        decode_ipc_args(["tensor", (4,)], device_index=0)
+
+
+def test_ipc_receive_weights_unpacked_queries_local_gpu_once_and_decodes_msgpack(
+    monkeypatch,
+):
+    """Unpacked receive_weights must query GPU properties once per call (not
+    once per parameter) and accept msgpack-decoded encoded IPC handles."""
+    from vllm.distributed.weight_transfer import ipc_engine as ipc_mod
+    from vllm.distributed.weight_transfer.packed_tensor import encode_ipc_args
+    from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
+
+    monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "0")
+    gpu_uuid = "GPU-test-uuid-0"
+    props_calls: list[int] = []
+
+    def fake_get_device_properties(device_index: int):
+        props_calls.append(device_index)
+        return SimpleNamespace(uuid=gpu_uuid)
+
+    rebuilt_calls: list[tuple] = []
+
+    def fake_rebuild_cuda_tensor(*args):
+        rebuilt_calls.append(args)
+        return torch.zeros(args[1], dtype=args[5])
+
+    monkeypatch.setattr(torch.cuda, "get_device_properties", fake_get_device_properties)
+    monkeypatch.setattr(ipc_mod, "rebuild_cuda_tensor", fake_rebuild_cuda_tensor)
+
+    loaded: list[tuple[str, torch.Tensor]] = []
+    model = MagicMock()
+    model.load_weights.side_effect = lambda weights: loaded.extend(weights)
+
+    engine = IPCWeightTransferEngine(
+        WeightTransferConfig(backend="ipc"),
+        create_mock_vllm_config(),
+        torch.device("cuda", 2),
+        model,
+    )
+    engine.init_transfer_engine(IPCWeightTransferInitInfo(packed=False))
+
+    names = [f"w{i}" for i in range(4)]
+    handles = [{gpu_uuid: encode_ipc_args(_sample_raw_ipc_args())} for _ in names]
+    wire = MsgpackEncoder().encode(
+        {
+            "names": names,
+            "dtype_names": ["bfloat16"] * len(names),
+            "shapes": [[4, 8]] * len(names),
+            "ipc_handles": handles,
+        }
+    )
+    decoded_dict = MsgpackDecoder().decode(wire)
+    update_info = engine.parse_update_info(decoded_dict)
+
+    engine.receive_weights(update_info)
+
+    assert props_calls == [2]
+    assert len(rebuilt_calls) == 4
+    assert all(
+        args[0] is torch.Tensor
+        and args[4] is torch.storage.TypedStorage
+        and args[5] is torch.bfloat16
+        and args[6] == 2
+        for args in rebuilt_calls
+    )
+    assert [n for n, _ in loaded] == names
+
+    # Empty unpacked batch should not query GPU properties at all.
+    props_calls.clear()
+    empty_info = IPCWeightTransferUpdateInfo(
+        names=[], dtype_names=[], shapes=[], ipc_handles=[]
+    )
+    engine.receive_weights(empty_info)
+    assert props_calls == []
+
+
+def test_ipc_trainer_send_unpacked_payload_serializes_with_msgpack_strict(
+    monkeypatch,
+):
+    """IPCTrainerWeightTransferEngine._send_unpacked must emit update_info that
+    passes MsgpackEncoder with VLLM_ALLOW_INSECURE_SERIALIZATION=0."""
+    from vllm.distributed.weight_transfer import ipc_engine as ipc_mod
+    from vllm.v1.serial_utils import MsgpackEncoder
+
+    monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "0")
+    monkeypatch.setattr(torch.accelerator, "current_device_index", lambda: 0)
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda idx: SimpleNamespace(uuid="GPU-trainer-0"),
+    )
+    monkeypatch.setattr(torch.cuda, "ipc_collect", lambda: None)
+    monkeypatch.setattr(
+        ipc_mod,
+        "reduce_tensor",
+        lambda t: (
+            ipc_mod.rebuild_cuda_tensor,
+            _sample_raw_ipc_args(shape=tuple(t.shape), dtype=t.dtype, src_device=0),
+        ),
+    )
+
+    client = RecordingClient()
+    engine = IPCTrainerWeightTransferEngine(
+        client=client,
+        source=ModuleSource(
+            _module_with(("w", torch.ones(4, 8, dtype=torch.bfloat16)))
+        ),
+        packed=False,
+    )
+    engine.send_weights()
+
+    assert client.last_update_info is not None
+    # Must serialize cleanly without VLLM_ALLOW_INSECURE_SERIALIZATION=1.
+    wire = MsgpackEncoder().encode(client.last_update_info)
+    assert len(wire) == 1
+    assert isinstance(wire[0], (bytes, bytearray))
