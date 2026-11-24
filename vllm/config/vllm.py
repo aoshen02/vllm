@@ -45,7 +45,7 @@ from .engram import EngramConfig, model_has_engram_layers
 from .kernel import KernelConfig
 from .kv_events import KVEventsConfig
 from .kv_transfer import KVCacheAccess, KVTransferConfig, hisparse_host_pool_gib
-from .load import LoadConfig
+from .load import LoadConfig, resolve_reload_mode
 from .logging import LoggingConfig
 from .lora import LoRAConfig
 from .mamba import MambaBackendEnum, MambaConfig
@@ -1320,7 +1320,7 @@ class VllmConfig:
     def _verify_direct_reload_compat(self) -> None:
         """Reject configurations that direct weight reload cannot support."""
         # imported only in direct mode: it loads the model loaders
-        if envs.VLLM_RELOAD_MODE != "direct":
+        if resolve_reload_mode(getattr(self, "load_config", None)) != "direct":
             return
         from vllm.model_executor.model_loader.reload.direct import (
             direct_reload_refusal,
