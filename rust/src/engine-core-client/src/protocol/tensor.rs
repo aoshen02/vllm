@@ -221,6 +221,10 @@ pub enum ArrayRowsError {
     RowSizeOverflow { shape: Vec<usize> },
     #[error("array data is an unresolved auxiliary frame")]
     UnresolvedAuxFrame,
+    #[error("cannot split {num_rows} rows into parts of {parts:?} rows")]
+    SplitMismatch { num_rows: usize, parts: Vec<usize> },
+    #[error("array data has {len} bytes, not what shape {shape:?} needs")]
+    DataLength { len: usize, shape: Vec<usize> },
     #[error(
         "cannot concatenate {dtype:?} {shape:?} rows onto {first_dtype:?} {first_shape:?} rows"
     )]
@@ -298,6 +302,40 @@ impl WireNdArray {
         let mut shape = first.shape;
         shape[0] = num_rows;
         Ok(Some(Self::from_raw(first.dtype, shape, data)))
+    }
+
+    /// Split along axis 0 into consecutive parts of the given row counts, the
+    /// inverse of [`Self::concat_rows`]. The parts share this array's bytes.
+    pub fn split_rows(&self, parts: &[usize]) -> Result<Vec<Self>, ArrayRowsError> {
+        let row_bytes = self.row_bytes()?;
+        let WireArrayData::RawView(data) = &self.data else {
+            return Err(ArrayRowsError::UnresolvedAuxFrame);
+        };
+        if self.shape[0].checked_mul(row_bytes) != Some(data.len()) {
+            return Err(ArrayRowsError::DataLength {
+                len: data.len(),
+                shape: self.shape.clone(),
+            });
+        }
+        let total = parts.iter().try_fold(0usize, |sum, &n| sum.checked_add(n));
+        if total != Some(self.shape[0]) {
+            return Err(ArrayRowsError::SplitMismatch {
+                num_rows: self.shape[0],
+                parts: parts.to_vec(),
+            });
+        }
+        let mut start = 0;
+        Ok(parts
+            .iter()
+            .map(|&num_rows| {
+                let end = start + num_rows * row_bytes;
+                let mut shape = self.shape.clone();
+                shape[0] = num_rows;
+                let part = Self::from_raw_bytes(self.dtype, shape, data.slice(start..end));
+                start = end;
+                part
+            })
+            .collect())
     }
 }
 
@@ -463,6 +501,26 @@ mod tests {
         let mut unresolved = rows(&[1]);
         unresolved.data = WireArrayData::AuxIndex(1);
         assert!(unresolved.truncate_rows(0).is_err());
+    }
+
+    #[test]
+    fn split_rows_inverts_concat_rows() {
+        let array = rows(&[1, 2, 3, 4, 5, 6]);
+        let parts = array.split_rows(&[1, 0, 5]).unwrap();
+        assert_eq!(
+            parts.iter().map(|p| p.shape[0]).collect::<Vec<_>>(),
+            [1, 0, 5]
+        );
+        assert_eq!(
+            WireNdArray::concat_rows(parts).unwrap(),
+            Some(array.clone())
+        );
+        for parts in [&[1, 1][..], &[2, 2]] {
+            assert!(matches!(
+                array.split_rows(parts),
+                Err(ArrayRowsError::SplitMismatch { .. })
+            ));
+        }
     }
 
     #[test]

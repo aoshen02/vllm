@@ -3,7 +3,7 @@
 
 import enum
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -340,6 +340,37 @@ class UtilityOutput(
     result: UtilityResult | None = None
 
 
+class PackedOutputField(
+    msgspec.Struct,
+    array_like=True,  # type: ignore[call-arg]
+    gc=False,
+):  # type: ignore[call-arg]
+    """One per-output array field of every output in a message, batched."""
+
+    # The EngineCoreOutput field, a key of _PACKED_OUTPUT_FIELDS.
+    name: str
+    # Per component, the outputs' arrays concatenated in output order.
+    arrays: list[np.ndarray | None]
+    # Per component, the row count of each output; -1 where it has none. An
+    # output whose first component is -1 does not have the field.
+    rows: list[list[int]]
+
+
+# EngineCoreOutput fields that pack_for_transport batches: a field value to its
+# component arrays (None if it cannot be batched), and back.
+_PACKED_OUTPUT_FIELDS: dict[str, tuple[Callable[[Any], Any], Callable[[Any], Any]]] = {
+    "new_logprobs": (
+        lambda v: None if v.cu_num_generated_tokens is not None else v[:3],
+        lambda parts: LogprobsLists(*parts),
+    ),
+    "routed_experts": (lambda v: (v,), lambda parts: parts[0]),
+    "new_sampling_mask": (
+        lambda v: None if v.cu_num_generated_tokens is not None else v[:2],
+        lambda parts: SamplingMaskLists(*parts),
+    ),
+}
+
+
 class EngineCoreOutputs(
     msgspec.Struct,
     array_like=True,  # type: ignore[call-arg]
@@ -369,58 +400,67 @@ class EngineCoreOutputs(
     # Weight version used for this step.
     weight_version: str | None = None
 
-    # Per-output sample logprobs batched for transport (see pack_for_transport):
-    # the outputs' rows concatenated in output order, and the row count per
-    # output (-1 for none).
-    packed_logprobs: LogprobsLists | None = None
-    packed_logprobs_rows: list[int] | None = None
+    # Per-output array fields batched for transport; see pack_for_transport.
+    packed_fields: list[PackedOutputField] | None = None
 
     def __post_init__(self):
         if self.timestamp == 0.0:
             self.timestamp = time.monotonic()
 
     def pack_for_transport(self) -> None:
-        """Batch the outputs' sample logprobs before serialization.
+        """Batch the outputs' per-output array fields before serialization.
 
-        Sent per output, sample logprobs cost three small arrays per request
-        per step to encode, send and decode, which dominates the front end's
-        output handling at high concurrency. Batched, they are three arrays per
-        step. If the arrays differ in dtype or trailing shape within the
-        message, they are sent per output as before.
+        Sent per output, every array costs a separate encode, send and decode
+        per request per step, which dominates the front end's output handling
+        at high concurrency. Batched, each field costs one array per component
+        per step. A field is sent per output as before when fewer than two
+        outputs have it or its arrays differ in dtype or trailing shape.
         """
-        lps = [o.new_logprobs for o in self.outputs if o.new_logprobs is not None]
-        if len(lps) >= 2 and all(
-            p.cu_num_generated_tokens is None
-            and all(
-                a.dtype == b.dtype and a.shape[1:] == b.shape[1:]
-                for a, b in zip(p[:3], lps[0][:3])
-            )
-            for p in lps
-        ):
-            self.packed_logprobs = LogprobsLists(
-                *(np.concatenate([p[i] for p in lps]) for i in range(3))
-            )
-            self.packed_logprobs_rows = [
-                -1 if o.new_logprobs is None else len(o.new_logprobs.logprobs)
-                for o in self.outputs
-            ]
-            for o in self.outputs:
-                o.new_logprobs = None
+        packed = []
+        for name, (to_arrays, _) in _PACKED_OUTPUT_FIELDS.items():
+            values = [getattr(o, name) for o in self.outputs]
+            parts = [None if v is None else to_arrays(v) for v in values]
+            present = [p for p in parts if p is not None]
+            if len(present) < 2 or len(present) != sum(v is not None for v in values):
+                continue
+            arrays: list[np.ndarray | None] = []
+            rows: list[list[int]] = []
+            for c in range(len(present[0])):
+                column = [p[c] for p in present if p[c] is not None]
+                if any(
+                    a.dtype != column[0].dtype or a.shape[1:] != column[0].shape[1:]
+                    for a in column
+                ):
+                    break
+                arrays.append(np.concatenate(column) if column else None)
+                rows.append(
+                    [-1 if p is None or p[c] is None else len(p[c]) for p in parts]
+                )
+            else:
+                packed.append(PackedOutputField(name, arrays, rows))
+                for o in self.outputs:
+                    setattr(o, name, None)
+        self.packed_fields = packed or None
 
     def unpack_after_transport(self) -> None:
-        """Give each output its rows of the batched logprobs back, as views."""
-        if self.packed_logprobs is not None and self.packed_logprobs_rows is not None:
-            token_ids, logprobs, ranks = self.packed_logprobs[:3]
-            start = 0
-            for output, n in zip(self.outputs, self.packed_logprobs_rows):
-                if n >= 0:
-                    end = start + n
-                    output.new_logprobs = LogprobsLists(
-                        token_ids[start:end], logprobs[start:end], ranks[start:end]
-                    )
-                    start = end
-        self.packed_logprobs = None
-        self.packed_logprobs_rows = None
+        """Give each output its rows of the batched fields back, as views."""
+        for field in self.packed_fields or ():
+            _, from_arrays = _PACKED_OUTPUT_FIELDS[field.name]
+            starts = [0] * len(field.arrays)
+            for i, output in enumerate(self.outputs):
+                if field.rows[0][i] < 0:
+                    continue
+                parts = []
+                for c, array in enumerate(field.arrays):
+                    n = field.rows[c][i]
+                    if n < 0:
+                        parts.append(None)
+                        continue
+                    assert array is not None
+                    parts.append(array[starts[c] : starts[c] + n])
+                    starts[c] += n
+                setattr(output, field.name, from_arrays(parts))
+        self.packed_fields = None
 
 
 class EngineCoreRequestType(enum.Enum):

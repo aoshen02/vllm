@@ -3966,10 +3966,10 @@ fn python_msgpack_fixtures_match_rust_encoding_and_record_nixl_metrics() {
     let simple_cpu_offload_stats_hex =
         lines.next().expect("missing SimpleCPUOffload stats fixture line");
     let kv_offload_stats_hex = lines.next().expect("missing kv offload stats fixture line");
-    let inline_packed_logprobs_frames =
-        lines.next().expect("missing inline packed logprobs fixture line");
-    let multipart_packed_logprobs_frames =
-        lines.next().expect("missing multipart packed logprobs fixture line");
+    let inline_packed_fields_frames =
+        lines.next().expect("missing inline packed fields fixture line");
+    let multipart_packed_fields_frames =
+        lines.next().expect("missing multipart packed fields fixture line");
 
     let request_bytes = hex::decode(request_hex).unwrap();
     let multimodal_request_bytes = hex::decode(multimodal_request_hex).unwrap();
@@ -4186,11 +4186,8 @@ fn python_msgpack_fixtures_match_rust_encoding_and_record_nixl_metrics() {
             .expect("multipart prompt logprobs decoded"),
     );
 
-    // Sample logprobs batched for transport: each output gets its rows back.
-    for frames in [
-        inline_packed_logprobs_frames,
-        multipart_packed_logprobs_frames,
-    ] {
+    // Output fields batched for transport: each output gets its rows back.
+    for frames in [inline_packed_fields_frames, multipart_packed_fields_frames] {
         let packed = EngineCoreOutputs::from_frames(&decode_frames(frames)).unwrap();
         let outputs = &packed.as_request_batch().unwrap().outputs;
         assert_eq!(outputs.len(), 3);
@@ -4205,6 +4202,23 @@ fn python_msgpack_fixtures_match_rust_encoding_and_record_nixl_metrics() {
                 .map(|entry| (entry.token_id, entry.logprob, entry.rank))
                 .collect::<Vec<_>>(),
             vec![(7, 7.0, 3), (8, 8.0, 1), (9, 9.0, 2)]
+        );
+        let experts: Vec<_> = outputs
+            .iter()
+            .map(|output| output.routed_experts.as_ref().map(|array| array.shape.clone()))
+            .collect();
+        assert_eq!(experts, [None, Some(vec![3, 2]), Some(vec![1, 2])]);
+        let masks: Vec<_> = outputs
+            .iter()
+            .map(|output| output.new_sampling_mask.as_ref().map(|mask| mask.rows.clone()))
+            .collect();
+        assert_eq!(
+            masks,
+            [
+                Some(vec![vec![7, 8]]),
+                Some(vec![vec![1, 2], vec![3]]),
+                None
+            ]
         );
     }
 

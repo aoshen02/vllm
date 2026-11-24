@@ -15,8 +15,8 @@ use serde_with::serde_as;
 use super::serde_utils::AllowTrailingFields;
 use super::utility::UtilityOutput;
 use crate::error::{Error, Result, bail_ext_value_decode, ext_value_decode};
-use crate::protocol::logprobs::{Logprobs, MaybeWireLogprobs};
-use crate::protocol::sampling_mask::MaybeWireSamplingMask;
+use crate::protocol::logprobs::{MaybeWireLogprobs, WireLogprobs};
+use crate::protocol::sampling_mask::{MaybeWireSamplingMask, WireSamplingMask};
 use crate::protocol::stats::{PrefillStats, SchedulerStats};
 use crate::protocol::tensor::WireNdArray;
 use crate::protocol::{OpaqueValue, decode_msgpack, encode_msgpack};
@@ -302,62 +302,104 @@ struct WireEngineCoreOutputs {
     /// `set_weight_version` utility; `"default"` until set.
     #[serde(default)]
     weight_version: Option<String>,
-    /// The outputs' sample logprobs batched for transport: every output's rows
-    /// concatenated in output order. [`Self::unpack_logprobs`] gives each
-    /// output its rows back as `new_logprobs`.
+    /// Per-output array fields batched for transport.
+    /// [`Self::unpack_fields`] gives each output its rows back.
     #[serde(default)]
-    packed_logprobs: Option<MaybeWireLogprobs>,
-    /// Row count per output in `packed_logprobs`, or -1 for an output without
-    /// sample logprobs.
-    #[serde(default)]
-    packed_logprobs_rows: Option<Vec<i64>>,
+    packed_fields: Option<Vec<PackedOutputField>>,
+}
+
+/// One per-output array field of every output in a message, batched.
+///
+/// Python packs it in `EngineCoreOutputs.pack_for_transport`.
+#[derive(Debug, Clone, PartialEq, Serialize_tuple, Deserialize_tuple)]
+struct PackedOutputField {
+    /// The `EngineCoreOutput` field.
+    name: String,
+    /// Per component, the outputs' arrays concatenated in output order.
+    arrays: Vec<Option<WireNdArray>>,
+    /// Per component, the row count of each output; -1 where it has none. An
+    /// output whose first component is -1 does not have the field.
+    rows: Vec<Vec<i64>>,
+}
+
+impl PackedOutputField {
+    /// Each output's arrays of the field: per output, one per component.
+    fn split(self, num_outputs: usize, frames: &[Bytes]) -> Result<Vec<Vec<Option<WireNdArray>>>> {
+        let name = &self.name;
+        if self.rows.len() != self.arrays.len() || self.rows.iter().any(|r| r.len() != num_outputs)
+        {
+            bail_ext_value_decode!("packed field {name}: rows do not match arrays and outputs");
+        }
+        let mut per_output = vec![Vec::with_capacity(self.arrays.len()); num_outputs];
+        for (array, rows) in self.arrays.into_iter().zip(&self.rows) {
+            let counts: Vec<usize> = rows.iter().filter_map(|&n| usize::try_from(n).ok()).collect();
+            if rows.iter().any(|&n| n < -1) || (counts.is_empty() != array.is_none()) {
+                bail_ext_value_decode!("packed field {name}: bad rows {rows:?}");
+            }
+            let mut parts = match array {
+                Some(mut array) => {
+                    array
+                        .resolve_aux_frame(frames)
+                        .map_err(|message| ext_value_decode!("packed field {name}: {message}"))?;
+                    array
+                        .split_rows(&counts)
+                        .map_err(|error| ext_value_decode!("packed field {name}: {error}"))?
+                }
+                None => Vec::new(),
+            }
+            .into_iter();
+            for (arrays, &n) in per_output.iter_mut().zip(rows) {
+                arrays.push(if n < 0 { None } else { parts.next() });
+            }
+        }
+        Ok(per_output)
+    }
 }
 
 impl WireEngineCoreOutputs {
-    /// Give each output its rows of the batched sample logprobs back as
-    /// `new_logprobs`. Needs the message frames: large arrays travel in
-    /// auxiliary frames.
-    fn unpack_logprobs(&mut self, frames: &[Bytes]) -> Result<()> {
-        let Some(packed) = self.packed_logprobs.take() else {
-            return Ok(());
-        };
-        let Some(rows) = self.packed_logprobs_rows.take() else {
-            bail_ext_value_decode!("packed_logprobs is set without packed_logprobs_rows");
-        };
-        if rows.len() != self.outputs.len() {
-            bail_ext_value_decode!(
-                "packed_logprobs_rows has {} entries for {} outputs",
-                rows.len(),
-                self.outputs.len()
-            );
-        }
-        let Ok(Logprobs { positions }) = packed.resolve(frames, "packed_logprobs")?.into_direct()
-        else {
-            unreachable!("MaybeWireLogprobs::resolve returns decoded logprobs");
-        };
-        let total = positions.len();
-        let mut positions = positions.into_iter();
-        for (output, &count) in self.outputs.iter_mut().zip(&rows) {
-            if count == -1 {
-                continue;
+    /// Give each output its rows of the batched fields back. Needs the message
+    /// frames: large arrays travel in auxiliary frames.
+    fn unpack_fields(&mut self, frames: &[Bytes]) -> Result<()> {
+        for field in self.packed_fields.take().into_iter().flatten() {
+            let name = field.name.clone();
+            let num_components = field.arrays.len();
+            let per_output = field.split(self.outputs.len(), frames)?;
+            for (output, arrays) in self.outputs.iter_mut().zip(per_output) {
+                let mut arrays = arrays.into_iter();
+                let Some(first) = arrays.next().flatten() else {
+                    continue;
+                };
+                let mut next = || {
+                    arrays
+                        .next()
+                        .flatten()
+                        .ok_or_else(|| ext_value_decode!("packed field {name}: missing component"))
+                };
+                match (name.as_str(), num_components) {
+                    ("new_logprobs", 3) => {
+                        output.new_logprobs =
+                            Some(MaybeWireLogprobs::Wire(Box::new(WireLogprobs {
+                                logprob_token_ids: first,
+                                logprobs: next()?,
+                                token_ranks: next()?,
+                                cu_num_generated_tokens: None,
+                                cu_num_generated_tokens_tensor: None,
+                            })));
+                    }
+                    ("routed_experts", 1) => output.routed_experts = Some(Box::new(first)),
+                    ("new_sampling_mask", 2) => {
+                        output.new_sampling_mask =
+                            Some(MaybeWireSamplingMask::Wire(Box::new(WireSamplingMask {
+                                token_ids: first,
+                                offsets: next().ok(),
+                                cu_num_generated_tokens: None,
+                            })));
+                    }
+                    _ => bail_ext_value_decode!(
+                        "unknown packed field {name} with {num_components} components"
+                    ),
+                }
             }
-            let Ok(count) = usize::try_from(count) else {
-                bail_ext_value_decode!("packed_logprobs_rows has row count {count}");
-            };
-            let output_positions: Vec<_> = positions.by_ref().take(count).collect();
-            if output_positions.len() != count {
-                bail_ext_value_decode!(
-                    "packed_logprobs has {total} rows, fewer than packed_logprobs_rows lists"
-                );
-            }
-            output.new_logprobs = Some(MaybeWireLogprobs::Direct(Logprobs {
-                positions: output_positions,
-            }));
-        }
-        if positions.next().is_some() {
-            bail_ext_value_decode!(
-                "packed_logprobs has {total} rows, more than packed_logprobs_rows lists"
-            );
         }
         Ok(())
     }
@@ -457,10 +499,10 @@ impl TryFrom<WireEngineCoreOutputs> for EngineCoreOutputs {
 
     fn try_from(value: WireEngineCoreOutputs) -> Result<Self> {
         // Reached by `Deserialize`, which has no frames; dropping the batched
-        // logprobs would silently lose every output's logprobs.
-        if value.packed_logprobs.is_some() {
+        // fields would silently lose them from every output.
+        if value.packed_fields.is_some() {
             bail_ext_value_decode!(
-                "batched sample logprobs need the message frames; decode with \
+                "batched output fields need the message frames; decode with \
                  `EngineCoreOutputs::from_frames`"
             );
         }
@@ -575,7 +617,7 @@ impl EngineCoreOutputs {
             frames.first().ok_or_else(|| ext_value_decode!("missing output frame"))?;
 
         let mut wire: WireEngineCoreOutputs = decode_msgpack(first_frame.as_ref())?;
-        wire.unpack_logprobs(frames)?;
+        wire.unpack_fields(frames)?;
         let mut outputs = Self::try_from(wire)?;
         outputs.resolve_in_place(frames)?;
         Ok(outputs)
@@ -601,6 +643,7 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::*;
+    use crate::protocol::dtype::TensorDtype;
     use crate::protocol::output::EngineCoreOutput;
     use crate::protocol::{decode_msgpack, encode_msgpack};
 
@@ -849,25 +892,55 @@ mod tests {
     }
 
     #[test]
-    fn engine_core_outputs_unpack_batched_sample_logprobs() {
-        use crate::protocol::logprobs::{Logprobs, PositionLogprobs, TokenLogprob};
-
-        let position = |token_id: u32| PositionLogprobs {
-            entries: vec![
-                TokenLogprob {
-                    token_id,
-                    logprob: -0.5,
-                    rank: 1,
-                },
-                TokenLogprob {
-                    token_id: token_id + 1,
-                    logprob: -1.5,
-                    rank: 1,
-                },
-            ],
+    fn engine_core_outputs_unpack_packed_fields() {
+        let field =
+            |name: &str, arrays: Vec<Option<WireNdArray>>, rows: Vec<Vec<i64>>| PackedOutputField {
+                name: name.into(),
+                arrays,
+                rows,
+            };
+        // Output 0: two logprobs positions and a single-position mask.
+        // Output 1: three rows of routed experts and a two-position mask.
+        // Output 2: one logprobs position and one row of routed experts.
+        let logprobs = || {
+            field(
+                "new_logprobs",
+                vec![
+                    Some(WireNdArray::from_i32(vec![3, 2], vec![10, 11, 20, 21, 30, 31]).unwrap()),
+                    Some(
+                        WireNdArray::from_f32(
+                            vec![3, 2],
+                            vec![-0.5, -1.5, -0.25, -2.0, -1.0, -3.0],
+                        )
+                        .unwrap(),
+                    ),
+                    Some(WireNdArray::from_i32(vec![3], vec![1, 2, 1]).unwrap()),
+                ],
+                vec![vec![2, -1, 1]; 3],
+            )
         };
-        let positions: Vec<_> = (0..3).map(|i| position(10 * i)).collect();
-        let packed = |rows: Vec<i64>| WireEngineCoreOutputs {
+        let routed_experts = || {
+            field(
+                "routed_experts",
+                vec![Some(WireNdArray::from_raw(
+                    TensorDtype::U8,
+                    vec![4, 2],
+                    (0..8).collect(),
+                ))],
+                vec![vec![-1, 3, 1]],
+            )
+        };
+        let sampling_mask = || {
+            field(
+                "new_sampling_mask",
+                vec![
+                    Some(WireNdArray::from_i64(vec![5], vec![7, 8, 1, 2, 3]).unwrap()),
+                    Some(WireNdArray::from_i64(vec![3], vec![0, 2, 3]).unwrap()),
+                ],
+                vec![vec![2, 3, -1], vec![-1, 3, -1]],
+            )
+        };
+        let packed = |fields: Vec<PackedOutputField>| WireEngineCoreOutputs {
             outputs: ["a", "b", "c"]
                 .map(|request_id| EngineCoreOutput {
                     request_id: request_id.into(),
@@ -875,39 +948,71 @@ mod tests {
                     ..Default::default()
                 })
                 .into(),
-            packed_logprobs: Some(MaybeWireLogprobs::Direct(Logprobs {
-                positions: positions.clone(),
-            })),
-            packed_logprobs_rows: Some(rows),
+            packed_fields: Some(fields),
             ..Default::default()
         };
         let decode = |wire: &WireEngineCoreOutputs| {
             EngineCoreOutputs::from_frames(&[Bytes::from(encode_msgpack(wire).unwrap())])
         };
 
-        let decoded = decode(&packed(vec![2, -1, 1])).unwrap();
-        let unpacked: Vec<_> = decoded
-            .as_request_batch()
-            .unwrap()
-            .outputs
+        let decoded = decode(&packed(vec![logprobs(), routed_experts(), sampling_mask()])).unwrap();
+        let outputs = &decoded.as_request_batch().unwrap().outputs;
+        let token_ids = |output: &EngineCoreOutput| {
+            output.new_logprobs.as_ref().map(|lp| {
+                lp.positions
+                    .iter()
+                    .map(|position| position.entries.iter().map(|e| e.token_id).collect::<Vec<_>>())
+                    .collect::<Vec<_>>()
+            })
+        };
+        assert_eq!(
+            token_ids(&outputs[0]),
+            Some(vec![vec![10, 11], vec![20, 21]])
+        );
+        assert_eq!(token_ids(&outputs[1]), None);
+        assert_eq!(token_ids(&outputs[2]), Some(vec![vec![30, 31]]));
+        let experts = |output: &EngineCoreOutput| {
+            output.routed_experts.as_ref().map(|array| {
+                (
+                    array.shape.clone(),
+                    array.data.as_raw_view().unwrap().to_vec(),
+                )
+            })
+        };
+        assert_eq!(experts(&outputs[0]), None);
+        assert_eq!(experts(&outputs[1]), Some((vec![3, 2], (0..6).collect())));
+        assert_eq!(experts(&outputs[2]), Some((vec![1, 2], vec![6, 7])));
+        let masks: Vec<_> = outputs
             .iter()
-            .map(|output| output.new_logprobs.as_ref().map(|lp| lp.positions.clone()))
+            .map(|output| output.new_sampling_mask.as_ref().map(|mask| mask.rows.clone()))
             .collect();
         assert_eq!(
-            unpacked,
-            vec![
-                Some(positions[..2].to_vec()),
-                None,
-                Some(positions[2..].to_vec())
+            masks,
+            [
+                Some(vec![vec![7, 8]]),
+                Some(vec![vec![1, 2], vec![3]]),
+                None
             ]
         );
 
-        // Row counts that disagree with the batched rows or the outputs fail.
-        for rows in [vec![2, -1, 2], vec![1, -1, 1], vec![2, 1], vec![2, -2, 1]] {
-            assert!(decode(&packed(rows)).is_err());
+        // Rows that disagree with the arrays or the outputs fail, as do
+        // unknown fields.
+        let bad_rows = [
+            vec![vec![1, 1, 1]],
+            vec![vec![2, 1]],
+            vec![vec![-1, -2, 4]],
+            vec![],
+        ];
+        for rows in bad_rows {
+            let mut field = routed_experts();
+            field.rows = rows;
+            assert!(decode(&packed(vec![field])).is_err());
         }
-        // Without the frames the batched logprobs would be dropped, so this fails.
-        let bytes = encode_msgpack(&packed(vec![2, -1, 1])).unwrap();
+        let mut unknown = routed_experts();
+        unknown.name = "pooling_output".into();
+        assert!(decode(&packed(vec![unknown])).is_err());
+        // Without the frames the batched fields would be dropped, so this fails.
+        let bytes = encode_msgpack(&packed(vec![logprobs()])).unwrap();
         let without_frames: Result<EngineCoreOutputs> = decode_msgpack(&bytes);
         assert!(without_frames.is_err());
     }
