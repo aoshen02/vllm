@@ -1317,21 +1317,14 @@ class ShardedRDTTrainerWeightTransferEngine(
         )
 
         update = asdict(ShardedRDTWeightTransferUpdateInfo(sync_idx=self._sync_idx))
-        executor = ThreadPoolExecutor(max_workers=1)
-        try:
+        with ThreadPoolExecutor(max_workers=1) as exe:
             # The workers block inside update_weights until they've pulled every
             # group, so it runs concurrently with the gather/publish loop.
-            future = executor.submit(self.client.update_weights, update)
-            if future.done():
-                future.result()
+            future = exe.submit(self.client.update_weights, update)
             self._run_gather_loop(
                 update_future=future, live_count=live_count, live_ids=live_ids
             )
             future.result()  # surface inference-side errors
-        finally:
-            # Never wait for the RPC thread on error: if the gather loop raised,
-            # workers may stay blocked in update_weights and joining would hang.
-            executor.shutdown(wait=False, cancel_futures=True)
 
         self.client.finish_weight_update()
 
