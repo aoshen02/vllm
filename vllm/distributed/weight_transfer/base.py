@@ -5,6 +5,8 @@
 import math
 from abc import ABC, abstractmethod
 from collections.abc import Iterator
+from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from functools import cached_property
 from typing import (
@@ -30,6 +32,16 @@ TInitInfo = TypeVar("TInitInfo", bound="WeightTransferInitInfo")
 TUpdateInfo = TypeVar("TUpdateInfo", bound="WeightTransferUpdateInfo")
 TTrainerInitInfo = TypeVar("TTrainerInitInfo", bound="TrainerInitInfo")
 WeightTransferUpdatePayload = dict[str, Any] | list[dict[str, Any]]
+
+
+def global_worker_rank(parallel_config: ParallelConfig, rank: int | None = None) -> int:
+    """Return this worker's global rank across TP*PP*PCP and DP replicas.
+
+    Uses `data_parallel_index` (not `data_parallel_rank`), which stays distinct
+    across DP replicas even after `reconfigure_for_independent_dp_rank()`.
+    """
+    local_rank = parallel_config.rank if rank is None else rank
+    return parallel_config.data_parallel_index * parallel_config.world_size + local_rank
 
 
 def _stack_key(name: str) -> tuple[str, int] | None:
@@ -565,24 +577,32 @@ class WeightTransferEngine(ABC, Generic[TInitInfo, TUpdateInfo]):
         """
         raise NotImplementedError
 
-    @abstractmethod
     def start_weight_update(self) -> None:
         """Prepare the engine for a new weight update.
 
-        Engines that receive weights in checkpoint format initialize layerwise reloading
-        here, else this is typically a no-op.
+        By default, begins reloading checkpoint weights into `self.model`
+        (direct or layerwise, matching the model's cold-start reload mode).
+        Engines that apply weights in place override this as a no-op.
         See: https://docs.vllm.ai/en/latest/training/layerwise/ for more details.
         """
-        raise NotImplementedError
+        from vllm.model_executor.model_loader.reload import start_reload
 
-    @abstractmethod
+        start_reload(self.model)
+
     def finish_weight_update(self) -> None:
         """Finalize the current weight update.
 
-        Checkpoint-format engines finalize layerwise reloading here; engines
-        that apply weights in place leave this as a no-op.
+        By default, completes reloading and releases cached allocator buffers so
+        memory allocated outside PyTorch (e.g. NCCL or co-located processes) can
+        reclaim temporaries. Engines that apply weights in place override this.
         """
-        raise NotImplementedError
+        from vllm.model_executor.model_loader.reload import finish_reload
+
+        finish_reload(self.model, self.model_config, self.device)
+        # Release cached receive buffers and post-load temporaries so memory
+        # allocated outside torch (NCCL, other processes on the GPU) can use it.
+        if torch.accelerator.is_available():
+            torch.accelerator.empty_cache()
 
     def update_weights(self, update_info: dict[str, Any]) -> None:
         """Receive one weight update chunk and load it into the model.
@@ -593,9 +613,10 @@ class WeightTransferEngine(ABC, Generic[TInitInfo, TUpdateInfo]):
         """
         typed_update_info = self.parse_update_info(update_info)
         self.receive_weights(typed_update_info)
-        # NCCL broadcast / IPC paths may be asynchronous. Synchronize here so the
-        # next step uses the new weights.
-        torch.accelerator.synchronize()
+        if not self.defers_processing:
+            # NCCL broadcast / IPC paths may be asynchronous. Synchronize here
+            # so the next step uses the new weights.
+            torch.accelerator.synchronize()
 
     @abstractmethod
     def receive_weights(self, update_info: TUpdateInfo) -> None:
@@ -717,6 +738,36 @@ class TrainerWeightTransferEngine(ABC, Generic[TTrainerInitInfo]):
         `finish_weight_update`. Called on every trainer rank.
         """
         raise NotImplementedError
+
+    @contextmanager
+    def _concurrent_update_rpc(
+        self,
+        update_info: WeightTransferUpdatePayload,
+        *,
+        thread_name_prefix: str = "",
+    ) -> Iterator[Future[None]]:
+        """Run `self.client.update_weights(update_info)` on a background thread
+        concurrently with the body, then surface any RPC error on normal exit.
+
+        On body exception, exits immediately without waiting on the RPC thread
+        (`shutdown(wait=False, cancel_futures=True)`): if the trainer-side send
+        failed, workers may remain blocked in a matching collective and joining
+        the RPC thread would turn the error into a permanent hang.
+        """
+        executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix=thread_name_prefix
+        )
+        try:
+            future = executor.submit(self.client.update_weights, update_info)
+            # Cheap best-effort: if update_weights already failed (e.g. a bad
+            # request rejected before entering any collective), surface it now
+            # instead of blocking on a peer that will never arrive.
+            if future.done():
+                future.result()
+            yield future
+            future.result()  # surface inference-side errors
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
 
     def shutdown(self) -> None:
         """Tear down communicators / process groups. Default no-op."""

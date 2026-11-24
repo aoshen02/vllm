@@ -9,7 +9,6 @@ packed parameters.
 
 import traceback
 from collections.abc import Iterable, Iterator
-from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 from typing import TYPE_CHECKING, ClassVar, Self
@@ -374,15 +373,7 @@ class SparseNCCLTrainerWeightTransferEngine(
 
             # update_weights (workers receive) must run concurrently with the
             # trainer-side broadcasts — both rendezvous inside the same NCCL calls.
-            executor = ThreadPoolExecutor(max_workers=1)
-            try:
-                future = executor.submit(
-                    self.client.update_weights, asdict(update_info)
-                )
-                # Surface an RPC that failed before the worker entered NCCL rather
-                # than broadcasting to a peer that will never receive.
-                if future.done():
-                    future.result()
+            with self._concurrent_update_rpc(asdict(update_info)):
                 stream = torch.cuda.current_stream()
                 for batch in update_info.batches():
                     self.model_update_group.broadcast(
@@ -403,11 +394,6 @@ class SparseNCCLTrainerWeightTransferEngine(
                             src=0,
                             stream=stream,
                         )
-                future.result()  # surface inference-side errors
-            finally:
-                # A failed broadcast can leave the RPC blocked in the matching
-                # receive. Waiting for that thread would hide the original error.
-                executor.shutdown(wait=False, cancel_futures=True)
             self._post_send_sync()
 
     @staticmethod

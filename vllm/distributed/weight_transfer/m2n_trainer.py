@@ -447,22 +447,11 @@ class M2NTrainerWeightTransferEngine(TrainerWeightTransferEngine[M2NTrainerInitI
 
         try:
             self.client.start_weight_update()
-            executor = ThreadPoolExecutor(
-                max_workers=1, thread_name_prefix="m2n-weight-sync"
-            )
-            try:
-                update = executor.submit(
-                    self.client.update_weights,
-                    {"names": [m.name for m in self._metas]},
-                )
-                # Surface an immediate worker-side rejection before trainers
-                # enter the collective sequence.
-                if update.done():
-                    update.result()
+            with self._concurrent_update_rpc(
+                {"names": [m.name for m in self._metas]},
+                thread_name_prefix="m2n-weight-sync",
+            ):
                 self._send()
-                update.result()
-            finally:
-                executor.shutdown(wait=False, cancel_futures=True)
             self.client.finish_weight_update()
         except BaseException as exc:
             try:

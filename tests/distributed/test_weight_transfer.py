@@ -41,7 +41,9 @@ from vllm.distributed.weight_transfer import (
 from vllm.distributed.weight_transfer.base import (
     TrainerInitInfo,
     WeightTransferEngine,
+    WeightTransferInitInfo,
     WeightTransferInitRequest,
+    WeightTransferUpdateInfo,
     WeightTransferUpdateRequest,
 )
 from vllm.distributed.weight_transfer.ipc_engine import (
@@ -1925,8 +1927,12 @@ class TestTrainerClients:
         assert update_req.update_info == {"names": ["w"]}
 
         client.finish_weight_update("step-42")
+        handle.finish_weight_update.remote.assert_called_once_with("step-42")
+        handle.update_weight_version.remote.assert_not_called()
+
+        handle.finish_weight_update.remote.reset_mock()
+        client.finish_weight_update()
         handle.finish_weight_update.remote.assert_called_once_with()
-        handle.update_weight_version.remote.assert_called_once_with("step-42")
 
         client.shutdown_weight_transfer_engine()
         handle.shutdown_weight_transfer_engine.remote.assert_called_once_with()
@@ -2133,6 +2139,39 @@ class TestDeferredProcessingContract:
         assert cls.defers_processing is True
         assert cls.drain_pending is not WeightTransferEngine.drain_pending
 
+    def test_base_update_weights_skips_sync_when_defers_processing(self, monkeypatch):
+        from dataclasses import dataclass
+
+        @dataclass
+        class _Info(WeightTransferUpdateInfo):
+            pass
+
+        class _DeferredEngine(WeightTransferEngine):
+            init_info_cls = WeightTransferInitInfo
+            update_info_cls = _Info
+            defers_processing = True
+
+            def init_transfer_engine(self, init_info):
+                pass
+
+            def receive_weights(self, update_info):
+                self.received = update_info
+
+            def shutdown(self):
+                pass
+
+        sync = MagicMock()
+        monkeypatch.setattr(torch.accelerator, "synchronize", sync)
+        engine = _DeferredEngine(
+            WeightTransferConfig(backend="nccl"),
+            create_mock_vllm_config(),
+            torch.device("cpu"),
+            torch.nn.Module(),
+        )
+        engine.update_weights({})
+        assert isinstance(engine.received, _Info)
+        sync.assert_not_called()
+
 
 class TestTrainerFactory:
     """WeightTransferTrainerFactory registry mechanics."""
@@ -2202,6 +2241,39 @@ class TestTrainerEngineBase:
         )
         assert engine.is_sender is False
         engine.shutdown()  # must not raise
+
+    def test_concurrent_update_rpc_surfaces_worker_error(self):
+        class _FailingClient(RecordingClient):
+            def update_weights(self, update_info):
+                raise RuntimeError("worker failed")
+
+        engine = _DummyTrainerEngine(client=_FailingClient())
+        with (
+            pytest.raises(RuntimeError, match="worker failed"),
+            engine._concurrent_update_rpc({"names": ["w"]}),
+        ):
+            pass
+
+    def test_concurrent_update_rpc_does_not_hang_on_body_error(self):
+        started = threading.Event()
+        release = threading.Event()
+
+        class _BlockingClient(RecordingClient):
+            def update_weights(self, update_info):
+                started.set()
+                release.wait(timeout=5.0)
+
+        engine = _DummyTrainerEngine(client=_BlockingClient())
+        try:
+            with (
+                pytest.raises(RuntimeError, match="sender boom"),
+                engine._concurrent_update_rpc({"names": ["w"]}) as future,
+            ):
+                assert started.wait(timeout=2.0)
+                assert not future.done()
+                raise RuntimeError("sender boom")
+        finally:
+            release.set()
 
 
 @pytest.mark.skipif(

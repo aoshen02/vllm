@@ -321,3 +321,63 @@ def test_missing_engine_raises():
     worker = _make_worker(None)
     with pytest.raises(RuntimeError, match="Weight transfer not configured"):
         Worker.start_weight_update(worker)
+
+
+def test_start_enters_kv_cache_loan_before_engine_and_rolls_back_on_error(monkeypatch):
+    from contextlib import contextmanager
+
+    events: list[str] = []
+
+    @contextmanager
+    def fake_loan(*args, **kwargs):
+        events.append("loan_enter")
+        try:
+            yield
+        finally:
+            events.append("loan_exit")
+
+    class _FailingStartEngine(_RecordingEngine):
+        def start_weight_update(self) -> None:
+            events.append("engine_start")
+            raise RuntimeError("start failed")
+
+        def reset_weight_update_target(self) -> None:
+            events.append("engine_reset")
+            super().reset_weight_update_target()
+
+    monkeypatch.setattr(gpu_worker, "kv_cache_lent_for_weight_update", fake_loan)
+    engine = _FailingStartEngine()
+    worker = _make_worker(engine)
+
+    with pytest.raises(RuntimeError, match="start failed"):
+        Worker.start_weight_update(worker)
+
+    assert events == ["loan_enter", "engine_start", "loan_exit", "engine_reset"]
+    assert worker._weight_update_active is False
+    assert Worker.has_incomplete_weight_update(worker)
+
+
+@pytest.mark.parametrize("raise_on_finish", [False, True])
+def test_finish_closes_kv_cache_loan_once(monkeypatch, raise_on_finish):
+    close_calls = 0
+
+    class _CountingExitStack(ExitStack):
+        def close(self) -> None:
+            nonlocal close_calls
+            close_calls += 1
+            super().close()
+
+    engine = _RecordingEngine(raise_on_finish=raise_on_finish)
+    worker = _make_worker(engine)
+    worker._weight_update_kv_cache_loan = _CountingExitStack()
+
+    Worker.start_weight_update(worker)
+    if raise_on_finish:
+        with pytest.raises(ValueError, match="boom"):
+            Worker.finish_weight_update(worker)
+    else:
+        Worker.finish_weight_update(worker)
+
+    assert close_calls == 1
+    assert worker._weight_update_active is False
+    assert engine.reset_count == 1

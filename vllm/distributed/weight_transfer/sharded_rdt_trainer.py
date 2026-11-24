@@ -23,7 +23,6 @@ import threading
 import time
 import uuid
 from collections.abc import Callable, Collection, Iterator
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from typing import Any, ClassVar, Self
 
@@ -1317,14 +1316,12 @@ class ShardedRDTTrainerWeightTransferEngine(
         )
 
         update = asdict(ShardedRDTWeightTransferUpdateInfo(sync_idx=self._sync_idx))
-        with ThreadPoolExecutor(max_workers=1) as exe:
-            # The workers block inside update_weights until they've pulled every
-            # group, so it runs concurrently with the gather/publish loop.
-            future = exe.submit(self.client.update_weights, update)
+        # The workers block inside update_weights until they've pulled every
+        # group, so it runs concurrently with the gather/publish loop.
+        with self._concurrent_update_rpc(update) as future:
             self._run_gather_loop(
                 update_future=future, live_count=live_count, live_ids=live_ids
             )
-            future.result()  # surface inference-side errors
 
         self.client.finish_weight_update()
 

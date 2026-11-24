@@ -66,6 +66,7 @@ from vllm.distributed.weight_transfer.base import (
     WeightTransferEngine,
     WeightTransferInitInfo,
     WeightTransferUpdateInfo,
+    global_worker_rank,
 )
 from vllm.distributed.weight_transfer.sharded_rdt_common import (
     RdtRouter,
@@ -1027,8 +1028,7 @@ class ShardedRDTWeightTransferEngine(
         latter to 0 in a dense worker but keeps the former as the distinct global
         DP rank. Same formula as the sibling `nccl_engine`, so dense-via-TP and
         MoE-via-DP+EP both yield distinct 0..C-1."""
-        pc = self.parallel_config
-        return pc.data_parallel_index * pc.world_size + pc.rank  # world_size = TP*PP
+        return global_worker_rank(self.parallel_config)
 
     def _num_consumers(self, state: "_InitState | None" = None) -> int:
         """Total inference-worker count. Prefers the driver-supplied
@@ -1041,32 +1041,11 @@ class ShardedRDTWeightTransferEngine(
             return into._num_consumers_override
         return self.parallel_config.world_size_across_dp
 
-    def start_weight_update(self) -> None:
-        """Put the model's params on meta so layerwise reload streams them in
-        as each layer's slices land. Baked replay uses checkpoint format."""
-        from vllm.model_executor.model_loader.reload import (
-            initialize_layerwise_reload,
-        )
-
-        initialize_layerwise_reload(self.model)
-
     def finish_weight_update(self) -> None:
         """Drain the deferred pull/process pipeline (so every layer is fully
-        loaded) before finalizing the layerwise reload."""
-        from vllm.model_executor.model_loader.reload import (
-            finalize_layerwise_reload,
-        )
-
+        loaded) before finalizing the reload."""
         self.drain_pending()
-        finalize_layerwise_reload(self.model, self.model_config)
-
-    def update_weights(self, update_info: dict[str, Any]) -> None:
-        """Receive one update. Unlike the base, does NOT issue a per-update
-        device sync: post-processing is deferred to background threads and a
-        sync here would block on them and serialize the pull/process pipeline.
-        Completion is guaranteed by `drain_pending` in
-        `finish_weight_update`."""
-        self.receive_weights(self.parse_update_info(update_info))
+        super().finish_weight_update()
 
     def receive_weights(
         self,
