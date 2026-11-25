@@ -183,14 +183,14 @@ def _planner(baked, *, name_meta, live=None, held_by=None, group_lens=None):
     else:
         n_prod, owner_sets, classes = 1, [[0]], [0] * len(names)
     eng = consumer_engine()
-    eng._name_to_plan = dict(baked)
-    eng._name_meta = dict(name_meta)
-    eng._live_names = set(live or name_meta)
+    eng._state.name_to_plan = dict(baked)
+    eng._state.name_meta = dict(name_meta)
+    eng._state.live_names = set(live or name_meta)
     router = RdtRouter(
         n_prod, 1, owner_sets, classes, names, group_lens or [1] * len(names)
     )
     router.bind([object()] * n_prod, [object()] * n_prod, 0)
-    eng._router = router
+    eng._state.router = router
     return eng
 
 
@@ -468,19 +468,19 @@ class TestConsumerIdentity:
         out = []
         for dp_index in workers:
             eng = self._engine(dp_index=dp_index, rank=0, world_size=1)
-            eng._num_consumers_override = num_consumers
+            eng._state.num_consumers_override = num_consumers
             out.append(eng._resolve_consumer_id(info))
         return out
 
     def test_one_engine_indexes_by_dp_and_tp(self):
         """dense-via-TP and MoE-via-DP+EP both flatten to 0..C-1."""
         eng = self._engine(dp_index=0, rank=3, world_size=8)
-        eng._num_consumers_override = 8
+        eng._state.num_consumers_override = 8
         info = ShardedRDTWeightTransferInitInfo(num_consumers=8)
         assert eng._resolve_consumer_id(info) == 3
 
         eng = self._engine(dp_index=5, rank=0, world_size=1)
-        eng._num_consumers_override = 8
+        eng._state.num_consumers_override = 8
         assert eng._resolve_consumer_id(info) == 5
 
     def test_independent_engines_offset_into_distinct_ranges(self):
@@ -1136,7 +1136,7 @@ class TestCallPlanRouting:
         )
         router.validate()
         router.bind([object()] * n_prod, [object()] * n_prod, consumer_id)
-        eng._router = router
+        eng._state.router = router
         return eng, names, group_lens
 
     def test_two_stage_ownership_splits_chunks_between_owners(self):
@@ -1740,9 +1740,9 @@ def _bake_probe(self, model_name):  # noqa: PLR0915  (runs in the vLLM worker)
     )
 
     # (1) the bake ran and produced a plan
-    assert eng._name_to_plan, "bake produced no plan"
-    assert eng._live_names, "bake recorded no live names"
-    n_modules = len({id(v) for v in eng._name_to_plan.values()})
+    assert eng._state.name_to_plan, "bake produced no plan"
+    assert eng._state.live_names, "bake recorded no live names"
+    n_modules = len({id(v) for v in eng._state.name_to_plan.values()})
 
     # (2) every intermediate change to model state was undone
     for mod in model.modules():
@@ -1762,7 +1762,7 @@ def _bake_probe(self, model_name):  # noqa: PLR0915  (runs in the vLLM worker)
         assert torch.equal(p.detach().cpu(), reference[pname]), f"bake mutated {pname}"
 
     # (3) replaying the recorded op chains reproduces that same load
-    scatters = {id(v): v for v in eng._name_to_plan.values()}
+    scatters = {id(v): v for v in eng._state.name_to_plan.values()}
 
     # No deferred-attention layer may be a plan target. The engine's quant
     # thread calls `info.reset()` on every module it processes, which makes
@@ -1857,8 +1857,8 @@ def _bake_probe(self, model_name):  # noqa: PLR0915  (runs in the vLLM worker)
 
     return {
         "names": len(names),
-        "baked": len(eng._name_to_plan),
-        "live": len(eng._live_names),
+        "baked": len(eng._state.name_to_plan),
+        "live": len(eng._state.live_names),
         "modules": n_modules,
         "loaded_params": len(loaded),
         "derived_not_in_plan": len(derived),
@@ -1933,8 +1933,8 @@ def _engine(
     chunk_bytes: tuple[int, ...] = (32,),
 ) -> ShardedRDTWeightTransferEngine:
     engine = consumer_engine()
-    engine._cached_plan = _plan(streams=streams, chunk_bytes=chunk_bytes)
-    engine._router = SimpleNamespace(
+    engine._state.cached_plan = _plan(streams=streams, chunk_bytes=chunk_bytes)
+    engine._state.router = SimpleNamespace(
         num_producers=1,
         reserve_serve_buffers=lambda _sizes, _digests: [],
         pull=lambda _owner, _keys, _seq: object(),
@@ -1946,7 +1946,7 @@ def _engine(
             num_rdt_buffers=ring_depth,
         )
     )
-    engine._size_pool(config, engine._cached_plan)
+    engine._size_pool(config, engine._state.cached_plan)
     return engine
 
 
@@ -2085,7 +2085,7 @@ def _stub_init(engine, monkeypatch, plan: _CallPlan, *, fail: Exception | None):
     monkeypatch.setattr(
         engine,
         "_resolve_producers",
-        lambda _info, state: setattr(state, "_router", engine._router),
+        lambda _info, state: setattr(state, "router", engine._state.router),
     )
     monkeypatch.setattr(engine, "_bake", lambda _info, state: None)
     monkeypatch.setattr(engine, "_build_static_plan", lambda _info, state: plan)
@@ -2132,23 +2132,23 @@ def test_pool_geometry_clamps_lanes_and_assigns_disjoint_slot_blocks(
         streams=streams,
         chunk_bytes=() if streams == 0 else (32,),
     )
-    assert (engine._lanes, engine._num_slots) == expected
-    blocks = [set(engine._lane_slots(lane)) for lane in range(engine._lanes)]
+    assert (engine._state.lanes, engine._state.num_slots) == expected
+    blocks = [set(engine._lane_slots(lane)) for lane in range(engine._state.lanes)]
     assert all(len(block) == ring_depth for block in blocks)
-    assert len(set().union(*blocks)) == engine._num_slots
+    assert len(set().union(*blocks)) == engine._state.num_slots
 
 
 def test_active_pool_rejects_a_geometry_change_without_mutation():
     engine = _engine(stages_in_flight=2, ring_depth=2, streams=2)
     engine._proc_thread = object()
-    engine._slot_read_done = [object()] * 4
-    engine._slot_queued = [0] * 4
-    engine._slot_done = [0] * 4
+    engine._state.slot_read_done = [object()] * 4
+    engine._state.slot_queued = [0] * 4
+    engine._state.slot_done = [0] * 4
     before = (
-        engine._pool_geometry,
-        engine._dest_buffers,
-        engine._slot_read_done,
-        engine._lane_cursors,
+        engine._state.pool_geometry,
+        engine._state.dest_buffers,
+        engine._state.slot_read_done,
+        engine._state.lane_cursors,
     )
     config = engine._configure_ring(
         ShardedRDTWeightTransferInitInfo(
@@ -2161,10 +2161,10 @@ def test_active_pool_rejects_a_geometry_change_without_mutation():
         engine._size_pool(config, _plan(streams=1))
 
     assert (
-        engine._pool_geometry,
-        engine._dest_buffers,
-        engine._slot_read_done,
-        engine._lane_cursors,
+        engine._state.pool_geometry,
+        engine._state.dest_buffers,
+        engine._state.slot_read_done,
+        engine._state.lane_cursors,
     ) == before
 
 
@@ -2181,7 +2181,7 @@ def test_receive_slots_use_the_selected_memory_and_register_once(
         cuda_runtime.load_error = AssertionError("libcudart is not loaded")
     engine._preregister_at_init()
 
-    buffers = [slot[torch.uint8] for slot in engine._dest_buffers]
+    buffers = list(engine._state.dest_buffers)
     slot_calls = [
         call for call in allocations.calls if call.get("dtype") is torch.uint8
     ]
@@ -2204,11 +2204,11 @@ def test_receive_slots_use_the_selected_memory_and_register_once(
 def test_shutdown_releases_every_host_slot_before_dropping_it(nixl, cuda_runtime):
     engine = _host_pool_engine()
     engine._preregister_at_init()
-    buffers = [slot[torch.uint8] for slot in engine._dest_buffers]
+    buffers = list(engine._state.dest_buffers)
 
     engine.shutdown()
 
-    assert engine._dest_buffers == [{}, {}, {}, {}]
+    assert engine._state.dest_buffers == [None, None, None, None]
     assert _ids(nixl.deregistered) == _ids(buffers)
     assert cuda_runtime.events == _released(buffers)
 
@@ -2229,12 +2229,12 @@ def test_the_regrow_in_issue_pull_releases_the_replaced_host_slot(
 ):
     engine = _engine(staging_device="host", ring_depth=1, chunk_bytes=(32,))
     engine._preregister_at_init()
-    old = engine._dest_buffers[0][torch.uint8]
+    old = engine._state.dest_buffers[0]
     assert old.numel() == 32
 
     _regrow_slot_zero(engine, monkeypatch)
 
-    new = engine._dest_buffers[0][torch.uint8]
+    new = engine._state.dest_buffers[0]
     assert new is not old and new.numel() == 64
     assert _ids(nixl.registered) == _ids([old, new])
     assert cuda_runtime.events == _released([old])
@@ -2248,17 +2248,17 @@ def test_gpu_staging_releases_nothing_on_regrow_or_shutdown(
     cuda_runtime.load_error = AssertionError("libcudart is not loaded")
     engine = _host_pool_engine("gpu")
     engine._preregister_at_init()
-    old = engine._dest_buffers[0][torch.uint8]
+    old = engine._state.dest_buffers[0]
 
     _regrow_slot_zero(engine, monkeypatch)
-    new = engine._dest_buffers[0][torch.uint8]
+    new = engine._state.dest_buffers[0]
     engine.shutdown()
 
     # GPU slots keep their NIXL registration for the process lifetime: the
     # regrow and the shutdown only drop the engine's references.
     assert new is not old and new.numel() == 64
     assert _ids(nixl.registered)[-1] == id(new)
-    assert engine._dest_buffers == [{}, {}, {}, {}]
+    assert engine._state.dest_buffers == [None, None, None, None]
     assert nixl.deregistered == [] and cuda_runtime.events == []
     assert engine._parked_host_slots == []
 
@@ -2289,7 +2289,7 @@ def test_a_host_slot_whose_release_is_unsure_is_parked_and_reported(
 ):
     engine = _host_pool_engine()
     engine._preregister_at_init()
-    slots = [slot[torch.uint8] for slot in engine._dest_buffers]
+    slots = list(engine._state.dest_buffers)
     if trigger == "nixl_deregister_raises":
         nixl.deregister_failure = RuntimeError("NIXL refcount already zero")
     elif trigger == "cuda_host_unregister_nonzero":
@@ -2298,15 +2298,15 @@ def test_a_host_slot_whose_release_is_unsure_is_parked_and_reported(
     if release == "regrow":
         _regrow_slot_zero(engine, monkeypatch)
         parked = slots[:1]
-        assert engine._dest_buffers[0][torch.uint8] is not slots[0]
+        assert engine._state.dest_buffers[0] is not slots[0]
     elif trigger == "worker_thread_alive":
         _shutdown_with_a_live_worker(engine, monkeypatch)
         parked = slots
-        assert engine._dest_buffers == [{}, {}, {}, {}]
+        assert engine._state.dest_buffers == [None, None, None, None]
     else:
         engine.shutdown()
         parked = slots
-        assert engine._dest_buffers == [{}, {}, {}, {}]
+        assert engine._state.dest_buffers == [None, None, None, None]
 
     # A slot that may still be NIXL-registered, page-locked or being read is
     # never handed back to the allocator: it stays referenced for the process
@@ -2336,7 +2336,7 @@ def test_a_failed_first_init_releases_every_host_slot_it_built(
     _stub_init(
         engine,
         monkeypatch,
-        engine._cached_plan,
+        engine._state.cached_plan,
         fail=RuntimeError("worker start failed"),
     )
 
@@ -2345,7 +2345,7 @@ def test_a_failed_first_init_releases_every_host_slot_it_built(
 
     built = nixl.registered
     assert len(built) == 4
-    assert engine._dest_buffers == [{}, {}, {}, {}]
+    assert engine._state.dest_buffers == [None, None, None, None]
     assert _ids(nixl.deregistered) == _ids(built)
     assert cuda_runtime.events == _released(built)
 
@@ -2355,7 +2355,7 @@ def test_a_failed_re_init_grow_keeps_the_restored_host_slots_registered(
 ):
     engine = _host_pool_engine()
     engine._preregister_at_init()
-    old = [slot[torch.uint8] for slot in engine._dest_buffers]
+    old = list(engine._state.dest_buffers)
     grown = _plan(streams=2, chunk_bytes=(64, 16))
     _stub_init(engine, monkeypatch, grown, fail=RuntimeError("worker start failed"))
 
@@ -2365,8 +2365,8 @@ def test_a_failed_re_init_grow_keeps_the_restored_host_slots_registered(
     new = nixl.registered[4:]
     assert len(new) == 4 and all(buffer.numel() == 64 for buffer in new)
     # The restored slots are the old ones, still registered and never released.
-    assert _ids(slot[torch.uint8] for slot in engine._dest_buffers) == _ids(old)
-    assert engine._cached_plan is not grown
+    assert _ids(engine._state.dest_buffers) == _ids(old)
+    assert engine._state.cached_plan is not grown
     assert _ids(nixl.deregistered) == _ids(new)
     assert cuda_runtime.events == _released(new)
 
@@ -2376,16 +2376,16 @@ def test_a_committed_re_init_grow_releases_the_replaced_host_slots(
 ):
     engine = _host_pool_engine()
     engine._preregister_at_init()
-    old = [slot[torch.uint8] for slot in engine._dest_buffers]
+    old = list(engine._state.dest_buffers)
     grown = _plan(streams=2, chunk_bytes=(64, 16))
     _stub_init(engine, monkeypatch, grown, fail=None)
 
     engine.init_transfer_engine(_HOST_INIT)
 
-    new = [slot[torch.uint8] for slot in engine._dest_buffers]
+    new = list(engine._state.dest_buffers)
     assert _ids(new) == _ids(nixl.registered[4:])
     assert all(buffer.numel() == 64 for buffer in new)
-    assert engine._cached_plan is grown
+    assert engine._state.cached_plan is grown
     assert _ids(nixl.deregistered) == _ids(old)
     assert cuda_runtime.events == _released(old)
 
@@ -2410,7 +2410,7 @@ def test_a_nonzero_cuda_host_register_code_fails_loudly_without_a_leak(
     assert isinstance(cause, RuntimeError) and "fake cuda error 712" in str(cause)
     assert len(cuda_runtime.registered) == 1
     assert nixl.registered == [] and cuda_runtime.events == []
-    assert torch.uint8 not in engine._dest_buffers[0]
+    assert engine._state.dest_buffers[0] is None
     assert all("pin_memory" not in call for call in allocations.calls)
 
 
@@ -2429,7 +2429,7 @@ def test_a_nixl_registration_failure_unregisters_the_partial_slot(nixl, cuda_run
     base, size, _flags = cuda_runtime.registered[0]
     assert size == 48
     assert nixl.deregistered == [] and cuda_runtime.events == [("unregister", base)]
-    assert torch.uint8 not in engine._dest_buffers[0]
+    assert engine._state.dest_buffers[0] is None
 
 
 def test_a_failed_rollback_unregister_parks_the_half_allocated_slot(
@@ -2445,7 +2445,7 @@ def test_a_failed_rollback_unregister_parks_the_half_allocated_slot(
     # The allocation still fails loudly, with the NIXL error as its cause, and
     # nothing enters the pool.
     assert excinfo.value.__cause__ is nixl.failure
-    assert torch.uint8 not in engine._dest_buffers[0]
+    assert engine._state.dest_buffers[0] is None
     base, size, _flags = cuda_runtime.registered[0]
     assert cuda_runtime.events == [("unregister", base)]
     # The rollback could not confirm the page-lock is gone, so the slot is
@@ -2471,7 +2471,7 @@ def test_a_raising_rollback_unregister_parks_the_half_allocated_slot(
     # A rollback that raises instead of returning a code is the same unsure
     # release: the NIXL error is still the cause, nothing enters the pool.
     assert excinfo.value.__cause__ is nixl.failure
-    assert torch.uint8 not in engine._dest_buffers[0]
+    assert engine._state.dest_buffers[0] is None
     base, size, _flags = cuda_runtime.registered[0]
     assert cuda_runtime.events == [("unregister", base)]
     assert len(engine._parked_host_slots) == 1
@@ -2503,7 +2503,7 @@ def test_an_unloadable_cuda_runtime_fails_loudly_in_host_mode(
     assert excinfo.value.__cause__ is cuda_runtime.load_error
     assert cuda_runtime.registered == [] and nixl.registered == []
     assert cuda_runtime.events == []
-    assert torch.uint8 not in engine._dest_buffers[0]
+    assert engine._state.dest_buffers[0] is None
     assert all("pin_memory" not in call for call in allocations.calls)
 
 
@@ -2516,13 +2516,13 @@ def test_slot_reuse_waits_for_the_queued_read_done_event():
 
     engine = _engine(ring_depth=1)
     event = Event()
-    engine._slot_read_done = [event]
-    engine._slot_cv = threading.Condition()
-    engine._slot_queued = [1]
-    engine._slot_done = [0]
+    engine._state.slot_read_done = [event]
+    engine._state.slot_cv = threading.Condition()
+    engine._state.slot_queued = [1]
+    engine._state.slot_done = [0]
 
     assert not engine._slot_free(0)
-    engine._slot_done[0] = 1
+    engine._state.slot_done[0] = 1
     assert not engine._slot_free(0)
     event.ready = True
     assert engine._slot_free(0)
@@ -2653,13 +2653,13 @@ def _record_pipeline(engine, monkeypatch):
         lambda group: events.append(("signal", group)),
     )
     monkeypatch.setattr(engine, "_wait_any_head", lambda _pulls, timeout=None: 0)
-    engine._run_chunk_pipeline(engine._cached_plan)
+    engine._run_chunk_pipeline(engine._state.cached_plan)
     return events, peak
 
 
 def test_sync_zero_is_one_lane_at_depth_one_in_whole_plan_order(monkeypatch):
     engine = _engine(stages_in_flight=3, ring_depth=2, streams=3)
-    engine._cached_plan = _stream_plan(streams=3, chunks_per_stream=2)
+    engine._state.cached_plan = _stream_plan(streams=3, chunks_per_stream=2)
     engine._completed_syncs = 0
 
     events, peak = _record_pipeline(engine, monkeypatch)
@@ -2667,9 +2667,9 @@ def test_sync_zero_is_one_lane_at_depth_one_in_whole_plan_order(monkeypatch):
 
     assert peak == 1
     assert [event[1] for event in issues] == [
-        chunk.keys[0][0] for chunk in engine._cached_plan.chunks
+        chunk.keys[0][0] for chunk in engine._state.cached_plan.chunks
     ]
-    assert {event[2] // engine._ring_depth for event in issues} == {0}
+    assert {event[2] // engine._state.ring_depth for event in issues} == {0}
 
 
 # ---------------------------------------------------------------------------
@@ -2825,15 +2825,15 @@ def host_scatter(monkeypatch):
     slot = engine._alloc_receive_buffer(SLICE)
     # The whole storage is page-locked, so the scatter copies at the pinned rate.
     assert slot.is_pinned()
-    engine._dest_buffers[0][torch.uint8] = slot
-    engine._router = SimpleNamespace(
+    engine._state.dest_buffers[0] = slot
+    engine._state.router = SimpleNamespace(
         pull=lambda _owner, _keys, _seq: object(),
     )
     engine._proc_stream = torch.cuda.Stream(device=device)
-    engine._slot_read_done = [torch.cuda.Event()]
-    engine._slot_queued = [0]
-    engine._slot_done = [0]
-    engine._slot_cv = threading.Condition()
+    engine._state.slot_read_done = [torch.cuda.Event()]
+    engine._state.slot_queued = [0]
+    engine._state.slot_done = [0]
+    engine._state.slot_cv = threading.Condition()
 
     state = SimpleNamespace(
         engine=engine,
@@ -2860,7 +2860,7 @@ def _scatter(state, hold=True) -> float:
         results={("w", ()): state.slot[:SLICE]},
         slot=0,
     )
-    state.engine._slot_queued[0] += 1
+    state.engine._state.slot_queued[0] += 1
     if hold:
         state.held = _hold(state.engine._proc_stream, HOLD_SECONDS)
     start = time.perf_counter()
@@ -2871,7 +2871,7 @@ def _scatter(state, hold=True) -> float:
 @requires_cuda
 def test_the_copy_is_queued_not_waited_for(host_scatter):
     seconds = _scatter(host_scatter)
-    queued = not host_scatter.engine._slot_read_done[0].query()
+    queued = not host_scatter.engine._state.slot_read_done[0].query()
     host_scatter.engine._proc_stream.synchronize()
     held = host_scatter.held[0].elapsed_time(host_scatter.held[1]) / 1000
 
@@ -2896,7 +2896,7 @@ def test_the_slot_is_pulled_into_again_only_after_its_copy_ran(
     seen = {}
 
     def set_target_for_ref(_ref, _buffers):
-        seen["copy ran"] = host_scatter.engine._slot_read_done[0].query()
+        seen["copy ran"] = host_scatter.engine._state.slot_read_done[0].query()
 
     monkeypatch.setattr(
         ray.experimental,
@@ -2983,7 +2983,7 @@ def test_replay_updates_cpu_offloaded_engram_in_place(dist_init):
         group_lens=[2],
     )
     engine = consumer_engine(device=device, model=model)
-    engine._router = RdtRouter(1, 1, names=info.names, group_lens=info.group_lens)
+    engine._state.router = RdtRouter(1, 1, names=info.names, group_lens=info.group_lens)
     engine._bake(info)
     (chunk,) = engine._build_static_plan(info).chunks
     originals = dict(table.named_parameters())
