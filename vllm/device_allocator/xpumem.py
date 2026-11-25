@@ -1,20 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import atexit
 import gc
-from collections.abc import Callable, Collection, Generator
+from collections.abc import Generator
 from contextlib import contextmanager
 from typing import Any
 
 import torch
 
-from vllm.device_allocator import (
-    DEFERRABLE_TAGS,
-    AllocationData,
-    HandleType,
-    discardable_allocations,
-)
+from vllm.device_allocator import AllocationData, HandleType
+from vllm.device_allocator._base import BaseMemAllocator
 from vllm.logger import init_logger
 from vllm.utils.torch_utils import PIN_MEMORY
 
@@ -68,53 +63,7 @@ def _xpu_memcpy_sync(
     )
 
 
-def get_pluggable_allocator(
-    python_malloc_fn: Callable[[HandleType], None],
-    python_free_func: Callable[[int], HandleType],
-) -> Any:
-    if not xpumem_available or xpumem_allocator is None:
-        raise RuntimeError("xpumem allocator extension is not available")
-
-    xpumem_allocator.init_module(python_malloc_fn, python_free_func)
-    mem_mod = _xpu_memory_module()
-    alloc_cls = getattr(mem_mod, "XPUPluggableAllocator", None)
-    if alloc_cls is None:
-        raise RuntimeError("torch.xpu.memory.XPUPluggableAllocator is not available")
-
-    lib_name = xpumem_allocator.__file__
-    return alloc_cls(lib_name, "my_malloc", "my_free")
-
-
-def create_and_allocate(allocation_handle: HandleType) -> None:
-    if not xpumem_available or xpumem_allocator is None:
-        raise RuntimeError("xpumem allocator extension is not available")
-    xpumem_allocator.python_create_and_allocate(*allocation_handle)
-
-
-def unmap_and_release(allocation_handle: HandleType) -> None:
-    if not xpumem_available or xpumem_allocator is None:
-        raise RuntimeError("xpumem allocator extension is not available")
-    xpumem_allocator.python_unmap_and_release(*allocation_handle)
-
-
-@contextmanager
-def use_memory_pool_with_allocator(
-    python_malloc_fn: Callable[[HandleType], None],
-    python_free_func: Callable[[int], HandleType],
-) -> Generator[tuple[Any, Any]]:
-    mem_mod = _xpu_memory_module()
-    if not _supports_xpu_mem_pool(mem_mod):
-        raise RuntimeError(
-            "torch.xpu.memory MemPool APIs are not available "
-            "(need MemPool and use_mem_pool)."
-        )
-    new_alloc = get_pluggable_allocator(python_malloc_fn, python_free_func)
-    mem_pool = mem_mod.MemPool(new_alloc._allocator)
-    with mem_mod.use_mem_pool(mem_pool):
-        yield mem_pool, new_alloc
-
-
-class XpuMemAllocator:
+class XpuMemAllocator(BaseMemAllocator):
     """A singleton pluggable allocator helper for XPU.
 
     Note:
@@ -125,172 +74,79 @@ class XpuMemAllocator:
     """
 
     instance: "XpuMemAllocator | None" = None
-    default_tag: str = "default"
 
-    @staticmethod
-    def get_instance() -> "XpuMemAllocator":
+    @classmethod
+    def _check_available(cls) -> None:
         assert xpumem_available, "xpumem allocator is not available"
-        if XpuMemAllocator.instance is None:
-            XpuMemAllocator.instance = XpuMemAllocator()
-            # Ensure MemPool/allocator wrappers are released before interpreter
-            # finalization tears down XPU runtime internals.
-            atexit.register(XpuMemAllocator._shutdown_singleton)
-        return XpuMemAllocator.instance
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._pending_allocators: list[Any] = []
 
     @staticmethod
-    def _shutdown_singleton() -> None:
-        instance = XpuMemAllocator.instance
-        if instance is None:
-            return
-        try:
-            instance.release_pools()
-        except Exception:
-            logger.exception("XpuMemAllocator singleton shutdown failed")
+    def _create_and_map(allocation_handle: HandleType) -> None:
+        if not xpumem_available or xpumem_allocator is None:
+            raise RuntimeError("xpumem allocator extension is not available")
+        xpumem_allocator.python_create_and_allocate(*allocation_handle)
 
-    def __init__(self):
-        self.pointer_to_data: dict[int, AllocationData] = {}
-        self.current_tag: str = XpuMemAllocator.default_tag
-        self.allocator_and_pools: dict[str, list[Any]] = {}
-        self._pending_allocators: list[Any] = []
-        self.python_malloc_callback = self._python_malloc_callback
-        self.python_free_callback = self._python_free_callback
+    @staticmethod
+    def _unmap_and_release(allocation_handle: HandleType) -> None:
+        if not xpumem_available or xpumem_allocator is None:
+            raise RuntimeError("xpumem allocator extension is not available")
+        xpumem_allocator.python_unmap_and_release(*allocation_handle)
 
-    def _python_malloc_callback(self, allocation_handle: HandleType) -> None:
-        ptr = allocation_handle[2]
-        self.pointer_to_data[ptr] = AllocationData(allocation_handle, self.current_tag)
-        logger.debug(
-            "Allocated %s bytes for %s at %s",
-            allocation_handle[1],
-            self.current_tag,
-            ptr,
+    @staticmethod
+    def _create_cpu_backup(size_in_bytes: int) -> torch.Tensor:
+        return torch.empty(
+            size_in_bytes,
+            dtype=torch.uint8,
+            device="cpu",
+            pin_memory=PIN_MEMORY,
         )
+
+    def _copy_to_cpu(self, data: AllocationData, ptr: int, cpu_ptr: int) -> None:
+        device, size_in_bytes, _, _ = data.handle
+        _xpu_memcpy_sync(cpu_ptr, ptr, size_in_bytes, MEMCPY_DEVICE_TO_HOST, device)
+
+    def _copy_from_cpu(self, data: AllocationData, cpu_ptr: int, ptr: int) -> None:
+        device, size_in_bytes, _, _ = data.handle
+        _xpu_memcpy_sync(ptr, cpu_ptr, size_in_bytes, MEMCPY_HOST_TO_DEVICE, device)
+
+    def _get_pluggable_allocator(self) -> Any:
+        if not xpumem_available or xpumem_allocator is None:
+            raise RuntimeError("xpumem allocator extension is not available")
+
+        xpumem_allocator.init_module(
+            self.python_malloc_callback, self.python_free_callback
+        )
+        mem_mod = _xpu_memory_module()
+        alloc_cls = getattr(mem_mod, "XPUPluggableAllocator", None)
+        if alloc_cls is None:
+            raise RuntimeError(
+                "torch.xpu.memory.XPUPluggableAllocator is not available"
+            )
+
+        lib_name = xpumem_allocator.__file__
+        return alloc_cls(lib_name, "my_malloc", "my_free")
+
+    @contextmanager
+    def _use_memory_pool_with_allocator(self) -> Generator[tuple[Any, Any]]:
+        mem_mod = _xpu_memory_module()
+        if not _supports_xpu_mem_pool(mem_mod):
+            raise RuntimeError(
+                "torch.xpu.memory MemPool APIs are not available "
+                "(need MemPool and use_mem_pool)."
+            )
+        new_alloc = self._get_pluggable_allocator()
+        mem_pool = mem_mod.MemPool(new_alloc._allocator)
+        with mem_mod.use_mem_pool(mem_pool):
+            yield mem_pool, new_alloc
 
     def _python_free_callback(self, ptr: int) -> HandleType:
         data = self.pointer_to_data.pop(ptr)
         data.cpu_backup_tensor = None
         logger.debug("Freed %s bytes for %s at %s", data.handle[1], data.tag, ptr)
         return data.handle
-
-    def sleep(
-        self,
-        offload_tags: tuple[str, ...] | str | None = None,
-        discardable: Collection[int] = (),
-    ) -> None:
-        if offload_tags is None:
-            offload_tags = (XpuMemAllocator.default_tag,)
-        elif isinstance(offload_tags, str):
-            offload_tags = (offload_tags,)
-
-        assert isinstance(offload_tags, tuple)
-
-        total_bytes = 0
-        backup_bytes = 0
-        has_policy_conflict = False
-        discarded = discardable_allocations(self.allocator_and_pools, discardable)
-
-        for ptr, data in self.pointer_to_data.items():
-            offload = data.tag in offload_tags and ptr not in discarded
-            if data.is_asleep:
-                if offload != (data.cpu_backup_tensor is not None):
-                    has_policy_conflict = True
-                continue
-            total_bytes += data.handle[1]
-            if offload:
-                backup_bytes += data.handle[1]
-            self._put_to_sleep(ptr, data, offload)
-
-        logger.info(
-            "XpuMemAllocator: sleep freed %.2f GiB memory in total, of which "
-            "%.2f GiB is backed up in CPU and the rest %.2f GiB is discarded "
-            "directly.",
-            total_bytes / 1024**3,
-            backup_bytes / 1024**3,
-            (total_bytes - backup_bytes) / 1024**3,
-        )
-
-        if has_policy_conflict:
-            logger.warning(
-                "XpuMemAllocator: sleep cannot change the policy of "
-                "already-asleep allocations; the existing policy was kept."
-            )
-
-        gc.collect()
-        xpu_empty_cache = getattr(torch.xpu, "empty_cache", None)
-        if callable(xpu_empty_cache):
-            xpu_empty_cache()
-
-    def _put_to_sleep(self, ptr: int, data: AllocationData, offload: bool) -> None:
-        device, size_in_bytes, _, _ = data.handle
-        if offload:
-            if data.cpu_backup_tensor is None:
-                data.cpu_backup_tensor = torch.empty(
-                    size_in_bytes,
-                    dtype=torch.uint8,
-                    device="cpu",
-                    pin_memory=PIN_MEMORY,
-                )
-            cpu_ptr = data.cpu_backup_tensor.data_ptr()
-            _xpu_memcpy_sync(cpu_ptr, ptr, size_in_bytes, MEMCPY_DEVICE_TO_HOST, device)
-        else:
-            data.cpu_backup_tensor = None
-        unmap_and_release(data.handle)
-        data.is_asleep = True
-
-    def discard(self, tags: tuple[str, ...] | str) -> None:
-        """Discard mapped allocations with the given tags without CPU backup."""
-        if isinstance(tags, str):
-            tags = (tags,)
-
-        discarded_bytes = 0
-        has_policy_conflict = False
-        for ptr, data in self.pointer_to_data.items():
-            if data.tag not in tags:
-                continue
-            if data.is_asleep:
-                if data.cpu_backup_tensor is not None:
-                    has_policy_conflict = True
-                continue
-            torch.accelerator.synchronize(data.handle[0])
-            self._put_to_sleep(ptr, data, offload=False)
-            discarded_bytes += data.handle[1]
-
-        logger.info(
-            "XpuMemAllocator: discarded %.2f GiB for tags %s.",
-            discarded_bytes / 1024**3,
-            tags,
-        )
-
-        if has_policy_conflict:
-            logger.warning(
-                "XpuMemAllocator: discard cannot change the policy of "
-                "already-asleep allocations; the existing policy was kept."
-            )
-
-    def wake_up(self, tags: list[str] | None = None) -> None:
-        for ptr, data in self.pointer_to_data.items():
-            if not data.is_asleep:
-                continue
-            if (
-                tags is not None
-                and data.tag not in tags
-                and data.tag in DEFERRABLE_TAGS
-            ):
-                continue
-            create_and_allocate(data.handle)
-            data.is_asleep = False
-
-            cpu_backup_tensor = data.cpu_backup_tensor
-            if cpu_backup_tensor is None:
-                continue
-
-            device, size_in_bytes, _, _ = data.handle
-            _xpu_memcpy_sync(
-                ptr,
-                cpu_backup_tensor.data_ptr(),
-                size_in_bytes,
-                MEMCPY_HOST_TO_DEVICE,
-                device,
-            )
 
     def release_pools(self) -> None:
         """Release pools, retaining allocators until their allocations are freed."""
@@ -325,23 +181,14 @@ class XpuMemAllocator:
     @contextmanager
     def use_memory_pool(self, tag: str | None = None):
         if tag is None:
-            tag = XpuMemAllocator.default_tag
+            tag = self.default_tag
 
         old_tag = self.current_tag
         self.current_tag = tag
         try:
-            with use_memory_pool_with_allocator(
-                self.python_malloc_callback,
-                self.python_free_callback,
-            ) as data:
+            with self._use_memory_pool_with_allocator() as data:
                 # Keep every entry's pool alive (pytorch/pytorch#146431).
                 self.allocator_and_pools.setdefault(tag, []).append(data)
                 yield
         finally:
             self.current_tag = old_tag
-
-    def get_current_usage(self) -> int:
-        total = 0
-        for data in self.pointer_to_data.values():
-            total += data.handle[1]
-        return total
