@@ -489,8 +489,8 @@ class TestSyncIndexPlumbing:
     @staticmethod
     def _worker(calls):
         engine = consumer_engine()
-        engine._cached_plan = _CallPlan(chunks=[], pre_free=[0, 1])
-        engine._router = SimpleNamespace(
+        engine._state.cached_plan = _CallPlan(chunks=[], pre_free=[0, 1])
+        engine._state.router = SimpleNamespace(
             free_group=lambda group_idx, sync_idx: (
                 calls.append((group_idx, sync_idx)) or []
             )
