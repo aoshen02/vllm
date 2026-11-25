@@ -35,26 +35,23 @@ from vllm.distributed.weight_transfer.base import (
 from vllm.distributed.weight_transfer.m2n_common import (
     DESTINATION_SHARD_AXIS,
     M2N_WIRE_SCHEMA_VERSION,
-    MESH_NDIMS,
     M2NLayout,
     M2NMesh,
     M2NParamMeta,
     M2NWireParam,
     Placements,
     check_complete_plan_agreement,
-    check_data_plane_agreement,
-    check_runtime_ready_agreement,
     check_source_plan_agreement,
     check_transferable,
-    create_m2n_communicator,
+    decode_m2n_unique_id,
     expected_local_shape,
     import_m2n,
-    prepare_m2n_local_runtime,
+    init_m2n_data_plane,
     publish_destination_placements,
-    resolve_layout,
+    reshard_m2n_tensor,
+    shutdown_m2n_resources,
     source_plan_digest,
-    to_mesh,
-    to_placements,
+    validate_m2n_rendezvous,
     validate_transfer_plan,
 )
 from vllm.distributed.weight_transfer.m2n_layout import (
@@ -63,15 +60,11 @@ from vllm.distributed.weight_transfer.m2n_layout import (
 )
 from vllm.distributed.weight_transfer.nccl_common import (
     NCCLWeightTransferInitInfo,
-    decode_nccl_unique_id,
     worker_init_metadata_group,
 )
-from vllm.logger import init_logger
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
-
-logger = init_logger(__name__)
 
 __all__ = [
     "M2NWeightTransferInitInfo",
@@ -112,37 +105,14 @@ class M2NWeightTransferInitInfo(WeightTransferInitInfo):
     max_cta: int | None = None
 
     def __post_init__(self) -> None:
-        if not isinstance(self.master_address, str) or not self.master_address:
-            raise ValueError("`master_address` must name the metadata rendezvous")
-        if (
-            not isinstance(self.master_port, int)
-            or isinstance(self.master_port, bool)
-            or not 0 < self.master_port < 65536
-        ):
-            raise ValueError("`master_port` must be a valid metadata port")
-        if (
-            not isinstance(self.rank_offset, int)
-            or isinstance(self.rank_offset, bool)
-            or not isinstance(self.world_size, int)
-            or isinstance(self.world_size, bool)
-            or self.rank_offset < 1
-            or self.rank_offset >= self.world_size
-        ):
-            raise ValueError(
-                f"`rank_offset` ({self.rank_offset}) must leave at least one "
-                f"trainer rank and one worker in world_size {self.world_size}"
-            )
-        num_workers = self.world_size - self.rank_offset
-        dst = tuple(self.dst_mesh_dims)
-        try:
-            dst_mesh = M2NMesh(cast(tuple[int, int], dst), self.rank_offset)
-        except (TypeError, ValueError) as exc:
-            raise ValueError(f"invalid `dst_mesh_dims` {dst}: {exc}") from exc
-        if dst_mesh.size != num_workers:
-            raise ValueError(
-                f"`dst_mesh_dims` {dst} must be {MESH_NDIMS} dims covering the "
-                f"{num_workers} inference workers"
-            )
+        validate_m2n_rendezvous(
+            master_address=self.master_address,
+            master_port=self.master_port,
+            num_trainer_ranks=self.rank_offset,
+            world_size=self.world_size,
+            dst_mesh_dims=self.dst_mesh_dims,
+            split_field="rank_offset",
+        )
 
     def parse_wire_params(self) -> tuple[M2NWireParam, ...]:
         """Parse and authenticate the ordered source plan."""
@@ -180,13 +150,8 @@ class M2NWeightTransferInitInfo(WeightTransferInitInfo):
 
     @property
     def nccl_unique_id_bytes(self) -> bytes | None:
-        if self.nccl_unique_id_b64 is None:
-            return None
-        return decode_nccl_unique_id(
-            master_address=None,
-            master_port=None,
-            nccl_unique_id_b64=self.nccl_unique_id_b64,
-            ctx="M2NWeightTransferInitInfo data plane",
+        return decode_m2n_unique_id(
+            self.nccl_unique_id_b64, "M2NWeightTransferInitInfo data plane"
         )
 
 
@@ -281,35 +246,13 @@ class M2NWeightTransferEngine(
             destination_error = f"{type(exc).__name__}: {exc}"
             self._parameter_destinations = []
 
-        unique_id_bytes: bytes | None = None
-        data_plane_error: str | None = None
-        try:
-            unique_id_bytes = init_info.nccl_unique_id_bytes
-        except Exception as exc:
-            data_plane_error = f"{type(exc).__name__}: {exc}"
-        check_data_plane_agreement(
+        with init_m2n_data_plane(
+            self._m2n,
             metadata_group,
-            unique_id_bytes,
-            data_plane_error,
-        )
-
-        handle = None
-        group = None
-        try:
-            runtime_error = destination_error
-            nccl = None
-            device = None
-            if runtime_error is None:
-                try:
-                    nccl, device, handle = prepare_m2n_local_runtime(
-                        self._m2n, init_info.max_cta
-                    )
-                except Exception as exc:
-                    runtime_error = f"{type(exc).__name__}: {exc}"
-            check_runtime_ready_agreement(metadata_group, runtime_error)
-            assert nccl is not None and device is not None and handle is not None
-            group = create_m2n_communicator(nccl, metadata_group, unique_id_bytes)
-
+            lambda: init_info.nccl_unique_id_bytes,
+            init_info.max_cta,
+            pre_runtime_error=destination_error,
+        ) as (handle, group, _device):
             # Keep the merged destination-placement publication unchanged: source
             # agreement is independent of worker-side destination selection.
             mine = [
@@ -348,24 +291,6 @@ class M2NWeightTransferEngine(
                 agreed,
                 complete_plan_error,
             )
-        except BaseException:
-            if group is not None:
-                try:
-                    # Transport cleanup only; reload validity belongs to the
-                    # model-update lifecycle, not this backend.
-                    group.abort()
-                except BaseException:
-                    logger.exception(
-                        "failed to abort partially initialized nccl_m2n communicator"
-                    )
-            if handle is not None:
-                try:
-                    handle.destroy()
-                except BaseException:
-                    logger.exception(
-                        "failed to destroy partially initialized nccl_m2n handle"
-                    )
-            raise
 
         self._handle = handle
         self.model_update_group = group
@@ -544,23 +469,16 @@ class M2NWeightTransferEngine(
         worker mesh; `dst_buffer` is this rank's physical storage.
         """
         assert self._dst_mesh is not None
-        m2n = self._m2n
-        src_mesh, resolved_src_placements = resolve_layout(
-            src_meta.source_layout.mesh, src_meta.source_layout.placements
-        )
-        dst_mesh, resolved_dst_placements = resolve_layout(
-            self._dst_mesh, dst_placements
-        )
-        m2n.reshard(
-            None,
-            dst_buffer,
+        reshard_m2n_tensor(
+            self._m2n,
+            self._handle,
             comm,
             stream,
-            src_mesh=to_mesh(m2n, src_mesh),
-            src_placements=to_placements(m2n, resolved_src_placements),
-            dst_mesh=to_mesh(m2n, dst_mesh),
-            dst_placements=to_placements(m2n, resolved_dst_placements),
-            handle=self._handle,
+            src_tensor=None,
+            dst_tensor=dst_buffer,
+            src_meta=src_meta,
+            dst_mesh=self._dst_mesh,
+            dst_placements=dst_placements,
         )
 
     def shutdown(self) -> None:
@@ -573,24 +491,4 @@ class M2NWeightTransferEngine(
         self._parameter_destinations = []
         self._index = {}
         self._uses_load_weights = False
-
-        first_error: BaseException | None = None
-
-        def attempt(action: Any, message: str) -> None:
-            nonlocal first_error
-            try:
-                action()
-            except BaseException as exc:
-                if first_error is None:
-                    first_error = exc
-                logger.exception(message)
-
-        if handle is not None or group is not None:
-            # M2N does not synchronize caller streams on finalize.
-            attempt(torch.accelerator.synchronize, "failed to synchronize nccl_m2n")
-        if handle is not None:
-            attempt(handle.destroy, "failed to destroy nccl_m2n handle")
-        if group is not None:
-            attempt(group.abort, "failed to abort nccl_m2n communicator")
-        if first_error is not None:
-            raise first_error
+        shutdown_m2n_resources(handle, group)
