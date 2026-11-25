@@ -23,12 +23,11 @@ fn http_request_duration_highr_histogram() -> Histogram {
     Histogram::new(HTTP_REQUEST_DURATION_HIGHR_BUCKETS.iter().copied())
 }
 
-fn weight_operation_duration_histogram() -> Histogram {
-    Histogram::new([0.01, 0.1, 1.0, 10.0, 30.0, 60.0, 120.0, 300.0, 600.0])
-}
+const OPERATION_DURATION_BUCKETS: [f64; 9] =
+    [0.01, 0.1, 1.0, 10.0, 30.0, 60.0, 120.0, 300.0, 600.0];
 
-fn sleep_mode_operation_duration_histogram() -> Histogram {
-    Histogram::new([0.01, 0.1, 1.0, 10.0, 30.0, 60.0, 120.0, 300.0, 600.0])
+fn operation_duration_histogram() -> Histogram {
+    Histogram::new(OPERATION_DURATION_BUCKETS)
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
@@ -45,34 +44,76 @@ pub struct HttpHandlerLabels {
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
-pub struct WeightOperationLabels {
-    pub operation: &'static str,
-}
-
-#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
-pub struct SleepModeOperationLabels {
+pub struct OperationLabels {
     pub operation: &'static str,
 }
 
 pub(crate) type HttpRequestCounterFamily = Family<HttpRequestLabels, U64Counter>;
 pub(crate) type HttpHandlerHistogramFamily =
     Family<HttpHandlerLabels, Histogram, fn() -> Histogram>;
-pub(crate) type WeightOperationHistogramFamily =
-    Family<WeightOperationLabels, Histogram, fn() -> Histogram>;
-pub(crate) type WeightOperationGaugeFamily = Family<WeightOperationLabels, U64Gauge>;
-pub(crate) type SleepModeOperationHistogramFamily =
-    Family<SleepModeOperationLabels, Histogram, fn() -> Histogram>;
-pub(crate) type SleepModeOperationGaugeFamily = Family<SleepModeOperationLabels, U64Gauge>;
+pub(crate) type OperationHistogramFamily = Family<OperationLabels, Histogram, fn() -> Histogram>;
+pub(crate) type OperationGaugeFamily = Family<OperationLabels, U64Gauge>;
+
+/// Duration histogram and in-flight gauge for labeled API-server operations.
+pub struct OperationMetrics {
+    pub duration_seconds: OperationHistogramFamily,
+    pub in_flight: OperationGaugeFamily,
+}
+
+impl OperationMetrics {
+    fn register(
+        registry: &mut Registry,
+        duration_name: &str,
+        duration_help: &str,
+        in_flight_name: &str,
+        in_flight_help: &str,
+    ) -> Self {
+        let duration_seconds =
+            Family::new_with_constructor(operation_duration_histogram as fn() -> Histogram);
+        registry.register(duration_name, duration_help, duration_seconds.clone());
+
+        let in_flight = OperationGaugeFamily::default();
+        registry.register(in_flight_name, in_flight_help, in_flight.clone());
+
+        Self {
+            duration_seconds,
+            in_flight,
+        }
+    }
+
+    pub fn record(&self, operation: &'static str) -> OperationRecorder {
+        let labels = OperationLabels { operation };
+        let in_flight = self.in_flight.get_or_create_owned(&labels);
+        in_flight.inc();
+        OperationRecorder {
+            started_at: Instant::now(),
+            duration: self.duration_seconds.get_or_create_owned(&labels),
+            in_flight,
+        }
+    }
+}
+
+/// Records duration and clears in-flight tracking on completion or cancellation.
+pub struct OperationRecorder {
+    started_at: Instant,
+    duration: Histogram,
+    in_flight: U64Gauge,
+}
+
+impl Drop for OperationRecorder {
+    fn drop(&mut self) {
+        self.in_flight.dec();
+        self.duration.observe(self.started_at.elapsed().as_secs_f64());
+    }
+}
 
 /// API-server Prometheus families exported from the HTTP middleware layer.
 pub struct ApiServerMetrics {
     pub http_requests: HttpRequestCounterFamily,
     pub http_request_duration_seconds: HttpHandlerHistogramFamily,
     pub http_request_duration_highr_seconds: Histogram,
-    pub weight_operation_duration_seconds: WeightOperationHistogramFamily,
-    pub weight_operations_in_flight: WeightOperationGaugeFamily,
-    pub sleep_mode_operation_duration_seconds: SleepModeOperationHistogramFamily,
-    pub sleep_mode_operations_in_flight: SleepModeOperationGaugeFamily,
+    pub weight_operations: OperationMetrics,
+    pub sleep_mode_operations: OperationMetrics,
 }
 
 impl ApiServerMetrics {
@@ -101,100 +142,38 @@ impl ApiServerMetrics {
             http_request_duration_highr_seconds.clone(),
         );
 
-        let weight_operation_duration_seconds =
-            Family::new_with_constructor(weight_operation_duration_histogram as fn() -> Histogram);
-        registry.register(
+        let weight_operations = OperationMetrics::register(
+            registry,
             "vllm:rl_weight_update_operation_duration_seconds",
             "Duration of one weight-transfer operation.",
-            weight_operation_duration_seconds.clone(),
-        );
-
-        let weight_operations_in_flight = WeightOperationGaugeFamily::default();
-        registry.register(
             "vllm:rl_weight_update_operations_in_flight",
             "Weight-transfer operations currently awaited.",
-            weight_operations_in_flight.clone(),
         );
-
-        let sleep_mode_operation_duration_seconds = Family::new_with_constructor(
-            sleep_mode_operation_duration_histogram as fn() -> Histogram,
-        );
-        registry.register(
+        let sleep_mode_operations = OperationMetrics::register(
+            registry,
             "vllm:sleep_mode_operation_duration_seconds",
             "Duration of one sleep-mode operation.",
-            sleep_mode_operation_duration_seconds.clone(),
-        );
-
-        let sleep_mode_operations_in_flight = SleepModeOperationGaugeFamily::default();
-        registry.register(
             "vllm:sleep_mode_operations_in_flight",
             "Sleep-mode operations currently awaited.",
-            sleep_mode_operations_in_flight.clone(),
         );
 
         Self {
             http_requests,
             http_request_duration_seconds,
             http_request_duration_highr_seconds,
-            weight_operation_duration_seconds,
-            weight_operations_in_flight,
-            sleep_mode_operation_duration_seconds,
-            sleep_mode_operations_in_flight,
+            weight_operations,
+            sleep_mode_operations,
         }
     }
 
     /// Track one weight-transfer operation until the returned guard is dropped.
-    pub fn record_weight_operation(&self, operation: &'static str) -> WeightOperationRecorder {
-        let labels = WeightOperationLabels { operation };
-        let in_flight = self.weight_operations_in_flight.get_or_create_owned(&labels);
-        in_flight.inc();
-        WeightOperationRecorder {
-            started_at: Instant::now(),
-            duration: self.weight_operation_duration_seconds.get_or_create_owned(&labels),
-            in_flight,
-        }
+    pub fn record_weight_operation(&self, operation: &'static str) -> OperationRecorder {
+        self.weight_operations.record(operation)
     }
 
     /// Record one dispatched sleep-mode engine operation.
-    pub fn record_sleep_mode_operation(
-        &self,
-        operation: &'static str,
-    ) -> SleepModeOperationRecorder {
-        let labels = SleepModeOperationLabels { operation };
-        let in_flight = self.sleep_mode_operations_in_flight.get_or_create_owned(&labels);
-        in_flight.inc();
-        SleepModeOperationRecorder {
-            started_at: Instant::now(),
-            duration: self.sleep_mode_operation_duration_seconds.get_or_create_owned(&labels),
-            in_flight,
-        }
-    }
-}
-
-pub struct WeightOperationRecorder {
-    started_at: Instant,
-    duration: Histogram,
-    in_flight: U64Gauge,
-}
-
-impl Drop for WeightOperationRecorder {
-    fn drop(&mut self) {
-        self.in_flight.dec();
-        self.duration.observe(self.started_at.elapsed().as_secs_f64());
-    }
-}
-
-/// Records duration and clears in-flight tracking on completion or cancellation.
-pub struct SleepModeOperationRecorder {
-    started_at: Instant,
-    duration: Histogram,
-    in_flight: U64Gauge,
-}
-
-impl Drop for SleepModeOperationRecorder {
-    fn drop(&mut self) {
-        self.in_flight.dec();
-        self.duration.observe(self.started_at.elapsed().as_secs_f64());
+    pub fn record_sleep_mode_operation(&self, operation: &'static str) -> OperationRecorder {
+        self.sleep_mode_operations.record(operation)
     }
 }
 
