@@ -491,13 +491,13 @@ class TestWireTypes:
         )
         handle = Mock()
         monkeypatch.setattr(
-            "vllm.distributed.weight_transfer.m2n_engine.prepare_m2n_local_runtime",
+            "vllm.distributed.weight_transfer.m2n_common.prepare_m2n_local_runtime",
             Mock(return_value=(Mock(), 0, handle)),
         )
         communicator = Mock()
         make_communicator = Mock(return_value=communicator)
         monkeypatch.setattr(
-            "vllm.distributed.weight_transfer.m2n_engine.create_m2n_communicator",
+            "vllm.distributed.weight_transfer.m2n_common.create_m2n_communicator",
             make_communicator,
         )
         publish = Mock(return_value=[])
@@ -884,12 +884,12 @@ class TestTrainerSourceContract:
         handle = Mock()
         nccl = Mock()
         monkeypatch.setattr(
-            "vllm.distributed.weight_transfer.m2n_trainer.prepare_m2n_local_runtime",
+            "vllm.distributed.weight_transfer.m2n_common.prepare_m2n_local_runtime",
             Mock(return_value=(nccl, 0, handle)),
         )
         communicator = Mock()
         monkeypatch.setattr(
-            "vllm.distributed.weight_transfer.m2n_trainer.create_m2n_communicator",
+            "vllm.distributed.weight_transfer.m2n_common.create_m2n_communicator",
             Mock(return_value=communicator),
         )
         monkeypatch.setattr(

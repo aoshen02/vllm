@@ -34,26 +34,21 @@ from vllm.distributed.weight_transfer.m2n_common import (
     M2NWireParam,
     Placements,
     check_complete_plan_agreement,
-    check_data_plane_agreement,
-    check_runtime_ready_agreement,
     check_source_plan_agreement,
     check_transferable,
-    create_m2n_communicator,
+    decode_m2n_unique_id,
     expected_local_shape,
     import_m2n,
+    init_m2n_data_plane,
     m2n_param_meta,
-    prepare_m2n_local_runtime,
     publish_destination_placements,
-    resolve_layout,
+    reshard_m2n_tensor,
+    shutdown_m2n_resources,
     source_plan_digest,
-    to_mesh,
-    to_placements,
+    validate_m2n_rendezvous,
     validate_transfer_plan,
 )
-from vllm.distributed.weight_transfer.nccl_common import (
-    decode_nccl_unique_id,
-    stateless_init_metadata_group,
-)
+from vllm.distributed.weight_transfer.nccl_common import stateless_init_metadata_group
 from vllm.logger import init_logger
 
 if TYPE_CHECKING:
@@ -104,31 +99,14 @@ class M2NTrainerInitInfo(TrainerInitInfo):
 
     def __post_init__(self) -> None:
         """Reject rank counts or destination meshes that cannot form a group."""
-        if not isinstance(self.master_address, str) or not self.master_address:
-            raise ValueError("`master_address` must name the metadata rendezvous")
-        if (
-            not isinstance(self.master_port, int)
-            or isinstance(self.master_port, bool)
-            or not 0 < self.master_port < 65536
-        ):
-            raise ValueError("`master_port` must be a valid metadata port")
-        if not 0 < self.num_trainer_ranks < self.world_size:
-            raise ValueError(
-                f"`num_trainer_ranks` ({self.num_trainer_ranks}) must leave at "
-                f"least one worker in world_size {self.world_size}"
-            )
-        num_workers = self.world_size - self.num_trainer_ranks
-        if self.dst_mesh_dims is not None:
-            dims = tuple(self.dst_mesh_dims)
-            try:
-                mesh = M2NMesh(cast(tuple[int, int], dims), self.num_trainer_ranks)
-            except (TypeError, ValueError) as exc:
-                raise ValueError(f"invalid `dst_mesh_dims` {dims}: {exc}") from exc
-            if mesh.size != num_workers:
-                raise ValueError(
-                    f"`dst_mesh_dims` {dims} must be two dims covering the "
-                    f"{num_workers} inference workers"
-                )
+        validate_m2n_rendezvous(
+            master_address=self.master_address,
+            master_port=self.master_port,
+            num_trainer_ranks=self.num_trainer_ranks,
+            world_size=self.world_size,
+            dst_mesh_dims=self.dst_mesh_dims,
+            split_field="num_trainer_ranks",
+        )
         if not 0 <= self.rank < self.num_trainer_ranks:
             raise ValueError(
                 f"trainer `rank` ({self.rank}) must be below "
@@ -144,13 +122,8 @@ class M2NTrainerInitInfo(TrainerInitInfo):
 
     @property
     def nccl_unique_id_bytes(self) -> bytes | None:
-        if self.nccl_unique_id_b64 is None:
-            return None
-        return decode_nccl_unique_id(
-            master_address=None,
-            master_port=None,
-            nccl_unique_id_b64=self.nccl_unique_id_b64,
-            ctx="M2NTrainerInitInfo data plane",
+        return decode_m2n_unique_id(
+            self.nccl_unique_id_b64, "M2NTrainerInitInfo data plane"
         )
 
 
@@ -250,8 +223,6 @@ class M2NTrainerWeightTransferEngine(TrainerWeightTransferEngine[M2NTrainerInitI
                 self.client.init_weight_transfer_engine,
                 self._worker_init_info(init_info),
             )
-        handle = None
-        group = None
         try:
             reservation = init_info.listen_socket
             try:
@@ -278,83 +249,47 @@ class M2NTrainerWeightTransferEngine(TrainerWeightTransferEngine[M2NTrainerInitI
             self._dst_mesh = M2NMesh(
                 init_info.destination_mesh_dims, init_info.num_trainer_ranks
             )
-            unique_id_bytes: bytes | None = None
-            data_plane_error: str | None = None
-            try:
-                unique_id_bytes = init_info.nccl_unique_id_bytes
-            except Exception as exc:
-                data_plane_error = f"{type(exc).__name__}: {exc}"
-            check_data_plane_agreement(
+            with init_m2n_data_plane(
+                self._m2n,
                 metadata_group,
-                unique_id_bytes,
-                data_plane_error,
-            )
-
-            runtime_error: str | None = None
-            nccl = None
-            device = None
-            try:
-                nccl, device, handle = prepare_m2n_local_runtime(
-                    self._m2n, init_info.max_cta
+                lambda: init_info.nccl_unique_id_bytes,
+                init_info.max_cta,
+            ) as (handle, group, device):
+                destination_placements = self._receive_destination_plan(
+                    group,
+                    init_info.num_trainer_ranks,
+                    torch.device("cuda", device),
                 )
-            except Exception as exc:
-                runtime_error = f"{type(exc).__name__}: {exc}"
-            check_runtime_ready_agreement(metadata_group, runtime_error)
-            assert nccl is not None and device is not None and handle is not None
-            group = create_m2n_communicator(nccl, metadata_group, unique_id_bytes)
-            destination_placements = self._receive_destination_plan(
-                group,
-                init_info.num_trainer_ranks,
-                torch.device("cuda", device),
-            )
 
-            complete_plan_error: str | None = None
-            try:
+                complete_plan_error: str | None = None
+                try:
+                    assert self._dst_mesh is not None
+                    validate_transfer_plan(
+                        self._metas, self._dst_mesh, destination_placements
+                    )
+                except Exception as exc:
+                    complete_plan_error = f"{type(exc).__name__}: {exc}"
                 assert self._dst_mesh is not None
-                validate_transfer_plan(
-                    self._metas, self._dst_mesh, destination_placements
+                check_complete_plan_agreement(
+                    metadata_group,
+                    plan_digest,
+                    self._dst_mesh,
+                    destination_placements,
+                    complete_plan_error,
                 )
-            except Exception as exc:
-                complete_plan_error = f"{type(exc).__name__}: {exc}"
-            assert self._dst_mesh is not None
-            check_complete_plan_agreement(
-                metadata_group,
-                plan_digest,
-                self._dst_mesh,
-                destination_placements,
-                complete_plan_error,
-            )
 
-            if init_future is not None:
-                init_future.result()
+                if init_future is not None:
+                    init_future.result()
 
-            logger.info(
-                "nccl_m2n trainer ready: %d parameters, trainer ranks [0, %d), "
-                "inference ranks [%d, %d)",
-                len(self._metas),
-                init_info.num_trainer_ranks,
-                init_info.num_trainer_ranks,
-                init_info.world_size,
-            )
-            logger.info("nccl_m2n source plan digest: %s", plan_digest)
-        except BaseException:
-            if group is not None:
-                try:
-                    # Transport cleanup only; reload validity belongs to the
-                    # model-update lifecycle, not this backend.
-                    group.abort()
-                except BaseException:
-                    logger.exception(
-                        "failed to abort partially initialized nccl_m2n communicator"
-                    )
-            if handle is not None:
-                try:
-                    handle.destroy()
-                except BaseException:
-                    logger.exception(
-                        "failed to destroy partially initialized nccl_m2n handle"
-                    )
-            raise
+                logger.info(
+                    "nccl_m2n trainer ready: %d parameters, trainer ranks [0, %d), "
+                    "inference ranks [%d, %d)",
+                    len(self._metas),
+                    init_info.num_trainer_ranks,
+                    init_info.num_trainer_ranks,
+                    init_info.world_size,
+                )
+                logger.info("nccl_m2n source plan digest: %s", plan_digest)
         finally:
             if executor is not None:
                 executor.shutdown(wait=False, cancel_futures=True)
@@ -549,22 +484,16 @@ class M2NTrainerWeightTransferEngine(TrainerWeightTransferEngine[M2NTrainerInitI
                     f"{tuple(shard.shape)}, but its layout implies {meta.dtype} "
                     f"{local_shape}"
                 )
-            src_mesh, src_placements = resolve_layout(
-                meta.source_layout.mesh, meta.source_layout.placements
-            )
-            dst_mesh, dst_placements = resolve_layout(
-                self._dst_mesh, self._dst_placements[sent]
-            )
-            m2n.reshard(
-                shard,
-                None,
+            reshard_m2n_tensor(
+                m2n,
+                self._handle,
                 self.group,
                 stream,
-                src_mesh=to_mesh(m2n, src_mesh),
-                src_placements=to_placements(m2n, src_placements),
-                dst_mesh=to_mesh(m2n, dst_mesh),
-                dst_placements=to_placements(m2n, dst_placements),
-                handle=self._handle,
+                src_tensor=shard,
+                dst_tensor=None,
+                src_meta=meta,
+                dst_mesh=self._dst_mesh,
+                dst_placements=self._dst_placements[sent],
             )
             # Let the allocator recycle the shard's storage in stream order.
             shard.record_stream(stream)
@@ -590,23 +519,4 @@ class M2NTrainerWeightTransferEngine(TrainerWeightTransferEngine[M2NTrainerInitI
         self._dst_placements = []
         self._dst_mesh = None
         self._m2n = None
-
-        first_error: BaseException | None = None
-
-        def attempt(action: Any, message: str) -> None:
-            nonlocal first_error
-            try:
-                action()
-            except BaseException as exc:
-                if first_error is None:
-                    first_error = exc
-                logger.exception(message)
-
-        if handle is not None or group is not None:
-            attempt(torch.accelerator.synchronize, "failed to synchronize nccl_m2n")
-        if handle is not None:
-            attempt(handle.destroy, "failed to destroy nccl_m2n handle")
-        if group is not None:
-            attempt(group.abort, "failed to abort nccl_m2n communicator")
-        if first_error is not None:
-            raise first_error
+        shutdown_m2n_resources(handle, group)

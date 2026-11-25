@@ -11,17 +11,22 @@ so the engine module stays about the transfer itself.
 
 import hashlib
 import json
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
 
 from vllm.distributed.weight_transfer.base import ParamMeta, Shard
+from vllm.distributed.weight_transfer.nccl_common import decode_nccl_unique_id
+from vllm.logger import init_logger
 from vllm.utils.nccl import unpinned_nccl_env
 
 if TYPE_CHECKING:
     from vllm.distributed.utils import StatelessProcessGroup
+
+logger = init_logger(__name__)
 
 # Placement code for a mesh axis that replicates. Any other (non-negative) code
 # is the tensor dim that axis shards. Ints rather than `nccl.m2n` objects so
@@ -543,6 +548,77 @@ def complete_plan_digest(
     return hashlib.sha256(payload).hexdigest()
 
 
+def _preflight_agree(
+    group: "StatelessProcessGroup",
+    *,
+    phase: str,
+    label: str,
+    error_prefix: str,
+    local_error: str | None,
+    default_payload: Mapping[str, Any] | None = None,
+    build_payload: Callable[[], Mapping[str, Any]] | None = None,
+    extract_value: Callable[[Mapping[str, Any]], Any] | None = None,
+    validate_values: Callable[[list[tuple[int, Any]]], list[str]] | None = None,
+    disagreement_message: str = "",
+) -> Any:
+    """Gather a per-rank preflight envelope and require unanimous agreement."""
+    payload = {} if default_payload is None else dict(default_payload)
+    prepared_error = local_error
+    if prepared_error is None and build_payload is not None:
+        try:
+            payload.update(build_payload())
+        except Exception as exc:
+            prepared_error = f"{type(exc).__name__}: {exc}"
+    elif prepared_error is not None and (
+        not isinstance(prepared_error, str) or not prepared_error
+    ):
+        prepared_error = f"TypeError: local {label} error must be a non-empty string"
+
+    envelope = {"phase": phase, "error": prepared_error, **payload}
+    gathered = group.all_gather_obj(envelope)
+    expected_fields = set(envelope)
+    errors: list[str] = []
+    if len(gathered) != group.world_size:
+        errors.append(
+            "control-plane all-gather returned "
+            f"{len(gathered)} records for world size {group.world_size}"
+        )
+
+    values: list[tuple[int, Any]] = []
+    for rank, item in enumerate(gathered):
+        if (
+            not isinstance(item, Mapping)
+            or set(item) != expected_fields
+            or item.get("phase") != phase
+        ):
+            errors.append(f"rank {rank}: invalid {label} envelope")
+            continue
+        error = item["error"]
+        if error is not None:
+            if not isinstance(error, str) or not error:
+                errors.append(f"rank {rank}: invalid {label} error")
+            else:
+                errors.append(f"rank {rank}: {error}")
+            continue
+        if extract_value is not None:
+            try:
+                values.append((rank, extract_value(item)))
+            except ValueError as exc:
+                errors.append(f"rank {rank}: {exc}")
+
+    if not errors and values:
+        if validate_values is not None:
+            errors.extend(validate_values(values))
+        else:
+            canonical = values[0][1]
+            for rank, value in values[1:]:
+                if value != canonical:
+                    errors.append(f"rank {rank}: {disagreement_message}")
+    if errors:
+        raise RuntimeError(f"{error_prefix}: " + "; ".join(errors))
+    return values[0][1] if values else None
+
+
 def check_source_plan_agreement(
     group: "StatelessProcessGroup",
     params: Sequence[M2NWireParam],
@@ -550,80 +626,53 @@ def check_source_plan_agreement(
     local_error: str | None = None,
 ) -> str:
     """Verify every participant entered with the same source plan."""
-    prepared_error = local_error
-    digest: str | None = None
-    declared: str | None = expected_digest
-    if prepared_error is None:
-        try:
-            digest = source_plan_digest(params)
-            declared = digest if expected_digest is None else expected_digest
-            if not isinstance(declared, str) or not declared:
-                raise ValueError("declared source digest must be a non-empty string")
-        except Exception as exc:
-            prepared_error = f"{type(exc).__name__}: {exc}"
-    elif not isinstance(prepared_error, str) or not prepared_error:
-        prepared_error = "TypeError: local source error must be a non-empty string"
 
-    gathered = group.all_gather_obj(
-        {
-            "phase": "source",
-            "digest": digest,
-            "declared_digest": declared,
-            "error": prepared_error,
-        }
-    )
-    errors: list[str] = []
-    expected_fields = {"phase", "digest", "declared_digest", "error"}
-    if len(gathered) != group.world_size:
-        errors.append(
-            "control-plane all-gather returned "
-            f"{len(gathered)} records for world size {group.world_size}"
-        )
-    agreed: list[tuple[int, str, str]] = []
-    for rank, item in enumerate(gathered):
-        if not isinstance(item, Mapping) or set(item) != expected_fields:
-            errors.append(f"rank {rank}: invalid source preflight envelope")
-            continue
-        if item["phase"] != "source":
-            errors.append(f"rank {rank}: invalid source preflight phase")
-            continue
-        error = item["error"]
-        if error is not None:
-            if not isinstance(error, str) or not error:
-                errors.append(f"rank {rank}: invalid source preflight error")
-            else:
-                errors.append(f"rank {rank}: {error}")
-            continue
-        computed = item["digest"]
-        claimed = item["declared_digest"]
-        if (
-            not isinstance(computed, str)
-            or not computed
-            or not isinstance(claimed, str)
-            or not claimed
+    def build() -> Mapping[str, Any]:
+        digest = source_plan_digest(params)
+        declared = digest if expected_digest is None else expected_digest
+        if not isinstance(declared, str) or not declared:
+            raise ValueError("declared source digest must be a non-empty string")
+        return {"digest": digest, "declared_digest": declared}
+
+    def extract(item: Mapping[str, Any]) -> tuple[str, str]:
+        computed, claimed = item["digest"], item["declared_digest"]
+        if not (
+            isinstance(computed, str)
+            and computed
+            and isinstance(claimed, str)
+            and claimed
         ):
-            errors.append(f"rank {rank}: invalid source digest")
-            continue
-        agreed.append((rank, computed, claimed))
-    if errors:
-        raise RuntimeError(
-            "nccl_m2n source preflight rejected before NCCL init: " + "; ".join(errors)
-        )
+            raise ValueError("invalid source digest")
+        return computed, claimed
 
-    canonical = agreed[0][1]
-    for rank, computed, claimed in agreed:
-        if computed != claimed:
-            errors.append(
-                f"rank {rank}: computed digest {computed} does not match "
-                f"declared digest {claimed}"
-            )
-        if computed != canonical:
-            errors.append(f"rank {rank}: source digest disagrees with rank 0")
-    if errors:
-        raise RuntimeError(
-            "nccl_m2n source preflight rejected before NCCL init: " + "; ".join(errors)
-        )
-    return canonical
+    def validate(values: list[tuple[int, tuple[str, str]]]) -> list[str]:
+        canonical = values[0][1][0]
+        errs: list[str] = []
+        for rank, (computed, claimed) in values:
+            if computed != claimed:
+                errs.append(
+                    f"rank {rank}: computed digest {computed} does not match "
+                    f"declared digest {claimed}"
+                )
+            if computed != canonical:
+                errs.append(f"rank {rank}: source digest disagrees with rank 0")
+        return errs
+
+    computed, _ = cast(
+        tuple[str, str],
+        _preflight_agree(
+            group,
+            phase="source",
+            label="source preflight",
+            error_prefix="nccl_m2n source preflight rejected before NCCL init",
+            local_error=local_error,
+            default_payload={"digest": None, "declared_digest": expected_digest},
+            build_payload=build,
+            extract_value=extract,
+            validate_values=validate,
+        ),
+    )
+    return computed
 
 
 def check_complete_plan_agreement(
@@ -634,97 +683,44 @@ def check_complete_plan_agreement(
     local_error: str | None = None,
 ) -> str:
     """Require every rank to accept the same complete transfer plan."""
-    prepared_error = local_error
-    digest: str | None = None
-    if prepared_error is None:
-        try:
-            digest = complete_plan_digest(source_digest, dst_mesh, dst_placements)
-        except Exception as exc:
-            prepared_error = f"{type(exc).__name__}: {exc}"
-    elif not isinstance(prepared_error, str) or not prepared_error:
-        prepared_error = "TypeError: local plan error must be a non-empty string"
 
-    gathered = group.all_gather_obj(
-        {"phase": "complete_plan", "digest": digest, "error": prepared_error}
-    )
-    errors: list[str] = []
-    valid: list[tuple[int, str]] = []
-    expected_fields = {"phase", "digest", "error"}
-    if len(gathered) != group.world_size:
-        errors.append(
-            "control-plane all-gather returned "
-            f"{len(gathered)} records for world size {group.world_size}"
-        )
-    for rank, item in enumerate(gathered):
-        if (
-            not isinstance(item, Mapping)
-            or set(item) != expected_fields
-            or item.get("phase") != "complete_plan"
-        ):
-            errors.append(f"rank {rank}: invalid complete-plan envelope")
-            continue
-        error = item["error"]
-        if error is not None:
-            if not isinstance(error, str) or not error:
-                errors.append(f"rank {rank}: invalid complete-plan error")
-            else:
-                errors.append(f"rank {rank}: {error}")
-            continue
+    def extract(item: Mapping[str, Any]) -> str:
         rank_digest = item["digest"]
         if not isinstance(rank_digest, str) or not rank_digest:
-            errors.append(f"rank {rank}: invalid complete-plan digest")
-            continue
-        valid.append((rank, rank_digest))
-    if not errors:
-        canonical = valid[0][1]
-        for rank, rank_digest in valid[1:]:
-            if rank_digest != canonical:
-                errors.append(
-                    f"rank {rank}: complete-plan digest disagrees with rank 0"
-                )
-    if errors:
-        raise RuntimeError(
-            "nccl_m2n complete-plan preflight rejected before first reshard: "
-            + "; ".join(errors)
-        )
-    return valid[0][1]
+            raise ValueError("invalid complete-plan digest")
+        return rank_digest
+
+    return cast(
+        str,
+        _preflight_agree(
+            group,
+            phase="complete_plan",
+            label="complete-plan",
+            error_prefix=(
+                "nccl_m2n complete-plan preflight rejected before first reshard"
+            ),
+            local_error=local_error,
+            default_payload={"digest": None},
+            build_payload=lambda: {
+                "digest": complete_plan_digest(source_digest, dst_mesh, dst_placements)
+            },
+            extract_value=extract,
+            disagreement_message="complete-plan digest disagrees with rank 0",
+        ),
+    )
 
 
 def check_runtime_ready_agreement(
     group: "StatelessProcessGroup", local_error: str | None
 ) -> None:
     """Require every rank to prepare local resources before NCCL init."""
-    prepared_error = local_error
-    if prepared_error is not None and (
-        not isinstance(prepared_error, str) or not prepared_error
-    ):
-        prepared_error = "TypeError: local runtime error must be a non-empty string"
-    gathered = group.all_gather_obj({"phase": "runtime_ready", "error": prepared_error})
-    errors: list[str] = []
-    if len(gathered) != group.world_size:
-        errors.append(
-            "control-plane all-gather returned "
-            f"{len(gathered)} records for world size {group.world_size}"
-        )
-    for rank, item in enumerate(gathered):
-        if (
-            not isinstance(item, Mapping)
-            or set(item) != {"phase", "error"}
-            or item.get("phase") != "runtime_ready"
-        ):
-            errors.append(f"rank {rank}: invalid runtime readiness envelope")
-            continue
-        error = item.get("error")
-        if error is not None:
-            if not isinstance(error, str) or not error:
-                errors.append(f"rank {rank}: invalid runtime readiness error")
-            else:
-                errors.append(f"rank {rank}: {error}")
-    if errors:
-        raise RuntimeError(
-            "nccl_m2n local runtime preflight failed before NCCL init: "
-            + "; ".join(errors)
-        )
+    _preflight_agree(
+        group,
+        phase="runtime_ready",
+        label="runtime readiness",
+        error_prefix="nccl_m2n local runtime preflight failed before NCCL init",
+        local_error=local_error,
+    )
 
 
 def check_data_plane_agreement(
@@ -733,71 +729,197 @@ def check_data_plane_agreement(
     local_error: str | None = None,
 ) -> None:
     """Agree on the NCCL rendezvous identity before NCCL init."""
-    prepared_error = local_error
-    uid_digest: str | None = None
-    if prepared_error is None:
-        try:
-            if unique_id_bytes is not None:
-                if not isinstance(unique_id_bytes, bytes):
-                    raise TypeError("NCCL unique id must decode to bytes")
-                uid_digest = hashlib.sha256(unique_id_bytes).hexdigest()
-        except Exception as exc:
-            prepared_error = f"{type(exc).__name__}: {exc}"
-    elif not isinstance(prepared_error, str) or not prepared_error:
-        prepared_error = "TypeError: local data-plane error must be non-empty"
 
-    gathered = group.all_gather_obj(
-        {
-            "phase": "data_plane",
-            "mode": "uid" if unique_id_bytes is not None else "tcp",
-            "uid_digest": uid_digest,
-            "error": prepared_error,
-        }
-    )
-    expected_fields = {
-        "phase",
-        "mode",
-        "uid_digest",
-        "error",
-    }
-    errors: list[str] = []
-    valid: list[tuple[int, str, str | None]] = []
-    if len(gathered) != group.world_size:
-        errors.append(
-            "control-plane all-gather returned "
-            f"{len(gathered)} records for world size {group.world_size}"
-        )
-    for rank, item in enumerate(gathered):
-        if (
-            not isinstance(item, Mapping)
-            or set(item) != expected_fields
-            or item.get("phase") != "data_plane"
-        ):
-            errors.append(f"rank {rank}: invalid data-plane preflight envelope")
-            continue
-        error = item["error"]
-        if error is not None:
-            if not isinstance(error, str) or not error:
-                errors.append(f"rank {rank}: invalid data-plane preflight error")
-            else:
-                errors.append(f"rank {rank}: {error}")
-            continue
-        mode = item["mode"]
-        uid = item["uid_digest"]
+    def build() -> Mapping[str, Any]:
+        if unique_id_bytes is None:
+            return {"uid_digest": None}
+        if not isinstance(unique_id_bytes, bytes):
+            raise TypeError("NCCL unique id must decode to bytes")
+        return {"uid_digest": hashlib.sha256(unique_id_bytes).hexdigest()}
+
+    def extract(item: Mapping[str, Any]) -> tuple[str, str | None]:
+        mode, uid = item["mode"], item["uid_digest"]
         if mode not in {"tcp", "uid"} or (mode == "uid") != isinstance(uid, str):
-            errors.append(f"rank {rank}: invalid data-plane identity")
-            continue
-        valid.append((rank, mode, uid))
-    if not errors:
-        _, mode, uid = valid[0]
-        for rank, other_mode, other_uid in valid[1:]:
-            if (other_mode, other_uid) != (mode, uid):
-                errors.append(f"rank {rank}: NCCL data-plane identity disagrees")
-    if errors:
-        raise RuntimeError(
-            "nccl_m2n data-plane preflight rejected before NCCL init: "
-            + "; ".join(errors)
+            raise ValueError("invalid data-plane identity")
+        return mode, uid
+
+    _preflight_agree(
+        group,
+        phase="data_plane",
+        label="data-plane preflight",
+        error_prefix="nccl_m2n data-plane preflight rejected before NCCL init",
+        local_error=local_error,
+        default_payload={
+            "mode": "uid" if unique_id_bytes is not None else "tcp",
+            "uid_digest": None,
+        },
+        build_payload=build,
+        extract_value=extract,
+        disagreement_message="NCCL data-plane identity disagrees",
+    )
+
+
+def validate_m2n_rendezvous(
+    *,
+    master_address: str,
+    master_port: int,
+    num_trainer_ranks: int,
+    world_size: int,
+    dst_mesh_dims: Sequence[int] | None,
+    split_field: str,
+) -> None:
+    """Validate shared metadata rendezvous, rank split, and destination mesh."""
+    if not isinstance(master_address, str) or not master_address:
+        raise ValueError("`master_address` must name the metadata rendezvous")
+    if (
+        not isinstance(master_port, int)
+        or isinstance(master_port, bool)
+        or not 0 < master_port < 65536
+    ):
+        raise ValueError("`master_port` must be a valid metadata port")
+    if (
+        not isinstance(num_trainer_ranks, int)
+        or isinstance(num_trainer_ranks, bool)
+        or not isinstance(world_size, int)
+        or isinstance(world_size, bool)
+        or not 0 < num_trainer_ranks < world_size
+    ):
+        raise ValueError(
+            f"`{split_field}` ({num_trainer_ranks}) must leave at least one "
+            f"trainer rank and one worker in world_size {world_size}"
         )
+    num_workers = world_size - num_trainer_ranks
+    if dst_mesh_dims is not None:
+        dims = tuple(dst_mesh_dims)
+        try:
+            mesh = M2NMesh(cast(tuple[int, int], dims), num_trainer_ranks)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"invalid `dst_mesh_dims` {dims}: {exc}") from exc
+        if mesh.size != num_workers:
+            raise ValueError(
+                f"`dst_mesh_dims` {dims} must be {MESH_NDIMS} dims covering the "
+                f"{num_workers} inference workers"
+            )
+
+
+def decode_m2n_unique_id(nccl_unique_id_b64: str | None, ctx: str) -> bytes | None:
+    """Decode an optional base64 NCCL unique ID for the M2N data plane."""
+    if nccl_unique_id_b64 is None:
+        return None
+    return decode_nccl_unique_id(
+        master_address=None,
+        master_port=None,
+        nccl_unique_id_b64=nccl_unique_id_b64,
+        ctx=ctx,
+    )
+
+
+@contextmanager
+def init_m2n_data_plane(
+    m2n: Any,
+    metadata_group: "StatelessProcessGroup",
+    get_unique_id_bytes: Callable[[], bytes | None],
+    max_cta: int | None,
+    *,
+    pre_runtime_error: str | None = None,
+) -> Iterator[tuple[Any, Any, int]]:
+    """Agree on data-plane/runtime readiness, construct handle & communicator,
+    and abort/destroy them if any subsequent init step fails."""
+    unique_id_bytes: bytes | None = None
+    data_plane_error: str | None = None
+    try:
+        unique_id_bytes = get_unique_id_bytes()
+    except Exception as exc:
+        data_plane_error = f"{type(exc).__name__}: {exc}"
+    check_data_plane_agreement(metadata_group, unique_id_bytes, data_plane_error)
+
+    handle = None
+    group = None
+    try:
+        runtime_error = pre_runtime_error
+        nccl = None
+        device = None
+        if runtime_error is None:
+            try:
+                nccl, device, handle = prepare_m2n_local_runtime(m2n, max_cta)
+            except Exception as exc:
+                runtime_error = f"{type(exc).__name__}: {exc}"
+        check_runtime_ready_agreement(metadata_group, runtime_error)
+        assert nccl is not None and device is not None and handle is not None
+        group = create_m2n_communicator(nccl, metadata_group, unique_id_bytes)
+        yield handle, group, device
+    except BaseException:
+        if group is not None:
+            try:
+                # Transport cleanup only; reload validity belongs to the
+                # model-update lifecycle, not this backend.
+                group.abort()
+            except BaseException:
+                logger.exception(
+                    "failed to abort partially initialized nccl_m2n communicator"
+                )
+        if handle is not None:
+            try:
+                handle.destroy()
+            except BaseException:
+                logger.exception(
+                    "failed to destroy partially initialized nccl_m2n handle"
+                )
+        raise
+
+
+def reshard_m2n_tensor(
+    m2n: Any,
+    handle: Any,
+    comm: Any,
+    stream: torch.cuda.Stream,
+    *,
+    src_tensor: torch.Tensor | None,
+    dst_tensor: torch.Tensor | None,
+    src_meta: M2NParamMeta,
+    dst_mesh: M2NMesh,
+    dst_placements: Placements | None,
+) -> None:
+    """Reshard one parameter between trainer and worker meshes."""
+    src_mesh, resolved_src = resolve_layout(
+        src_meta.source_layout.mesh, src_meta.source_layout.placements
+    )
+    resolved_dst_mesh, resolved_dst = resolve_layout(dst_mesh, dst_placements)
+    m2n.reshard(
+        src_tensor,
+        dst_tensor,
+        comm,
+        stream,
+        src_mesh=to_mesh(m2n, src_mesh),
+        src_placements=to_placements(m2n, resolved_src),
+        dst_mesh=to_mesh(m2n, resolved_dst_mesh),
+        dst_placements=to_placements(m2n, resolved_dst),
+        handle=handle,
+    )
+
+
+def shutdown_m2n_resources(handle: Any, group: Any) -> None:
+    """Finish pending GPU work and release M2N handle and communicator."""
+    first_error: BaseException | None = None
+
+    def attempt(action: Any, message: str) -> None:
+        nonlocal first_error
+        try:
+            action()
+        except BaseException as exc:
+            if first_error is None:
+                first_error = exc
+            logger.exception(message)
+
+    if handle is not None or group is not None:
+        # M2N does not synchronize caller streams on finalize.
+        attempt(torch.accelerator.synchronize, "failed to synchronize nccl_m2n")
+    if handle is not None:
+        attempt(handle.destroy, "failed to destroy nccl_m2n handle")
+    if group is not None:
+        attempt(group.abort, "failed to abort nccl_m2n communicator")
+    if first_error is not None:
+        raise first_error
 
 
 def to_mesh(m2n: Any, mesh: M2NMesh) -> Any:
