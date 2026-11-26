@@ -219,12 +219,14 @@ class NCCLWeightTransferEngine(
         """
         from vllm.model_executor.model_loader.reload import check_plannable
 
+        # Destroy any existing communicator and clear cached plan/update state
+        # before forming a new group so re-init does not leak ncclComm_t or
+        # GPU/RDMA resources.
+        self.shutdown()
         self.rank_offset = init_info.rank_offset
         self.packed = init_info.packed
         self.packed_buffer_size_bytes = init_info.packed_buffer_size_bytes
         self.packed_num_buffers = init_info.packed_num_buffers
-        self._last_update_info.clear()
-        self._plan = self._plan_metadata = self._plan_manifest = None
         self.model_update_group = worker_init_process_group(
             init_info, self.parallel_config
         )
@@ -372,6 +374,8 @@ class NCCLWeightTransferEngine(
         if self.model_update_group is not None:
             self.model_update_group.destroy()
             self.model_update_group = None
+        self._last_update_info.clear()
+        self._plan = self._plan_metadata = self._plan_manifest = None
 
 
 class NCCLTrainerWeightTransferEngine(TrainerWeightTransferEngine[NCCLTrainerInitInfo]):
