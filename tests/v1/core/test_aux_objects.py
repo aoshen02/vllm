@@ -7,6 +7,7 @@ import time
 from collections import Counter, deque
 from collections.abc import Iterable
 from concurrent.futures import Future
+from itertools import chain
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import Mock
@@ -15,7 +16,7 @@ import numpy as np
 import pytest
 import regex as re
 import torch
-from safetensors.numpy import save
+from safetensors.numpy import load, save
 
 from tests.distributed.aux_output_connector.utils import fake_store, wait_for_writer
 from tests.v1.core.test_async_scheduler import PipelinedEngine
@@ -31,6 +32,7 @@ from vllm.distributed.aux_output_connector.connector import (
     AuxOutputSchedulerConnector,
     retained_objects,
 )
+from vllm.distributed.aux_output_connector.fields import AuxFieldCapturer
 from vllm.distributed.aux_output_connector.object_store import (
     AuxObjectWriter,
     aux_namespace_cache_salt,
@@ -107,9 +109,17 @@ def _requests(
     return requests
 
 
+def _capturer_config(**aux_output_config):
+    return SimpleNamespace(
+        aux_output_config=SimpleNamespace(aux_fields=set(), **aux_output_config),
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=0),
+    )
+
+
 def _worker(store):
     worker = object.__new__(AuxOutputWorkerConnector)
     worker._capturer = Mock()
+    worker._field_capturer = AuxFieldCapturer(torch.nn.Module(), _capturer_config())
     worker._store = BlockObjectStore(max_bytes=1 << 20, object_nbytes=_BLOCK * 6)
     worker._buffer = RoutedExpertsBuffer(
         np.dtype(np.uint8), (3, 2), _BLOCK, 16, 1024, 2
@@ -1586,17 +1596,85 @@ def test_namespace_keeps_its_writes_after_a_failed_batch():
     engine.worker.close()
 
 
+def _indexer_rows(routed_experts):
+    return routed_experts.reshape(len(routed_experts), 2, 3).astype(np.int32) - 1
+
+
+_FIELD_ROWS = {"indexer_topk": _indexer_rows}
+
+
+class _FieldCapturer(AuxFieldCapturer):
+    """The worker's field capturer, whose indexer top-k rows are the
+    routed-experts rows of the step, which tag the computation of each
+    position, in another shape and dtype."""
+
+    def __init__(self, worker):
+        super().__init__(torch.nn.Module(), _capturer_config())
+        routing = worker._capturer.snapshot_routing_data
+        self._snapshots["indexer_topk"] = lambda num_rows: torch.from_numpy(
+            _indexer_rows(routing.return_value.numpy())
+        )
+        self.num_snapshots = 0
+
+    def snapshot(self, *args):
+        self.num_snapshots += 1
+        return super().snapshot(*args)
+
+
+@pytest.mark.parametrize(
+    "async_scheduling,queue_size,lookahead",
+    [(False, 1, 0), (True, 2, 0), (True, 2, 1)],
+    ids=["sync", "async", "async-lookahead"],
+)
+def test_objects_hold_the_enabled_fields_of_the_positions_they_hold(
+    async_scheduling, queue_size, lookahead
+):
+    # Namespace requests share prompts with each other and run beside inline
+    # requests, under preemptions and prefix-cache hits: every object holds,
+    # for each position, the enabled fields of the computation whose routed
+    # experts it holds. Steps without a namespace request take no snapshot.
+    engine = _Engine(
+        async_scheduling=async_scheduling, num_blocks=20, max_num_batched_tokens=64
+    )
+    capturer = engine.worker._field_capturer = _FieldCapturer(engine.worker)
+    namespaced = _requests([f"n-{i}" for i in range(4)], 70, 27, lookahead=lookahead)
+    inline = _requests(
+        [f"i-{i}" for i in range(3)], 102, 27, namespace=None, lookahead=lookahead
+    )
+    pending = [*inline[:1], *chain.from_iterable(zip(namespaced, inline[1:]))]
+    pending += namespaced[2:]
+
+    def before_step(step, _):
+        if step % 2 == 0 and pending:
+            engine.scheduler.add_request(pending.pop(0))
+
+    engine.scheduler.add_request(pending.pop(0))
+    PipelinedEngine(engine.scheduler, queue_size=queue_size).run(
+        before_step=before_step
+    )
+    engine.close()
+    assert engine.num_hits and 0 < capturer.num_snapshots < engine.num_steps
+    listed = [objects for _, objects, _, _ in engine.finals if objects is not None]
+    assert len(listed) == 4
+    for key, start, end in chain.from_iterable(listed):
+        fields = load(engine.client.objects[key])
+        assert set(fields) == {"routed_experts", *_FIELD_ROWS}
+        assert len(fields["routed_experts"]) >= end - start
+        for name, rows in _FIELD_ROWS.items():
+            np.testing.assert_array_equal(fields[name], rows(fields["routed_experts"]))
+
+
 def test_object_run_writes_the_bytes_of_the_rows_in_position_order():
     # A prefill computes two whole blocks and opens block 2, which decode
     # steps fill; its tail is written before the block.
     rows = np.arange(48 * 6, dtype=np.uint8).reshape(48, 3, 2)
     run = _ObjectRun(_BLOCK)
-    run.add(0, rows[:40])
+    run.add(0, {"routed_experts": rows[:40]})
     for position in range(40, 47):
-        run.add(position, rows[position : position + 1])
+        run.add(position, {"routed_experts": rows[position : position + 1]})
     run.writes = [("b0", 0, 16), ("b1", 16, 32), ("t", 32, 47), ("t0", 0, 40)]
     objects = run.take_ready()
-    run.add(47, rows[47:])
+    run.add(47, {"routed_experts": rows[47:]})
     run.writes = [("b2", 32, 48)]
     objects += run.take_ready()
     spans = [
@@ -1615,12 +1693,13 @@ def test_object_run_writes_the_bytes_of_the_rows_in_position_order():
 def test_object_run_recompute_leaves_taken_objects_unchanged():
     # A failed load computes again positions of a block already taken.
     run = _ObjectRun(_BLOCK)
-    run.add(32, np.ones((16, 3, 2), dtype=np.uint8))
+    run.add(32, {"routed_experts": np.ones((16, 3, 2), dtype=np.uint8)})
     run.writes = [("b2", 32, 48)]
     [(_, fields)] = run.take_ready()
-    run.add(16, np.full((24, 3, 2), 2, dtype=np.uint8))
+    run.add(16, {"routed_experts": np.full((24, 3, 2), 2, dtype=np.uint8)})
     assert (fields["routed_experts"] == 1).all()
-    assert (run.blocks[2][:8] == 2).all() and (run.blocks[2][8:] == 1).all()
+    block = run.blocks[2]["routed_experts"]
+    assert (block[:8] == 2).all() and (block[8:] == 1).all()
 
 
 @pytest.mark.parametrize("rows_first", [False, True], ids=["on-output", "on-step"])

@@ -20,6 +20,10 @@ from vllm.distributed.aux_output_connector.connector import (
     object_put_timeout_s,
     retained_objects,
 )
+from vllm.distributed.aux_output_connector.fields import (
+    ROUTED_EXPERTS,
+    AuxFieldCapturer,
+)
 from vllm.distributed.aux_output_connector.object_store import (
     AuxObjects,
     AuxObjectWriter,
@@ -55,14 +59,15 @@ class _ObjectRun:
     is filled in place in its own buffer. Positions computed again, after a
     failed KV load, go to copies of their blocks: the writer may still read
     objects taken from them. Runs start on a block boundary and every object
-    starts at one; a tail object may span blocks."""
+    starts at one; a tail object may span blocks. Rows are arrays by object
+    field: the routed experts and the fields `AuxOutputConfig` enables."""
 
     block_size: int
     end: int = -1
-    blocks: dict[int, np.ndarray] = field(default_factory=dict)
+    blocks: dict[int, dict[str, np.ndarray]] = field(default_factory=dict)
     writes: list[AuxObject] = field(default_factory=list)
 
-    def add(self, token_start: int, rows: np.ndarray) -> None:
+    def add(self, token_start: int, rows: dict[str, np.ndarray]) -> None:
         if 0 <= self.end < token_start:
             # A step scheduled while drafts were in flight starts after the
             # ones rejected: its rows follow those kept.
@@ -70,23 +75,30 @@ class _ObjectRun:
         size = self.block_size
         if token_start < self.end:
             for block in range(token_start // size, cdiv(self.end, size)):
-                if (buffer := self.blocks.get(block)) is not None:
-                    self.blocks[block] = buffer.copy()
+                if (buffers := self.blocks.get(block)) is not None:
+                    self.blocks[block] = {
+                        name: buffer.copy() for name, buffer in buffers.items()
+                    }
         position = token_start
-        self.end = end = token_start + len(rows)
+        self.end = end = token_start + len(rows[ROUTED_EXPERTS])
         while position < end:
             block, offset = divmod(position, size)
             stop = min(end, position - offset + size)
-            part = rows[position - token_start : stop - token_start]
+            parts = {
+                name: array[position - token_start : stop - token_start]
+                for name, array in rows.items()
+            }
             position = stop
-            if len(part) == size:
-                self.blocks[block] = part
+            if len(parts[ROUTED_EXPERTS]) == size:
+                self.blocks[block] = parts
                 continue
-            if (buffer := self.blocks.get(block)) is None:
-                buffer = self.blocks[block] = np.empty(
-                    (size, *part.shape[1:]), part.dtype
-                )
-            buffer[offset : offset + len(part)] = part
+            if (buffers := self.blocks.get(block)) is None:
+                buffers = self.blocks[block] = {
+                    name: np.empty((size, *part.shape[1:]), part.dtype)
+                    for name, part in parts.items()
+                }
+            for name, part in parts.items():
+                buffers[name][offset : offset + len(part)] = part
 
     def take_ready(self) -> AuxObjects:
         """Objects whose rows are all here. Later writes start at or after
@@ -98,10 +110,7 @@ class _ObjectRun:
             return []
         self.writes = [write for write in self.writes if write[2] > self.end]
         size = self.block_size
-        objects = [
-            (key, {"routed_experts": self._rows(start, end)})
-            for key, start, end in ready
-        ]
+        objects = [(key, self._rows(start, end)) for key, start, end in ready]
         keep = min(
             (start for _, start, _ in self.writes),
             default=max(start for _, start, _ in ready),
@@ -110,13 +119,18 @@ class _ObjectRun:
             del self.blocks[block]
         return objects
 
-    def _rows(self, start: int, end: int) -> np.ndarray:
+    def _rows(self, start: int, end: int) -> dict[str, np.ndarray]:
         size = self.block_size
         first = start // size
         if end - start <= size:
-            return self.blocks[first][: end - start]
+            return {
+                name: rows[: end - start] for name, rows in self.blocks[first].items()
+            }
         blocks = [self.blocks[block] for block in range(first, cdiv(end, size))]
-        return np.concatenate(blocks)[: end - start]
+        return {
+            name: np.concatenate([block[name] for block in blocks])[: end - start]
+            for name in blocks[0]
+        }
 
 
 @dataclass(slots=True)
@@ -143,8 +157,10 @@ class PendingAuxOutput:
     query_start_loc: np.ndarray
     # GPU snapshot taken on the main stream.
     routed_experts_gpu: torch.Tensor
+    fields_gpu: dict[str, torch.Tensor] = field(default_factory=dict)
     # Filled by enqueue_cpu_copy on the output copy stream.
     routed_experts: np.ndarray | None = None
+    fields: dict[str, np.ndarray] = field(default_factory=dict)
     num_sampled: np.ndarray | None = None
     num_rejected: np.ndarray | None = None
     runs: dict[str, _ObjectRun] = field(default_factory=dict)
@@ -158,6 +174,10 @@ class PendingAuxOutput:
         self.routed_experts = self.routed_experts_gpu.to(
             "cpu", non_blocking=True
         ).numpy()
+        self.fields = {
+            name: rows.to("cpu", non_blocking=True).numpy()
+            for name, rows in self.fields_gpu.items()
+        }
 
     def process_output(self) -> dict[str, AuxRequestOutput]:
         return self.connector.process_output(self)
@@ -178,6 +198,7 @@ class AuxOutputWorkerConnector:
         )
         bind_routed_experts_capturer(model, capturer)
         self._capturer = capturer
+        self._field_capturer = AuxFieldCapturer(model, vllm_config)
         self._vllm_config = vllm_config
         self._store: BackgroundBlockObjectStore | None = None
         self._buffer: RoutedExpertsBuffer | None = None
@@ -241,6 +262,8 @@ class AuxOutputWorkerConnector:
             query_start_loc=query_start_loc,
             routed_experts_gpu=self._capturer.snapshot_routing_data(num_rows),
         )
+        if self._step_metadata.has_namespace_requests:
+            pending_output.fields_gpu = self._field_capturer.snapshot(num_rows)
         with self._lock:
             assert len(self._pending_outputs) < self._max_concurrent_batches, (
                 "auxiliary output step outputs are not consumed in order"
@@ -322,7 +345,11 @@ class AuxOutputWorkerConnector:
             )
             rows = routed_experts[start : end - rejected]
             if (run := pending.runs.get(request_id)) is not None:
-                run.add(token_start, rows)
+                fields = {
+                    name: array[start : end - rejected]
+                    for name, array in pending.fields.items()
+                }
+                run.add(token_start, {ROUTED_EXPERTS: rows, **fields})
                 objects.extend(run.take_ready())
                 continue
 

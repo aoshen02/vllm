@@ -780,7 +780,9 @@ def test_aux_output_worker_connector_binds_capture_on_non_output_rank(monkeypatc
     )
 
     config = SimpleNamespace(
-        aux_output_config=SimpleNamespace(enable_return_routed_experts=True),
+        aux_output_config=SimpleNamespace(
+            enable_return_routed_experts=True, aux_fields=set()
+        ),
         kv_transfer_config=None,
         max_concurrent_batches=2,
         scheduler_config=SimpleNamespace(max_num_batched_tokens=32),
@@ -828,7 +830,9 @@ def test_aux_output_worker_connector_default_capacity(monkeypatch):
     monkeypatch.setattr(aux_output_worker, "RoutedExpertsBuffer", buffer_constructor)
 
     config = SimpleNamespace(
-        aux_output_config=SimpleNamespace(max_bytes=None, object_key_prefix=None),
+        aux_output_config=SimpleNamespace(
+            max_bytes=None, object_key_prefix=None, aux_fields=set()
+        ),
         kv_transfer_config=None,
         cache_config=SimpleNamespace(enable_prefix_caching=True),
         scheduler_config=SimpleNamespace(max_num_seqs=8, max_num_batched_tokens=32),

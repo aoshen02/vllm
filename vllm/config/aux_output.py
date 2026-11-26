@@ -16,6 +16,10 @@ class AuxOutputConfig:
     enable_return_routed_experts: bool = False
     """Capture and return routed-experts auxiliary outputs."""
 
+    enable_return_indexer_topk: bool = False
+    """Store the top-k positions each sparse-attention indexer layer selects
+    in the objects of `SamplingParams.aux_namespace` requests."""
+
     max_bytes: int | None = Field(default=None, gt=0)
     """Initial capacity, or `None` to derive it from the KV cache capacity.
     Grows when every object is referenced."""
@@ -43,6 +47,13 @@ class AuxOutputConfig:
     def enabled(self) -> bool:
         """Whether any execution auxiliary output is enabled."""
         return self.enable_return_routed_experts
+
+    @property
+    def aux_fields(self) -> set[str]:
+        """The auxiliary outputs that the objects of `aux_namespace` requests
+        store besides the routed experts."""
+        enabled = {"indexer_topk": self.enable_return_indexer_topk}
+        return {name for name, on in enabled.items() if on}
 
     def compile_factors(self) -> CompileFactors:
         """WARNING: Whenever a new field is added to this config, add it to

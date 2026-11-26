@@ -717,6 +717,8 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 None,
                 index_weights,
             )
+        if self.indexer is not None and self.indexer.topk_capture_fn is not None:
+            self.indexer.topk_capture_fn(hidden_states.shape[0])
 
         # MLA attention writes into the pre-allocated `out` buffer
         # (see _alloc_attn_out).
@@ -975,6 +977,8 @@ class DeepseekV4Indexer(nn.Module):
             vllm_config.model_config.max_model_len // self.compress_ratio
         )
         self.prefix = prefix
+        self.layer_id = extract_layer_index(prefix)
+        self.topk_capture_fn: Callable[[int], None] | None = None
 
         self.max_total_seq_len = (
             get_max_prefill_buffer_size(vllm_config) // self.compress_ratio
