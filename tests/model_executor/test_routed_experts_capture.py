@@ -801,7 +801,7 @@ def test_aux_output_worker_connector_binds_capture_on_non_output_rank(monkeypatc
         vllm_config=config,
     )
     bind.assert_called_once_with(model, capturer)
-    connector.begin_step(Mock())
+    connector.begin_step(aux_output_worker.AuxOutputConnectorMetadata(0, {}, {}, ()))
     assert connector.prepare_output(Mock()) is None
     capturer.snapshot_routing_data.assert_not_called()
 

@@ -24,6 +24,10 @@ class AuxOutputConfig:
     """Store the final hidden states, the input of the LM head, in the objects
     of `SamplingParams.aux_namespace` requests."""
 
+    return_topk_logprobs: int = Field(default=0, ge=0)
+    """Store the top-k next-token ids and log-probabilities of every position
+    in the objects of `SamplingParams.aux_namespace` requests; 0 disables."""
+
     max_bytes: int | None = Field(default=None, gt=0)
     """Initial capacity, or `None` to derive it from the KV cache capacity.
     Grows when every object is referenced."""
@@ -59,6 +63,7 @@ class AuxOutputConfig:
         enabled = {
             "indexer_topk": self.enable_return_indexer_topk,
             "hidden_states": self.enable_return_hidden_states,
+            "topk_logprobs": self.return_topk_logprobs > 0,
         }
         return {name for name, on in enabled.items() if on}
 
@@ -72,5 +77,6 @@ class AuxOutputConfig:
             "object_key_prefix",
             "object_store",
             "object_store_extra_config",
+            "return_topk_logprobs",
         }
         return get_compile_factors(self, ignored_factors)

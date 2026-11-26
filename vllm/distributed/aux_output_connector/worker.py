@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from threading import Lock
 from typing import TYPE_CHECKING, Any
@@ -248,11 +248,24 @@ class AuxOutputWorkerConnector:
             )
 
     def prepare_output(
-        self, input_batch: InputBatch, hidden_states: torch.Tensor | None = None
+        self,
+        input_batch: InputBatch,
+        hidden_states: torch.Tensor | None = None,
+        compute_logits: Callable[[torch.Tensor], torch.Tensor | None] | None = None,
     ) -> PendingAuxOutput | None:
         """Snapshot one step's R3 tensor and enabled fields, given its LM-head
-        inputs `hidden_states`, for asynchronous CPU transfer."""
-        if self._buffer is None or self._step_metadata is None:
+        inputs `hidden_states`, for asynchronous CPU transfer. Call on every
+        rank, which `compute_logits` may need."""
+        if self._step_metadata is None:
+            return None
+        fields_gpu = {}
+        if self._step_metadata.has_namespace_requests:
+            assert hidden_states is not None and compute_logits is not None
+            num_tokens = int(input_batch.query_start_loc_np[len(input_batch.req_ids)])
+            fields_gpu = self._field_capturer.snapshot(
+                hidden_states[:num_tokens], compute_logits
+            )
+        if self._buffer is None:
             return None
 
         request_ids = list(input_batch.req_ids)
@@ -264,12 +277,8 @@ class AuxOutputWorkerConnector:
             token_starts=input_batch.num_computed_tokens_np,
             query_start_loc=query_start_loc,
             routed_experts_gpu=self._capturer.snapshot_routing_data(num_rows),
+            fields_gpu=fields_gpu,
         )
-        if self._step_metadata.has_namespace_requests:
-            assert hidden_states is not None
-            pending_output.fields_gpu = self._field_capturer.snapshot(
-                hidden_states[:num_rows]
-            )
         with self._lock:
             assert len(self._pending_outputs) < self._max_concurrent_batches, (
                 "auxiliary output step outputs are not consumed in order"
