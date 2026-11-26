@@ -668,3 +668,43 @@ def test_objects_without_a_checksum_read_as_rows_only():
     )
     with pytest.raises(AuxObjectCorrupted, match="has no token ids or checksum"):
         read_aux_spans(store, [(keys[0], 0, 4)])
+
+
+# One object of 6 positions per kind of auxiliary output: the binding and the
+# checksum do not depend on the arrays an object holds.
+_ARTIFACTS = {
+    "routed-experts": {"routed_experts": ((6, 3, 2), np.uint8)},
+    "indexer-top-k": {"indexer_topk": ((6, 2, 8), np.int16)},
+    # bfloat16 rows travel as their uint16 bits.
+    "hidden-states": {"hidden_states": ((6, 16), np.uint16)},
+    "top-k-logprobs": {
+        "topk_logprobs": ((6, 4), np.float32),
+        "topk_token_ids": ((6, 4), np.int32),
+    },
+    "multimodal-embedding": {"mm_embedding": ((6, 16), np.float16)},
+}
+
+
+@pytest.mark.parametrize("artifact", list(_ARTIFACTS), ids=list(_ARTIFACTS))
+def test_every_artifact_is_bound_and_checksummed(artifact):
+    rng = np.random.default_rng(0)
+    fields = {
+        name: rng.integers(0, 100, shape).astype(dtype)
+        for name, (shape, dtype) in _ARTIFACTS[artifact].items()
+    }
+    tokens = np.array([5, 9, 9, 2, 7, 3, 8], np.int32)
+    store = DictObjectStore()
+    writer = AuxObjectWriter(store, timeout_s=5)
+    writer.put([("job/g/0", {**fields, "token_ids": tokens[:6]}, {"start": "0"})])
+    wait_for_writer(writer)
+    writer.close()
+    for name, array in fields.items():
+        spans = [("job/g/0", 0, 6)]
+        rows, row_tokens, row_positions = read_aux_spans(store, spans, name)
+        np.testing.assert_array_equal(rows, array)
+        verify_aux_rows(tokens[:6], np.arange(6), row_tokens, row_positions)
+        with pytest.raises(AuxRowsMisaligned):
+            verify_aux_rows(tokens[1:], np.arange(6), row_tokens, row_positions)
+    store.objects["job/g/0"] = _corrupt(store.objects["job/g/0"], "payload")
+    with pytest.raises(AuxObjectCorrupted, match="does not match"):
+        read_aux_spans(store, [("job/g/0", 0, 6)], next(iter(fields)))
