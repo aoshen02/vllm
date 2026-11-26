@@ -22,12 +22,16 @@ from tests.distributed.aux_output_connector.utils import (
 )
 from vllm.distributed.aux_output_connector import object_store
 from vllm.distributed.aux_output_connector.object_store import (
+    AuxObjectCorrupted,
     AuxObjectWriter,
+    AuxRowsMisaligned,
     MooncakeAuxObjectStore,
     aux_namespace_prefix,
     aux_prefix,
     create_aux_object_store,
     read_aux_rows,
+    read_aux_spans,
+    verify_aux_rows,
 )
 from vllm.distributed.aux_output_connector.store import BlockObjectStoreError
 
@@ -169,7 +173,9 @@ def test_objects_round_trip_through_a_store_other_than_mooncake():
     store = DictObjectStore()
     writer = AuxObjectWriter(store, timeout_s=5)
     rows = _rows(0, 4)
-    writer.put([("job/g/0", {"routed_experts": rows}), ("job/h/0", {"x": rows})])
+    writer.put(
+        [("job/g/0", {"routed_experts": rows}, {}), ("job/h/0", {"x": rows}, {})]
+    )
     wait_for_writer(writer)
     np.testing.assert_array_equal(
         read_aux_rows(store, ["job/g/0"], "routed_experts"), rows
@@ -247,7 +253,7 @@ def test_namespace_prefix_covers_the_namespaces_nested_in_it(namespace, released
 
 
 def _objects(*keys):
-    return [(key, {"routed_experts": np.zeros((1, 1), np.uint8)}) for key in keys]
+    return [(key, {"routed_experts": np.zeros((1, 1), np.uint8)}, {}) for key in keys]
 
 
 def _writer(put, timeout_s=10.0):
@@ -429,3 +435,236 @@ def test_writer_blocks_a_full_queue_until_a_write_ends_or_misses_its_deadline(
     writer.close()
     writer._thread.join(10)
     assert list(client.objects) == written
+
+
+_SPAN = 4
+# Two samples of a group: a shared 6-token prompt, then their own outputs.
+_TRAJECTORIES = [
+    [7, 3, 9, 1, 4, 4, *range(10, 20)],
+    [7, 3, 9, 1, 4, 4, *range(20, 30)],
+]
+
+
+def _written(trajectories=_TRAJECTORIES):
+    """Objects of `_SPAN` positions over each trajectory, as an engine writes
+    them, and the listing of each."""
+    store = DictObjectStore()
+    writer = AuxObjectWriter(store, timeout_s=5)
+    listings = []
+    for sample, tokens in enumerate(trajectories):
+        objects, listing = [], []
+        for start in range(0, len(tokens) - 1, _SPAN):
+            end = min(start + _SPAN, len(tokens) - 1)
+            key = f"job/g/{sample}-{start}"
+            rows = _rows(100 * sample + start, end - start)
+            token_ids = np.array(tokens[start:end], np.int32)
+            fields = {"routed_experts": rows, "token_ids": token_ids}
+            objects.append((key, fields, {"start": str(start)}))
+            listing.append((key, start, end))
+        writer.put(objects)
+        listings.append(listing)
+    wait_for_writer(writer)
+    writer.close()
+    return store, listings
+
+
+def _packed(store, listings, trajectories=_TRAJECTORIES):
+    """A trainer's packed batch: input ids, positions, the binding of each
+    row (one placeholder for each last token, which has no row), the replay
+    mask, and sequence starts."""
+    inputs, positions, row_tokens, row_positions, mask = [], [], [], [], []
+    for tokens, listing in zip(trajectories, listings, strict=True):
+        _, row_token, row_position = read_aux_spans(store, listing)
+        inputs.append(np.array(tokens))
+        positions.append(np.arange(len(tokens)))
+        row_tokens.append(np.append(row_token, 0))
+        row_positions.append(np.append(row_position, 0))
+        mask.append(np.arange(len(tokens)) < len(tokens) - 1)
+    lengths = [len(tokens) for tokens in trajectories]
+    return (
+        np.concatenate(inputs),
+        np.concatenate(positions),
+        np.concatenate(row_tokens),
+        np.concatenate(row_positions),
+        np.concatenate(mask),
+        np.cumsum([0, *lengths]),
+    )
+
+
+def _zigzag(array, cu_seqlens, rank, cp):
+    """Rank `rank`'s part of each sequence under zigzag context parallelism:
+    chunks `rank` and `2 * cp - 1 - rank` of `2 * cp`."""
+    parts = []
+    for start, end in zip(cu_seqlens[:-1], cu_seqlens[1:]):
+        chunks = np.array_split(array[start:end], 2 * cp)
+        parts += [chunks[rank], chunks[2 * cp - 1 - rank]]
+    return np.concatenate(parts)
+
+
+def _contiguous(array, cu_seqlens, rank, cp):
+    """The bug: a contiguous split where the inputs use zigzag."""
+    parts = []
+    for start, end in zip(cu_seqlens[:-1], cu_seqlens[1:]):
+        chunks = np.array_split(array[start:end], 2 * cp)
+        parts += [chunks[2 * rank], chunks[2 * rank + 1]]
+    return np.concatenate(parts)
+
+
+def _shift_one(binding, cu_seqlens):
+    """The bug: each sample's rows placed one position early."""
+    shifted = binding.copy()
+    for start, end in zip(cu_seqlens[:-1], cu_seqlens[1:]):
+        shifted[start : end - 1] = binding[start + 1 : end]
+    return shifted
+
+
+def _swap_samples(binding, cu_seqlens):
+    """The bug: the rows of two samples of equal length swapped."""
+    (a, b, c) = cu_seqlens
+    return np.concatenate([binding[b:c], binding[a:b]])
+
+
+def _swap_repeated_tokens(binding, cu_seqlens):
+    """The bug: the rows of positions 4 and 5, both token 4, swapped; only
+    positions tell them apart."""
+    swapped = binding.copy()
+    for start in cu_seqlens[:-1]:
+        swapped[[start + 4, start + 5]] = binding[[start + 5, start + 4]]
+    return swapped
+
+
+class TestVerifyAuxRows:
+    def test_aligned_rows_pass_packing_and_context_parallelism(self):
+        inputs, positions, row_tokens, row_positions, mask, cu = _packed(*_written())
+        verify_aux_rows(inputs, positions, row_tokens, row_positions, mask=mask)
+        for rank in range(2):
+            local = [_zigzag(a, cu, rank, 2) for a in (inputs, positions)]
+            binding = [_zigzag(a, cu, rank, 2) for a in (row_tokens, row_positions)]
+            verify_aux_rows(*local, *binding, mask=_zigzag(mask, cu, rank, 2))
+
+    @pytest.mark.parametrize(
+        "misplace,index,position,offset",
+        [
+            (_shift_one, 0, 0, 1),
+            (_swap_samples, 6, 6, 0),
+            (_swap_repeated_tokens, 4, 4, 1),
+        ],
+        ids=["shifted-one-position", "swapped-samples", "swapped-repeated-tokens"],
+    )
+    def test_misplaced_rows_are_reported(self, misplace, index, position, offset):
+        inputs, positions, row_tokens, row_positions, mask, cu = _packed(*_written())
+        with pytest.raises(AuxRowsMisaligned) as error:
+            verify_aux_rows(
+                inputs,
+                positions,
+                misplace(row_tokens, cu),
+                misplace(row_positions, cu),
+                mask=mask,
+            )
+        found = (error.value.index, error.value.position, error.value.offset)
+        assert found == (index, position, offset)
+
+    def test_rows_sharded_unlike_the_inputs_are_reported_on_their_rank(self):
+        # Inputs are sharded zigzag, the rows contiguously: rank 0's second
+        # chunk holds positions 4-7 where its tokens are positions 12-15.
+        inputs, positions, row_tokens, row_positions, mask, cu = _packed(*_written())
+        local = [_zigzag(a, cu, 0, 2) for a in (inputs, positions, mask)]
+        binding = [_contiguous(a, cu, 0, 2) for a in (row_tokens, row_positions)]
+        with pytest.raises(AuxRowsMisaligned) as error:
+            verify_aux_rows(local[0], local[1], *binding, mask=local[2])
+        assert (error.value.position, error.value.offset) == (12, -8)
+
+    def test_rows_missing_from_a_replayed_position_are_reported(self):
+        # The trainer fills a span it did not read with zeros, as it pads.
+        inputs, positions, row_tokens, row_positions, mask, cu = _packed(*_written())
+        row_tokens[4:8] = row_positions[4:8] = 0
+        with pytest.raises(AuxRowsMisaligned) as error:
+            verify_aux_rows(inputs, positions, row_tokens, row_positions, mask=mask)
+        assert (error.value.position, error.value.offset) == (4, -4)
+
+    def test_rows_of_other_tokens_at_their_position_are_reported(self):
+        # A trajectory retokenized after the engine returned it.
+        store, listings = _written()
+        _, row_tokens, row_positions = read_aux_spans(store, listings[0])
+        tokens = np.array(_TRAJECTORIES[0][:-1])
+        tokens[9] += 1
+        match = r"computed for token 13 at position 9 \(offset 0\), not token 14"
+        with pytest.raises(AuxRowsMisaligned, match=match):
+            verify_aux_rows(tokens, row_positions, row_tokens, row_positions)
+
+    def test_a_mask_not_one_per_row_is_refused(self):
+        # Broadcast, one False would skip every row.
+        with pytest.raises(ValueError, match="a mask of 1"):
+            verify_aux_rows([1, 2], [0, 1], [9, 9], [8, 8], mask=[False])
+
+
+def test_strided_fields_read_back_as_written():
+    rows = np.arange(48, dtype=np.uint8).reshape(4, 2, 6)[:, :, ::2]
+    store = DictObjectStore()
+    writer = AuxObjectWriter(store, timeout_s=5)
+    token_ids = np.arange(4, dtype=np.int32)
+    fields = {"routed_experts": rows, "token_ids": token_ids}
+    writer.put([("job/g/0", fields, {"start": "0"})])
+    wait_for_writer(writer)
+    writer.close()
+    np.testing.assert_array_equal(
+        read_aux_rows(store, ["job/g/0"], "routed_experts"), rows
+    )
+
+
+def test_read_aux_spans_reads_a_spliced_listing_from_object_starts():
+    # Turn 2 holds positions [0, 6) from turn 1 and takes [6, 8) from the
+    # object that starts at 4.
+    store, (listing, _) = _written()
+    spliced = [listing[0], ("job/g/0-4", 4, 6), ("job/g/0-4", 6, 8), listing[2]]
+    rows, row_tokens, row_positions = read_aux_spans(store, spliced)
+    np.testing.assert_array_equal(rows, _rows(0, 12))
+    assert row_tokens.tolist() == _TRAJECTORIES[0][:12]
+    assert row_positions.tolist() == list(range(12))
+
+
+@pytest.mark.parametrize(
+    "spans,match",
+    [
+        ([("job/g/0-4", 3, 6)], r"\[3, 6\) are not in .*holds \[4, 8\)"),
+        ([("job/g/0-4", 6, 9)], r"\[6, 9\) are not in .*holds \[4, 8\)"),
+        ([("job/g/0-0", 0, 4), ("job/g/0-8", 8, 12)], "starts at 8, not at .* 4"),
+    ],
+    ids=["before-object", "past-object", "gap"],
+)
+def test_read_aux_spans_refuses_positions_its_objects_do_not_hold(spans, match):
+    store, _ = _written()
+    with pytest.raises(ValueError, match=match):
+        read_aux_spans(store, spans)
+
+
+def _corrupt(data: bytes, how: str) -> bytes:
+    if how == "payload":
+        return data[:-1] + bytes([data[-1] ^ 1])
+    # Same length, so the header still parses: rows reshaped, or every
+    # position shifted.
+    old, new = {"shape": (b"[4,2,3]", b"[2,4,3]"), "start": (b'"4"', b'"5"')}[how]
+    assert data.count(old) == 1
+    return data.replace(old, new)
+
+
+@pytest.mark.parametrize("how", ["payload", "shape", "start"])
+def test_corrupted_objects_are_refused_on_read(how):
+    store, (listing, _) = _written()
+    store.objects["job/g/0-4"] = _corrupt(store.objects["job/g/0-4"], how)
+    with pytest.raises(AuxObjectCorrupted, match="'job/g/0-4' does not match"):
+        read_aux_rows(store, [key for key, _, _ in listing], "routed_experts")
+    with pytest.raises(AuxObjectCorrupted, match="'job/g/0-4' does not match"):
+        read_aux_spans(store, listing)
+    store.objects["job/g/0-4"] = b"\xff" * 16
+    with pytest.raises(AuxObjectCorrupted, match="'job/g/0-4' does not parse"):
+        read_aux_rows(store, ["job/g/0-4"], "routed_experts")
+
+
+def test_objects_without_a_checksum_read_as_rows_only():
+    store, keys = _stored([_rows(0, 4)])
+    np.testing.assert_array_equal(
+        read_aux_rows(store, keys, "routed_experts"), _rows(0, 4)
+    )
+    with pytest.raises(AuxObjectCorrupted, match="has no token ids or checksum"):
+        read_aux_spans(store, [(keys[0], 0, 4)])

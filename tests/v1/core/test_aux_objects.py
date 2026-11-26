@@ -33,8 +33,11 @@ from vllm.distributed.aux_output_connector.connector import (
 )
 from vllm.distributed.aux_output_connector.object_store import (
     AuxObjectWriter,
+    _load,
     aux_namespace_cache_salt,
     read_aux_rows,
+    read_aux_spans,
+    verify_aux_rows,
 )
 from vllm.distributed.aux_output_connector.routed_experts import RoutedExpertsBuffer
 from vllm.distributed.aux_output_connector.store import BlockObjectStore
@@ -124,11 +127,14 @@ def _worker(store):
     return worker
 
 
-def _input_batch(request_ids, starts, counts):
+def _input_batch(request_ids, starts, counts, input_ids=None):
     return SimpleNamespace(
         req_ids=request_ids,
         num_computed_tokens_np=np.array(starts),
         query_start_loc_np=np.cumsum([0, *counts]),
+        input_ids=torch.full((sum(counts),), -1, dtype=torch.int32)
+        if input_ids is None
+        else torch.tensor(input_ids, dtype=torch.int32),
     )
 
 
@@ -361,6 +367,8 @@ class _Engine:
             zip(model_runner_output.req_ids, model_runner_output.sampled_token_ids)
         )
         if pending is not None:
+            if pending.input_ids_gpu is not None:
+                self._fill_input_ids(pending, scheduled, sampled)
             drafts = scheduler_output.scheduled_spec_decode_tokens
             tokens = [sampled.get(r, []) for r in pending.request_ids]
             pending.enqueue_cpu_copy(
@@ -401,6 +409,19 @@ class _Engine:
                 if output.finish_reason in (FinishReason.STOP, FinishReason.LENGTH):
                     self._final(request, output.aux_objects, False)
         return outputs
+
+    @staticmethod
+    def _fill_input_ids(pending, scheduled, sampled):
+        # The device fills in the tokens the step's inputs take from earlier
+        # steps and its drafts; those it keeps are known once it samples.
+        loc = pending.query_start_loc
+        for index, request_id in enumerate(pending.request_ids):
+            request, start, _ = scheduled[request_id]
+            tokens = [*request.all_token_ids, *sampled.get(request_id, [])]
+            for row in range(loc[index], loc[index + 1]):
+                position = start + row - loc[index]
+                known = position < len(tokens)
+                pending.input_ids_gpu[row] = tokens[position] if known else -2
 
     def _final(self, request, objects, aborted):
         self.finals.append((request, objects, request.num_tokens, aborted))
@@ -505,9 +526,14 @@ def _check(engine):
         for _, owner, position in engine.computed
     )
     for key in engine.client.objects:
-        for tag in engine.tags(key):
+        fields, metadata = _load(key, engine.client.objects[key])
+        assert int(metadata["start"]) == engine.tags(key)[0][0], key
+        for tag, token_id in zip(engine.tags(key), fields["token_ids"], strict=True):
             assert not tag[4], key
             assert (tag[2], tag[3], tag[0]) not in engine.off_token, key
+            # Bound to the token its row was computed for.
+            owner_tokens = engine.by_owner[tag[3]].all_token_ids
+            assert token_id == owner_tokens[tag[0]], (key, tag)
     for request, objects, num_tokens, aborted in engine.finals:
         namespace = request.sampling_params.aux_namespace
         if namespace is None:
@@ -521,6 +547,14 @@ def _check(engine):
         first, end = start - start % _BLOCK, num_tokens - 1
         held = _splice(engine, objects)
         positions = sorted(held)
+        _, row_tokens, row_positions = read_aux_spans(
+            engine.store, objects, timeout_s=0
+        )
+        assert row_positions.tolist() == positions
+        all_tokens = np.array(request.all_token_ids)
+        verify_aux_rows(
+            all_tokens[row_positions], row_positions, row_tokens, row_positions
+        )
         if aborted:
             assert positions == list(range(first, first + len(positions)))
             assert first + len(positions) <= end
@@ -1590,13 +1624,18 @@ def test_object_run_writes_the_bytes_of_the_rows_in_position_order():
     # A prefill computes two whole blocks and opens block 2, which decode
     # steps fill; its tail is written before the block.
     rows = np.arange(48 * 6, dtype=np.uint8).reshape(48, 3, 2)
+    token_ids = np.arange(1000, 1048, dtype=np.int32)
     run = _ObjectRun(_BLOCK)
-    run.add(0, rows[:40])
+    run.add(0, rows[:40], token_ids[:40])
     for position in range(40, 47):
-        run.add(position, rows[position : position + 1])
+        run.add(
+            position,
+            rows[position : position + 1],
+            token_ids[position : position + 1],
+        )
     run.writes = [("b0", 0, 16), ("b1", 16, 32), ("t", 32, 47), ("t0", 0, 40)]
     objects = run.take_ready()
-    run.add(47, rows[47:])
+    run.add(47, rows[47:], token_ids[47:])
     run.writes = [("b2", 32, 48)]
     objects += run.take_ready()
     spans = [
@@ -1606,8 +1645,18 @@ def test_object_run_writes_the_bytes_of_the_rows_in_position_order():
         ("t0", 0, 40),
         ("b2", 32, 48),
     ]
-    assert [(key, save(fields)) for key, fields in objects] == [
-        (key, save({"routed_experts": rows[start:end]})) for key, start, end in spans
+    assert [(key, save(fields), metadata) for key, fields, metadata in objects] == [
+        (
+            key,
+            save(
+                {
+                    "routed_experts": rows[start:end],
+                    "token_ids": token_ids[start:end],
+                }
+            ),
+            {"start": str(start)},
+        )
+        for key, start, end in spans
     ]
     assert list(run.blocks) == [2]
 
@@ -1615,12 +1664,14 @@ def test_object_run_writes_the_bytes_of_the_rows_in_position_order():
 def test_object_run_recompute_leaves_taken_objects_unchanged():
     # A failed load computes again positions of a block already taken.
     run = _ObjectRun(_BLOCK)
-    run.add(32, np.ones((16, 3, 2), dtype=np.uint8))
+    run.add(32, np.ones((16, 3, 2), dtype=np.uint8), np.full(16, 1, np.int32))
     run.writes = [("b2", 32, 48)]
-    [(_, fields)] = run.take_ready()
-    run.add(16, np.full((24, 3, 2), 2, dtype=np.uint8))
-    assert (fields["routed_experts"] == 1).all()
-    assert (run.blocks[2][:8] == 2).all() and (run.blocks[2][8:] == 1).all()
+    [(_, fields, _)] = run.take_ready()
+    run.add(16, np.full((24, 3, 2), 2, dtype=np.uint8), np.full(24, 2, np.int32))
+    assert (fields["routed_experts"] == 1).all() and (fields["token_ids"] == 1).all()
+    rows, token_ids = run.blocks[2]
+    assert (rows[:8] == 2).all() and (rows[8:] == 1).all()
+    assert (token_ids[:8] == 2).all() and (token_ids[8:] == 1).all()
 
 
 @pytest.mark.parametrize("rows_first", [False, True], ids=["on-output", "on-step"])
@@ -1634,7 +1685,7 @@ def test_worker_puts_the_objects_of_a_step_at_once(rows_first):
     put = worker._writer.put
 
     def record_put(objects):
-        puts.append([key for key, _ in objects])
+        puts.append([key for key, _, _ in objects])
         return put(objects)
 
     worker._writer.put = record_put
@@ -1683,7 +1734,9 @@ def test_step_scheduled_behind_rejected_drafts_keeps_rows_in_position_order():
         rows = np.zeros((len(positions), 3, 2), dtype=np.uint8)
         rows[:, 0, 0] = positions
         worker._capturer.snapshot_routing_data.return_value = torch.from_numpy(rows)
-        batch = _input_batch(["r"], [token_start], [len(positions)])
+        # The device computes the tokens of the positions it really runs.
+        token_ids = [1000 + position for position in positions]
+        batch = _input_batch(["r"], [token_start], [len(positions)], token_ids)
         steps.append((worker.prepare_output(batch), rejected))
         if token_start == 0:
             # The next two steps are in flight together.
@@ -1695,8 +1748,10 @@ def test_step_scheduled_behind_rejected_drafts_keeps_rows_in_position_order():
         pending.process_output()
     run = worker._requests["r"].run
     run.writes = [("t", 32, 45)]
-    ((_, fields),) = run.take_ready()
+    ((_, fields, metadata),) = run.take_ready()
     assert fields["routed_experts"][:, 0, 0].tolist() == list(range(32, 45))
+    assert fields["token_ids"].tolist() == list(range(1032, 1045))
+    assert metadata == {"start": "32"}
     worker.close()
 
 

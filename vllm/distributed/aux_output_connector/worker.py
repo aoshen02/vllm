@@ -49,20 +49,22 @@ if TYPE_CHECKING:
 
 @dataclass(slots=True)
 class _ObjectRun:
-    """Rows a namespace request computed since it was last scheduled, by KV
-    block, and the objects still to write from them. A block a step computes
-    whole is a view of that step's rows; a block computed over several steps
-    is filled in place in its own buffer. Positions computed again, after a
-    failed KV load, go to copies of their blocks: the writer may still read
-    objects taken from them. Runs start on a block boundary and every object
-    starts at one; a tail object may span blocks."""
+    """Rows a namespace request computed since it was last scheduled, with the
+    token id each row was computed for, by KV block, and the objects still to
+    write from them. A block a step computes whole is a view of that step's
+    rows; a block computed over several steps is filled in place in its own
+    buffer. Positions computed again, after a failed KV load, go to copies of
+    their blocks: the writer may still read objects taken from them. Runs
+    start on a block boundary and every object starts at one; a tail object
+    may span blocks."""
 
     block_size: int
     end: int = -1
-    blocks: dict[int, np.ndarray] = field(default_factory=dict)
+    # Block -> (rows, token ids).
+    blocks: dict[int, tuple[np.ndarray, np.ndarray]] = field(default_factory=dict)
     writes: list[AuxObject] = field(default_factory=list)
 
-    def add(self, token_start: int, rows: np.ndarray) -> None:
+    def add(self, token_start: int, rows: np.ndarray, token_ids: np.ndarray) -> None:
         if 0 <= self.end < token_start:
             # A step scheduled while drafts were in flight starts after the
             # ones rejected: its rows follow those kept.
@@ -71,22 +73,26 @@ class _ObjectRun:
         if token_start < self.end:
             for block in range(token_start // size, cdiv(self.end, size)):
                 if (buffer := self.blocks.get(block)) is not None:
-                    self.blocks[block] = buffer.copy()
+                    self.blocks[block] = (buffer[0].copy(), buffer[1].copy())
         position = token_start
         self.end = end = token_start + len(rows)
         while position < end:
             block, offset = divmod(position, size)
             stop = min(end, position - offset + size)
             part = rows[position - token_start : stop - token_start]
+            ids = token_ids[position - token_start : stop - token_start]
+            count = stop - position
             position = stop
-            if len(part) == size:
-                self.blocks[block] = part
+            if count == size:
+                self.blocks[block] = (part, ids)
                 continue
             if (buffer := self.blocks.get(block)) is None:
-                buffer = self.blocks[block] = np.empty(
-                    (size, *part.shape[1:]), part.dtype
+                buffer = self.blocks[block] = (
+                    np.empty((size, *part.shape[1:]), part.dtype),
+                    np.empty(size, np.int32),
                 )
-            buffer[offset : offset + len(part)] = part
+            buffer[0][offset : offset + count] = part
+            buffer[1][offset : offset + count] = ids
 
     def take_ready(self) -> AuxObjects:
         """Objects whose rows are all here. Later writes start at or after
@@ -99,7 +105,7 @@ class _ObjectRun:
         self.writes = [write for write in self.writes if write[2] > self.end]
         size = self.block_size
         objects = [
-            (key, {"routed_experts": self._rows(start, end)})
+            (key, self._fields(start, end), {"start": str(start)})
             for key, start, end in ready
         ]
         keep = min(
@@ -110,13 +116,19 @@ class _ObjectRun:
             del self.blocks[block]
         return objects
 
-    def _rows(self, start: int, end: int) -> np.ndarray:
+    def _fields(self, start: int, end: int) -> dict[str, np.ndarray]:
         size = self.block_size
         first = start // size
         if end - start <= size:
-            return self.blocks[first][: end - start]
-        blocks = [self.blocks[block] for block in range(first, cdiv(end, size))]
-        return np.concatenate(blocks)[: end - start]
+            rows, token_ids = self.blocks[first]
+        else:
+            blocks = [self.blocks[block] for block in range(first, cdiv(end, size))]
+            rows = np.concatenate([rows for rows, _ in blocks])
+            token_ids = np.concatenate([ids for _, ids in blocks])
+        return {
+            "routed_experts": rows[: end - start],
+            "token_ids": token_ids[: end - start],
+        }
 
 
 @dataclass(slots=True)
@@ -148,6 +160,10 @@ class PendingAuxOutput:
     num_sampled: np.ndarray | None = None
     num_rejected: np.ndarray | None = None
     runs: dict[str, _ObjectRun] = field(default_factory=dict)
+    # The step's input token ids, taken when it has runs, which bind them to
+    # the rows they write.
+    input_ids_gpu: torch.Tensor | None = None
+    input_ids: np.ndarray | None = None
 
     def enqueue_cpu_copy(
         self, num_sampled: np.ndarray, num_rejected: np.ndarray
@@ -158,6 +174,8 @@ class PendingAuxOutput:
         self.routed_experts = self.routed_experts_gpu.to(
             "cpu", non_blocking=True
         ).numpy()
+        if self.input_ids_gpu is not None:
+            self.input_ids = self.input_ids_gpu.to("cpu", non_blocking=True).numpy()
 
     def process_output(self) -> dict[str, AuxRequestOutput]:
         return self.connector.process_output(self)
@@ -251,6 +269,10 @@ class AuxOutputWorkerConnector:
                 state.pending_outputs += 1
                 if state.run is not None:
                     pending_output.runs[request_id] = state.run
+        if pending_output.runs:
+            # The next step overwrites the input buffer in stream order after
+            # this copy.
+            pending_output.input_ids_gpu = input_batch.input_ids[:num_rows].clone()
         return pending_output
 
     def process_output(self, pending: PendingAuxOutput) -> dict[str, AuxRequestOutput]:
@@ -322,7 +344,8 @@ class AuxOutputWorkerConnector:
             )
             rows = routed_experts[start : end - rejected]
             if (run := pending.runs.get(request_id)) is not None:
-                run.add(token_start, rows)
+                assert pending.input_ids is not None
+                run.add(token_start, rows, pending.input_ids[start : end - rejected])
                 objects.extend(run.take_ready())
                 continue
 
