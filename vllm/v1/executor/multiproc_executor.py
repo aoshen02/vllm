@@ -159,6 +159,7 @@ class MultiprocExecutor(Executor):
         # and ensure workers will be terminated.
         self._finalizer = weakref.finalize(self, self.shutdown)
         self.is_failed = False
+        self._next_rpc_id = 0
         self.failure_callback: FailureCallback | None = None
 
         tp_size, pp_size, pcp_size = self._get_parallel_sizes()
@@ -514,7 +515,9 @@ class MultiprocExecutor(Executor):
             send_method = method
         else:
             send_method = cloudpickle.dumps(method, protocol=pickle.HIGHEST_PROTOCOL)
-        self.rpc_broadcast_mq.enqueue((send_method, args, kwargs, output_rank))
+        call_id = getattr(self, "_next_rpc_id", 0) + 1
+        self._next_rpc_id = call_id
+        self.rpc_broadcast_mq.enqueue((call_id, send_method, args, kwargs, output_rank))
 
         response_mqs: Sequence[MessageQueue] = self.response_mqs
         if output_rank is not None:
@@ -523,39 +526,61 @@ class MultiprocExecutor(Executor):
         def get_response():
             responses = []
             has_failure = False
+            first_error: RuntimeError | None = None
+            enable_ft = self.vllm_config.parallel_config.enable_fault_tolerance
 
             for mq in response_mqs:
-                dequeue_timeout = (
-                    None if deadline is None else max(0.0, deadline - time.monotonic())
-                )
-                try:
-                    status, result = mq.dequeue(timeout=dequeue_timeout)
-                except TimeoutError as e:
-                    raise TimeoutError(f"RPC call to {method} timed out.") from e
+                while True:
+                    dequeue_timeout = (
+                        None
+                        if deadline is None
+                        else max(0.0, deadline - time.monotonic())
+                    )
+                    try:
+                        resp_call_id, status, result = mq.dequeue(
+                            timeout=dequeue_timeout
+                        )
+                    except TimeoutError as e:
+                        raise TimeoutError(f"RPC call to {method} timed out.") from e
+                    if resp_call_id < call_id:
+                        logger.debug(
+                            "Discarding stale RPC response "
+                            "(call_id=%d < expected=%d) for method %s",
+                            resp_call_id,
+                            call_id,
+                            method,
+                        )
+                        continue
+                    break
 
                 if status == WorkerProc.ResponseStatus.FAILURE_WITH_KV_OUTPUT:
-                    if (
-                        not self.vllm_config.parallel_config.enable_fault_tolerance
-                        or self.is_failed
-                    ):
-                        raise RuntimeError("Worker failed with KV connector output")
+                    err = RuntimeError("Worker failed with KV connector output")
+                    if self.is_failed:
+                        raise err
                     has_failure = True
-                    assert isinstance(result, KVConnectorOutput)
-                    responses.append(result)
+                    if first_error is None:
+                        first_error = err
+                    if enable_ft:
+                        assert isinstance(result, KVConnectorOutput)
+                        responses.append(result)
                 elif status != WorkerProc.ResponseStatus.SUCCESS:
-                    if (
-                        not self.vllm_config.parallel_config.enable_fault_tolerance
-                        or self.is_failed
-                    ):
-                        raise RuntimeError(
-                            f"Worker failed with error '{result}', please check the"
-                            " stack trace above for the root cause"
-                        )
+                    err = RuntimeError(
+                        f"Worker failed with error '{result}', please check the"
+                        " stack trace above for the root cause"
+                    )
+                    if self.is_failed:
+                        raise err
                     has_failure = True
+                    if first_error is None:
+                        first_error = err
                 else:
                     responses.append(result)
 
             if has_failure:
+                if not enable_ft:
+                    assert first_error is not None
+                    raise first_error
+
                 kv_connector_outputs: list[KVConnectorOutput | None] = []
                 for resp in responses:
                     if isinstance(resp, KVConnectorOutput):
@@ -1130,7 +1155,7 @@ class WorkerProc:
         FAILURE = auto()
         FAILURE_WITH_KV_OUTPUT = auto()
 
-    def enqueue_output(self, output: Any):
+    def enqueue_output(self, output: Any, call_id: int = 0):
         """Prepares output from the worker and enqueues it to the
         worker_response_mq. If the output is an Exception, it is
         converted to a FAILURE response.
@@ -1150,26 +1175,27 @@ class WorkerProc:
                     output = e
 
         if isinstance(output, ExceptionWithKVConnectorOutput):
-            result: tuple[WorkerProc.ResponseStatus, Any] = (
+            result: tuple[int, WorkerProc.ResponseStatus, Any] = (
+                call_id,
                 WorkerProc.ResponseStatus.FAILURE_WITH_KV_OUTPUT,
                 output.kv_connector_output,
             )
         elif isinstance(output, Exception):
-            result = (WorkerProc.ResponseStatus.FAILURE, str(output))
+            result = (call_id, WorkerProc.ResponseStatus.FAILURE, str(output))
         else:
-            result = (WorkerProc.ResponseStatus.SUCCESS, output)
+            result = (call_id, WorkerProc.ResponseStatus.SUCCESS, output)
         if (response_mq := self.worker_response_mq) is not None:
             response_mq.enqueue(result)
 
-    def handle_output(self, output: Any):
+    def handle_output(self, output: Any, call_id: int = 0):
         """Handles output from the worker. If async scheduling is enabled,
         it is passed to the async_output_busy_loop thread. Otherwise, it is
         enqueued directly to the worker_response_mq.
         """
         if self.use_async_scheduling:
-            self.async_output_queue.put(output)
+            self.async_output_queue.put((call_id, output))
         else:
-            self.enqueue_output(output)
+            self.enqueue_output(output, call_id)
 
     def async_output_busy_loop(self):
         """Entrypoint for the thread which handles outputs asynchronously."""
@@ -1185,8 +1211,8 @@ class WorkerProc:
             current_platform.set_device(self.worker.device)
 
         while True:
-            output = self.async_output_queue.get()
-            self.enqueue_output(output)
+            call_id, output = self.async_output_queue.get()
+            self.enqueue_output(output, call_id)
 
     def worker_busy_loop(self):
         """Main busy loop for Multiprocessing Workers."""
@@ -1199,10 +1225,12 @@ class WorkerProc:
 
     def _execute_worker_rpc(
         self,
-        rpc_request: tuple[str | bytes, tuple[Any, ...], dict[str, Any], int | None],
+        rpc_request: tuple[
+            int, str | bytes, tuple[Any, ...], dict[str, Any], int | None
+        ],
     ) -> None:
         """Execute one RPC in a separate frame from the dequeue loop."""
-        method, args, kwargs, output_rank = rpc_request
+        call_id, method, args, kwargs, output_rank = rpc_request
         try:
             if isinstance(method, str):
                 func = getattr(self.worker, method)
@@ -1218,7 +1246,7 @@ class WorkerProc:
             watchdog.feed()
 
             if output_rank is None or self.rank == output_rank:
-                self.handle_output(output)
+                self.handle_output(output, call_id)
         except Exception as e:
             # Notes have been introduced in python 3.11
             if hasattr(e, "add_note"):
@@ -1227,7 +1255,7 @@ class WorkerProc:
             # enqueue_output converts the exception to a FAILURE response
             # containing its string representation before transport.
             if output_rank is None or self.rank == output_rank:
-                self.handle_output(e)
+                self.handle_output(e, call_id)
 
     @staticmethod
     def setup_proc_title_and_log_prefix(enable_ep: bool) -> None:
