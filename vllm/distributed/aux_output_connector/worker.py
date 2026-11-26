@@ -24,6 +24,7 @@ from vllm.distributed.aux_output_connector.object_store import (
     AuxObjects,
     AuxObjectWriter,
     create_aux_object_store,
+    mm_embeds_fields,
 )
 from vllm.distributed.aux_output_connector.routed_experts import (
     RoutedExpertsBuffer,
@@ -36,15 +37,92 @@ from vllm.distributed.aux_output_connector.store import (
     BlockObjectStore,
 )
 from vllm.distributed.parallel_state import get_tp_group
+from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
     RoutedExpertsCapturer,
     bind_routed_experts_capturer,
 )
 from vllm.utils.math_utils import cdiv, round_up
 
+logger = init_logger(__name__)
+
 if TYPE_CHECKING:
     from vllm.v1.kv_cache_interface import KVCacheConfig
     from vllm.v1.worker.gpu.input_batch import InputBatch
+    from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
+
+
+@dataclass(slots=True)
+class _MmEmbedsCopy:
+    """A host copy of an encoder output, ready once `event` completes."""
+
+    key: str
+    host: torch.Tensor
+    event: torch.cuda.Event | None
+
+    def to_object(self) -> tuple[str, dict[str, np.ndarray]]:
+        if self.event is not None:
+            self.event.synchronize()
+        return self.key, mm_embeds_fields(self.host)
+
+
+class _MmEmbeds:
+    """Copies the encoder outputs a step consumes to the host, on a side
+    stream, for the step's objects."""
+
+    def __init__(self) -> None:
+        self.writes: list[tuple[str, str]] = []
+        self.copies: list[_MmEmbedsCopy] = []
+        self._stream: torch.cuda.Stream | None = None
+
+    def begin_step(self, writes: list[tuple[str, str]] | None) -> AuxObjects:
+        """Take the step's writes; return the objects of copies no step
+        output took."""
+        objects = [copy.to_object() for copy in self.take_copies()]
+        self.writes.extend(writes or ())
+        return objects
+
+    def take_copies(self) -> list[_MmEmbedsCopy]:
+        copies, self.copies = self.copies, []
+        return copies
+
+    def copy(self, encoder_outputs: dict[str, torch.Tensor]) -> None:
+        for key, identifier in self.writes:
+            if (tensor := encoder_outputs.get(identifier)) is None:
+                logger.error(
+                    "Encoder output %s of object %r is gone; not written.",
+                    identifier,
+                    key,
+                )
+                continue
+            event = None
+            if tensor.is_cuda:
+                if self._stream is None:
+                    self._stream = torch.cuda.Stream(tensor.device)
+                stream = self._stream
+                stream.wait_stream(torch.cuda.current_stream(tensor.device))
+                with torch.cuda.stream(stream):
+                    host = torch.empty(
+                        tensor.shape, dtype=tensor.dtype, pin_memory=True
+                    )
+                    host.copy_(tensor, non_blocking=True)
+                    event = torch.cuda.Event()
+                    event.record(stream)
+                tensor.record_stream(stream)
+            else:
+                host = tensor.clone()
+            self.copies.append(_MmEmbedsCopy(key, host, event))
+        self.writes = []
+
+
+def copy_aux_mm_embeds(
+    connector: AuxOutputWorkerConnector | None, encoder_cache: EncoderCache | None
+) -> None:
+    """Copy the encoder outputs this step writes as objects; call once the
+    step's encoder outputs are in `encoder_cache`."""
+    if connector is not None and connector._mm is not None:
+        assert encoder_cache is not None
+        connector._mm.copy(encoder_cache.encoder_outputs)
 
 
 @dataclass(slots=True)
@@ -148,6 +226,7 @@ class PendingAuxOutput:
     num_sampled: np.ndarray | None = None
     num_rejected: np.ndarray | None = None
     runs: dict[str, _ObjectRun] = field(default_factory=dict)
+    mm_copies: list[_MmEmbedsCopy] = field(default_factory=list)
 
     def enqueue_cpu_copy(
         self, num_sampled: np.ndarray, num_rejected: np.ndarray
@@ -165,6 +244,9 @@ class PendingAuxOutput:
 
 class AuxOutputWorkerConnector:
     """Own capture, request tails, and backend resources on the output worker."""
+
+    # Encoder-output objects, on the rank that writes objects.
+    _mm: _MmEmbeds | None = None
 
     def __init__(
         self,
@@ -225,6 +307,8 @@ class AuxOutputWorkerConnector:
                 ),
                 timeout_s=object_put_timeout_s(),
             )
+            if config.enable_return_mm_embeds:
+                self._mm = _MmEmbeds()
 
     def prepare_output(self, input_batch: InputBatch) -> PendingAuxOutput | None:
         """Snapshot one step's R3 tensor for asynchronous CPU transfer."""
@@ -251,6 +335,8 @@ class AuxOutputWorkerConnector:
                 state.pending_outputs += 1
                 if state.run is not None:
                     pending_output.runs[request_id] = state.run
+            if self._mm is not None:
+                pending_output.mm_copies = self._mm.take_copies()
         return pending_output
 
     def process_output(self, pending: PendingAuxOutput) -> dict[str, AuxRequestOutput]:
@@ -362,6 +448,7 @@ class AuxOutputWorkerConnector:
                 else:
                     materialize_outputs.append((request_id, emit_start, token_end))
 
+        objects.extend(copy.to_object() for copy in pending.mm_copies)
         self._put_objects(objects)
         # A consumer may reuse a block produced earlier in the same batch.
         self._publish_blocks(block_batches)
@@ -460,6 +547,8 @@ class AuxOutputWorkerConnector:
         )
         with self._lock:
             objects: AuxObjects = []
+            if self._mm is not None:
+                objects.extend(self._mm.begin_step(metadata.mm_embed_writes))
             for request_id, writes in (metadata.object_writes or {}).items():
                 run = self._requests[request_id].run
                 assert run is not None

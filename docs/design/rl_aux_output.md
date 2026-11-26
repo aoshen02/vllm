@@ -68,6 +68,18 @@ An object is a safetensors file with one array, `routed_experts`, of the inline 
 
 **Writer.** The first TP rank writes from a background thread. The worker queues the writes due at the start of a step and those of a step's output as one batch each. Every batch must be written within 80% of `VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS` of being queued; for a store that offloads to slow SSD, raise that timeout. A put the store refuses is retried until then; a put that fails otherwise is dropped at once. A batch not written by its deadline is dropped and logged: its keys stay listed and read as missing, and nothing else changes (later objects of the same namespaces and all other objects are written as before). The queue holds 256 batches; a step that finds it full waits until a batch lands or misses its deadline, and a batch queued behind one past its deadline is dropped at once, so a step waits at most one deadline.
 
+## Encoder outputs
+
+With `enable_return_mm_embeds`, the engine also delivers the encoder output of every multimodal item a namespace request consumes, so that a trainer whose vision tower is frozen can feed it to the language model instead of running its own encoder. The object holds what the encoder cache holds and the language model consumes. For Qwen3-VL that is `[image tokens, 4 × out_hidden_size]`: the merger output followed by the three deepstack merger outputs, the Hugging Face `pooler_output` and `deepstack_features` concatenated (16 KiB per image token and 16 MiB for a 1024×1024 image on Qwen3-VL-30B-A3B, which store requirement 6 must count).
+
+| Object | Key | Holds |
+| --- | --- | --- |
+| Encoder output | `<object_key_prefix>/<aux_namespace>/mm-<identifier>` | one array `mm_embeds.<torch dtype>`, the bits of the output, as numpy has no bfloat16; `read_aux_mm_embeds` returns the tensor |
+
+`identifier` is the item's encoder-cache identifier, its content hash, or the SHA-256 of it when it is not a key segment. The listing appends `[key, offset, offset + length]`, the item's placeholder, for each item whose placeholder ends after `aux_prompt_start`, in prompt order, after the routed-experts entries; `is_mm_embeds_key` tells the two apart. The object has one row per placeholder position that takes an embedding, every position for an image.
+
+An item is written once per namespace, in the step whose positions first overlap its placeholder: that step holds its encoder output, computed then or found in the encoder cache. An item a prefix-cache hit covers is listed without a write, since only a request of the namespace can have computed the KV, and it wrote the item. The worker copies the output to pinned host memory on a side stream after the step's encoder run and writes it with the step's other objects, under the writer rules above. The output depends only on the item and the vision weights, so preemption, failed loads and recomputation leave the object as written. Another computation of the item keeps the first copy, which is identical under batch invariance, vision attention included. The objects carry the vision weights of their write: the feature is meant for a vision tower the trainer keeps frozen.
+
 ## Hits, replicas and weight updates
 
 A request with a namespace may hit up to the last span boundary below its last token, from the GPU prefix cache or any KV connector keyed by vLLM's block hashes (offloading, simple CPU, HiSparse, Mooncake store, and the multi connector over them). An external hit is used only if it ends on a span boundary within the hashed blocks. A connector that loads the whole prompt asynchronously is the exception to the first rule: the request computes its last prompt position again, and its run starts after the hit, so the hit's objects are listed and that position's rows are not written again.
@@ -127,6 +139,7 @@ On Mooncake: `"mode": "standalone-store"`, with a master and pool of its own, ne
 | --- | --- |
 | `enable_return_routed_experts` | Capture routed experts. Required by `object_key_prefix`. |
 | `object_key_prefix` | Enables namespaces. Non-empty, without `/`; the first segment of every key. |
+| `enable_return_mm_embeds` | Deliver the encoder outputs of namespace requests ([encoder outputs](#encoder-outputs)). Requires `enable_return_routed_experts` and `object_key_prefix`. |
 | `object_store` | `"mooncake"` (default), or the qualified name of a class implementing `AuxObjectStore`, `create` included ([the store](#the-store)). |
 | `object_store_extra_config` | Keyword arguments of the store's `create`. Mooncake: `"config_path"`, its configuration file (default `MOONCAKE_CONFIG_PATH`); `"hard_pin"`, pin objects in memory (default `false`). |
 

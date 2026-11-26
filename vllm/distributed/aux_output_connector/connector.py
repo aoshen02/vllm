@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import uuid
 from collections import OrderedDict
 from collections.abc import Callable, Iterable, Iterator, Sequence
@@ -12,11 +13,13 @@ from itertools import chain, islice
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
+import regex as re
 
 import vllm.envs as envs
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
     get_routed_experts_bytes_per_token,
 )
+from vllm.multimodal.utils import get_mm_features_in_window
 from vllm.utils.math_utils import cdiv, round_up
 from vllm.v1.core.kv_cache_utils import (
     maybe_convert_block_hash,
@@ -82,9 +85,14 @@ def retained_objects(
     return num_blocks * (block_size // hash_block_size), hash_block_size
 
 
+_MAX_MM_WRITTEN = 1 << 16
+_SAFE_IDENTIFIER = re.compile(r"[A-Za-z0-9._:-]+")
+
 AuxObject = tuple[str, int, int]
 """`(key, start, end)`: positions `[start, end)` are the first `end - start`
-rows of the object `key`, whose first position is `start`."""
+rows of the object `key`, whose first position is `start`. An encoder-output
+object (`is_mm_embeds_key`) holds the rows of the positions of the item's
+placeholder `[start, end)` that take an embedding."""
 
 
 @dataclass(slots=True)
@@ -113,6 +121,9 @@ class AuxOutputConnectorMetadata:
     object_writes: dict[str, list[AuxObject]] | None = None
     # Positions per object.
     object_block_size: int = 0
+    # `(key, identifier)`: write the encoder output `identifier`, which this
+    # step consumes, as the object `key`.
+    mm_embed_writes: list[tuple[str, str]] | None = None
 
 
 @dataclass(slots=True)
@@ -133,6 +144,9 @@ class _NamespaceRequest:
     computed: int = 0
     running: bool = False
     in_worker: bool = False
+    # Leading multimodal items whose encoder output is written: the items
+    # before the furthest position scheduled.
+    mm_items: int = 0
 
 
 class AuxOutputSchedulerConnector:
@@ -143,6 +157,7 @@ class AuxOutputSchedulerConnector:
         kv_cache_manager: KVCacheManager,
         num_objects: int,
         key_prefix: str | None = None,
+        mm_embeds: bool = False,
     ) -> None:
         # Number of hashes already sent to the worker for each active request.
         self._sent_hash_counts: dict[str, int] = {}
@@ -187,6 +202,10 @@ class AuxOutputSchedulerConnector:
         self._namespaces: dict[str, _NamespaceRequest] = {}
         self._runs: list[str] = []
         self._writes: dict[str, list[AuxObject]] = {}
+        # Encoder-output objects written by this engine, most recent last.
+        self._mm_embeds = mm_embeds and key_prefix is not None
+        self._mm_written: OrderedDict[str, None] = OrderedDict()
+        self._mm_writes: list[tuple[str, str]] = []
 
     def build_connector_meta(
         self,
@@ -200,6 +219,8 @@ class AuxOutputSchedulerConnector:
             request = requests[request_id]
             if (namespace := self._namespace(request)) is not None:
                 self._run_namespace(request, namespace)
+                if self._mm_embeds:
+                    self._write_mm_embeds(request, num_tokens)
                 continue
             self._sent_hash_counts.setdefault(request_id, 0)
             self._computed_from.setdefault(request_id, request.num_computed_tokens)
@@ -261,9 +282,10 @@ class AuxOutputSchedulerConnector:
             self._runs or None,
             self._writes or None,
             self._object_size,
+            self._mm_writes or None,
         )
         self._retained_hashes, self._released_hashes = [], []
-        self._runs, self._writes = [], {}
+        self._runs, self._writes, self._mm_writes = [], {}, []
         return metadata
 
     def _namespace(self, request: Request) -> str | None:
@@ -292,6 +314,46 @@ class AuxOutputSchedulerConnector:
             request.num_computed_tokens, self._object_size
         )
         self._runs.append(request.request_id)
+
+    def _write_mm_embeds(self, request: Request, num_tokens: int) -> None:
+        """Write the encoder outputs of the multimodal items whose positions
+        this step computes; the worker holds them during the step. The items
+        before the step's positions were computed by requests of the
+        namespace, as the namespace salts every hit, which wrote them."""
+        state = self._namespaces[request.request_id]
+        lo, hi = get_mm_features_in_window(
+            request.mm_features,
+            request.num_computed_tokens,
+            request.num_computed_tokens + num_tokens,
+        )
+        for feature in request.mm_features[lo:hi]:
+            key = self._mm_key(state, feature.identifier)
+            if key in self._mm_written:
+                self._mm_written.move_to_end(key)
+                continue
+            self._mm_written[key] = None
+            if len(self._mm_written) > _MAX_MM_WRITTEN:
+                # Writing an object again keeps the first copy.
+                self._mm_written.popitem(last=False)
+            self._mm_writes.append((key, feature.identifier))
+        state.mm_items = max(state.mm_items, hi)
+
+    def _mm_key(self, state: _NamespaceRequest, identifier: str) -> str:
+        if not _SAFE_IDENTIFIER.fullmatch(identifier):
+            identifier = hashlib.sha256(identifier.encode()).hexdigest()
+        return f"{self._key_prefix}/{state.namespace}/mm-{identifier}"
+
+    def _mm_listing(self, state: _NamespaceRequest) -> list[AuxObject]:
+        """`(key, offset, offset + length)` of the written items whose
+        placeholder ends after the request's prompt start."""
+        listing = []
+        for feature in state.request.mm_features[: state.mm_items]:
+            position = feature.mm_position
+            end = position.offset + position.length
+            if end > state.prompt_start:
+                key = self._mm_key(state, feature.identifier)
+                listing.append((key, position.offset, end))
+        return listing
 
     def _object_key(self, state: _NamespaceRequest, start: int) -> str:
         block_hash = state.request.block_hashes[
@@ -550,6 +612,8 @@ class AuxOutputSchedulerConnector:
             end = state.computed
             limit = min(state.computed, request.num_tokens - 1)
         listing = self._end_run(state, end, limit, tail)
+        if self._mm_embeds:
+            listing += self._mm_listing(state)
         aborted = request.status == RequestStatus.FINISHED_ABORTED
         request.aux_objects = None if aborted and not listing else listing
 
@@ -587,3 +651,4 @@ class AuxOutputSchedulerConnector:
         self._released_hashes.extend(chain.from_iterable(self._kv_cached.values()))
         self._kv_cached.clear()
         self._rowless.clear()
+        self._mm_written.clear()
