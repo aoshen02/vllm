@@ -257,7 +257,7 @@ def test_non_output_rank_skips_capture_snapshot():
     worker._store = None
     worker._buffer = None
     worker._capturer = Mock()
-    worker._step_metadata = Mock()
+    worker._step_metadata = AuxOutputConnectorMetadata(0, {}, {}, ())
     assert worker.prepare_output(_input_batch([], np.array([]), np.array([]))) is None
     worker._capturer.snapshot_routing_data.assert_not_called()
 

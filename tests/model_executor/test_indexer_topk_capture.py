@@ -6,7 +6,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from vllm.distributed.aux_output_connector.fields import AuxFieldCapturer
+from vllm.distributed.aux_output_connector.fields import (
+    AuxFieldCapturer,
+    topk_logprobs,
+)
 from vllm.model_executor.layers.indexer_topk_capturer import (
     bind_indexer_topk_capturer,
 )
@@ -71,9 +74,23 @@ def test_field_capturer_snapshots_every_enabled_field():
     model[0].topk_indices_buffer[:3] = torch.tensor([[1, 2], [3, 4], [5, 6]])
     model[0].topk_capture_fn(3)
     hidden_states = torch.tensor([[0.5, -1.0], [2.0, 3.0]], dtype=torch.bfloat16)
-    snapshot = capturer.snapshot(hidden_states)
+    snapshot = capturer.snapshot(hidden_states, compute_logits=None)
     assert snapshot.keys() == {"indexer_topk", "hidden_states"}
     assert snapshot["indexer_topk"].tolist() == [[[1, 2]], [[3, 4]]]
     # NumPy has no bfloat16: hidden states keep their bit patterns as int16.
     assert snapshot["hidden_states"].dtype == torch.int16
     assert torch.equal(snapshot["hidden_states"].view(torch.bfloat16), hidden_states)
+
+
+@pytest.mark.parametrize("chunk_size", [1, 2, 8], ids=["chunk-1", "chunk-2", "whole"])
+def test_topk_logprobs_of_every_row(chunk_size):
+    # Rows go through the logits in chunks; a rank that does not receive the
+    # logits gets nothing.
+    weight = torch.tensor([[1.0, 0.0, -1.0, 2.0], [0.0, 3.0, 1.0, -2.0]])
+    hidden_states = torch.tensor([[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]])
+    topk = topk_logprobs(hidden_states, lambda rows: rows @ weight, 2, chunk_size)
+    expected = torch.log_softmax(hidden_states @ weight, dim=-1).topk(2, dim=-1)
+    assert topk["topk_token_ids"].dtype == torch.int32
+    assert topk["topk_token_ids"].tolist() == [[3, 0], [1, 2], [1, 0]]
+    assert torch.equal(topk["topk_logprobs"], expected.values)
+    assert topk_logprobs(hidden_states, lambda rows: None, 2) == {}

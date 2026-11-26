@@ -146,6 +146,16 @@ def _hidden_states(routing):
     return routing.reshape(len(routing), -1).to(torch.bfloat16)
 
 
+def _logits(hidden_states):
+    weight = torch.arange(6 * 32, dtype=torch.float32).reshape(6, 32) % 7 - 3
+    return hidden_states.float() @ weight
+
+
+def _topk(routed_experts):
+    logits = _logits(_hidden_states(torch.from_numpy(routed_experts)))
+    return torch.log_softmax(logits, dim=-1).topk(3, dim=-1)
+
+
 def _tag(row):
     return (
         int(row[0, 0]),
@@ -353,7 +363,7 @@ class _Engine:
             routing = torch.from_numpy(np.concatenate(rows))
             self.worker._capturer.snapshot_routing_data.return_value = routing
             pending = self.worker.prepare_output(
-                _input_batch(ids, starts, counts), _hidden_states(routing)
+                _input_batch(ids, starts, counts), _hidden_states(routing), _logits
             )
         self._in_flight[id(scheduler_output)] = (
             step,
@@ -1611,6 +1621,10 @@ _FIELD_ROWS = {
     "hidden_states": lambda routed_experts: (
         _hidden_states(torch.from_numpy(routed_experts)).view(torch.int16).numpy()
     ),
+    "topk_logprobs": lambda routed_experts: _topk(routed_experts).values.numpy(),
+    "topk_token_ids": lambda routed_experts: (
+        _topk(routed_experts).indices.to(torch.int32).numpy()
+    ),
 }
 
 
@@ -1621,7 +1635,10 @@ class _FieldCapturer(AuxFieldCapturer):
 
     def __init__(self, worker):
         super().__init__(
-            torch.nn.Module(), _capturer_config(aux_fields={"hidden_states"})
+            torch.nn.Module(),
+            _capturer_config(
+                aux_fields={"hidden_states", "topk_logprobs"}, return_topk_logprobs=3
+            ),
         )
         routing = worker._capturer.snapshot_routing_data
         self._snapshots["indexer_topk"] = lambda rows: torch.from_numpy(
