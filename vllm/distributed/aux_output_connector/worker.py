@@ -256,7 +256,7 @@ class AuxOutputWorkerConnector:
             teardown = []
             release_keys: list[str] = []
             try:
-                outputs = self._commit_output(pending)
+                outputs, objects = self._commit_output(pending)
             finally:
                 self._pending_outputs.remove(pending)
                 for request_id in pending.request_ids:
@@ -269,9 +269,13 @@ class AuxOutputWorkerConnector:
             if teardown:
                 self._publish_blocks([], release_keys=release_keys)
                 self._teardown(teardown)
-            return outputs
+            writer = self._writer
+        self._put_objects(writer, objects)
+        return outputs
 
-    def _commit_output(self, pending: PendingAuxOutput) -> dict[str, AuxRequestOutput]:
+    def _commit_output(
+        self, pending: PendingAuxOutput
+    ) -> tuple[dict[str, AuxRequestOutput], AuxObjects]:
         buffer = self._buffer
         store = self._store
         assert buffer is not None and store is not None
@@ -357,7 +361,6 @@ class AuxOutputWorkerConnector:
                 else:
                     materialize_outputs.append((request_id, emit_start, token_end))
 
-        self._put_objects(objects)
         # A consumer may reuse a block produced earlier in the same batch.
         self._publish_blocks(block_batches)
 
@@ -387,7 +390,7 @@ class AuxOutputWorkerConnector:
                 )
             outputs[request_id] = AuxRequestOutput(emit_start, rows)
             state.emit_cursor = token_end
-        return outputs
+        return outputs, objects
 
     def _publish_blocks(
         self,
@@ -422,11 +425,13 @@ class AuxOutputWorkerConnector:
             for _, rows in blocks:
                 buffer.release_block(rows)
 
-    def _put_objects(self, objects: AuxObjects) -> None:
-        """One put per step, so a step waits for the writer at most once."""
+    @staticmethod
+    def _put_objects(writer: AuxObjectWriter | None, objects: AuxObjects) -> None:
+        """One put per step, so a step waits for the writer at most once.
+        Called without the lock: a full writer queue blocks only this thread."""
         if objects:
-            assert self._writer is not None
-            self._writer.put(objects)
+            assert writer is not None
+            writer.put(objects)
 
     def _teardown(self, request_ids: Iterable[str]) -> None:
         """Drop finished requests' temporary state after publishing key releases."""
@@ -460,7 +465,6 @@ class AuxOutputWorkerConnector:
                 assert run is not None
                 run.writes.extend(writes)
                 objects.extend(run.take_ready())
-            self._put_objects(objects)
             namespace = str(self._generation)
             hashes = metadata.retained_block_hashes or ()
             retained_keys = routed_experts_keys(hashes, namespace)
@@ -512,6 +516,8 @@ class AuxOutputWorkerConnector:
                 release_keys.extend(reversed(state.aux_output_keys))
             self._publish_blocks(block_batches, retained_keys, release_keys)
             self._teardown(finished_now)
+            writer = self._writer
+        self._put_objects(writer, objects)
 
     def close(self) -> None:
         with self._lock:
