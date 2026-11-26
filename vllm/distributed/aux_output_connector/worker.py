@@ -247,8 +247,11 @@ class AuxOutputWorkerConnector:
                 timeout_s=object_put_timeout_s(),
             )
 
-    def prepare_output(self, input_batch: InputBatch) -> PendingAuxOutput | None:
-        """Snapshot one step's R3 tensor for asynchronous CPU transfer."""
+    def prepare_output(
+        self, input_batch: InputBatch, hidden_states: torch.Tensor | None = None
+    ) -> PendingAuxOutput | None:
+        """Snapshot one step's R3 tensor and enabled fields, given its LM-head
+        inputs `hidden_states`, for asynchronous CPU transfer."""
         if self._buffer is None or self._step_metadata is None:
             return None
 
@@ -263,7 +266,10 @@ class AuxOutputWorkerConnector:
             routed_experts_gpu=self._capturer.snapshot_routing_data(num_rows),
         )
         if self._step_metadata.has_namespace_requests:
-            pending_output.fields_gpu = self._field_capturer.snapshot(num_rows)
+            assert hidden_states is not None
+            pending_output.fields_gpu = self._field_capturer.snapshot(
+                hidden_states[:num_rows]
+            )
         with self._lock:
             assert len(self._pending_outputs) < self._max_concurrent_batches, (
                 "auxiliary output step outputs are not consumed in order"
