@@ -113,6 +113,7 @@ class AuxOutputConnectorMetadata:
     object_writes: dict[str, list[AuxObject]] | None = None
     # Positions per object.
     object_block_size: int = 0
+    has_namespace_requests: bool = False
 
 
 @dataclass(slots=True)
@@ -196,10 +197,12 @@ class AuxOutputSchedulerConnector:
         """Build one step's incremental worker metadata."""
         scheduled_requests: dict[str, int] = {}
         block_hashes_by_request: dict[str, PackedBlockHashes] = {}
+        has_namespace_requests = False
         for request_id, num_tokens in scheduler_output.num_scheduled_tokens.items():
             request = requests[request_id]
             if (namespace := self._namespace(request)) is not None:
                 self._run_namespace(request, namespace)
+                has_namespace_requests = True
                 continue
             self._sent_hash_counts.setdefault(request_id, 0)
             self._computed_from.setdefault(request_id, request.num_computed_tokens)
@@ -220,7 +223,9 @@ class AuxOutputSchedulerConnector:
                 packed = self._take_new_hashes(request, request.num_computed_tokens)
                 if packed is not None:
                     block_hashes_by_request[request_id] = packed
-        return self._take_metadata(scheduled_requests, block_hashes_by_request)
+        metadata = self._take_metadata(scheduled_requests, block_hashes_by_request)
+        metadata.has_namespace_requests = has_namespace_requests
+        return metadata
 
     def flush_metadata(self) -> AuxOutputConnectorMetadata | None:
         """Metadata that hands the worker the writes due when the engine

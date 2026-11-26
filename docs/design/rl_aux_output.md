@@ -56,7 +56,13 @@ The final output of a request that stops or is aborted (the last chunk when stre
 | Full | `<object_key_prefix>/<aux_namespace>/<hash of the span's last hash block, hex>` | the rows of one span |
 | Tail | `<object_key_prefix>/<aux_namespace>/tail-<UUID4 hex>` | the rows of the positions after the last full object a request lists |
 
-An object is a safetensors file with one array, `routed_experts`, of the inline rows' layout: `[positions, layer visits, experts per token]`, `uint8` up to 256 experts, else `uint16`. A tail's name is drawn at random when the engine lists it and carried by the listing; a name derived from the request id could repeat across retries or replicas.
+An object is a safetensors file with one array per field, each with one row per position. `routed_experts` has the inline rows' layout: `[positions, layer visits, experts per token]`, `uint8` up to 256 experts, else `uint16`. The objects of every namespace request also hold the fields that `AuxOutputConfig` enables:
+
+| Field | Enabled by | Row |
+| --- | --- | --- |
+| `indexer_topk` | `enable_return_indexer_topk` | int32 `[indexer layers, top-k]`: the positions each sparse-attention indexer layer selected, -1 padded |
+
+A tail's name is drawn at random when the engine lists it and carried by the listing; a name derived from the request id could repeat across retries or replicas.
 
 **Partial hash hits.** When a Mamba or linear-attention group with prefix caching has a block larger than the hash block, vLLM lets prefix-cache hits end inside a KV block. Objects then span one hash block (`--prefix-match-unit` when set, else the gcd of the prefix-cacheable groups' block sizes), so every hit ends on an object boundary. Otherwise an object spans one block of the anchor group (the full-attention group, else group 0), whatever the block sizes of the other groups.
 
