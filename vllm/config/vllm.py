@@ -1290,6 +1290,7 @@ class VllmConfig:
 
     def _verify_aux_output_compatibility(self) -> None:
         """Reject configurations unsupported by enabled auxiliary outputs."""
+        self.aux_output_config.verify_mm_embeds()
         if not self.aux_output_config.enabled:
             return
         if self.model_config.runner_type != "generate":

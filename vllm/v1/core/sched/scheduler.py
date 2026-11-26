@@ -500,6 +500,7 @@ class Scheduler(SchedulerInterface):
                 self.kv_cache_manager,
                 retained_objects(vllm_config, self.kv_cache_manager.kv_cache_config)[0],
                 vllm_config.aux_output_config.object_key_prefix,
+                vllm_config.aux_output_config.enable_return_mm_embeds,
             )
             if vllm_config.aux_output_config.enabled
             else None

@@ -15,6 +15,7 @@ from typing import Any, Protocol
 
 import numpy as np
 import regex as re
+import torch
 from safetensors.numpy import load, save
 
 from vllm.distributed.aux_output_connector.store import BlockObjectStoreError
@@ -160,16 +161,49 @@ def read_aux_rows(
     """Concatenate `field` of the objects `keys`; wait up to `timeout_s` in
     total for objects that are still being written."""
     deadline = time.monotonic() + timeout_s
-    parts = []
-    for key in keys:
-        while (data := store.get(key)) is None:
-            if time.monotonic() >= deadline:
-                raise BlockObjectStoreError(
-                    f"auxiliary-output object {key!r} is missing after {timeout_s}s"
-                )
-            time.sleep(0.05)
-        parts.append(load(data)[field])
+    parts = [load(_get(store, key, deadline, timeout_s))[field] for key in keys]
     return np.concatenate(parts) if parts else np.empty(0)
+
+
+def _get(store: AuxObjectStore, key: str, deadline: float, timeout_s: float) -> bytes:
+    while (data := store.get(key)) is None:
+        if time.monotonic() >= deadline:
+            raise BlockObjectStoreError(
+                f"auxiliary-output object {key!r} is missing after {timeout_s}s"
+            )
+        time.sleep(0.05)
+    return data
+
+
+_MM_EMBEDS_FIELD = "mm_embeds."
+_RAW_DTYPES = {1: "uint8", 2: "int16", 4: "int32", 8: "int64"}
+
+
+def is_mm_embeds_key(key: str) -> bool:
+    """Whether `key`, from an `aux_objects` listing, names an encoder output
+    rather than routed-experts rows."""
+    return key.rpartition("/")[2].startswith("mm-")
+
+
+def mm_embeds_fields(embeds: torch.Tensor) -> dict[str, np.ndarray]:
+    """The fields of an encoder-output object: the bits of `embeds` under
+    `mm_embeds.<torch dtype>`, as numpy has no bfloat16."""
+    raw = getattr(torch, _RAW_DTYPES[embeds.element_size()])
+    name = _MM_EMBEDS_FIELD + str(embeds.dtype).removeprefix("torch.")
+    return {name: embeds.contiguous().view(raw).numpy()}
+
+
+def read_aux_mm_embeds(
+    store: AuxObjectStore, key: str, timeout_s: float = 600.0
+) -> torch.Tensor:
+    """The encoder output written as the object `key`: one row per position
+    of the item's placeholder that takes an embedding, as the model's
+    encoder returns it (for Qwen3-VL, the merger output followed by the
+    deepstack merger outputs). Waits up to `timeout_s` for the object."""
+    fields = load(_get(store, key, time.monotonic() + timeout_s, timeout_s))
+    ((name, bits),) = fields.items()
+    dtype = getattr(torch, name.removeprefix(_MM_EMBEDS_FIELD))
+    return torch.from_numpy(bits).view(dtype)
 
 
 _RETRY_INTERVAL_S = 0.2

@@ -44,6 +44,7 @@ from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.config.compilation import CompilationMode, CUDAGraphMode
 from vllm.distributed.aux_output_connector.worker import (
     AuxOutputWorkerConnector,
+    copy_aux_mm_embeds,
     get_aux_output_connector,
 )
 from vllm.distributed.parallel_state import (
@@ -2120,6 +2121,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     inputs_embeds = self.model_state.prepare_inputs_embeds(
                         scheduled_encoder_inputs, input_batch, self.req_states
                     )
+                copy_aux_mm_embeds(self.aux_output_connector, self.encoder_cache)
             if inputs_embeds is not None and not requires_raw_input_tokens(self.model):
                 input_ids = None
 

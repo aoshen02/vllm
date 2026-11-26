@@ -82,7 +82,9 @@ class CompletionOutput:
         weight_versions: Contiguous weight version spans over output-token indexes.
             Set on the final output only.
         aux_objects: For an `aux_namespace` request, `(key, start, end)`: positions
-            `[start, end)` are the first rows of object `key`. Final output only.
+            `[start, end)` are the first rows of object `key`; with
+            `enable_return_mm_embeds`, followed by the encoder output of each
+            multimodal item, `[start, end)` its placeholder. Final output only.
 
     """
 
