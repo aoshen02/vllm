@@ -61,6 +61,7 @@ An object is a safetensors file with one array per field, each with one row per 
 | Field | Enabled by | Row |
 | --- | --- | --- |
 | `indexer_topk` | `enable_return_indexer_topk` | int32 `[indexer layers, top-k]`: the positions each sparse-attention indexer layer selected, -1 padded |
+| `hidden_states` | `enable_return_hidden_states` | `[hidden size]` in the model dtype, the input of the LM head; bfloat16 as int16 bit patterns, read back with `torch.from_numpy(rows).view(torch.bfloat16)` |
 
 A tail's name is drawn at random when the engine lists it and carried by the listing; a name derived from the request id could repeat across retries or replicas.
 

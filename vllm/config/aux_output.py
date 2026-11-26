@@ -20,6 +20,10 @@ class AuxOutputConfig:
     """Store the top-k positions each sparse-attention indexer layer selects
     in the objects of `SamplingParams.aux_namespace` requests."""
 
+    enable_return_hidden_states: bool = False
+    """Store the final hidden states, the input of the LM head, in the objects
+    of `SamplingParams.aux_namespace` requests."""
+
     max_bytes: int | None = Field(default=None, gt=0)
     """Initial capacity, or `None` to derive it from the KV cache capacity.
     Grows when every object is referenced."""
@@ -52,7 +56,10 @@ class AuxOutputConfig:
     def aux_fields(self) -> set[str]:
         """The auxiliary outputs that the objects of `aux_namespace` requests
         store besides the routed experts."""
-        enabled = {"indexer_topk": self.enable_return_indexer_topk}
+        enabled = {
+            "indexer_topk": self.enable_return_indexer_topk,
+            "hidden_states": self.enable_return_hidden_states,
+        }
         return {name for name, on in enabled.items() if on}
 
     def compile_factors(self) -> CompileFactors:
@@ -60,6 +67,7 @@ class AuxOutputConfig:
         `ignored_factors` if it does not affect the computation graph.
         """
         ignored_factors = {
+            "enable_return_hidden_states",
             "max_bytes",
             "object_key_prefix",
             "object_store",

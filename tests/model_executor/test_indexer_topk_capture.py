@@ -64,13 +64,16 @@ class TestIndexerTopkCapture:
 def test_field_capturer_snapshots_every_enabled_field():
     model = torch.nn.Sequential(FakeIndexer(0))
     config = SimpleNamespace(
-        aux_output_config=SimpleNamespace(aux_fields={"indexer_topk"}),
+        aux_output_config=SimpleNamespace(aux_fields={"indexer_topk", "hidden_states"}),
         scheduler_config=SimpleNamespace(max_num_batched_tokens=4),
     )
     capturer = AuxFieldCapturer(model, config)
     model[0].topk_indices_buffer[:3] = torch.tensor([[1, 2], [3, 4], [5, 6]])
     model[0].topk_capture_fn(3)
-    snapshot = capturer.snapshot(2)
-    assert {name: rows.tolist() for name, rows in snapshot.items()} == {
-        "indexer_topk": [[[1, 2]], [[3, 4]]]
-    }
+    hidden_states = torch.tensor([[0.5, -1.0], [2.0, 3.0]], dtype=torch.bfloat16)
+    snapshot = capturer.snapshot(hidden_states)
+    assert snapshot.keys() == {"indexer_topk", "hidden_states"}
+    assert snapshot["indexer_topk"].tolist() == [[[1, 2]], [[3, 4]]]
+    # NumPy has no bfloat16: hidden states keep their bit patterns as int16.
+    assert snapshot["hidden_states"].dtype == torch.int16
+    assert torch.equal(snapshot["hidden_states"].view(torch.bfloat16), hidden_states)

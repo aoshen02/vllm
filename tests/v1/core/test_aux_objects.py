@@ -111,7 +111,7 @@ def _requests(
 
 def _capturer_config(**aux_output_config):
     return SimpleNamespace(
-        aux_output_config=SimpleNamespace(aux_fields=set(), **aux_output_config),
+        aux_output_config=SimpleNamespace(**{"aux_fields": set(), **aux_output_config}),
         scheduler_config=SimpleNamespace(max_num_batched_tokens=0),
     )
 
@@ -140,6 +140,10 @@ def _input_batch(request_ids, starts, counts):
         num_computed_tokens_np=np.array(starts),
         query_start_loc_np=np.cumsum([0, *counts]),
     )
+
+
+def _hidden_states(routing):
+    return routing.reshape(len(routing), -1).to(torch.bfloat16)
 
 
 def _tag(row):
@@ -348,7 +352,9 @@ class _Engine:
         if ids:
             routing = torch.from_numpy(np.concatenate(rows))
             self.worker._capturer.snapshot_routing_data.return_value = routing
-            pending = self.worker.prepare_output(_input_batch(ids, starts, counts))
+            pending = self.worker.prepare_output(
+                _input_batch(ids, starts, counts), _hidden_states(routing)
+            )
         self._in_flight[id(scheduler_output)] = (
             step,
             version,
@@ -1600,18 +1606,25 @@ def _indexer_rows(routed_experts):
     return routed_experts.reshape(len(routed_experts), 2, 3).astype(np.int32) - 1
 
 
-_FIELD_ROWS = {"indexer_topk": _indexer_rows}
+_FIELD_ROWS = {
+    "indexer_topk": _indexer_rows,
+    "hidden_states": lambda routed_experts: (
+        _hidden_states(torch.from_numpy(routed_experts)).view(torch.int16).numpy()
+    ),
+}
 
 
 class _FieldCapturer(AuxFieldCapturer):
-    """The worker's field capturer, whose indexer top-k rows are the
-    routed-experts rows of the step, which tag the computation of each
-    position, in another shape and dtype."""
+    """The worker's field capturer on the hidden states the test engine
+    passes, the routed-experts rows of the step, which tag the computation of
+    each position; its indexer top-k rows are those rows in another shape."""
 
     def __init__(self, worker):
-        super().__init__(torch.nn.Module(), _capturer_config())
+        super().__init__(
+            torch.nn.Module(), _capturer_config(aux_fields={"hidden_states"})
+        )
         routing = worker._capturer.snapshot_routing_data
-        self._snapshots["indexer_topk"] = lambda num_rows: torch.from_numpy(
+        self._snapshots["indexer_topk"] = lambda rows: torch.from_numpy(
             _indexer_rows(routing.return_value.numpy())
         )
         self.num_snapshots = 0
