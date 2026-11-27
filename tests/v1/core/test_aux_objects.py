@@ -44,6 +44,7 @@ from vllm.distributed.aux_output_connector.worker import (
 )
 from vllm.sampling_params import SamplingParams
 from vllm.utils.hashing import sha256
+from vllm.utils.math_utils import cdiv
 from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler
@@ -79,6 +80,7 @@ def _requests(
     stop_token_ids=None,
     token=0,
     cache_salt=None,
+    kv_transfer_params=None,
 ):
     init_none_hash(sha256)
     prompt = prompt or [token] * num_tokens
@@ -90,6 +92,11 @@ def _requests(
             stop_token_ids=stop_token_ids,
             aux_namespace=namespace,
             aux_prompt_start=prompt_start,
+            extra_args=(
+                {"kv_transfer_params": dict(kv_transfer_params)}
+                if kv_transfer_params is not None
+                else None
+            ),
         )
         params.update_from_generation_config({}, EOS_TOKEN_ID)
         requests.append(
@@ -161,6 +168,7 @@ class _Engine:
         scheduler: Scheduler | None = None,
         kv_load_failure_policy: str = "recompute",
         drafts: int = 0,
+        store: Any = None,
         **kwargs: Any,
     ) -> None:
         if drafts:
@@ -175,7 +183,7 @@ class _Engine:
             _PREFIX,
         )
         scheduler.aux_output_connector = self.connector
-        self.client, self.store = fake_store()
+        self.client, self.store = store or fake_store()
         self.worker = _worker(self.store)
         begin_step = self.worker.begin_step
 
@@ -1460,6 +1468,166 @@ def test_external_hit_inside_a_kv_block_is_refused():
     # Past the hashed positions.
     assert engine.connector.cap_external_hit(request, 16, 32) == 0
     engine.worker.close()
+
+
+_TAIL = ["job/g/1/tail-0", 32, 40]
+
+
+@pytest.mark.parametrize(
+    "num_tokens,num_local,num_external,tail,expected",
+    [
+        (40, 0, 40, None, 0),
+        (40, 0, 40, _TAIL, 40),
+        (48, 0, 48, None, 48),
+        (40, 0, 39, _TAIL, 39),
+        (49, 0, 48, None, 48),
+        (40, 16, 24, _TAIL, 24),
+        (40, 0, 40, ["job/g/1/tail-0", 16, 40], 0),
+        (40, 0, 40, ["job/g/1/tail-0", 32, 38], 0),
+    ],
+    ids=[
+        "inside-a-span-without-a-tail",
+        "inside-a-span",
+        "on-a-span-boundary",
+        "backoff-inside-a-span",
+        "backoff-on-a-span-boundary",
+        "after-a-local-hit",
+        "tail-in-another-span",
+        "tail-short-of-the-hit",
+    ],
+)
+def test_remote_prefill_hit_inside_a_span_needs_the_prefillers_tail(
+    num_tokens, num_local, num_external, tail, expected
+):
+    engine = _Engine()
+    params = {"do_remote_prefill": True}
+    if tail is not None:
+        params["aux_tail"] = tail
+    (request,) = _requests(["r"], num_tokens, 1, kv_transfer_params=params)
+    assert engine.connector.cap_external_hit(request, num_local, num_external) == (
+        expected
+    )
+    engine.worker.close()
+
+
+@pytest.mark.parametrize(
+    "num_tokens,namespace,kv_transfer_params,tail",
+    [
+        (40, _NAMESPACE, {"do_remote_decode": True}, (32, 40)),
+        (48, _NAMESPACE, {"do_remote_decode": True}, None),
+        (40, None, {"do_remote_decode": True}, None),
+        (40, _NAMESPACE, None, None),
+    ],
+    ids=["inside-a-span", "on-a-span-boundary", "no-namespace", "no-remote-decoder"],
+)
+def test_prefill_for_a_remote_decoder_returns_its_tail(
+    num_tokens, namespace, kv_transfer_params, tail
+):
+    engine = _Engine(_connector_scheduler())
+    _add(
+        engine,
+        "r",
+        num_tokens,
+        1,
+        namespace=namespace,
+        kv_transfer_params=kv_transfer_params,
+    )
+    params = engine.run()["r"].kv_transfer_params
+    if tail is None:
+        assert not params or "aux_tail" not in params
+    else:
+        assert params["aux_tail"] == list(engine.listings["r"][-1])
+        assert tuple(params["aux_tail"][1:]) == tail
+    engine.close()
+
+
+def _remote_decoder(decoder, prefiller, backoff):
+    connector = decoder.scheduler.connector
+    loads = {}
+
+    def matched(request, num_computed_tokens):
+        num_remote = request.num_prompt_tokens - backoff - num_computed_tokens
+        loads[request.request_id] = num_computed_tokens
+        return max(num_remote, 0), num_remote > 0
+
+    def allocated(request, blocks, num_external_tokens):
+        first = loads.pop(request.request_id, 0)
+        if not num_external_tokens:
+            return
+        (block_ids,) = blocks.get_block_ids()
+        remote = prefiller.blocks[id(prefiller.requests[request.request_id])]
+        end = cdiv(first + num_external_tokens, _BLOCK)
+        for index in range(first // _BLOCK, end):
+            decoder.kv[block_ids[index]] = list(prefiller.kv[remote[index]])
+        decoder._recving.add(request.request_id)
+
+    connector.get_num_new_matched_tokens = matched
+    connector.update_state_after_alloc = allocated
+
+
+@pytest.mark.parametrize(
+    "num_tokens,backoff",
+    [(40, 0), (48, 0), (40, 1)],
+    ids=["inside-a-span", "on-a-span-boundary", "connector-backoff"],
+)
+@pytest.mark.parametrize("namespace", ["g/1", "g/1/s0"], ids=["group", "trajectory"])
+def test_remote_decoder_lists_the_prefillers_tail_and_its_own_rows(
+    num_tokens, backoff, namespace
+):
+    prefiller = _Engine(_connector_scheduler())
+    decoder = _Engine(_connector_scheduler(), store=(prefiller.client, prefiller.store))
+    _remote_decoder(decoder, prefiller, backoff)
+    prefiller.version, decoder.version = 1, 2
+    tokens, held = list(range(num_tokens)), 0
+    for turn, (extra, max_tokens) in enumerate([(0, 20), (9, 5)]):
+        request_id = f"t{turn}"
+        tokens += list(range(100, 100 + extra))
+        num_prompt = len(tokens)
+        (prefill,) = _requests(
+            [request_id],
+            0,
+            1,
+            namespace=namespace,
+            prompt=tokens[: num_prompt - backoff],
+            prompt_start=held,
+            kv_transfer_params={"do_remote_decode": True},
+        )
+        prefiller.scheduler.add_request(prefill)
+        params = prefiller.run()[request_id].kv_transfer_params or {}
+        prefiller.pause()
+        (decode,) = _requests(
+            [request_id],
+            0,
+            max_tokens,
+            namespace=namespace,
+            prompt=list(tokens),
+            prompt_start=held,
+            kv_transfer_params={**params, "do_remote_prefill": True},
+        )
+        decoder.scheduler.add_request(decode)
+        decoder.run()
+        decoder.pause()
+        assert decoder.hits[request_id] == num_prompt - 1
+        own = num_prompt - 1 if backoff or num_prompt % _BLOCK else num_prompt
+        block_ids = decoder.blocks[id(decode)]
+        for position, (key, tag) in _splice(
+            decoder, decoder.listings[request_id]
+        ).items():
+            if position >= held:
+                assert (tag[1] == 2) == (position >= own), (position, key)
+                if position != own - 1 or own < num_prompt:
+                    assert tag == decoder._slot(block_ids, position), (position, key)
+        seam = (num_prompt - backoff) // _BLOCK
+        assert decoder.connector._dropped == (
+            {decode.block_hashes[seam]}
+            if seam * _BLOCK < num_prompt - 1 and seam < len(decode.block_hashes)
+            else set()
+        )
+        tokens = list(decode.all_token_ids)
+        held = len(tokens) - 1
+    prefiller.close()
+    decoder.computed += prefiller.computed
+    decoder.close()
 
 
 def test_requests_failing_on_a_failed_load_list_nothing():

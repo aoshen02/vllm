@@ -3320,6 +3320,10 @@ class Scheduler(SchedulerInterface):
         self._unreserve_parked(request)
         self._set_kv_fetch_stage(request, None)
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
+        if self.aux_output_connector is not None:
+            kv_xfer_params = self.aux_output_connector.remote_tail(
+                request, kv_xfer_params
+            )
 
         # EC Connector: mirror the KV hook. The contract requires firing
         # before the encoder cache is freed so the connector can inspect

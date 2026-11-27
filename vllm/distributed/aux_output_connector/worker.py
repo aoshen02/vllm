@@ -54,8 +54,8 @@ class _ObjectRun:
     whole is a view of that step's rows; a block computed over several steps
     is filled in place in its own buffer. Positions computed again, after a
     failed KV load, go to copies of their blocks: the writer may still read
-    objects taken from them. Runs start on a block boundary and every object
-    starts at one; a tail object may span blocks."""
+    objects taken from them. Runs start on a block boundary, or after a remote
+    prefill's tail; a tail object may start inside a block and span blocks."""
 
     block_size: int
     end: int = -1
@@ -112,11 +112,11 @@ class _ObjectRun:
 
     def _rows(self, start: int, end: int) -> np.ndarray:
         size = self.block_size
-        first = start // size
-        if end - start <= size:
-            return self.blocks[first][: end - start]
+        first, offset = divmod(start, size)
+        if offset + end - start <= size:
+            return self.blocks[first][offset : offset + end - start]
         blocks = [self.blocks[block] for block in range(first, cdiv(end, size))]
-        return np.concatenate(blocks)[: end - start]
+        return np.concatenate(blocks)[offset : offset + end - start]
 
 
 @dataclass(slots=True)
