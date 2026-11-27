@@ -814,6 +814,7 @@ def _pausable_engine_core_proc() -> EngineCoreProc:
     core._checkpoint_state = CheckpointState.RUNNING
     core._checkpoint_error = None
     core._kv_cache_reclaimable = False
+    core.vllm_config = MagicMock(weight_transfer_config=None)
     core.model_executor = MagicMock()
     core.model_executor.vllm_config.cache_config.enable_extensible_kv_cache = False
     core.scheduler = MagicMock()
@@ -934,7 +935,6 @@ def test_checkpoint_prepare_then_restore_run_in_order():
     state. Restoring brings external state back before the KV cache wakes and
     scheduling resumes. Repeating either is a no-op."""
     core = _pausable_engine_core_proc()
-    core.vllm_config = MagicMock()
     core.model_executor.is_sleeping = False
     core._reset_caches = MagicMock()
     core.reject_new_requests = False
