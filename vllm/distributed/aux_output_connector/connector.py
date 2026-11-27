@@ -133,6 +133,8 @@ class _NamespaceRequest:
     computed: int = 0
     running: bool = False
     in_worker: bool = False
+    tail: AuxObject | None = None
+    head: AuxObject | None = None
 
 
 class AuxOutputSchedulerConnector:
@@ -188,6 +190,7 @@ class AuxOutputSchedulerConnector:
         self._runs: list[str] = []
         self._writes: dict[str, list[AuxObject]] = {}
         self._dropped: set[bytes] = set()
+        self._tails: dict[str, AuxObject] = {}
 
     def build_connector_meta(
         self,
@@ -281,7 +284,9 @@ class AuxOutputSchedulerConnector:
         computed again, and their rows replace the earlier ones, as for inline
         rows. The blocks before it were written at the preemption. A hit of
         the whole prompt computes its last position again; the run starts at
-        the end of the hit, so that row is neither written nor listed."""
+        the end of the hit, so that row is neither written nor listed. A remote
+        prefill hit inside a span starts the run where it computes, after the
+        prefiller's tail: no object holds that span whole, and it is not hit."""
         state = self._namespaces.get(request.request_id)
         if state is None:
             state = _NamespaceRequest(request, namespace, self._emit_start(request))
@@ -289,9 +294,13 @@ class AuxOutputSchedulerConnector:
         if state.running:
             return
         state.running = state.in_worker = True
-        state.start = state.written = round_up(
-            request.num_computed_tokens, self._object_size
-        )
+        num_computed = request.num_computed_tokens
+        state.start = round_up(num_computed, self._object_size)
+        state.tail = state.head = None
+        tail = self._tails.pop(request.request_id, None)
+        if tail is not None and tail[1] < num_computed:
+            state.tail, state.start = (tail[0], tail[1], num_computed), num_computed
+        state.written = state.start
         self._runs.append(request.request_id)
 
     def _object_key(self, state: _NamespaceRequest, start: int) -> str:
@@ -306,11 +315,15 @@ class AuxOutputSchedulerConnector:
         another request can hit was computed by a run that writes it."""
         request, size = state.request, self._object_size
         end = min(limit, len(request.block_hashes) * self._hash_block_size)
+        first = round_up(state.written, size)
         writes = [
             (self._object_key(state, start), start, start + size)
-            for start in range(state.written, end - end % size, size)
+            for start in range(first, end - end % size, size)
         ]
         if writes:
+            if state.written < first:
+                state.head = (self._tail_key(state), state.written, first)
+                self._writes.setdefault(request.request_id, []).append(state.head)
             self._writes.setdefault(request.request_id, []).extend(writes)
             state.written = writes[-1][2]
             if self._dropped:
@@ -339,11 +352,20 @@ class AuxOutputSchedulerConnector:
             (self._object_key(state, start), start, start + size)
             for start in range(first, boundary, size)
         ]
-        if tail and end > max(boundary, state.prompt_start) and boundary >= state.start:
-            key = f"{self._key_prefix}/{state.namespace}/tail-{uuid.uuid4().hex}"
-            listing.append((key, boundary, end))
-            self._writes.setdefault(request.request_id, []).append((key, boundary, end))
+        if state.tail is not None and first <= (seam := state.tail[1]) < end:
+            parts = [(state.tail[0], seam, min(state.tail[2], end))]
+            if state.head is not None and boundary > seam:
+                parts.append(state.head)
+            listing[(seam - first) // size : (seam - first) // size + 1] = parts
+        start = max(boundary, state.start)
+        if tail and end > max(start, state.prompt_start):
+            key = self._tail_key(state)
+            listing.append((key, start, end))
+            self._writes.setdefault(request.request_id, []).append((key, start, end))
         return listing
+
+    def _tail_key(self, state: _NamespaceRequest) -> str:
+        return f"{self._key_prefix}/{state.namespace}/tail-{uuid.uuid4().hex}"
 
     @staticmethod
     def _settled(request: Request) -> int:
@@ -382,6 +404,9 @@ class AuxOutputSchedulerConnector:
     ) -> int:
         num_hit = num_local + num_external
         if self._namespace(request) is not None:
+            params = request.kv_transfer_params
+            if params and params.get("do_remote_prefill"):
+                return self._remote_hit(request, num_local, num_external)
             hashed = len(request.block_hashes) * self._hash_block_size
             usable = num_hit % self._object_size == 0 and num_hit <= min(
                 hashed, self._before_dropped(request)
@@ -398,6 +423,43 @@ class AuxOutputSchedulerConnector:
         elif num_hit % self._block_size or num_hit > self.max_cache_hit(request):
             return 0
         return num_external
+
+    def _remote_hit(self, request: Request, num_local: int, num_external: int) -> int:
+        """Accept a remote prefill ending on a span boundary, or inside the span
+        where the prefiller's tail object starts; the prefiller wrote the rest."""
+        size, num_hit = self._object_size, num_local + num_external
+        start = num_hit - num_hit % size
+        tail = (request.kv_transfer_params or {}).get("aux_tail")
+        self._tails.pop(request.request_id, None)
+        if start > len(request.block_hashes) * self._hash_block_size or (
+            start < num_hit and not (tail and tail[1] == start and tail[2] >= num_hit)
+        ):
+            return 0
+        if start < num_hit:
+            self._tails[request.request_id] = (tail[0], start, num_hit)
+        if self._dropped:
+            step = size // self._hash_block_size
+            self._dropped.difference_update(
+                request.block_hashes[end - 1]
+                for end in range(
+                    (num_local + size) // self._hash_block_size,
+                    start // self._hash_block_size + 1,
+                    step,
+                )
+            )
+        return num_external
+
+    def remote_tail(
+        self, request: Request, kv_transfer_params: dict[str, Any] | None
+    ) -> dict[str, Any] | None:
+        """Add the tail object of a namespace prefill for a remote decoder to
+        the KV transfer params it returns."""
+        params, listing = request.kv_transfer_params, request.aux_objects
+        if not (params and params.get("do_remote_decode") and listing):
+            return kv_transfer_params
+        if not listing[-1][0].rpartition("/")[2].startswith("tail-"):
+            return kv_transfer_params
+        return {**(kv_transfer_params or {}), "aux_tail": list(listing[-1])}
 
     def request_loading(self, request: Request, num_tokens: int) -> None:
         if self._namespace(request) is not None:
@@ -518,7 +580,8 @@ class AuxOutputSchedulerConnector:
                 self._dropped.add(bytes.fromhex(name))
 
     def _before_dropped(self, request: Request) -> int:
-        """Start of the first object of `request` that was dropped."""
+        """Start of the first object of `request` that was dropped or that no
+        object holds whole."""
         if self._dropped:
             step = self._object_size // self._hash_block_size
             for end in range(step, len(request.block_hashes) + 1, step):
@@ -542,10 +605,15 @@ class AuxOutputSchedulerConnector:
         may hit, unless KV it held failed to load (`loads_failed`).
         """
         request_id = request.request_id
+        self._tails.pop(request_id, None)
         state = self._namespaces.get(request_id)
         if state is None:
             return
         num_computed = request.num_computed_tokens
+        if state.tail is not None:
+            index = (state.tail[1] + self._object_size) // self._hash_block_size - 1
+            if index < len(request.block_hashes):
+                self._dropped.add(request.block_hashes[index])
         if not request.is_finished():
             self._write_blocks(state, num_computed)
             state.running = False

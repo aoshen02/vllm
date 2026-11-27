@@ -18,7 +18,7 @@ Startup fails with a `ValueError` unless:
 
 Rejected at startup: adaptive speculative verification, PP > 1 and DCP/PCP > 1. Regular speculative decoding works.
 
-KV connectors are not rejected, including the prefill/decode ones (`NixlConnector`, `MoRIIOConnector`, `MooncakeConnector`, ...). In a prefill/decode deployment, however, the decode engine holds no rows for the KV the prefill engine computed. It accepts that KV only up to `routed_experts_prompt_start` and computes the rest of the prompt again, so the output is correct but the prefill work past that position is lost.
+KV connectors are not rejected, including the prefill/decode ones (`NixlConnector`, `MoRIIOConnector`, `MooncakeConnector`, ...). With inline rows, the decode engine holds no rows for the KV the prefill engine computed: it accepts that KV only up to `aux_prompt_start` and computes the rest of the prompt again, so the output is correct but the prefill work past that position is lost. With a [namespace](#namespaces-delivering-routed-experts-through-a-shared-object-store), the decode engine uses the prefill engine's KV and lists its objects.
 
 ### Backend row restoration
 
@@ -139,6 +139,7 @@ Send `aux_namespace` inside `sampling_params` on `/inference/v1/generate`, or as
 - **Turns.** Send `aux_prompt_start = min(positions held, longest common token prefix of the new prompt and the held tokens, prompt length - 1)`, and splice each listing onto the trajectory with the earlier copy winning ([turns and splicing](aux_outputs.md#turns-and-splicing)).
 - **Reading.** `object_store.read_aux_rows(store, keys, "routed_experts")` from `vllm.distributed.aux_output_connector`, with `store = object_store.create_aux_object_store("mooncake", {"config_path": ...})`, reads the objects in order and concatenates their rows. Writes have no barrier: wait for a training batch's keys no shorter than the write deadline, 80% of `VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS`; a key still missing then is lost, and the samples that need it are masked. Once the engine has written the drop marker of a key it dropped, that key raises at once.
 - **Release.** Once every sample of a namespace is settled and none of its requests runs or will be sent, remove it with `store.remove_prefix(object_store.aux_namespace_prefix(object_key_prefix, aux_namespace))`, which also removes the namespaces under its prefix. Never send a released namespace again.
+- **Prefill/decode disaggregation.** Start both engines with the same `object_key_prefix`, send `aux_namespace` and `aux_prompt_start` to both, and forward the `kv_transfer_params` the prefill engine returns, `aux_tail` included, to the decode engine. Its listing then covers the whole request ([prefill/decode disaggregation](aux_outputs.md#hits-replicas-and-weight-updates)).
 - **KV cache layout.** Hybrid layouts are supported. With `object_key_prefix`, the engine refuses to start without prefix caching or with prefix replay (pass `--no-swa-bounded-replay` on DeepSeek-V4.1).
 
 ### Choosing a namespace
