@@ -49,7 +49,9 @@ For further details on sleep mode, please refer to [this page](../features/sleep
 ## Cache Management APIs
 
 - `LLM.reset_mm_cache` - Resets the multi-modal cache.
-- `LLM.reset_prefix_cache` - Resets the prefix cache.
+- `LLM.reset_prefix_cache(reset_running_requests=False, reset_connector=False) -> bool` - Resets the prefix cache. Returns `False` if blocks are still held (retry, or pass `reset_running_requests=True` to preempt running requests first; it raises `RuntimeError` if the reset still fails). `reset_connector=True` also resets the KV connector cache (`reset_external` on the HTTP endpoint).
+
+There is no `LLM.reset_encoder_cache`; use `llm.llm_engine.reset_encoder_cache()`. To reset all caches after a weight update in one call, pause with `clear_cache=True` (see [Async RL](../training/async_rl.md#pause_generation)). For the HTTP endpoints, see [Cache Management APIs](online_serving/README.md#cache-management-apis).
 
 ## Metrics APIs
 
