@@ -523,26 +523,52 @@ class MultiprocExecutor(Executor):
         if output_rank is not None:
             response_mqs = (response_mqs[output_rank],)
 
+        # Cache per-rank replies already dequeued by non-blocking poll().
+        received: list[tuple[WorkerProc.ResponseStatus, Any] | None] = [None] * len(
+            response_mqs
+        )
+
+        def response_ready() -> bool:
+            for i, mq in enumerate(response_mqs):
+                if received[i] is not None:
+                    continue
+                while mq.readable():
+                    try:
+                        resp_call_id, status, result = mq.dequeue(timeout=0.0)
+                    except TimeoutError:
+                        break
+                    if resp_call_id < call_id:
+                        continue
+                    received[i] = (status, result)
+                    break
+            return all(r is not None for r in received)
+
         def get_response():
             responses = []
             has_failure = False
 
-            for mq in response_mqs:
-                while True:
-                    dequeue_timeout = (
-                        None
-                        if deadline is None
-                        else max(0.0, deadline - time.monotonic())
-                    )
-                    try:
-                        resp_call_id, status, result = mq.dequeue(
-                            timeout=dequeue_timeout
+            for i, mq in enumerate(response_mqs):
+                if (cached := received[i]) is not None:
+                    status, result = cached
+                else:
+                    while True:
+                        dequeue_timeout = (
+                            None
+                            if deadline is None
+                            else max(0.0, deadline - time.monotonic())
                         )
-                    except TimeoutError as e:
-                        raise TimeoutError(f"RPC call to {method} timed out.") from e
-                    if resp_call_id < call_id:
-                        continue
-                    break
+                        try:
+                            resp_call_id, status, result = mq.dequeue(
+                                timeout=dequeue_timeout
+                            )
+                        except TimeoutError as e:
+                            raise TimeoutError(
+                                f"RPC call to {method} timed out."
+                            ) from e
+                        if resp_call_id < call_id:
+                            continue
+                        received[i] = (status, result)
+                        break
 
                 if status == WorkerProc.ResponseStatus.FAILURE_WITH_KV_OUTPUT:
                     if (
@@ -586,8 +612,8 @@ class MultiprocExecutor(Executor):
             return responses[0] if output_rank is not None else responses
 
         def wait_for_response(pending: Sized, deadline: float) -> None:
-            for mq in response_mqs:
-                if not mq.readable():
+            for i, mq in enumerate(response_mqs):
+                if received[i] is None and not mq.readable():
                     mq.spin_until_readable(pending, deadline)
                     return
 
@@ -595,7 +621,7 @@ class MultiprocExecutor(Executor):
             self.futures_queue,
             get_response=get_response,
             aggregate=aggregate,
-            response_ready=lambda: all(mq.readable() for mq in response_mqs),
+            response_ready=response_ready,
             wait_for_response=wait_for_response,
         )
 

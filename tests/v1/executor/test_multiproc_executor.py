@@ -264,3 +264,93 @@ def test_collective_rpc_discards_stale_failure_and_timeout_replies():
     ]
     assert len(worker_mqs[0]) == 0
     assert len(worker_mqs[1]) == 0
+
+
+def test_collective_rpc_poll_discards_stale_without_blocking():
+    """Verify non-blocking FutureWrapper.poll() does not block when a rank has
+    only a stale reply queued while another rank already has its fresh reply.
+    """
+    worker_mqs: list[deque[Any]] = [deque(), deque()]
+
+    class _PollFakeMQ:
+        def __init__(self, idx: int):
+            self.idx = idx
+
+        def readable(self) -> bool:
+            return len(worker_mqs[self.idx]) > 0
+
+        def enqueue(self, item: Any) -> None:
+            worker_mqs[self.idx].append(item)
+
+        def dequeue(self, timeout: float | None = None) -> Any:
+            if not worker_mqs[self.idx]:
+                if timeout == 0.0:
+                    raise TimeoutError
+                raise AssertionError(
+                    f"poll() unexpectedly called blocking dequeue on rank {self.idx}"
+                )
+            return worker_mqs[self.idx].popleft()
+
+    state = {"fail_rank0": True, "delay_rank1": False}
+    deferred_rank1: list[Any] = []
+
+    def _make_worker(rank: int) -> Any:
+        wp: Any = WorkerProc.__new__(WorkerProc)
+        wp.rank = rank
+        wp.use_async_scheduling = False
+        wp.worker_response_mq = _PollFakeMQ(rank)
+
+        def rpc_fn(tag: str) -> str:
+            if rank == 0 and state["fail_rank0"]:
+                raise RuntimeError(f"rank 0 failed on {tag}")
+            return f"ok-{rank}-{tag}"
+
+        wp.worker = SimpleNamespace(rpc_fn=rpc_fn)
+        return wp
+
+    workers = [_make_worker(0), _make_worker(1)]
+    response_mqs = [_PollFakeMQ(0), _PollFakeMQ(1)]
+
+    def broadcast_enqueue(rpc_request: Any) -> None:
+        workers[0]._execute_worker_rpc(rpc_request)
+        if state["delay_rank1"]:
+            deferred_rank1.append(rpc_request)
+        else:
+            workers[1]._execute_worker_rpc(rpc_request)
+
+    executor: Any = MultiprocExecutor.__new__(MultiprocExecutor)
+    executor.vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(enable_fault_tolerance=False)
+    )
+    executor.is_failed = False
+    executor.futures_queue = deque()
+    executor.rpc_broadcast_mq = SimpleNamespace(enqueue=broadcast_enqueue)
+    executor.response_mqs = response_mqs
+
+    # 1. Fail first RPC on rank 0 -> rank 1's stale reply (call_id=1) stays queued.
+    with pytest.raises(RuntimeError, match="rank 0 failed on attempt1"):
+        executor.collective_rpc("rpc_fn", args=("attempt1",))
+    assert len(worker_mqs[0]) == 0
+    assert len(worker_mqs[1]) == 1
+
+    # 2. Retry with non_block=True while rank 1's fresh reply is delayed.
+    state["fail_rank0"] = False
+    state["delay_rank1"] = True
+    fut = executor.collective_rpc("rpc_fn", args=("retry",), non_block=True)
+
+    # Rank 0's fresh reply and rank 1's stale reply are both readable.
+    # poll() must discard rank 1's stale reply, retain rank 0's fresh reply,
+    # and return False immediately without blocking.
+    assert fut.poll() is False
+    assert not fut.done()
+    assert len(worker_mqs[0]) == 0
+    assert len(worker_mqs[1]) == 0
+
+    # Subsequent poll while rank 1 is still pending also returns False promptly.
+    assert fut.poll() is False
+
+    # 3. Once rank 1's fresh reply arrives, poll() completes with both replies.
+    workers[1]._execute_worker_rpc(deferred_rank1.pop())
+    assert fut.poll() is True
+    assert fut.done()
+    assert fut.result() == ["ok-0-retry", "ok-1-retry"]
