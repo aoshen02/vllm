@@ -18,6 +18,7 @@ from vllm.model_executor.layers.fused_moe import (
 from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compressed_tensors_wNa16 import (  # noqa
     WNA16_SUPPORTED_BITS,
 )
+from vllm.model_executor.layers.quantization.utils.quant_utils import kMxfp8Dynamic
 from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
@@ -70,7 +71,11 @@ class CompressedTensorsMoEMethod(FusedMoEMethodBase):
 
             return CompressedTensorsW4A8Mxfp4MoEMethod(
                 layer.moe_config,
-                activation_key=quant_config._fp8_dynamic_input_key(input_quant),
+                activation_key=(
+                    kMxfp8Dynamic
+                    if quant_config._is_mxfp8(input_quant)
+                    else quant_config._fp8_dynamic_input_key(input_quant)
+                ),
             )
 
         if quant_config._is_mxfp4(weight_quant):
